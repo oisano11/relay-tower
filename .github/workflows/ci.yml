@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  validate:
+    name: Code & Config Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          cd upstream-monitor
+          npm install
+
+      - name: Validate JavaScript Syntax
+        run: |
+          cd upstream-monitor
+          node --check server.js
+          node --check auth.js
+          node --check telegram.js
+
+      - name: Validate Example JSON Files
+        run: |
+          node -e '
+            const fs = require("fs");
+            const files = [
+              "upstream-monitor/data/channels.example.json",
+              "upstream-monitor/data/telegram_config.example.json",
+              "upstream-monitor/data/auto_switch_config.example.json"
+            ];
+            for (const f of files) {
+              JSON.parse(fs.readFileSync(f, "utf8"));
+              console.log("Validated JSON:", f);
+            }
+          '
+
+      - name: Validate Dockerfile build
+        run: |
+          docker build -t relay-tower-monitor:test ./upstream-monitor

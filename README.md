@@ -1,9 +1,12 @@
 <div align="center">
 
+<img src="assets/relay-tower-banner.png" alt="Relay Tower Banner" width="100%" style="border-radius: 12px; margin-bottom: 20px;" />
+
 # 🗼 中转塔台 · Relay Tower
 
 **企业级全栈 AI 大模型聚合中转网关 · 智能上游倍率差分监控 · 毫秒级零停机热切换 · 独家 Prompt Cache 锁定保护 · Telegram 移动端调度中枢**
 
+[![CI](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml/badge.svg)](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED.svg?logo=docker&logoColor=white)](docker-compose.yml)
