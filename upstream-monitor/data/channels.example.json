@@ -1,0 +1,105 @@
+{
+  "activeChannelId": "1",
+  "autoPollIntervalSeconds": 300,
+  "channels": [
+    {
+      "id": "1",
+      "name": "OpenAI 官方直连通道",
+      "vendor": "OpenAI",
+      "provider": "OpenAI Official",
+      "platform": "openai",
+      "providerType": "OpenAI兼容",
+      "baseUrl": "https://api.openai.com",
+      "apiKey": "sk-your-openai-api-key-here",
+      "pricingUrl": "",
+      "multiplier": 1.0,
+      "costMultiplier": 1.0,
+      "saleMultiplier": 1.2,
+      "primaryGroupName": "默认通用分组",
+      "primaryGroupId": 1,
+      "profitSpread": 0.2,
+      "marginPercent": 16.7,
+      "isLoss": false,
+      "groupsDetail": [
+        {
+          "id": 1,
+          "name": "默认通用分组",
+          "sale_rate": 1.2,
+          "spread": 0.2,
+          "margin_percent": 16.7,
+          "is_loss": false,
+          "is_primary": true
+        }
+      ],
+      "previousMultiplier": 1.0,
+      "status": "online",
+      "schedulable": true,
+      "priority": 10,
+      "groups": [
+        "默认通用分组"
+      ],
+      "modelMapping": {
+        "gpt-4o": "gpt-4o",
+        "gpt-4o-mini": "gpt-4o-mini"
+      },
+      "configuredModels": [
+        "gpt-4o",
+        "gpt-4o-mini"
+      ],
+      "knownModels": [
+        "gpt-4o",
+        "gpt-4o-mini"
+      ],
+      "latency": 280,
+      "lastCheck": "2026-09-10T12:00:00.000Z"
+    },
+    {
+      "id": "2",
+      "name": "Claude 聚合高速备用通道",
+      "vendor": "Anthropic",
+      "provider": "Upstream Partner",
+      "platform": "anthropic",
+      "providerType": "Claude",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "sk-ant-your-claude-api-key-here",
+      "pricingUrl": "https://api.anthropic.com/api/pricing",
+      "multiplier": 0.85,
+      "costMultiplier": 0.85,
+      "saleMultiplier": 1.0,
+      "primaryGroupName": "Claude 专线分组",
+      "primaryGroupId": 2,
+      "profitSpread": 0.15,
+      "marginPercent": 15.0,
+      "isLoss": false,
+      "groupsDetail": [
+        {
+          "id": 2,
+          "name": "Claude 专线分组",
+          "sale_rate": 1.0,
+          "spread": 0.15,
+          "margin_percent": 15.0,
+          "is_loss": false,
+          "is_primary": true
+        }
+      ],
+      "previousMultiplier": 0.85,
+      "status": "online",
+      "schedulable": true,
+      "priority": 20,
+      "groups": [
+        "Claude 专线分组"
+      ],
+      "modelMapping": {
+        "claude-3-7-sonnet-20250219": "claude-3-7-sonnet-20250219"
+      },
+      "configuredModels": [
+        "claude-3-7-sonnet-20250219"
+      ],
+      "knownModels": [
+        "claude-3-7-sonnet-20250219"
+      ],
+      "latency": 320,
+      "lastCheck": "2026-09-10T12:00:00.000Z"
+    }
+  ]
+}

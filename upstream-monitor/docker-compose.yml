@@ -1,0 +1,13 @@
+services:
+  upstream-monitor:
+    build: .
+    container_name: upstream-monitor
+    restart: always
+    ports:
+      - "33890:3300"
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PORT=3300
+      - IS_VPS=true

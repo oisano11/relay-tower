@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "botToken": "your_telegram_bot_token_here",
+  "adminChatIds": [],
+  "notifyOnRatioChange": true,
+  "notifyOnActiveSurge": true,
+  "notifyOnAutoSwitch": true,
+  "notifyOnOutage": true,
+  "proxy": ""
+}
