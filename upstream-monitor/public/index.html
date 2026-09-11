@@ -1,0 +1,1612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>天枢 Aegis | 智能上游调度与利润风控中控台</title>
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="stylesheet" href="style.css?v=20260906_users">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- 顶部导航栏 -->
+    <header class="top-nav">
+      <div class="brand-area">
+        <div class="brand-logo" style="display: flex; align-items: center; justify-content: center; background: transparent; padding: 0;">
+          <img src="favicon.png" style="width: 30px; height: 30px; border-radius: 7px; box-shadow: 0 2px 8px rgba(0,0,0,0.25);">
+        </div>
+        <div class="brand-text">
+          <h1>天枢 Aegis <span>智能调度与风控中控台</span></h1>
+        </div>
+      </div>
+
+      <div class="header-center">
+        <!-- 快速单切换 -->
+        <div class="quick-switcher-badge">
+          <span class="dot-live"></span>
+          <span class="label">当前主调:</span>
+          <select id="headerChannelSelect" class="channel-dropdown" title="一键将选中的上游设为最高优先主调">
+            <!-- 动态填充 -->
+          </select>
+          <span id="headerMultiplierBadge" class="ratio-pill">--x</span>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <div class="gateway-status">
+          <span class="mono-code">/v1 本地转发正常</span>
+        </div>
+        <div class="gateway-status" id="globalUserStatusBadge" style="cursor: pointer;" title="全站实时在线与活跃客户（点击打开充值与消费统计看板）">
+          <span class="mono-code" id="globalUserStatusText">👥 0 人在线 · 今日 0 人活跃</span>
+        </div>
+        <button id="btnOpenUserFinancesModal" class="btn btn-finance-nav" title="打开全站用户充值金额、消费明细与每日财务统计大盘">
+          <span>💳</span> 充值与消费看板
+        </button>
+        <div class="poller-badge" id="pollerBadge" title="自动巡检倒计时 (倍率5分钟/次，余额10分钟/次)">
+          <span>⏱</span>
+          <span id="pollerCountdown">5分00秒</span>
+        </div>
+        <button id="btnRefreshBalances" class="btn btn-glass" title="一键抓取并刷新所有上游钱包余额">
+          <span>💰</span> 刷新余额
+        </button>
+        <button id="btnOpenAllGroupsModal" class="btn btn-glass" title="直接在中控管理所有业务销售分组与对外倍率">
+          <span>📁</span> 业务分组
+        </button>
+        <button id="btnOpenJinlongModal" class="btn btn-glass" title="配置上游 New API 后台账号获取余额与倍率">
+          <span>🔑</span> 上游后台 <span id="jinlongStatusPill" class="jinlong-status-mini">待配置</span>
+        </button>
+        <button id="btnOpenAutoSwitchModal" class="btn btn-glass" title="配置基于首字速度与成本性价比的智能自动切换">
+          <span>⚡</span> 自动切线 <span id="autoSwitchStatusPill" class="auto-switch-status-pill on">已启用</span>
+        </button>
+        <button id="btnOpenTelegramModal" class="btn btn-glass" title="配置 Telegram 机器人推送与手机端一键切线">
+          <span style="color: #0284c7;">✈️</span> Telegram <span id="tgHeaderStatusPill" class="auto-switch-status-pill on">已连接</span>
+        </button>
+        <button id="btnOpenAlertsDrawer" class="btn btn-glass btn-alerts-box" title="打开报错与告警信息盒 (查看全部上游调价、自动切线熔断与报错流水)">
+          <span class="bell-icon" id="alertsBellIcon">🔔</span> 报错信息盒 <span id="alertsBadgeCount" class="alerts-badge-count" style="display: none;">0</span>
+        </button>
+        <button id="btnRefreshAll" class="btn btn-glass" title="立刻检查全部上游">
+          <span>⟳</span> 立即检测
+        </button>
+        <button id="btnSimulate" class="btn btn-warning-glass" title="模拟上游变价，测试弹窗效果">
+          <span>⚡</span> 模拟调价测试
+        </button>
+        <button id="btnOpenSecurityModal" class="btn btn-glass" title="查看系统防御状态与修改管理员密码">
+          <span>🛡️</span> 安全设置
+        </button>
+        <button id="btnLogout" class="btn btn-glass" title="安全退出登录并注销凭据">
+          <span>🚪</span> 退出
+        </button>
+      </div>
+    </header>
+
+    <!-- 主体内容 -->
+    <main class="main-container">
+      <!-- 1. 全局轻量化运营态势中枢 (一体化精简排版，替代原有笨重 4 大卡片，大幅上提渠道监控) -->
+      <section class="ops-ribbon-section">
+        <div class="ops-ribbon-bar">
+          
+          <!-- 左侧：客户财务实况 (最重要业务数据) -->
+          <div class="ops-ribbon-group group-finance" id="userFinanceQuickBar" style="cursor: pointer;" title="点击打开全景财务与客户盈利统计看板">
+            <div class="ops-pill-item pill-recharge" title="客户实际累计总充值（不含测试号）">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💳</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">客户实充</span>
+                <strong id="barTotalRecharge" class="ops-pill-val mono">¥--</strong>
+              </div>
+            </div>
+
+            <div class="ops-pill-item pill-spent" title="客户实际累计总消费（不含测试号）">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">📉</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">客户消费</span>
+                <strong id="barTotalSpent" class="ops-pill-val mono">¥--</strong>
+              </div>
+            </div>
+
+            <div class="ops-pill-item pill-profit highlight-profit-pill" title="客户消费减去上游采购真实净毛利与利润率">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💎</span></span>
+              <div class="ops-pill-text">
+                <div class="ops-pill-label-row">
+                  <span class="ops-pill-label">净赚毛利</span>
+                  <span id="barProfitMargin" class="ops-pill-margin-badge mono">--%</span>
+                </div>
+                <strong id="barTotalProfit" class="ops-pill-val mono">+¥--</strong>
+              </div>
+            </div>
+
+            <div class="ops-pill-item pill-balance" title="所有客户预存扣除消费后的资金池结存">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💰</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">资金池结存</span>
+                <strong id="barBalancePool" class="ops-pill-val mono">¥--</strong>
+              </div>
+            </div>
+
+            <div class="ops-pill-item pill-yesterday hide-on-compact" title="客户昨日24小时实际消费金额">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">📅</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">昨日消/透</span>
+                <strong id="barYesterdaySpent" class="ops-pill-val mono">¥--</strong>
+                <span id="barYesterdayProfit" style="display: none;"></span>
+              </div>
+            </div>
+
+            <div class="ops-pill-action">
+              <span class="ops-action-tag">
+                <span>财务对账</span>
+                <span class="action-arrow">↗</span>
+              </span>
+            </div>
+          </div>
+
+          <div class="ops-ribbon-divider"></div>
+
+          <!-- 右侧：上游通道与风控指标 (轻量状态胶囊) -->
+          <div class="ops-ribbon-group group-system">
+            <div class="ops-status-badge badge-channels" title="当前开启调度的上游通道数 / 总接入通道数">
+              <span class="ops-badge-dot pulse-green"></span>
+              <span class="ops-badge-label">通道:</span>
+              <strong id="metricEnabledCount" class="mono">-- / 18 开</strong>
+            </div>
+
+            <div class="ops-status-badge badge-risk" id="cardLossWarning" title="倒贴风险隐患排查">
+              <span class="ops-badge-icon">🛡️</span>
+              <strong id="metricLossCount">0 倒贴</strong>
+              <span id="metricLossBadge" style="display: none;">安全</span>
+            </div>
+
+            <div class="ops-status-badge badge-margin hide-on-compact" title="当前开启渠道综合加权预估毛利率">
+              <span class="ops-badge-icon">📈</span>
+              <span class="ops-badge-label">综合预估:</span>
+              <strong id="metricAvgMargin" class="mono">--%</strong>
+              <span id="metricMarginStatusBadge" style="display: none;">健康</span>
+            </div>
+
+            <div class="ops-status-badge badge-lowest hide-on-compact" title="全场最低进货价渠道">
+              <span class="ops-badge-icon">⚡</span>
+              <span class="ops-badge-label">最低:</span>
+              <strong id="metricLowestMultiplier" class="mono">--x</strong>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- 隐藏保留的旧指标占位元素，确保任何旧代码和逻辑 100% 兼容无报错 -->
+        <div style="display: none;" aria-hidden="true">
+          <span id="metricActiveName"></span>
+          <span id="metricActiveMultiplier"></span>
+          <span id="metricActiveSale"></span>
+          <span id="metricActiveMargin"></span>
+          <span id="metricActiveUrl"></span>
+          <span id="metricMarginDesc"></span>
+          <span id="metricMarginSpreadText"></span>
+          <span id="metricLossDesc"></span>
+          <span id="metricLossFooterText"></span>
+          <span id="metricChannelCount"></span>
+          <span id="metricLastProbeTime"></span>
+          <span id="barPayingUsers"></span>
+        </div>
+      </section>
+
+      <!-- 2. 流水与盈利实时测算器 (轻量化折叠设计，默认收起不占地) -->
+      <section class="calculator-section">
+        <div class="calc-card" id="calcCard">
+          <div class="calc-header" id="calcToggleHeader" style="cursor: pointer;" title="点击展开/收起流水盈利核算器">
+            <div class="calc-title-row">
+              <span class="calc-icon">💰</span>
+              <span class="calc-title">流水盈利核算器</span>
+              <span class="calc-tag">进销倍率与毛利实时测算</span>
+              <!-- 收起状态下的精简概要 -->
+              <span id="calcCompactSummary" class="calc-compact-summary">
+                测算: ¥<span id="compactRevenue">1,000</span> 流水 -> 预计毛利 <strong id="compactProfit" style="color: #059669;">+¥242.43</strong> (<span id="compactMargin" style="color: #059669;">+24.2%</span>)
+              </span>
+            </div>
+            <div class="calc-header-right">
+              <div class="calc-quick-presets" id="calcQuickPresets" style="display: none;">
+                <span style="font-size: 0.72rem; color: #71717a;">快捷流水:</span>
+                <button class="btn-preset" data-val="500">¥500</button>
+                <button class="btn-preset active" data-val="1000">¥1000</button>
+                <button class="btn-preset" data-val="5000">¥5000</button>
+                <button class="btn-preset" data-val="10000">¥10000</button>
+              </div>
+              <button id="btnToggleCalc" class="btn-toggle-calc" type="button" title="展开/收起核算器">
+                <span id="toggleCalcIcon">▼</span>
+                <span id="toggleCalcText">展开测算</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="calc-body" id="calcBody" style="display: none;">
+            <div class="calc-inputs-row">
+              <div class="calc-input-group">
+                <label>客户充值 / 消费流水 (元):</label>
+                <div class="input-addon-wrap">
+                  <span class="addon">¥</span>
+                  <input type="number" id="calcRevenueInput" value="1000" min="1" step="100" class="calc-input" />
+                </div>
+              </div>
+
+              <div class="calc-input-group" style="flex: 1.4;">
+                <label>核算渠道 / 业务分组:</label>
+                <select id="calcChannelSelect" class="calc-select">
+                  <option value="avg">【综合调度池】开启渠道平均 (加权估算)</option>
+                  <!-- 由 app.js 填充各渠道与分组 -->
+                </select>
+              </div>
+            </div>
+
+            <!-- 测算结果栏 -->
+            <div class="calc-results-grid">
+              <div class="calc-result-item">
+                <span class="res-label">销售入账 (用户支付)</span>
+                <span id="calcResRevenue" class="res-val val-revenue">¥ 1,000.00</span>
+                <span class="res-sub">下游客户实收金额</span>
+              </div>
+
+              <div class="calc-result-item">
+                <span class="res-label">上游采购成本 (支出)</span>
+                <span id="calcResCost" class="res-val val-cost">¥ 500.00</span>
+                <span id="calcResCostPercent" class="res-sub">成本占比 50.0%</span>
+              </div>
+
+              <div class="calc-result-item highlight">
+                <span class="res-label">中转站净利润 (毛利)</span>
+                <span id="calcResProfit" class="res-val val-profit">+¥ 500.00</span>
+                <span id="calcResMargin" class="res-sub">毛利率 +50.0%</span>
+              </div>
+
+              <div class="calc-result-item">
+                <span class="res-label">倍率利差公式</span>
+                <span id="calcResSpreadFormula" class="res-val val-formula">0.1200x - 0.0600x</span>
+                <span id="calcResSpreadDiff" class="res-sub">利差 +0.0600x</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. 分类切换与多通道调度大盘 -->
+      <section class="board-section">
+        <div class="section-header">
+          <div class="section-title-wrap">
+            <h2>上游渠道监控清单</h2>
+            <span class="subtitle-tag">进货成本 · 对外售价 · 利润利差 · 多开分流 · 免登后台双向直改倍率</span>
+          </div>
+          <div class="section-controls">
+            <div class="search-box">
+              <input type="text" id="channelSearchInput" placeholder="输入名称/分组/厂商搜索..." />
+            </div>
+          </div>
+        </div>
+
+        <!-- 【分类切换控制面板】 -->
+        <div class="filter-section">
+          <!-- 维度一：分类维度切换 -->
+          <div class="filter-dimension-row">
+            <span class="dimension-label">分类维度:</span>
+            <div class="dimension-tabs">
+              <button class="dim-tab active" data-dim="vendor">按模型厂商</button>
+              <button class="dim-tab" data-dim="provider">按上游供应商</button>
+              <button class="dim-tab" data-dim="group">按业务分组</button>
+              <button class="dim-tab" data-dim="active">活跃渠道</button>
+            </div>
+          </div>
+
+          <!-- 维度二：具体分类 Pills + 批量控制按钮 -->
+          <div class="filter-pills-row">
+            <div id="filterPillsContainer" class="filter-pills">
+              <!-- 由 app.js 动态生成标签 pills -->
+            </div>
+
+            <div class="batch-actions">
+              <span style="font-size: 0.72rem; color: #71717a;">批量:</span>
+              <button id="btnAutoQualifyCost" class="btn-batch" onclick="triggerAutoQualifyByCost()" style="color: #047857; background: #ecfdf5; border-color: #a7f3d0; font-weight: 700;" title="以不赔钱为第一主线，谁便宜谁是主调，次便宜为副调，保底尤慎重">⚡ 一键按价格定性</button>
+              <button id="btnBatchEnableAll" class="btn-batch" title="开启当前筛选出的所有上游调度">全部开启</button>
+              <button id="btnBatchDisableAll" class="btn-batch" title="关闭当前筛选出的所有上游调度">全部停用</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 正在调度异常预警横幅 -->
+        <div id="activeStabilityWarningBanner" class="active-stability-warning-banner" style="display: none;"></div>
+
+        <!-- 【条状表格安全横向滚动容器】 -->
+        <div class="strips-table-wrapper">
+          <!-- 【条状表头提示栏】 -->
+          <div class="strips-header-bar">
+            <div class="col-th" style="text-align: center;">状态</div>
+            <div class="col-th">上游名称 · 厂商 · 线路</div>
+            <div class="col-th" style="text-align: center;">调度开关</div>
+            <div class="col-th" style="text-align: center;">账户余额</div>
+            <div class="col-th">进货成本 (Cost)</div>
+            <div class="col-th">对外售价 (Sale)</div>
+            <div class="col-th">毛利率 / 利差</div>
+            <div class="col-th" style="text-align: center;">首字速度 & 稳定性</div>
+            <div class="col-th" style="text-align: center;">延迟</div>
+            <div class="col-th" style="text-align: right;">快捷操作</div>
+          </div>
+
+          <!-- 【条状容器】 -->
+          <div id="channelsStripsList" class="strips-container">
+            <!-- 由 app.js 动态渲染为横向条状 -->
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 弹窗：直接修改倍率弹窗 (无需登录中控后台) -->
+    <div id="rateEditModal" class="modal-backdrop">
+      <div class="modal-dialog" style="max-width: 400px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #eff6ff; color: #1e40af; border-color: #bfdbfe;">中控直改倍率</span>
+            <span style="font-size: 0.72rem; color: #64748b;">免登 Sub2API 后台</span>
+          </div>
+          <h3 id="rateEditChannelName" style="color: #0f172a; font-size: 1.1rem; margin-top: 2px;">修改上游倍率</h3>
+          <p style="font-size: 0.78rem; color: #64748b;">修改后将直接同步至线上生产数据库，立即对扣费生效。</p>
+
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.5rem;">
+            <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #64748b;">
+              <span>当前倍率:</span>
+              <strong id="rateEditCurrentVal" style="color: #0f172a; font-family: var(--font-mono);">0.0600x</strong>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <label style="font-size: 0.8rem; color: #334155; white-space: nowrap; font-weight: 600;">新进货倍率:</label>
+              <input type="number" id="rateEditInput" step="0.0001" min="0.0001" class="form-input" style="flex: 1; font-family: var(--font-mono); font-size: 1rem; font-weight: 700; color: #059669;" required />
+              <span style="font-family: var(--font-mono); font-weight: 700; color: #64748b;">x</span>
+            </div>
+          </div>
+
+          <div class="dialog-actions">
+            <button id="btnConfirmRateEdit" class="btn btn-primary" style="justify-content: center;">
+              立即保存并同步生效
+            </button>
+            <button id="btnCancelRateEdit" class="btn btn-secondary" style="justify-content: center;">
+              取消
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：直接修改业务分组对外售价 (无需登录中控后台) -->
+    <div id="saleRateEditModal" class="modal-backdrop">
+      <div class="modal-dialog" style="max-width: 420px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #ecfdf5; color: #047857; border-color: #a7f3d0;">中控直改销售倍率</span>
+            <span style="font-size: 0.72rem; color: #64748b;">免登 Sub2API 后台</span>
+          </div>
+          <h3 id="saleRateEditGroupName" style="color: #0f172a; font-size: 1.1rem; margin-top: 2px;">修改分组对外售价</h3>
+          <p style="font-size: 0.78rem; color: #64748b;">调整该业务分组对外卖给客户的扣费倍率，修改后立即对下游客户调用生效。</p>
+
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.5rem;">
+            <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #64748b;">
+              <span>当前对外售价:</span>
+              <strong id="saleRateEditCurrentVal" style="color: #0f172a; font-family: var(--font-mono);">0.1200x</strong>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <label style="font-size: 0.8rem; color: #334155; white-space: nowrap; font-weight: 600;">新销售倍率:</label>
+              <input type="number" id="saleRateEditInput" step="0.0001" min="0.0001" class="form-input" style="flex: 1; font-family: var(--font-mono); font-size: 1rem; font-weight: 700; color: #059669;" required />
+              <span style="font-family: var(--font-mono); font-weight: 700; color: #64748b;">x</span>
+            </div>
+          </div>
+
+          <div class="dialog-actions">
+            <button id="btnConfirmSaleRateEdit" class="btn btn-primary" style="justify-content: center;">
+              立即保存并同步生效
+            </button>
+            <button id="btnCancelSaleRateEdit" class="btn btn-secondary" style="justify-content: center;">
+              取消
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：上游改价强提醒弹窗 -->
+    <div id="alertModal" class="modal-backdrop">
+      <div class="modal-dialog alert-dialog">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" id="modalAlertBadge">上游改价提醒</span>
+            <span class="alert-time" id="modalAlertTime">刚刚</span>
+          </div>
+          <h2 id="modalAlertTitle" class="alert-title">注意：上游渠道调整了进货倍率！</h2>
+          <p id="modalAlertReason" class="alert-reason-text">系统在自动检测中抓取到了最新进货价格。</p>
+
+          <div class="price-compare-card">
+            <div class="compare-col">
+              <span class="col-label">原进货倍率</span>
+              <span id="modalOldRate" class="col-value old-rate">0.65x</span>
+            </div>
+            <div class="compare-arrow">
+              <span id="modalChangePercent" class="delta-pill delta-up">+46.1% 涨价</span>
+            </div>
+            <div class="compare-col">
+              <span class="col-label">调整后新倍率</span>
+              <span id="modalNewRate" class="col-value new-rate">0.95x</span>
+            </div>
+          </div>
+
+          <div id="modalActiveWarning" class="alert-warning-banner" style="display: none;">
+            <div>
+              <strong>严重警告：该涨价渠道正在开启调度中！</strong>
+              <p style="margin-top: 2px;">成本上涨可能导致中转站倒贴亏损，建议立刻暂停该渠道或换到同厂商低价备选。</p>
+            </div>
+          </div>
+
+          <div id="modalSameVendorNotice" class="alert-info-banner" style="display: none; margin-top: 0.75rem; padding: 0.75rem 1rem; border-radius: 8px; background: #f8fafc; border: 1px solid #e2e8f0; color: #475569; font-size: 0.85rem; line-height: 1.5;">
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1.25rem;">
+            <button id="modalBtnSwitchLowest" class="btn btn-success">
+              一键切换到同厂商最低上游 (<span id="modalLowestCandidateText">0.0600x</span>)
+            </button>
+            <button id="modalBtnDismiss" class="btn btn-secondary">
+              知道了，暂不切换
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 抽屉：报错与告警信息盒 -->
+    <div id="alertsDrawer" class="drawer-backdrop">
+      <div class="drawer-panel">
+        <div class="drawer-header">
+          <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <span style="font-size: 1.15rem;">🔔</span>
+            <h3 style="margin: 0; font-size: 0.98rem; font-weight: 700; color: #0f172a;">报错与告警信息盒</h3>
+            <span id="drawerAlertsTotal" class="mono" style="font-size: 0.72rem; color: #64748b; background: #f1f5f9; padding: 0.1rem 0.45rem; border-radius: 999px;">0 条</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.45rem;">
+            <button id="btnClearAlertsRead" class="btn btn-secondary" style="font-size: 0.74rem; padding: 0.2rem 0.55rem; color: #0284c7; border-color: #bae6fd; background: #f0f9ff;" title="将全部告警标记为已读">✓ 标记已读</button>
+            <button id="btnCloseDrawer" class="btn btn-secondary" style="padding: 0.2rem 0.5rem;">✕</button>
+          </div>
+        </div>
+        <div class="drawer-body">
+          <div id="alertsList" class="alerts-list">
+            <!-- 动态记录 -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：备选线路管理与切换 -->
+    <div id="backupLinesModal" class="modal-backdrop">
+      <div class="modal-dialog" style="max-width: 600px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;">备选线路与多节点调度</span>
+            <span style="font-size: 0.72rem; color: #64748b;">支持一键热切 & 自动同步线上数据库</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <h3 id="linesModalChannelName" style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">渠道线路管理</h3>
+            <button id="btnModalPingAllLines" class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.25rem 0.6rem;">
+              ⚡ 测速全部线路
+            </button>
+          </div>
+          <p style="font-size: 0.78rem; color: #64748b; margin-top: -2px;">
+            当前使用主线如果出现超时或封锁，可直接一键切换至备选线路，系统将自动向生产环境落库生效。
+          </p>
+
+          <!-- 线路列表容器 -->
+          <div id="modalLinesListContainer" class="modal-lines-list">
+            <!-- 由 app.js 动态渲染各线路卡片 -->
+          </div>
+
+          <!-- 添加备用线路折叠面板 -->
+          <div style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 0.75rem; margin-top: 0.75rem;">
+            <div style="font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.4rem;">添加自定义备用节点线路</div>
+            <div style="display: flex; gap: 0.5rem; margin-bottom: 0.4rem;">
+              <input type="text" id="inputNewLineLabel" placeholder="线路备注 (如: 香港备用专线)" class="form-input" style="flex: 1; font-size: 0.8rem;" />
+              <input type="url" id="inputNewLineUrl" placeholder="https://api-backup.example.com" class="form-input" style="flex: 2; font-family: var(--font-mono); font-size: 0.8rem;" />
+            </div>
+            <button id="btnModalAddNewLine" class="btn btn-secondary" style="width: 100%; justify-content: center; font-size: 0.78rem;">
+              + 添加到备选池
+            </button>
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1rem;">
+            <button id="btnCloseLinesModal" class="btn btn-primary" style="width: 100%; justify-content: center;">
+              完成并关闭
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：上游 New API 后台专属接入与倍率/余额获取 -->
+    <div id="jinlongModal" class="modal-backdrop">
+      <div class="modal-dialog" style="max-width: 540px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #f0fdf4; color: #15803d; border-color: #bbf7d0;">New-API 后台直连接入</span>
+            <span style="font-size: 0.72rem; color: #64748b;">获取真实倍率与个人中心余额</span>
+          </div>
+          <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">接入上游后台 (New API)</h3>
+          <p style="font-size: 0.78rem; color: #64748b;">
+            对接上游 New-API / One-API Web 管理后台，自动提取个人中心钱包余额与各模型实际进货倍率。
+          </p>
+
+          <!-- 模式切换 -->
+          <div style="display: flex; gap: 0.5rem; margin-bottom: 0.8rem;">
+            <button id="btnJinlongTabCreds" class="dim-tab active" style="flex: 1; text-align: center;">方式一：账号密码登录</button>
+            <button id="btnJinlongTabCookie" class="dim-tab" style="flex: 1; text-align: center;">方式二：粘贴 Cookie / Token</button>
+          </div>
+
+          <!-- 表单区 -->
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.6rem;">
+            <div>
+              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">后台地址 (New API):</label>
+              <input type="text" id="jinlongBackendUrl" value="https://api.example.com" class="form-input" style="width: 100%; font-family: var(--font-mono); font-size: 0.85rem;" />
+            </div>
+
+            <!-- 方式一：账号密码表单 -->
+            <div id="jinlongCredsForm">
+              <div style="display: flex; gap: 0.5rem;">
+                <div style="flex: 1;">
+                  <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">后台用户名 / 邮箱:</label>
+                  <input type="text" id="jinlongUsername" placeholder="登录上游后台的账号" class="form-input" style="width: 100%; font-size: 0.85rem;" />
+                </div>
+                <div style="flex: 1;">
+                  <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">密码:</label>
+                  <input type="password" id="jinlongPassword" placeholder="后台密码" class="form-input" style="width: 100%; font-size: 0.85rem;" />
+                </div>
+              </div>
+            </div>
+
+            <!-- 方式二：Cookie / Token 表单 -->
+            <div id="jinlongCookieForm" style="display: none;">
+              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">浏览器会话 Cookie 或 Access Token:</label>
+              <textarea id="jinlongCookieOrToken" placeholder="例如: session=ey..." class="form-input" style="width: 100%; height: 60px; font-family: var(--font-mono); font-size: 0.75rem;"></textarea>
+            </div>
+          </div>
+
+          <!-- 状态与连接反馈 -->
+          <div id="jinlongStatusBox" style="margin-top: 0.7rem; padding: 0.6rem; border-radius: 6px; font-size: 0.78rem; display: none;">
+            <!-- 由 JS 填充连接成功或错误信息 -->
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 0.8rem;">
+            <button id="btnSubmitJinlongConnect" class="btn btn-primary" style="flex: 1; justify-content: center;">
+              立即验证并同步资产
+            </button>
+            <button id="btnCloseJinlongModal" class="btn btn-secondary" style="justify-content: center;">
+              关闭
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：单渠道调整所属业务分组 -->
+    <div id="channelGroupsModal" class="modal-backdrop">
+      <div class="modal-dialog" style="max-width: 560px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #eef2ff; color: #4338ca; border-color: #c7d2fe;">渠道业务分组指派</span>
+            <span style="font-size: 0.72rem; color: #64748b;">支持多选勾选 · 自动更新生产数据库</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <h3 id="channelGroupsModalTitle" style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">调整所属分组</h3>
+            <span id="channelGroupsModalCost" class="strip-cost-val" style="font-size: 0.82rem;">进货成本: --x</span>
+          </div>
+          <p style="font-size: 0.78rem; color: #64748b; margin-top: -2px;">
+            选择该上游承接的业务销售分组。保存后系统将自动更新 <code class="mono" style="font-size: 0.75rem;">account_groups</code> 并在中控台即刻重算销售价与毛利率。
+          </p>
+
+          <div id="channelGroupsCheckboxesList" style="display: flex; flex-direction: column; gap: 0.45rem; max-height: 280px; overflow-y: auto; padding: 0.4rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; margin: 0.6rem 0;">
+            <!-- 由 app.js 动态渲染可用分组勾选框 -->
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 0.8rem; display: flex; gap: 0.5rem;">
+            <button id="btnSaveChannelGroups" class="btn btn-primary" style="flex: 1; justify-content: center;">
+              💾 保存分组配置
+            </button>
+            <button id="btnCloseChannelGroupsModal" class="btn btn-secondary" style="justify-content: center;">
+              取消
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：全站业务分组管理中枢 (增/改/分配) -->
+    <div id="allGroupsModal" class="modal-backdrop">
+      <div class="modal-dialog" style="max-width: 780px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #fdf2f8; color: #be185d; border-color: #fbcfe8;">业务分组控制中枢</span>
+            <span style="font-size: 0.72rem; color: #64748b;">免登录 Sub2API 后台直接维护分组与对外倍率</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="color: #0f172a; font-size: 1.18rem; margin-top: 2px;">业务分组与销售倍率管理</h3>
+            <button id="btnRefreshAllGroupsList" class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.22rem 0.6rem;">
+              ⟳ 刷新分组数据
+            </button>
+          </div>
+          <p style="font-size: 0.78rem; color: #64748b; margin-top: -2px;">
+            在下方直接新建分组、在线修改销售倍率，或指派所属上游渠道。所有变更将即时直写生产数据库。
+          </p>
+
+          <!-- 1. 新建分组栏 -->
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 7px; padding: 0.65rem 0.85rem; margin: 0.5rem 0 0.8rem 0;">
+            <div style="font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.35rem; display: flex; align-items: center; gap: 0.35rem;">
+              <span>➕ 新建业务销售分组</span>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+              <input type="text" id="inputNewGroupName" placeholder="分组名称 (如: DeepSeek 0.4 / Claude极速 1.1)" class="form-input" style="flex: 2; font-size: 0.82rem;" />
+              <div style="display: flex; align-items: center; gap: 0.25rem; flex: 1.2;">
+                <span style="font-size: 0.78rem; color: #64748b;">对外倍率:</span>
+                <input type="number" id="inputNewGroupRate" step="0.0001" min="0.0001" max="100" placeholder="1.0000" value="1.0000" class="form-input mono" style="width: 90px; font-size: 0.85rem; text-align: center;" />
+                <span style="font-size: 0.78rem; color: #64748b;">x</span>
+              </div>
+              <button id="btnCreateNewGroup" class="btn btn-primary" style="font-size: 0.8rem; padding: 0.35rem 0.8rem; white-space: nowrap;">
+                ➕ 确认创建
+              </button>
+            </div>
+          </div>
+
+          <!-- 2. 分组全景卡片列表 -->
+          <div id="allGroupsCardsContainer" style="display: flex; flex-direction: column; gap: 0.55rem; max-height: 380px; overflow-y: auto; padding-right: 0.2rem;">
+            <!-- 由 app.js 动态渲染各分组卡片 -->
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1rem;">
+            <button id="btnCloseAllGroupsModal" class="btn btn-secondary" style="width: 100%; justify-content: center;">
+              关闭窗口
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 7. 系统安全中心与密码修改模态框 -->
+    <div id="securityModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 500px;">
+        <div class="modal-header">
+          <div class="modal-title">
+            <span class="modal-icon">🛡️</span>
+            <div>
+              <h3>系统安全中心</h3>
+              <p class="modal-subtitle">5 层立体纵深防御体系与凭证加固</p>
+            </div>
+          </div>
+          <button id="btnCloseSecurityModal" class="btn-close">&times;</button>
+        </div>
+
+        <div class="modal-body" style="padding: 1.25rem;">
+          <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 12px 14px; margin-bottom: 1.25rem;">
+            <div style="font-weight: 600; color: #166534; font-size: 0.85rem; margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
+              <span>✅</span> 5 层立体防御状态：运行中
+            </div>
+            <ul style="font-size: 0.78rem; color: #15803d; line-height: 1.5; padding-left: 1.2rem; margin: 0;">
+              <li><strong>访问鉴权</strong>：HMAC-SHA256 加密 Token 保护</li>
+              <li><strong>防暴力破解</strong>：输错 5 次自动锁定 IP 15 分钟</li>
+              <li><strong>敏感凭证脱敏</strong>：API Key 与密码绝不明文传输</li>
+              <li><strong>数据库直通保护</strong>：参数化指令调用，杜绝注入</li>
+            </ul>
+          </div>
+
+          <form id="formChangePassword">
+            <div style="margin-bottom: 1rem;">
+              <label style="display: block; font-size: 0.82rem; font-weight: 600; color: #334155; margin-bottom: 0.4rem;">
+                当前管理密码
+              </label>
+              <input type="password" id="inputOldPassword" class="form-input" placeholder="请输入当前旧密码" required style="width: 100%;" />
+            </div>
+
+            <div style="margin-bottom: 1.25rem;">
+              <label style="display: block; font-size: 0.82rem; font-weight: 600; color: #334155; margin-bottom: 0.4rem;">
+                新管理密码 (建议至少 8 位，包含字母与数字)
+              </label>
+              <input type="password" id="inputNewPassword" class="form-input" placeholder="请输入新密码" required minlength="8" style="width: 100%;" />
+            </div>
+
+            <div class="dialog-actions">
+              <button type="button" id="btnCancelSecurityModal" class="btn btn-secondary">取消</button>
+              <button type="submit" id="btnSubmitChangePassword" class="btn btn-primary">确认修改密码</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：智能自动切线与熔断配置 (Auto Failover & Cost-Aware Routing) -->
+    <div id="autoSwitchModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 680px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #fef3c7; color: #b45309; border-color: #fde68a;">智能自动切线与熔断</span>
+            <span style="font-size: 0.72rem; color: #64748b;">首字速度检测 · 价格防倒贴 · 最优性价比编排</span>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+            <h3 style="color: #0f172a; font-size: 1.22rem; margin-top: 2px;">
+              ⚡ 自动切线与容灾调度策略（全站唯一基准体系）
+            </h3>
+            <button id="btnCloseAutoSwitchModalHeader" class="btn btn-secondary" style="font-size: 0.85rem; padding: 0.2rem 0.5rem;">✕</button>
+          </div>
+          <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 0.65rem 0.85rem; margin-top: 0.4rem; font-size: 0.78rem; color: #1e40af; line-height: 1.5;">
+            <strong>📌 全站唯一基准调度法则（严禁并存两套规则）：</strong><br/>
+            ① <strong>以不赔钱为第一主线</strong>：进货成本高于销售价的倒贴通道绝不调度，自动降为保底停用。<br/>
+            ② <strong>谁便宜谁是主调，按照价格来是第一要素</strong>：各业务分组内进货价最低者为主调，次低为副调，其余为保底。<br/>
+            ③ <strong>失败率超标（默认 ≥50%）才切副调</strong>：杜绝 1~2 次偶发网络错误误切，全力稳固全站 Prompt Cache 命中率。<br/>
+            ④ <strong>单主调严格独占·严禁主副双开</strong>：同组仅主调开启调度，副调强制冷备关停，杜绝请求跳跃打碎缓存。<br/>
+            ⑤ <strong>保底尤慎重·防横跳死循环</strong>：同业务组内副调可用坚决不动用保底，每次切线进入冷静期与 20 分钟防横跳锁定。
+          </div>
+
+          <!-- 1. 核心规则四大铁律卡片 -->
+          <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; margin-top: 0.75rem;">
+            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
+              <div style="font-weight: 700; color: #166534; margin-bottom: 2px;">🟢 谁便宜谁是主调</div>
+              <div style="color: #15803d; line-height: 1.35;">按进货倍率从低到高排列：最低为主调(100)，次低为副调(10)，其余为保底(1)</div>
+            </div>
+            <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
+              <div style="font-weight: 700; color: #1e40af; margin-bottom: 2px;">🔵 失败率 ≥ 50% 切副调</div>
+              <div style="color: #1d4ed8; line-height: 1.35;">主调真实错误率达到门槛 (默认≥50%, 样本≥5) 或连续5次硬报错才触发调换副调</div>
+            </div>
+            <div style="background: #fefce8; border: 1px solid #fef08a; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
+              <div style="font-weight: 700; color: #854d0e; margin-bottom: 2px;">🟡 保底尤慎重</div>
+              <div style="color: #a16207; line-height: 1.35;">只要同组有健康副调，坚决使用副调；主调副调全部不可用时，才底线启用保底</div>
+            </div>
+            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
+              <div style="font-weight: 700; color: #334155; margin-bottom: 2px;">🛡️ 单主独占·防横跳</div>
+              <div style="color: #475569; line-height: 1.35;">副调冷备停调严禁双开；10分钟冷静期与20分钟防横跳锁定，杜绝死循环</div>
+            </div>
+          </div>
+
+          <!-- 2. 核心调度与风控参数设定 -->
+          <div style="margin-top: 0.85rem;">
+            <div style="font-size: 0.8rem; font-weight: 700; color: #334155; margin-bottom: 0.45rem;">
+              ⚙️ 核心调度与风控参数设定
+            </div>
+            <div class="as-config-card">
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">自动切线总开关</span>
+                  <span class="as-config-desc">开启后云端将 24h 自动巡检全业务主调，当且仅当失败率超标或严重宕机时按价格调换</span>
+                </div>
+                <button id="btnToggleAutoSwitch" class="toggle-switch-btn is-on">
+                  <span>●</span> <span>已启用</span>
+                </button>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">🔒 单主调严格独占（严禁主副调双开）</span>
+                  <span class="as-config-desc">同业务分组仅开启当前主调调度，所有副调强制关停冷备。物理杜绝请求分流，彻底锁死 Prompt Cache 命中率！切线时原子互斥交接</span>
+                </div>
+                <button id="btnToggleSingleActive" class="toggle-switch-btn is-on">
+                  <span>●</span> <span>已开启独占</span>
+                </button>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">📊 故障切线失败率门槛</span>
+                  <span class="as-config-desc">主调通道错误率达到此百分比才触发调换副调（保全站 Prompt Cache 命中率）</span>
+                </div>
+                <select id="selectFailRateThreshold" class="form-input mono" style="width: 185px; font-weight: 700;">
+                  <option value="50" selected>50% (失败过半才切·推荐)</option>
+                  <option value="40">40% (轻度严格)</option>
+                  <option value="30">30% (高敏响应)</option>
+                  <option value="20">20% (成功率&lt;80%切线)</option>
+                </select>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">🔢 有效统计最小样本量</span>
+                  <span class="as-config-desc">主通道累计调用量达到该样本数才计算失败率，杜绝 1~2 次偶发网络抖动误切</span>
+                </div>
+                <select id="selectMinSampleSize" class="form-input mono" style="width: 170px; font-weight: 700;">
+                  <option value="5" selected>5 次 (均衡基准·推荐)</option>
+                  <option value="10">10 次 (高样本稳健)</option>
+                  <option value="20">20 次 (超高防抖)</option>
+                </select>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">💥 连续硬故障确诊熔断门槛</span>
+                  <span class="as-config-desc">上游连续爆出 502/503/429/401 达到此次数时，即便样本量未满也确诊宕机切线</span>
+                </div>
+                <select id="selectConsecutiveFailures" class="form-input mono" style="width: 170px; font-weight: 700;">
+                  <option value="3">连续 3 次 (敏捷响应)</option>
+                  <option value="5" selected>连续 5 次 (推荐·确诊宕机)</option>
+                  <option value="8">连续 8 次 (高耐受)</option>
+                </select>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">🧊 防抖动冷静期时长</span>
+                  <span class="as-config-desc">每次自动调换后锁定该时间段，杜绝频繁切换，保障下游客户端稳定连接</span>
+                </div>
+                <select id="selectCooldownMinutes" class="form-input mono" style="width: 170px; font-weight: 700;">
+                  <option value="5">5 分钟</option>
+                  <option value="10" selected>10 分钟 (核心推荐)</option>
+                  <option value="15">15 分钟</option>
+                  <option value="30">30 分钟 (深度防抖)</option>
+                </select>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">🔀 20分钟防死循环横跳锁定</span>
+                  <span class="as-config-desc">刚刚发生故障切离的通道在 20 分钟内禁止作为低价主线切回，彻底打破死循环</span>
+                </div>
+                <button id="btnToggleAntiFlappingLock" class="toggle-switch-btn is-on">
+                  <span>●</span> <span>已锁定防抖</span>
+                </button>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">🛡️ Prompt Cache 优先保护锁</span>
+                  <span class="as-config-desc">锁定主通道调度优先级，只要主调成功率在 80% 以上绝不跳线，力保上下文缓存命中</span>
+                </div>
+                <button id="btnTogglePromptCacheLock" class="toggle-switch-btn is-on">
+                  <span>●</span> <span>已锁定保护</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 3. 操作按钮与演练评估 -->
+          <div class="dialog-actions" style="margin-top: 1rem; display: flex; justify-content: space-between; align-items: center;">
+            <button id="btnEvaluateAutoSwitchNow" class="btn btn-secondary" style="font-size: 0.8rem;">
+              ⚡ 立即模拟演练评估
+            </button>
+            <div style="display: flex; gap: 0.5rem;">
+              <button id="btnCloseAutoSwitchModal" class="btn btn-secondary">取消</button>
+              <button id="btnSaveAutoSwitchConfig" class="btn btn-primary" style="padding: 0.4rem 1.25rem;">
+                💾 保存策略配置
+              </button>
+            </div>
+          </div>
+
+          <!-- 4. 自动切换决策历史记录流水 -->
+          <div style="margin-top: 1rem; border-top: 1px solid #e2e8f0; padding-top: 0.75rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
+              <span style="font-size: 0.78rem; font-weight: 700; color: #334155;">📋 最近自动切线决策流水记录</span>
+              <button id="btnRefreshAutoSwitchLogs" class="btn-micro-edit">⟳ 刷新流水</button>
+            </div>
+            <div class="as-logs-wrap">
+              <table class="as-logs-table">
+                <thead>
+                  <tr>
+                    <th style="width: 120px;">时间</th>
+                    <th>触发原因与决策</th>
+                    <th style="width: 110px; text-align: center;">原通道 (成本)</th>
+                    <th style="width: 110px; text-align: center;">新主调 (成本)</th>
+                    <th style="width: 70px; text-align: center;">状态</th>
+                  </tr>
+                </thead>
+                <tbody id="autoSwitchLogsTableBody">
+                  <!-- 由 app.js 渲染 -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：Telegram 机器人推送与移动端中控 (Telegram Bot Dispatcher) -->
+    <div id="telegramModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 680px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #e0f2fe; color: #0284c7; border-color: #bae6fd;">Telegram 机器人中控</span>
+            <span style="font-size: 0.72rem; color: #64748b;">实时变价通知 · 手机点选换线 · 24h 离机运维</span>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+            <h3 style="color: #0f172a; font-size: 1.22rem; margin-top: 2px; display: flex; align-items: center; gap: 0.5rem;">
+              <span>✈️</span> Telegram 机器人推送与移动中控
+            </h3>
+            <button id="btnCloseTelegramModalHeader" class="btn btn-secondary" style="font-size: 0.85rem; padding: 0.2rem 0.5rem;">✕</button>
+          </div>
+          <p style="font-size: 0.78rem; color: #64748b; margin-top: -2px;">
+            集成 Telegram 机器人。当上游调价或自动切线时立即推送手机；无需开电脑，直接在 Telegram 内点击交互按钮即可随时换线。
+          </p>
+
+          <!-- 1. 机器人运行状态横幅 -->
+          <div class="as-config-card" style="margin-top: 0.75rem; background: linear-gradient(135deg, rgba(2,132,199,0.04), rgba(2,132,199,0.08)); border-color: rgba(2,132,199,0.2);">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <div style="font-weight: 700; font-size: 0.95rem; color: #0f172a; display: flex; align-items: center; gap: 0.4rem;">
+                  <span id="tgBotDisplayName">天枢</span>
+                  <a id="tgBotLink" href="https://t.me/tianshuzhongzhuan_bot" target="_blank" class="mono" style="color: #0284c7; font-size: 0.82rem; text-decoration: none;">@tianshuzhongzhuan_bot</a>
+                </div>
+                <div id="tgAdminStatusText" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">
+                  管理员状态: <span id="tgAdminCountText" style="color: #059669; font-weight: 600;">已绑定 0 位管理员</span>
+                </div>
+              </div>
+              <div style="text-align: right;">
+                <span id="tgModalStatusBadge" class="auto-switch-status-pill on" style="font-size: 0.75rem;">🟢 监听中</span>
+              </div>
+            </div>
+            <div id="tgAutoBindBanner" style="margin-top: 0.6rem; padding: 0.45rem 0.65rem; background: #eff6ff; border-radius: 6px; border: 1px dashed #93c5fd; font-size: 0.76rem; color: #1e40af; display: flex; justify-content: space-between; align-items: center;">
+              <span>💡 在手机 Telegram 搜索 <a href="https://t.me/tianshuzhongzhuan_bot" target="_blank" style="font-weight: 700; color: #1d4ed8;">@tianshuzhongzhuan_bot</a> 发送 <code>/start</code> 即可一键自动绑定！</span>
+              <button id="btnTgAutoBind" class="btn-micro-edit" style="white-space: nowrap; margin-left: 0.5rem; background: #2563eb; color: #fff; border: none; padding: 2px 8px; border-radius: 4px; cursor: pointer;">⚡ 自动捕获</button>
+            </div>
+          </div>
+
+          <!-- 2. 基础配置项 -->
+          <div class="as-config-card" style="margin-top: 0.75rem;">
+            <div class="as-config-row">
+              <div class="as-config-info" style="max-width: 40%;">
+                <span class="as-config-label">Bot Token (凭据)</span>
+                <span class="as-config-desc">从 @BotFather 获取的机器人 Token</span>
+              </div>
+              <input type="text" id="inputTgBotToken" class="form-input mono" placeholder="格式: 123456:ABC-DEF..." style="flex: 1; font-size: 0.82rem;" />
+            </div>
+
+            <div class="as-divider"></div>
+
+            <div class="as-config-row">
+              <div class="as-config-info" style="max-width: 40%;">
+                <span class="as-config-label">管理员 Chat ID</span>
+                <span class="as-config-desc">接收推送与拥有换线权限的用户 ID (逗号分隔)</span>
+              </div>
+              <input type="text" id="inputTgAdminChatIds" class="form-input mono" placeholder="如: 123456789, 987654321" style="flex: 1; font-size: 0.82rem;" />
+            </div>
+          </div>
+
+          <!-- 3. 推送通知开关配置 -->
+          <div style="margin-top: 0.75rem;">
+            <span style="font-size: 0.8rem; font-weight: 700; color: #334155; display: block; margin-bottom: 0.4rem;">
+              🔔 推送触发事件偏好配置
+            </span>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+              <label class="as-strategy-card" style="margin: 0; padding: 0.6rem; cursor: pointer;">
+                <input type="checkbox" id="checkTgRatioChange" checked style="margin-right: 0.4rem;" />
+                <div>
+                  <span style="font-weight: 700; font-size: 0.82rem; color: #0f172a;">上游倍率变动告警</span>
+                  <p style="font-size: 0.72rem; color: #64748b; margin: 2px 0 0 0;">任何上游涨价或降价时推送卡片</p>
+                </div>
+              </label>
+
+              <label class="as-strategy-card" style="margin: 0; padding: 0.6rem; cursor: pointer;">
+                <input type="checkbox" id="checkTgActiveSurge" checked style="margin-right: 0.4rem;" />
+                <div>
+                  <span style="font-weight: 700; font-size: 0.82rem; color: #b91c1c;">主力涨价高危警报</span>
+                  <p style="font-size: 0.72rem; color: #64748b; margin: 2px 0 0 0;">主力涨价时附带一键换线按钮</p>
+                </div>
+              </label>
+
+              <label class="as-strategy-card" style="margin: 0; padding: 0.6rem; cursor: pointer;">
+                <input type="checkbox" id="checkTgAutoSwitch" checked style="margin-right: 0.4rem;" />
+                <div>
+                  <span style="font-weight: 700; font-size: 0.82rem; color: #0f172a;">自动切线报告</span>
+                  <p style="font-size: 0.72rem; color: #64748b; margin: 2px 0 0 0;">触发故障熔断/成本回切时通知</p>
+                </div>
+              </label>
+
+              <label class="as-strategy-card" style="margin: 0; padding: 0.6rem; cursor: pointer;">
+                <input type="checkbox" id="checkTgOutage" checked style="margin-right: 0.4rem;" />
+                <div>
+                  <span style="font-weight: 700; font-size: 0.82rem; color: #0f172a;">上游离线与异常</span>
+                  <p style="font-size: 0.72rem; color: #64748b; margin: 2px 0 0 0;">通道探活超时或连接失败提醒</p>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- 4. 手机端使用指南 -->
+          <div style="margin-top: 0.75rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.65rem 0.85rem;">
+            <span style="font-size: 0.78rem; font-weight: 700; color: #334155;">📱 手机端常用指令速查</span>
+            <div style="font-size: 0.73rem; color: #64748b; margin-top: 0.35rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem;">
+              <div><code>/status</code> - 查看大盘概况与当前主用</div>
+              <div><code>/switch</code> - 🔀 弹出全部渠道点选换线</div>
+              <div><code>/auto</code> - ⚡ 自动故障切线开关与策略</div>
+              <div><code>/rates</code> - 💰 各上游进货倍率天梯榜</div>
+              <div><code>/check</code> - 🔍 立即触发全量探活与测速</div>
+              <div><code>/help</code> - ❓ 查看帮助菜单与快捷操作</div>
+            </div>
+          </div>
+
+          <!-- 5. 操作按钮 -->
+          <div class="dialog-actions" style="margin-top: 1rem; display: flex; justify-content: space-between; align-items: center;">
+            <button id="btnSendTgTest" class="btn btn-secondary" style="font-size: 0.8rem; color: #0284c7;">
+              🚀 发送测试消息
+            </button>
+            <div style="display: flex; gap: 0.5rem;">
+              <button id="btnCloseTelegramModal" class="btn btn-secondary">关闭</button>
+              <button id="btnSaveTgConfig" class="btn btn-primary" style="padding: 0.4rem 1.25rem;">
+                💾 保存机器人配置
+              </button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：各模型首字速度 (TTFT) 与稳定性智能归因明细 -->
+    <div id="modelStabilityModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 900px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #ecfeff; color: #0891b2; border-color: #a5f3fc;">模型首字速度 (TTFT) 与稳定性诊断</span>
+            <span style="font-size: 0.72rem; color: #64748b;">Sub2API 真实数据 · 毫秒级首字 · 智能责任归因</span>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
+            <div>
+              <h3 id="modalStabilityChannelName" style="color: #0f172a; font-size: 1.22rem; display: inline-flex; align-items: center; gap: 0.5rem; margin-top: 2px;">
+                --
+              </h3>
+              <span id="modalStabilityChannelUrl" class="mono" style="font-size: 0.76rem; color: #64748b; margin-left: 0.5rem;">--</span>
+            </div>
+            <div style="display: flex; gap: 0.5rem;">
+              <button id="btnRefreshStabilityModal" class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.25rem 0.65rem;">
+                ⟳ 刷新 24h 指标
+              </button>
+              <button id="btnResolveModalErrors" class="btn btn-secondary" onclick="resolveCurrentModalErrors()" style="font-size: 0.75rem; padding: 0.25rem 0.65rem; color: #16a34a; border-color: #bbf7d0; background: #f0fdf4;" title="将此通道过去的历史报错标记为已解决并恢复满分">
+                ✓ 消除历史报错
+              </button>
+              <button id="btnCloseStabilityModalHeader" class="btn btn-secondary" style="font-size: 0.85rem; padding: 0.2rem 0.5rem;">✕</button>
+            </div>
+          </div>
+
+          <!-- 渠道 24h 概览卡片 -->
+          <div class="stability-overview-grid" style="margin-top: 0.75rem;">
+            <div class="stab-stat-card">
+              <span class="stab-stat-label">24h 综合成功率</span>
+              <span id="modalStabOverallRate" class="stab-stat-val">--%</span>
+              <span id="modalStabTotalCalls" class="stab-stat-sub">总调用 -- 次</span>
+            </div>
+            <div class="stab-stat-card">
+              <span class="stab-stat-label">加权平均首字速度 (TTFT)</span>
+              <span id="modalStabAvgTtft" class="stab-stat-val">-- ms</span>
+              <span class="stab-stat-sub">生成第 1 个字符耗时</span>
+            </div>
+            <div class="stab-stat-card">
+              <span class="stab-stat-label">综合稳定性判定</span>
+              <span id="modalStabFaultBadge" class="stab-stat-val" style="font-size: 0.95rem;">--</span>
+              <span id="modalStabFaultOwner" class="stab-stat-sub">责任判定: --</span>
+            </div>
+          </div>
+
+          <!-- 诊断说明与小叹号图例 -->
+          <div class="attribution-legend-bar">
+            <span class="legend-title">💡 责任归因指南 (悬停或点击表格小叹号查看诊断):</span>
+            <div class="legend-tags-row">
+              <span class="legend-item"><strong style="color: #dc2626;">🔴 上游服务商责任</strong>：HTTP 429 限流并发超限 / 502 宕机 / 403 欠费 / 524 超时</span>
+              <span class="legend-item"><strong style="color: #2563eb;">🔵 下游客户端原因</strong>：HTTP 499 (用户等待首字时主动按停止或断网) / 400 参数格式错误</span>
+              <span class="legend-item"><strong style="color: #d97706;">🟡 中转系统配置</strong>：HTTP 404 模型未映射或全上游被关闭</span>
+            </div>
+          </div>
+
+          <!-- 模型统计大盘与快捷操作工具栏 -->
+          <div class="modal-models-toolbar" style="margin-top: 0.85rem; display: flex; flex-direction: column; gap: 0.6rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.6rem;">
+              <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                <!-- 搜索框 -->
+                <div class="model-search-box" style="position: relative;">
+                  <input type="text" id="modalModelSearchInput" placeholder="🔍 搜索模型 (如 gpt-5, claude, deepseek)..." 
+                    style="padding: 0.35rem 0.75rem 0.35rem 1.8rem; font-size: 0.8rem; border: 1px solid #cbd5e1; border-radius: 6px; width: 220px; outline: none; background: #fff;">
+                  <span style="position: absolute; left: 0.55rem; top: 50%; transform: translateY(-50%); font-size: 0.75rem; color: #94a3b8; pointer-events: none;">🔍</span>
+                </div>
+
+                <!-- 过滤药丸 -->
+                <div class="model-filter-pills" style="display: flex; gap: 0.3rem;">
+                  <button class="model-filter-pill active" data-filter="all" onclick="setModalModelFilter('all')">全部 (<span id="countAllModels">0</span>)</button>
+                  <button class="model-filter-pill" data-filter="enabled" onclick="setModalModelFilter('enabled')">🟢 已开启 (<span id="countEnabledModels">0</span>)</button>
+                  <button class="model-filter-pill" data-filter="disabled" onclick="setModalModelFilter('disabled')">⚪ 未开启 (<span id="countDisabledModels">0</span>)</button>
+                  <button class="model-filter-pill" data-filter="tested" onclick="setModalModelFilter('tested')">⚡ 实测可用 (<span id="countTestedModels">0</span>)</button>
+                </div>
+              </div>
+
+              <!-- 批量操作与探测工具按钮 -->
+              <div style="display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;">
+                <button id="btnBatchProbeVisible" class="btn btn-secondary" onclick="batchProbeVisibleModels()" title="顺序实测当前可见列表中的所有模型，快速检验存活与耗时" style="font-size: 0.75rem; padding: 0.3rem 0.65rem; color: #0284c7; border-color: #bae6fd; background: #f0f9ff; font-weight: 700;">
+                  ⚡ 一键批量测速
+                </button>
+                <button id="btnSyncUpstreamModels" class="btn btn-secondary" onclick="syncCurrentChannelUpstreamModels()" title="直接向上游发起 /v1/models 探测请求，刷新可用模型清单" style="font-size: 0.75rem; padding: 0.3rem 0.65rem;">
+                  ⟳ 同步上游模型
+                </button>
+                <div class="dropdown-batch-ops" style="position: relative; display: inline-block;">
+                  <button id="btnBatchToggleDropdown" class="btn btn-secondary" onclick="toggleBatchOpsMenu(event)" style="font-size: 0.75rem; padding: 0.3rem 0.65rem;">
+                    批量开关 ▾
+                  </button>
+                  <div id="batchOpsMenu" class="batch-dropdown-content" style="display: none; position: absolute; right: 0; top: 100%; margin-top: 4px; background: #fff; border: 1px solid #cbd5e1; border-radius: 6px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); z-index: 50; min-width: 170px; padding: 0.3rem 0;">
+                    <button class="batch-menu-item" onclick="batchToggleAction('all_on')">🟢 一键开启当前筛选</button>
+                    <button class="batch-menu-item" onclick="batchToggleAction('all_off')">⚪ 一键停用当前筛选</button>
+                    <div style="height: 1px; background: #e2e8f0; margin: 0.25rem 0;"></div>
+                    <button class="batch-menu-item text-success" onclick="batchToggleAction('enable_live_success')" title="仅把实测成功的模型开启调度，将不可用模型关闭">✓ 仅开启实测成功模型</button>
+                  </div>
+                </div>
+                <button class="btn btn-secondary" onclick="promptAddCustomModel()" title="手动添加自定义模型 ID 并可直接开启与测速" style="font-size: 0.75rem; padding: 0.3rem 0.65rem;">
+                  ➕ 添加模型
+                </button>
+              </div>
+            </div>
+
+            <!-- 批量测速进度条 (默认隐藏) -->
+            <div id="batchProbeProgressBarWrap" style="display: none; align-items: center; gap: 0.6rem; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.35rem 0.75rem;">
+              <span id="batchProbeProgressText" style="font-size: 0.74rem; font-weight: 600; color: #16a34a; white-space: nowrap;">正在批量测速 (0/0)...</span>
+              <div style="flex: 1; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden;">
+                <div id="batchProbeProgressBar" style="width: 0%; height: 100%; background: #16a34a; transition: width 0.2s ease;"></div>
+              </div>
+              <button class="btn btn-secondary" onclick="abortBatchProbe()" style="font-size: 0.68rem; padding: 0.15rem 0.45rem; color: #ef4444; border-color: #fecaca; background: #fff;">终止测速</button>
+            </div>
+          </div>
+
+          <!-- 模型明细表格 -->
+          <div class="modal-models-table-wrap">
+            <table class="modal-models-table">
+              <thead>
+                <tr>
+                  <th style="text-align: left; width: 175px;">模型名称</th>
+                  <th style="text-align: center; width: 105px;">调度开关</th>
+                  <th style="text-align: center; width: 110px;">24h调用 / 成功率</th>
+                  <th style="text-align: center; width: 110px;">历史首字 (TTFT)</th>
+                  <th style="text-align: center; width: 115px;">实时测速 (Live)</th>
+                  <th style="text-align: left;">状态与责任归因 (点击叹号)</th>
+                  <th style="text-align: center; width: 85px;">操作</th>
+                </tr>
+              </thead>
+              <tbody id="modalModelsTableBody">
+                <!-- 由 app.js 动态渲染 -->
+              </tbody>
+            </table>
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1rem; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 0.75rem; color: #64748b;">
+              ⚡ 极简流式探测：接收到第 1 个 chunk (首字) 立即切断，单次仅耗 1 Token (约 ¥0.00001)，绝无大额扣费
+            </span>
+            <button id="btnCloseStabilityModal" class="btn btn-primary" style="padding: 0.4rem 1.25rem;">
+              关闭
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 8. 用户充值金额与消费金额统计看板模态框 -->
+    <div id="userFinancesModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 1120px;">
+        <div class="dialog-content" style="padding: 1.25rem 1.5rem;">
+          <!-- 头部信息 -->
+          <div class="modal-header-clean">
+            <div style="display: flex; align-items: center; gap: 0.6rem;">
+              <div class="modal-icon-badge" style="background: #ecfdf5; border: 1px solid #a7f3d0; font-size: 1.25rem; width: 38px; height: 38px; display: flex; align-items: center; justify-content: center; border-radius: 9px;">
+                💳
+              </div>
+              <div>
+                <div class="alert-tag-row" style="margin-bottom: 2px;">
+                  <span class="alert-type-badge" style="background: #ecfdf5; color: #047857; border-color: #a7f3d0;">财务与收支对账大盘</span>
+                  <span style="font-size: 0.72rem; color: #64748b;">Sub2API 真实充值与调用日志实时对账</span>
+                </div>
+                <h3 style="color: #0f172a; font-size: 1.22rem; margin: 0; font-weight: 700;">
+                  用户充值金额与消费金额统计看板
+                </h3>
+              </div>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <button id="btnRefreshUserFinances" class="btn btn-secondary" style="font-size: 0.76rem; padding: 0.3rem 0.75rem;">
+                ⟳ 刷新财务数据
+              </button>
+              <button id="btnCloseUserFinancesModal" class="btn btn-secondary" style="font-size: 0.85rem; padding: 0.25rem 0.55rem;">
+                ✕
+              </button>
+            </div>
+          </div>
+
+          <!-- Tab 选项卡导航 -->
+          <div class="fin-tabs-bar">
+            <button class="fin-tab-btn active" data-fintab="overview">
+              <span>📊</span> 核心收支大盘与每日走势
+            </button>
+            <button class="fin-tab-btn" data-fintab="users">
+              <span>👥</span> 用户收支明细与排行 (<span id="tabUserCountPill">0</span>)
+            </button>
+            <button class="fin-tab-btn" data-fintab="recharges">
+              <span>🧾</span> 最近充值明细流水
+            </button>
+          </div>
+
+          <!-- Tab 1 内容：核心收支大盘与每日走势 -->
+          <div id="finTabOverview" class="fin-tab-content active">
+            <!-- 6 大核心指标卡 (含净毛利润与毛利率) -->
+            <div class="fin-kpi-grid">
+              <!-- 卡片 1: 客户累计充值 -->
+              <div class="fin-kpi-card kpi-recharge">
+                <div class="kpi-header">
+                  <span class="kpi-title">客户累计总充值</span>
+                  <span class="kpi-tag success">资金流入</span>
+                </div>
+                <div class="kpi-val mono" id="kpiTotalRecharge">¥ --</div>
+                <div class="kpi-sub-row">
+                  <span>卡密付费: <strong id="kpiPaidRecharge" class="mono">¥ --</strong></span>
+                  <span class="sep">|</span>
+                  <span>后台加款: <strong id="kpiAdminRecharge" class="mono">¥ --</strong></span>
+                </div>
+                <div class="kpi-footer">
+                  <span>共 <strong id="kpiPayingUsers">0</strong> 位客户有充值记录</span>
+                </div>
+              </div>
+
+              <!-- 卡片 2: 客户累计消费 -->
+              <div class="fin-kpi-card kpi-spent">
+                <div class="kpi-header">
+                  <span class="kpi-title">客户累计总消费 (实收)</span>
+                  <span class="kpi-tag primary">API计费账面</span>
+                </div>
+                <div class="kpi-val mono" id="kpiTotalSpentCustomers">¥ --</div>
+                <div class="kpi-sub-row">
+                  <span>采购总成本: <strong id="kpiTotalCostCustomers" class="mono">¥ --</strong></span>
+                  <span class="sep">|</span>
+                  <span>全站(含自测): <span id="kpiTotalSpentAll" class="mono">¥ --</span></span>
+                </div>
+                <div class="kpi-footer">
+                  <span>基于 usage_logs 真实对账扣费总计</span>
+                </div>
+              </div>
+
+              <!-- 卡片 3: 累计净赚毛利 (核心盈利指标) -->
+              <div class="fin-kpi-card kpi-profit">
+                <div class="kpi-header">
+                  <span class="kpi-title">中转站净赚毛利润</span>
+                  <span class="kpi-tag success" style="background: #d1fae5; color: #047857; font-weight: 700;">净赚纯利</span>
+                </div>
+                <div class="kpi-val mono" id="kpiTotalProfitCustomers" style="color: #059669;">+¥ --</div>
+                <div class="kpi-sub-row">
+                  <span>综合毛利率: <strong id="kpiProfitMarginPercent" class="mono" style="color: #059669;">--%</strong></span>
+                  <span class="sep">|</span>
+                  <span>现金净结余: <strong id="kpiCashflowNetProfit" class="mono" style="color: #059669;" title="充值总流入 - 上游采购成本">¥ --</strong></span>
+                </div>
+                <div class="kpi-footer">
+                  <span>净毛利 = 客户消费实收 - 上游真实采购成本</span>
+                </div>
+              </div>
+
+              <!-- 卡片 4: 客户资金池剩余余额 -->
+              <div class="fin-kpi-card kpi-balance">
+                <div class="kpi-header">
+                  <span class="kpi-title">客户资金池结存</span>
+                  <span class="kpi-tag warning">待消费沉淀</span>
+                </div>
+                <div class="kpi-val mono" id="kpiCustomerBalancePool">¥ --</div>
+                <div class="kpi-sub-row">
+                  <span>全站总余额: <strong id="kpiAllBalancePool" class="mono">¥ --</strong></span>
+                </div>
+                <div class="kpi-footer">
+                  <span>充值流入 - 客户消费 = 客户沉淀资金池</span>
+                </div>
+              </div>
+
+              <!-- 卡片 5: 今日收支与实时毛利 -->
+              <div class="fin-kpi-card">
+                <div class="kpi-header">
+                  <span class="kpi-title">今日收支与实时毛利</span>
+                  <span class="kpi-tag live">实时对账</span>
+                </div>
+                <div class="kpi-split-vals">
+                  <div style="display: flex; justify-content: space-between;">
+                    <span class="kpi-split-label">今日充值:</span>
+                    <strong id="kpiTodayRecharge" class="mono text-success">¥ --</strong>
+                  </div>
+                  <div style="display: flex; justify-content: space-between;">
+                    <span class="kpi-split-label">客户消费:</span>
+                    <strong id="kpiTodaySpent" class="mono text-primary">¥ --</strong>
+                  </div>
+                  <div style="display: flex; justify-content: space-between;">
+                    <span class="kpi-split-label">今日净毛利:</span>
+                    <strong id="kpiTodayProfit" class="mono" style="color: #059669;">+¥ --</strong>
+                  </div>
+                </div>
+                <div class="kpi-footer">
+                  <span>今日活跃客户: <strong id="kpiTodayActive">0</strong> 人 (<span id="kpiTodayRequests">0</span>次)</span>
+                </div>
+              </div>
+
+              <!-- 卡片 6: 昨日对比与毛利 -->
+              <div class="fin-kpi-card">
+                <div class="kpi-header">
+                  <span class="kpi-title">昨日结算与毛利</span>
+                  <span class="kpi-tag neutral">历史对账</span>
+                </div>
+                <div class="kpi-split-vals">
+                  <div style="display: flex; justify-content: space-between;">
+                    <span class="kpi-split-label">昨日消费:</span>
+                    <strong id="kpiYesterdaySpent" class="mono text-primary">¥ --</strong>
+                  </div>
+                  <div style="display: flex; justify-content: space-between;">
+                    <span class="kpi-split-label">昨日净毛利:</span>
+                    <strong id="kpiYesterdayProfit" class="mono" style="color: #059669;">+¥ --</strong>
+                  </div>
+                  <div style="display: flex; justify-content: space-between;">
+                    <span class="kpi-split-label">昨日毛利率:</span>
+                    <strong id="kpiYesterdayMargin" class="mono" style="color: #059669;">--%</strong>
+                  </div>
+                </div>
+                <div class="kpi-footer">
+                  <span>昨日充值: <strong id="kpiYesterdayRecharge" class="mono">¥ --</strong> | 活跃客户: <strong id="kpiYesterdayActive">0</strong> 人</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 每日收支趋势走势可视化对比大盘 -->
+            <div class="fin-section-card" style="margin-top: 1rem;">
+              <div class="fin-section-header">
+                <div>
+                  <h4 style="font-size: 0.95rem; font-weight: 700; color: #1e293b; margin: 0;">
+                    📈 过去 14 天每日充值 vs 消费与盈利走势对账
+                  </h4>
+                  <span style="font-size: 0.74rem; color: #64748b;">绿色为充值结存，红色为透支往期存量余额（今天透支明天充值会在总资金池中自动抵消）</span>
+                </div>
+              </div>
+
+              <!-- 每日趋势列表容器 -->
+              <div class="daily-trends-container">
+                <table class="fin-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 100px;">日期</th>
+                      <th style="width: 120px; text-align: right;">当日充值 (¥)</th>
+                      <th style="width: 115px; text-align: right;">客户消费 (¥)</th>
+                      <th style="width: 105px; text-align: right;">采购成本 (¥)</th>
+                      <th style="width: 135px; text-align: right;">净赚毛利 (毛利率)</th>
+                      <th style="text-align: left; padding-left: 1.2rem;">充消比例</th>
+                      <th style="width: 145px; text-align: right;" title="当日充值总额 - 当日客户消费金额。正数表示当日新增沉淀结余；负数表示透支消耗往期充值余额。两日差额在总资金池中自动抵消！">当日充消结余 / 透支</th>
+                      <th style="width: 75px; text-align: center;">调用量</th>
+                      <th style="width: 70px; text-align: center;">活跃客户</th>
+                    </tr>
+                  </thead>
+                  <tbody id="dailyTrendsTableBody">
+                    <!-- 由 app.js 动态渲染 -->
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab 2 内容：用户收支排行与明细 -->
+          <div id="finTabUsers" class="fin-tab-content" style="display: none;">
+            <!-- 工具栏与筛选过滤 -->
+            <div class="fin-filter-toolbar">
+              <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                <div class="search-box" style="width: 260px;">
+                  <input type="text" id="userFinSearchInput" placeholder="🔍 搜索邮箱、用户名或用户 ID..." style="font-size: 0.8rem; padding: 0.35rem 0.75rem 0.35rem 1.8rem;" />
+                  <span style="position: absolute; left: 0.55rem; top: 50%; transform: translateY(-50%); font-size: 0.75rem; color: #94a3b8; pointer-events: none;">🔍</span>
+                </div>
+
+                <div class="fin-scope-toggle">
+                  <button class="scope-btn active" data-scope="customers">仅看外部客户</button>
+                  <button class="scope-btn" data-scope="all">全部用户 (含测试号与管理员)</button>
+                </div>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <label style="font-size: 0.78rem; color: #64748b; font-weight: 600;">排序方式:</label>
+                <select id="userFinSortSelect" class="form-input" style="font-size: 0.78rem; padding: 0.3rem 0.6rem; width: 175px;">
+                  <option value="profit_desc" selected>按贡献毛利 (高 → 低)</option>
+                  <option value="spent_desc">按累计消费 (高 → 低)</option>
+                  <option value="margin_desc">按毛利率 (高 → 低)</option>
+                  <option value="recharge_desc">按累计充值 (高 → 低)</option>
+                  <option value="balance_desc">按当前余额 (高 → 低)</option>
+                  <option value="yesterday_spent_desc">按昨日消费 (高 → 低)</option>
+                  <option value="requests_desc">按调用次数 (高 → 低)</option>
+                  <option value="id_asc">按用户 ID (低 → 高)</option>
+                </select>
+                <button id="btnQuickAddBalance" class="btn btn-primary" style="font-size: 0.78rem; padding: 0.35rem 0.85rem;">
+                  ➕ 给用户充值
+                </button>
+              </div>
+            </div>
+
+            <!-- 用户明细表格容器 -->
+            <div class="fin-table-scroll-wrap" style="max-height: 480px; overflow-y: auto; margin-top: 0.75rem; border: 1px solid #e2e8f0; border-radius: 8px;">
+              <table class="fin-table">
+                <thead>
+                  <tr>
+                    <th style="width: 48px; text-align: center;">排名</th>
+                    <th style="width: 68px; text-align: center;">用户 ID</th>
+                    <th style="min-width: 165px;">用户账号 / 邮箱</th>
+                    <th style="width: 95px; text-align: right;">账户余额</th>
+                    <th style="width: 105px; text-align: right;">累计充值</th>
+                    <th style="width: 95px; text-align: right;">客户消费</th>
+                    <th style="width: 85px; text-align: right;">采购成本</th>
+                    <th style="width: 125px; text-align: right;">贡献毛利 (毛利率)</th>
+                    <th style="width: 115px; text-align: right;">昨日消费(毛利)</th>
+                    <th style="width: 90px; text-align: right;">近7天消费</th>
+                    <th style="width: 75px; text-align: center;">总调用</th>
+                    <th style="width: 105px; text-align: center;">最近活跃</th>
+                    <th style="width: 130px; text-align: center;">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="userFinTableBody">
+                  <!-- 由 app.js 动态渲染 -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Tab 3 内容：最近充值明细流水 -->
+          <div id="finTabRecharges" class="fin-tab-content" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+              <span style="font-size: 0.8rem; font-weight: 600; color: #334155;">
+                📋 最近 50 笔卡密兑换与后台调账记录 (实时对账流水)
+              </span>
+              <span style="font-size: 0.72rem; color: #64748b;">
+                卡密充值自动生成，后台充值由管理员操作
+              </span>
+            </div>
+
+            <div class="fin-table-scroll-wrap" style="max-height: 480px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px;">
+              <table class="fin-table">
+                <thead>
+                  <tr>
+                    <th style="width: 140px;">充值时间</th>
+                    <th style="min-width: 180px;">用户邮箱 / ID</th>
+                    <th style="width: 110px; text-align: center;">充值类型</th>
+                    <th style="width: 110px; text-align: right;">充值金额</th>
+                    <th style="width: 140px; text-align: center;">卡密/凭证</th>
+                    <th>操作备注说明</th>
+                  </tr>
+                </thead>
+                <tbody id="recentRechargesTableBody">
+                  <!-- 由 app.js 动态渲染 -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 弹窗底部操作 -->
+          <div class="dialog-actions" style="margin-top: 1.25rem; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 0.75rem; color: #64748b;">
+              💡 统计看板数据每 15 秒自动更新，所有扣费基于 usage_logs 真实执行记录与 PostgreSQL 强一致事务。
+            </span>
+            <button id="btnCloseUserFinancesModalFooter" class="btn btn-secondary" style="padding: 0.35rem 1.25rem;">
+              关闭看板
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：快捷为用户充值/加款/补款 -->
+    <div id="quickRechargeModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 440px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #ecfdf5; color: #047857; border-color: #a7f3d0;">用户余额快捷加款</span>
+            <span style="font-size: 0.72rem; color: #64748b;">直写 Sub2API 数据库并入库流水</span>
+          </div>
+          <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">给用户充值 / 补发余额</h3>
+          <p style="font-size: 0.78rem; color: #64748b;">充值金额将立即增加至用户的可用余额，并生成一条充值对账记录。</p>
+
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.6rem;">
+            <div>
+              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.25rem;">目标用户:</label>
+              <select id="quickRechargeUserSelect" class="form-input" style="width: 100%; font-size: 0.85rem;">
+                <!-- 由 app.js 填充 -->
+              </select>
+            </div>
+
+            <div>
+              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.25rem;">充值金额 (元):</label>
+              <div style="display: flex; align-items: center; gap: 0.4rem;">
+                <span style="font-weight: 700; color: #059669; font-size: 1rem;">¥</span>
+                <input type="number" id="quickRechargeAmount" min="0.01" step="1" placeholder="例如: 50" class="form-input mono" style="font-size: 1rem; font-weight: 700; color: #059669; flex: 1;" required />
+              </div>
+            </div>
+
+            <div>
+              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.25rem;">操作备注 (可选):</label>
+              <input type="text" id="quickRechargeNotes" placeholder="如: 微信转账充值 / 异常调用补偿" class="form-input" style="width: 100%; font-size: 0.8rem;" />
+            </div>
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1rem; display: flex; gap: 0.5rem;">
+            <button id="btnConfirmQuickRecharge" class="btn btn-primary" style="flex: 1; justify-content: center;">
+              💾 确认充值并入账
+            </button>
+            <button id="btnCancelQuickRecharge" class="btn btn-secondary" style="justify-content: center;">
+              取消
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：快捷为用户调整最大并发数限制 -->
+    <div id="quickConcurrencyModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 440px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <span class="alert-type-badge" style="background: #eff6ff; color: #0284c7; border-color: #bae6fd;">客户并发限制管理</span>
+            <span style="font-size: 0.72rem; color: #64748b;">即时生效并记录审计流水</span>
+          </div>
+          <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">⚡ 调整客户最大并发限制</h3>
+          <p style="font-size: 0.78rem; color: #64748b;">限制该客户同时发起的最大并发请求数 (路数)，默认普通用户为 10 路。</p>
+
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.6rem;">
+            <div>
+              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.25rem;">目标用户:</label>
+              <select id="quickConcurrencyUserSelect" class="form-input" style="width: 100%; font-size: 0.85rem;">
+                <!-- 由 app.js 填充 -->
+              </select>
+            </div>
+
+            <div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem;">
+                <label style="font-size: 0.78rem; font-weight: 600; color: #334155;">新最大并发上限 (路数):</label>
+                <span id="quickConcurrencyCurrentVal" style="font-size: 0.74rem; color: #64748b;" class="mono">当前: -- 路</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 0.4rem;">
+                <span style="font-weight: 700; color: #0284c7; font-size: 1.1rem;">⚡</span>
+                <input type="number" id="quickConcurrencyValue" min="1" max="50000" step="1" placeholder="例如: 20" class="form-input mono" style="font-size: 1rem; font-weight: 700; color: #0284c7; flex: 1;" required />
+              </div>
+              <!-- 快捷预设按钮 -->
+              <div style="display: flex; gap: 0.35rem; margin-top: 0.45rem; flex-wrap: wrap;">
+                <button type="button" class="btn-preset-chip" onclick="setPresetConcurrency(10)">默认 10</button>
+                <button type="button" class="btn-preset-chip" onclick="setPresetConcurrency(20)">20 路</button>
+                <button type="button" class="btn-preset-chip" onclick="setPresetConcurrency(50)">50 路</button>
+                <button type="button" class="btn-preset-chip" onclick="setPresetConcurrency(100)">100 路</button>
+                <button type="button" class="btn-preset-chip" onclick="setPresetConcurrency(500)">500 路</button>
+                <button type="button" class="btn-preset-chip" onclick="setPresetConcurrency(1000)">1000 路</button>
+              </div>
+            </div>
+
+            <div>
+              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.25rem;">操作备注 (可选):</label>
+              <input type="text" id="quickConcurrencyNotes" placeholder="如: 定制大客户提速 / 压测临时提额" class="form-input" style="width: 100%; font-size: 0.8rem;" />
+            </div>
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1rem; display: flex; gap: 0.5rem;">
+            <button id="btnConfirmQuickConcurrency" class="btn btn-primary" style="flex: 1; justify-content: center; background: #0284c7; border-color: #0284c7;">
+              ⚡ 确认修改并发数
+            </button>
+            <button id="btnCancelQuickConcurrency" class="btn btn-secondary" style="justify-content: center;">
+              取消
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- 全局防遮挡悬浮责任归因卡片 (小叹号 Tooltip) -->
+    <div id="globalFloatingTooltip" class="floating-tooltip-card" style="display: none;">
+      <div class="ft-header">
+        <span id="ftIcon" class="ft-icon">⚠️</span>
+        <span id="ftTitle" class="ft-title">责任归因诊断</span>
+      </div>
+      <div id="ftBody" class="ft-body">详细原因描述...</div>
+      <div id="ftAdvice" class="ft-advice">💡 建议操作: ...</div>
+    </div>
+
+    <!-- 浮动提示容器 -->
+    <div id="toastContainer" class="toast-container"></div>
+  </div>
+
+  <script src="app.js?v=20260907_finances"></script>
+</body>
+</html>

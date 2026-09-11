@@ -1,0 +1,78 @@
+# =============================================================================
+# Git Ignore Configuration
+# =============================================================================
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment Variables & Secrets (CRITICAL)
+.env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+!.env.example
+upstream-monitor/.env
+upstream-monitor/.env.local
+!upstream-monitor/.env.example
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# Root Deployment Data
+/data/
+/postgres_data/
+/redis_data/
+
+# Upstream Monitor Runtime Data
+upstream-monitor/data/*
+!upstream-monitor/data/.gitkeep
+!upstream-monitor/data/*.example.json
+
+# Logs & PIDs
+*.log
+logs/
+*.pid
+*.seed
+
+# Temporary & Local Patch Files
+*.tmp
+*.temp
+*.bak
+*.swp
+docker-compose.remote.tmp.yml
+patch_server.py
+upstream-monitor/scripts/capture_vps_dashboard.js
+
+# Search Engine & Domain Verification Files
+*bed32c7432094dd99ea36c2bdb1b7c62.txt
+*google5ae53601658915da.html
+
+# IDE & Editor Folders
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Private Website & Customer Operations Assets (Not part of open-source framework)
+/website/
+/customer-pages/
+/docs/
+/index.html
+/styles.css
+/script.js
+/robots.txt
+/sitemap.xml
+/favicon.svg
+/og-banner.png

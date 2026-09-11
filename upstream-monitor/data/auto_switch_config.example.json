@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "mode": "cache_first",
+  "promptCacheLock": true,
+  "antiFlappingLock": true,
+  "singleActiveExclusive": true,
+  "ttftThresholdMs": 30000,
+  "failRateThreshold": 50,
+  "minSampleSize": 10,
+  "consecutiveFailuresThreshold": 5,
+  "strategy": "cost_first",
+  "cooldownMinutes": 10,
+  "autoRecoverLowestCost": false,
+  "lastSwitchTime": null,
+  "lastSwitchReason": null
+}

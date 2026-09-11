@@ -1,0 +1,798 @@
+const https = require('https');
+const http = require('http');
+const url = require('url');
+const fs = require('fs');
+const path = require('path');
+
+const DATA_DIR = path.join(__dirname, 'data');
+const CONFIG_FILE = path.join(DATA_DIR, 'telegram_config.json');
+
+// 默认配置
+const DEFAULT_CONFIG = {
+  enabled: Boolean(process.env.TELEGRAM_BOT_TOKEN),
+  botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+  adminChatIds: [],
+  notifyOnRatioChange: true,
+  notifyOnActiveSurge: true,
+  notifyOnAutoSwitch: true,
+  notifyOnOutage: true,
+  proxy: '' // 如 http://127.0.0.1:7890
+};
+
+class TelegramBotManager {
+  constructor() {
+    this.config = this.loadConfig();
+    this.botInfo = null;
+    this.isPolling = false;
+    this.pollAbortController = null;
+    this.lastUpdateId = 0;
+    this.context = {
+      getState: () => ({ channels: [], activeChannelId: null }),
+      getAutoSwitchConfig: () => ({ enabled: false }),
+      activateChannel: async () => ({ success: false }),
+      toggleAutoSwitch: async () => ({ success: false }),
+      forceCheck: async () => ({ success: false })
+    };
+  }
+
+  loadConfig() {
+    try {
+      if (fs.existsSync(CONFIG_FILE)) {
+        const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
+        const parsed = JSON.parse(raw);
+        return { ...DEFAULT_CONFIG, ...parsed };
+      }
+    } catch (e) {
+      console.error('[Telegram] 读取配置文件失败:', e.message);
+    }
+    return { ...DEFAULT_CONFIG };
+  }
+
+  saveConfig(newConfig) {
+    try {
+      this.config = { ...this.config, ...newConfig };
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(this.config, null, 2), 'utf-8');
+      return true;
+    } catch (e) {
+      console.error('[Telegram] 保存配置文件失败:', e.message);
+      return false;
+    }
+  }
+
+  init(contextHooks = {}) {
+    this.context = { ...this.context, ...contextHooks };
+    if (this.config.enabled && this.config.botToken) {
+      this.start();
+    } else {
+      console.log('⚪ [Telegram] Bot 未启用或未配置 Token');
+    }
+  }
+
+  async start() {
+    if (this.isPolling) return;
+    try {
+      console.log('✈️ [Telegram] 正在连接 Telegram Bot API...');
+      const me = await this.apiRequest('getMe');
+      if (me && me.is_bot) {
+        this.botInfo = me;
+        console.log(`✅ [Telegram] 机器人认证成功: [${me.first_name}] (@${me.username})`);
+        this.isPolling = true;
+        this.runPollingLoop();
+      } else {
+        console.error('❌ [Telegram] getMe 响应非 Bot 账号:', me);
+      }
+    } catch (e) {
+      console.error('❌ [Telegram] 初始化连接失败:', e.message);
+      // 10秒后重试
+      setTimeout(() => {
+        if (this.config.enabled && !this.isPolling) {
+          this.start();
+        }
+      }, 10000);
+    }
+  }
+
+  stop() {
+    this.isPolling = false;
+    if (this.pollAbortController) {
+      this.pollAbortController.abort();
+      this.pollAbortController = null;
+    }
+    console.log('🛑 [Telegram] 轮询已停止');
+  }
+
+  async updateConfig(partialConfig) {
+    const oldToken = this.config.botToken;
+    const oldEnabled = this.config.enabled;
+    const saved = this.saveConfig(partialConfig);
+
+    if (this.config.enabled !== oldEnabled || this.config.botToken !== oldToken) {
+      this.stop();
+      if (this.config.enabled && this.config.botToken) {
+        await this.start();
+      }
+    }
+    return saved;
+  }
+
+  // 基础 Telegram API HTTP 请求封装
+  apiRequest(method, payload = {}) {
+    return new Promise((resolve, reject) => {
+      const token = this.config.botToken;
+      if (!token) return reject(new Error('Bot Token 未配置'));
+
+      const postData = JSON.stringify(payload);
+      const reqUrl = `https://api.telegram.org/bot${token}/${method}`;
+      const parsed = url.parse(reqUrl);
+
+      const options = {
+        hostname: parsed.hostname,
+        port: parsed.port || 443,
+        path: parsed.path,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData)
+        },
+        timeout: method === 'getUpdates' ? 35000 : 10000
+      };
+
+      const req = https.request(options, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(body);
+            if (data.ok) {
+              resolve(data.result);
+            } else {
+              reject(new Error(data.description || `Telegram API Error (${data.error_code})`));
+            }
+          } catch (err) {
+            reject(new Error(`解析 Telegram 响应失败: ${err.message}`));
+          }
+        });
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Telegram API 请求超时'));
+      });
+
+      req.on('error', (err) => {
+        reject(err);
+      });
+
+      req.write(postData);
+      req.end();
+    });
+  }
+
+  // 长轮询监听循环
+  async runPollingLoop() {
+    while (this.isPolling) {
+      try {
+        const updates = await this.apiRequest('getUpdates', {
+          offset: this.lastUpdateId ? this.lastUpdateId + 1 : 0,
+          timeout: 20,
+          allowed_updates: ['message', 'callback_query']
+        });
+
+        if (Array.isArray(updates) && updates.length > 0) {
+          for (const update of updates) {
+            this.lastUpdateId = update.update_id;
+            try {
+              await this.handleUpdate(update);
+            } catch (err) {
+              console.error('[Telegram] 处理更新异常:', err.message);
+            }
+          }
+        }
+      } catch (err) {
+        if (!this.isPolling) break;
+        // 网络抖动或超时等待 5 秒再继续
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    }
+  }
+
+  // 校验权限
+  isAdmin(chatId) {
+    if (!chatId) return false;
+    const strId = String(chatId);
+    return Array.isArray(this.config.adminChatIds) && this.config.adminChatIds.includes(strId);
+  }
+
+  // 更新处理主入口
+  async handleUpdate(update) {
+    if (update.message) {
+      await this.handleMessage(update.message);
+    } else if (update.callback_query) {
+      await this.handleCallbackQuery(update.callback_query);
+    }
+  }
+
+  // 文本消息与指令处理
+  async handleMessage(msg) {
+    if (!msg || !msg.text) return;
+    const chatId = msg.chat.id;
+    const text = msg.text.trim();
+    const strChatId = String(chatId);
+
+    // 1. 管理员自动绑定逻辑 (首次无管理员时，发任意消息或 /start 即可直接绑定)
+    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) {
+      this.config.adminChatIds = [strChatId];
+      this.saveConfig(this.config);
+      console.log(`🎉 [Telegram] 已自动将 Chat ID ${strChatId} 绑定为超级管理员！`);
+      await this.sendMessage(chatId, 
+        `🎉 <b>恭喜！您已成功绑定为中控台超级管理员！</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👤 管理员: <b>${msg.from.first_name || '用户'}</b> (@${msg.from.username || '无用户名'})\n` +
+        `🆔 Chat ID: <code>${strChatId}</code>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `现在您可以随时接收上游变价推送，并直接在手机端点击按钮进行切线调度！\n` +
+        `👇 发送 /help 或点击下方菜单开始使用。`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📊 查看大盘状态', callback_data: 'cmd:status' }, { text: '🔀 一键切换线路', callback_data: 'cmd:switch' }],
+              [{ text: '⚡ 自动切线设置', callback_data: 'cmd:auto' }, { text: '🔍 立即全网测速', callback_data: 'cmd:check' }]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    // 2. 权限校验
+    if (!this.isAdmin(chatId)) {
+      // 允许输入 /bind 尝试绑定
+      if (text.startsWith('/bind')) {
+        await this.sendMessage(chatId, 
+          `🔒 <b>中控台权限锁定</b>\n` +
+          `当前系统已存在指定管理员。您的 Chat ID 是：<code>${strChatId}</code>\n` +
+          `请联系现有管理员在中控台 Web 界面中将此 Chat ID 加入白名单。`
+        );
+      } else {
+        await this.sendMessage(chatId, 
+          `⛔ <b>未授权访问</b>\n` +
+          `抱歉，您的 Telegram 账号未在中控台授权列表中。\n` +
+          `您的 Chat ID 为: <code>${strChatId}</code>`
+        );
+      }
+      return;
+    }
+
+    // 3. 指令路由
+    const cmd = text.split(' ')[0].toLowerCase();
+
+    if (cmd === '/start' || cmd === '/help') {
+      await this.sendHelp(chatId);
+    } else if (cmd === '/status' || text === '状态' || text === '大盘') {
+      await this.sendStatus(chatId);
+    } else if (cmd === '/switch' || text === '换线' || text === '切换') {
+      await this.sendSwitchMenu(chatId);
+    } else if (cmd === '/auto' || text === '自动切线') {
+      await this.sendAutoSwitchMenu(chatId);
+    } else if (cmd === '/rates' || text === '倍率' || text === '价格') {
+      await this.sendRatesList(chatId);
+    } else if (cmd === '/check' || text === '测速' || text === '巡检') {
+      await this.executeForceCheck(chatId);
+    } else {
+      await this.sendMessage(chatId, 
+        `💡 未知指令：<code>${text}</code>\n` +
+        `输入 /help 查看所有可用命令，或使用下方快捷按钮：`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📊 查看大盘', callback_data: 'cmd:status' }, { text: '🔀 换线菜单', callback_data: 'cmd:switch' }]
+            ]
+          }
+        }
+      );
+    }
+  }
+
+  // Inline 按钮点击交互 (Callback Query)
+  async handleCallbackQuery(query) {
+    const chatId = query.message?.chat?.id;
+    const data = query.data;
+    const queryId = query.id;
+
+    if (!this.isAdmin(chatId)) {
+      await this.answerCallbackQuery(queryId, { text: '⛔ 权限不足，无法操作', show_alert: true });
+      return;
+    }
+
+    if (!data) return;
+
+    if (data === 'cmd:status') {
+      await this.answerCallbackQuery(queryId);
+      await this.sendStatus(chatId, query.message.message_id);
+    } else if (data === 'cmd:switch') {
+      await this.answerCallbackQuery(queryId);
+      await this.sendSwitchMenu(chatId, query.message.message_id);
+    } else if (data === 'cmd:auto') {
+      await this.answerCallbackQuery(queryId);
+      await this.sendAutoSwitchMenu(chatId, query.message.message_id);
+    } else if (data === 'cmd:check') {
+      await this.answerCallbackQuery(queryId, { text: '🔄 正在触发全网测速巡检...' });
+      await this.executeForceCheck(chatId);
+    } else if (data.startsWith('switch:')) {
+      const channelId = data.replace('switch:', '');
+      await this.handleDoSwitch(chatId, queryId, channelId, query.message.message_id);
+    } else if (data === 'toggle_auto') {
+      const autoConfig = this.context.getAutoSwitchConfig();
+      const newEnabled = !autoConfig.enabled;
+      await this.context.toggleAutoSwitch({ enabled: newEnabled });
+      await this.answerCallbackQuery(queryId, { 
+        text: newEnabled ? '✅ 自动切线保护已开启 (严格按不赔钱与最低价格调度)' : '⚠️ 自动切线保护已暂停' 
+      });
+      await this.sendAutoSwitchMenu(chatId, query.message.message_id);
+    }
+  }
+
+  // 发送帮助菜单
+  async sendHelp(chatId) {
+    const state = this.context.getState();
+    const active = state.channels.find(c => String(c.id) === String(state.activeChannelId)) || state.channels[0] || {};
+    const autoConfig = this.context.getAutoSwitchConfig();
+
+    const text = 
+      `🤖 <b>天枢 · 中转站智能调度中枢</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🌟 <b>当前主力出海:</b> <b>${active.name || '--'}</b> (<code>${active.multiplier || '--'}x</code>)\n` +
+      `⚡ <b>自动切线保护:</b> <b>${autoConfig.enabled ? '🟢 运行中' : '🔴 已暂停'}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `📋 <b>快捷交互命令：</b>\n` +
+      `• /status - 查看实时大盘、倍率与毛利数据\n` +
+      `• /switch - 🔀 弹出所有可用上游渠道，手机点选换线\n` +
+      `• /auto   - ⚡ 开启/关闭自动故障切线与成本保护\n` +
+      `• /rates  - 💰 查看所有渠道倍率天梯榜\n` +
+      `• /check  - 🔍 立即全网同步与探活测速\n` +
+      `• /help   - ❓ 显示本帮助菜单\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 <i>您可以直接点击下方交互按钮快速操作：</i>`;
+
+    await this.sendMessage(chatId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📊 查看大盘', callback_data: 'cmd:status' }, { text: '🔀 一键换线', callback_data: 'cmd:switch' }],
+          [{ text: '⚡ 自动切线', callback_data: 'cmd:auto' }, { text: '🔍 全量巡检', callback_data: 'cmd:check' }]
+        ]
+      }
+    });
+  }
+
+  // 发送大盘状态卡片
+  async sendStatus(chatId, editMessageId = null) {
+    const state = this.context.getState();
+    const active = state.channels.find(c => String(c.id) === String(state.activeChannelId)) || state.channels[0] || {};
+    const autoConfig = this.context.getAutoSwitchConfig();
+
+    const schedulableCount = state.channels.filter(c => c.schedulable).length;
+    const lossCount = state.channels.filter(c => c.isLoss).length;
+
+    const text = 
+      `📊 <b>【中转站大盘实时运行状态】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🌟 <b>主力出海通道:</b> <b>${active.name || '--'}</b> (ID: <code>${active.id || '--'}</code>)\n` +
+      `💸 <b>进货成本倍率:</b> <code>${active.multiplier !== undefined ? active.multiplier.toFixed(4) : '--'}x</code>\n` +
+      `📈 <b>销售核算倍率:</b> <code>${active.saleMultiplier !== undefined ? active.saleMultiplier.toFixed(4) : '--'}x</code>\n` +
+      `💰 <b>当前毛利率:</b> <b>+${active.marginPercent !== undefined ? active.marginPercent : '--'}%</b>\n` +
+      `📶 <b>节点响应状态:</b> ${active.status === 'offline' ? '🔴 离线' : '🟢 正常'}${active.latency ? ` (${active.latency}ms)` : ''}\n` +
+      `⚡ <b>自动切线保护:</b> ${autoConfig.enabled ? '🟢 统一基准运行中' : '🔴 已暂停'} (<code>成本第一·不足80%切副调</code>)\n` +
+      `👥 <b>渠道调度池:</b> 共接入 ${state.channels.length} 家 (${schedulableCount} 家已开启调度 / ${lossCount} 家倒贴)\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🕒 <i>更新时间: ${new Date().toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' })}</i>`;
+
+    const reply_markup = {
+      inline_keyboard: [
+        [{ text: '🔀 一键切换主用线路', callback_data: 'cmd:switch' }],
+        [{ text: '⚡ 自动切线设置', callback_data: 'cmd:auto' }, { text: '🔄 刷新状态', callback_data: 'cmd:status' }],
+        [{ text: '🔍 立即全量测速', callback_data: 'cmd:check' }]
+      ]
+    };
+
+    if (editMessageId) {
+      await this.editMessageText(chatId, editMessageId, text, { reply_markup });
+    } else {
+      await this.sendMessage(chatId, text, { reply_markup });
+    }
+  }
+
+  // 发送换线菜单 (Inline Keyboard 按钮网格)
+  async sendSwitchMenu(chatId, editMessageId = null) {
+    const state = this.context.getState();
+    const activeId = String(state.activeChannelId);
+    const active = state.channels.find(c => String(c.id) === activeId) || state.channels[0] || {};
+
+    const keyboard = [];
+    let row = [];
+
+    state.channels.forEach((c) => {
+      const isCurrent = String(c.id) === activeId;
+      const p = Number(c.priority);
+      const roleTag = p >= 100 ? '🟢主' : (p <= 1 ? '🟡保' : '🔵副');
+      const label = `${isCurrent ? '🌟' : roleTag} ${c.name.slice(0, 9)} (${c.multiplier}x)`;
+      row.push({
+        text: label,
+        callback_data: `switch:${c.id}`
+      });
+      if (row.length === 2) {
+        keyboard.push(row);
+        row = [];
+      }
+    });
+    if (row.length > 0) keyboard.push(row);
+
+    keyboard.push([
+      { text: '🔄 刷新列表', callback_data: 'cmd:switch' },
+      { text: '◀️ 返回大盘', callback_data: 'cmd:status' }
+    ]);
+
+    const text = 
+      `🔀 <b>【一键切换主力出海通道】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🌟 <b>当前主力:</b> <b>${active.name || '--'}</b> (进货: <code>${active.multiplier || '--'}x</code>)\n` +
+      `👇 <b>请直接在手机上点击下方按钮切换：</b>`;
+
+    if (editMessageId) {
+      await this.editMessageText(chatId, editMessageId, text, { reply_markup: { inline_keyboard: keyboard } });
+    } else {
+      await this.sendMessage(chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+    }
+  }
+
+  // 执行换线
+  async handleDoSwitch(chatId, queryId, channelId, messageId) {
+    const state = this.context.getState();
+    const target = state.channels.find(c => String(c.id) === String(channelId));
+    if (!target) {
+      await this.answerCallbackQuery(queryId, { text: '❌ 目标通道未找到', show_alert: true });
+      return;
+    }
+
+    await this.answerCallbackQuery(queryId, { text: `正在切换至 [${target.name}]...` });
+    const res = await this.context.activateChannel(channelId, 'Telegram 移动端');
+
+    if (res && res.success) {
+      const text = 
+        `✅ <b>主力出海通道切换成功！</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🌟 <b>新主力通道:</b> <b>${target.name}</b> (ID: <code>${target.id}</code>)\n` +
+        `💸 <b>进货倍率:</b> <code>${target.multiplier.toFixed(4)}x</code>\n` +
+        `📈 <b>销售倍率:</b> <code>${target.saleMultiplier ? target.saleMultiplier.toFixed(4) : '--'}x</code>\n` +
+        `⚡ <b>Sub2API 调度与 Redis 路由已毫秒级同步生效！</b>\n` +
+        `━━━━━━━━━━━━━━━━━━`;
+
+      await this.editMessageText(chatId, messageId, text, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔀 换其它线路', callback_data: 'cmd:switch' }, { text: '📊 返回大盘', callback_data: 'cmd:status' }]
+          ]
+        }
+      });
+    } else {
+      await this.sendMessage(chatId, `❌ 切换失败: ${res?.error || '调度中心处理异常'}`);
+    }
+  }
+
+  // 发送自动切线设置菜单
+  async sendAutoSwitchMenu(chatId, editMessageId = null) {
+    const autoConfig = this.context.getAutoSwitchConfig();
+
+    const text = 
+      `⚡ <b>【全站统一自动切线与容灾保护】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `运行状态: <b>${autoConfig.enabled ? '🟢 已开启' : '🔴 已暂停'}</b>\n` +
+      `核心主线: 💰 <b>以不赔钱为第一主线，谁便宜谁是主调</b>\n` +
+      `调换副调: 📊 <b>主调成功率不足 80% (<80%) 或连续硬故障才切</b>\n` +
+      `分层保护: 🛡️ <b>调换副调，保底尤慎重 (副调可用绝不动用保底)</b>\n` +
+      `防抖冷静: ⏱️ <b>10 分钟防抖冷却 (20 分钟防死循环)</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 <i>全站执行单一基准调度法则，不设第二套冲突规则。</i>`;
+
+    const reply_markup = {
+      inline_keyboard: [
+        [
+          { text: autoConfig.enabled ? '🔴 暂停自动切线' : '🟢 开启自动切线', callback_data: 'toggle_auto' }
+        ],
+        [
+          { text: '📊 返回大盘', callback_data: 'cmd:status' },
+          { text: '🔀 换线菜单', callback_data: 'cmd:switch' }
+        ]
+      ]
+    };
+
+    if (editMessageId) {
+      await this.editMessageText(chatId, editMessageId, text, { reply_markup });
+    } else {
+      await this.sendMessage(chatId, text, { reply_markup });
+    }
+  }
+
+  // 发送倍率天梯榜
+  async sendRatesList(chatId) {
+    const state = this.context.getState();
+    const sorted = [...state.channels].sort((a, b) => a.multiplier - b.multiplier);
+
+    let listText = '';
+    sorted.forEach((c, idx) => {
+      const isCurrent = String(c.id) === String(state.activeChannelId);
+      listText += `${idx + 1}. [<code>${c.multiplier.toFixed(4)}x</code>] <b>${c.name}</b> ${isCurrent ? '🌟 (当前主用)' : ''}${c.schedulable ? '' : ' (🚫已禁)'}\n`;
+    });
+
+    const text = 
+      `💰 <b>【各上游渠道进货倍率天梯榜】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      listText +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 点击下方换线按钮可直接选择任意线路：`;
+
+    await this.sendMessage(chatId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔀 立即换线', callback_data: 'cmd:switch' }, { text: '📊 查看大盘', callback_data: 'cmd:status' }]
+        ]
+      }
+    });
+  }
+
+  // 触发全量巡检
+  async executeForceCheck(chatId) {
+    await this.sendMessage(chatId, '🔍 正在向 Sub2API 触发全量探活与倍率巡检，请稍候...');
+    try {
+      await this.context.forceCheck();
+      await this.sendMessage(chatId, '✅ <b>全网探活巡检完毕！最新数据已同步更新。</b>', {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📊 查看最新状态', callback_data: 'cmd:status' }]
+          ]
+        }
+      });
+    } catch (e) {
+      await this.sendMessage(chatId, `❌ 巡检失败: ${e.message}`);
+    }
+  }
+
+  // ====== 🔔 主动推送事件分发器 (Push Notification Emitters) ======
+
+  // 1. 上游倍率变动告警
+  async notifyRatioChange({ channel, oldMultiplier, newMultiplier, direction, changePercent, isActiveChannel, reason }) {
+    if (!this.config.enabled || !this.config.notifyOnRatioChange) return;
+    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
+
+    const isSurge = direction === 'up';
+    const isHighRisk = isActiveChannel && isSurge;
+
+    let title = isHighRisk 
+      ? `🚨 <b>【高危预警！当前主力通道暴涨】</b>`
+      : (isSurge ? `🔺 <b>【上游进货倍率涨价提醒】</b>` : `🔻 <b>【上游进货倍率下调喜报】</b>`);
+
+    let message = 
+      `${title}\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `📡 <b>变动渠道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
+      `📊 <b>倍率调整:</b> <code>${Number(oldMultiplier).toFixed(4)}x</code> ➔ <b><code>${Number(newMultiplier).toFixed(4)}x</code></b> (<b>${isSurge ? '+' : '-'}${changePercent}%</b>)\n` +
+      `🏢 <b>供应商:</b> ${channel.provider || channel.vendor || '通用'}\n` +
+      `💡 <b>检测原因:</b> ${reason || '自动探活巡检感知'}\n` +
+      `${isActiveChannel ? `\n🔴 <b>警告：该渠道正是您当前出海的主力主调线路！</b>\n` : ''}` +
+      `━━━━━━━━━━━━━━━━━━`;
+
+    let reply_markup = null;
+
+    // 如果是主力线路涨价，智能推荐其它更便宜的备用线路，直接生成一键切换按钮！
+    if (isHighRisk) {
+      const state = this.context.getState();
+      const candidates = state.channels
+        .filter(c => String(c.id) !== String(channel.id) && c.schedulable && c.multiplier < newMultiplier)
+        .sort((a, b) => a.multiplier - b.multiplier)
+        .slice(0, 3);
+
+      if (candidates.length > 0) {
+        const switchButtons = candidates.map(c => ([{
+          text: `⚡ 一键切到 ${c.name.slice(0, 10)} (${c.multiplier}x)`,
+          callback_data: `switch:${c.id}`
+        }]));
+        switchButtons.push([{ text: '🔀 查看全部备用通道', callback_data: 'cmd:switch' }]);
+        reply_markup = { inline_keyboard: switchButtons };
+      }
+    } else {
+      reply_markup = {
+        inline_keyboard: [
+          [{ text: '🔀 前往换线', callback_data: 'cmd:switch' }, { text: '📊 查看大盘', callback_data: 'cmd:status' }]
+        ]
+      };
+    }
+
+    await this.broadcastToAdmins(message, { reply_markup });
+  }
+
+  // 2. 自动切线触发通知
+  async notifyAutoSwitch(logEntry, toChannel) {
+    if (!this.config.enabled || !this.config.notifyOnAutoSwitch) return;
+    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
+
+    const message = 
+      `⚡ <b>【智能自动熔断切线触发】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🔄 <b>切线动作:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
+      `🎯 <b>触发原因:</b> ${logEntry.reason}\n` +
+      `💸 <b>进货倍率:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
+      `${logEntry.oldTtft ? `⏱️ <b>延迟对比:</b> <code>${logEntry.oldTtft}ms</code> ➔ <code>${logEntry.newTtft || '--'}ms</code>\n` : ''}` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `✅ <i>Sub2API 调度网关已即时切换至新通道！</i>`;
+
+    const reply_markup = {
+      inline_keyboard: [
+        [{ text: '🔀 人工选其它线', callback_data: 'cmd:switch' }, { text: '📊 查看大盘', callback_data: 'cmd:status' }]
+      ]
+    };
+
+    await this.broadcastToAdmins(message, { reply_markup });
+  }
+
+  // 3. 手动切线确认通知
+  async notifyManualSwitch(channel, operator = '控制台') {
+    if (!this.config.enabled) return;
+    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
+
+    // 如果操作者就是 Telegram Bot，自身已有交互回复，无需重复刷屏广播
+    if (operator && operator.includes('Telegram')) return;
+
+    const message = 
+      `🔀 <b>【主力出海线路切换通知】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🌟 <b>新主力通道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
+      `💸 <b>进货倍率:</b> <code>${channel.multiplier}x</code>\n` +
+      `👤 <b>操作来源:</b> ${operator}\n` +
+      `━━━━━━━━━━━━━━━━━━`;
+
+    await this.broadcastToAdmins(message, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📊 查看大盘', callback_data: 'cmd:status' }]
+        ]
+      }
+    });
+  }
+
+  // 4. 定性变更通知 (主调 / 副调 / 保底)
+  async notifyRoleChange(channel, role, operator = '控制台') {
+    if (!this.config.enabled) return;
+    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
+    if (operator && operator.includes('Telegram')) return;
+
+    const roleName = role === 'main' ? '⚡ 主调 (优先调度 100)' : (role === 'sub' ? '⚖️ 副调 (备用分流 10)' : '🛡️ 保底 (故障兜底 1)');
+    const message = 
+      `🎯 <b>【上游定性级别调整】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `📌 <b>目标通道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
+      `🏷️ <b>最新定性:</b> <b>${roleName}</b>\n` +
+      `💸 <b>进货倍率:</b> <code>${channel.costMultiplier !== undefined ? channel.costMultiplier : channel.multiplier}x</code>\n` +
+      `👤 <b>操作来源:</b> ${operator}\n` +
+      `━━━━━━━━━━━━━━━━━━`;
+
+    await this.broadcastToAdmins(message, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📊 查看大盘', callback_data: 'cmd:status' }]
+        ]
+      }
+    });
+  }
+
+  // 发送给所有绑定的管理员
+  async broadcastToAdmins(text, options = {}) {
+    if (!this.config.adminChatIds || !Array.isArray(this.config.adminChatIds)) return;
+    for (const chatId of this.config.adminChatIds) {
+      try {
+        await this.sendMessage(chatId, text, options);
+      } catch (err) {
+        console.error(`[Telegram] 广播消息至 ${chatId} 失败:`, err.message);
+      }
+    }
+  }
+
+  // 发送消息核心方法
+  async sendMessage(chatId, text, options = {}) {
+    return this.apiRequest('sendMessage', {
+      chat_id: chatId,
+      text: text,
+      parse_mode: 'HTML',
+      ...options
+    });
+  }
+
+  // 编辑消息核心方法
+  async editMessageText(chatId, messageId, text, options = {}) {
+    return this.apiRequest('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: text,
+      parse_mode: 'HTML',
+      ...options
+    });
+  }
+
+  // 回应内联按钮点击 (弹 Toast)
+  async answerCallbackQuery(queryId, options = {}) {
+    return this.apiRequest('answerCallbackQuery', {
+      callback_query_id: queryId,
+      ...options
+    });
+  }
+
+  // 发送测试消息
+  async sendTestMessage(targetChatId = null) {
+    const target = targetChatId || (this.config.adminChatIds && this.config.adminChatIds[0]);
+    if (!target) {
+      throw new Error('未配置任何接收人 Chat ID，请在 Telegram 中对机器人发送 /start 即可自动绑定');
+    }
+
+    const text = 
+      `🎉 <b>【中转塔台 Telegram 机器人测试成功】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🤖 <b>机器人:</b> ${this.botInfo ? `${this.botInfo.first_name} (@${this.botInfo.username})` : '天枢'}\n` +
+      `🕒 <b>测试时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n` +
+      `📡 <b>中控台状态:</b> 连通性良好，双向通信正常！\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 您已成功完成绑定，以后上游变价或自动切线时将第一时间通知您。`;
+
+    return this.sendMessage(target, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📊 查看当前大盘', callback_data: 'cmd:status' }, { text: '🔀 一键换线', callback_data: 'cmd:switch' }]
+        ]
+      }
+    });
+  }
+
+  // 尝试从最新收到的 update 中自动绑定管理员
+  async tryAutoBindFromUpdates() {
+    try {
+      const updates = await this.apiRequest('getUpdates', { limit: 10, timeout: 0 });
+      if (Array.isArray(updates) && updates.length > 0) {
+        // 取最新的 message
+        for (let i = updates.length - 1; i >= 0; i--) {
+          const u = updates[i];
+          const m = u.message || u.callback_query?.message;
+          if (m && m.chat && m.chat.id) {
+            const strId = String(m.chat.id);
+            if (!this.config.adminChatIds.includes(strId)) {
+              this.config.adminChatIds.push(strId);
+              this.saveConfig(this.config);
+              console.log(`[Telegram] 通过主动探测成功绑定 Chat ID: ${strId}`);
+              return { success: true, chatId: strId, username: m.chat.username || m.from?.username };
+            }
+          }
+        }
+      }
+      return { success: false, message: '未找到近期与机器人互动的消息，请先在 Telegram 手机端给机器人发一条 /start 消息' };
+    } catch (e) {
+      return { success: false, message: e.message };
+    }
+  }
+
+  // 获取对外状态
+  getStatus() {
+    return {
+      enabled: !!this.config.enabled,
+      configured: !!this.config.botToken,
+      botInfo: this.botInfo,
+      adminChatIds: this.config.adminChatIds || [],
+      notifyOnRatioChange: this.config.notifyOnRatioChange !== false,
+      notifyOnActiveSurge: this.config.notifyOnActiveSurge !== false,
+      notifyOnAutoSwitch: this.config.notifyOnAutoSwitch !== false,
+      notifyOnOutage: this.config.notifyOnOutage !== false,
+      isPolling: this.isPolling
+    };
+  }
+}
+
+module.exports = new TelegramBotManager();

@@ -1,0 +1,12 @@
+{
+  "name": "relay-tower",
+  "version": "1.0.0",
+  "description": "Relay Tower: Multi-Upstream LLM Monitor & Intelligent Dispatcher",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["ai", "relay", "upstream", "monitor", "pricing", "switcher"],
+  "author": "Relay Tower Community",
+  "license": "MIT"
+}
