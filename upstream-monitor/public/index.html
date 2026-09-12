@@ -682,29 +682,33 @@
           </p>
 
           <!-- 1. 新建分组栏 -->
-          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 7px; padding: 0.75rem 0.85rem; margin: 0.5rem 0 0.8rem 0;">
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.75rem 0.85rem; margin: 0.5rem 0 0.9rem 0;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.45rem;">
-              <div style="font-size: 0.82rem; font-weight: 600; color: #334155; display: flex; align-items: center; gap: 0.35rem;">
+              <div style="font-size: 0.82rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 0.4rem;">
                 <span>➕ 新建业务销售分组</span>
+                <span style="font-size: 0.68rem; font-weight: normal; color: #475569; background: #e2e8f0; padding: 1px 6px; border-radius: 3px;">如需修改已有分组请在下方卡片操作</span>
               </div>
-              <span style="font-size: 0.72rem; color: #64748b;">支持直接绑定通道，系统自动以最便宜健康通道为主调</span>
+              <span style="font-size: 0.72rem; color: #64748b;">支持直接勾选初始通道，系统自动以最便宜健康通道为主调</span>
             </div>
-            <div style="display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.55rem;">
-              <input type="text" id="inputNewGroupName" placeholder="分组名称 (如: DeepSeek 0.4 / Claude极速 1.1)" class="form-input" style="flex: 2; font-size: 0.82rem;" />
-              <div style="display: flex; align-items: center; gap: 0.25rem; flex: 1.2;">
-                <span style="font-size: 0.78rem; color: #64748b;">对外倍率:</span>
-                <input type="number" id="inputNewGroupRate" step="0.0001" min="0.0001" max="100" placeholder="1.0000" value="1.0000" class="form-input mono" style="width: 90px; font-size: 0.85rem; text-align: center;" />
+
+            <!-- 分组名称与倍率 -->
+            <div style="display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.55rem;">
+              <div style="flex: 2; display: flex; align-items: center; gap: 0.35rem;">
+                <span style="font-size: 0.76rem; color: #475569; white-space: nowrap; font-weight: 600;">分组名称:</span>
+                <input type="text" id="inputNewGroupName" placeholder="例如: DeepSeek 0.4 / Codex 专区" class="form-input" style="flex: 1; font-size: 0.82rem;" />
+              </div>
+              <div style="flex: 1.2; display: flex; align-items: center; gap: 0.35rem;">
+                <span style="font-size: 0.76rem; color: #475569; white-space: nowrap; font-weight: 600;">对外倍率:</span>
+                <input type="number" id="inputNewGroupRate" step="0.0001" min="0.0001" max="100" placeholder="1.0000" value="1.0000" class="form-input mono" style="width: 88px; font-size: 0.85rem; text-align: center;" />
                 <span style="font-size: 0.78rem; color: #64748b;">x</span>
               </div>
-              <button id="btnCreateNewGroup" class="btn btn-primary" style="font-size: 0.8rem; padding: 0.35rem 0.8rem; white-space: nowrap;">
-                ➕ 确认创建分组
-              </button>
             </div>
+
             <!-- 通道直接绑定勾选区 -->
             <div style="border-top: 1px dashed #cbd5e1; padding-top: 0.45rem; margin-top: 0.2rem;">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
-                <span style="font-size: 0.75rem; font-weight: 600; color: #475569;">
-                  📦 放入该分组的初始通道 (可多选，选中的通道将直接归入该销售分组)：
+                <span style="font-size: 0.75rem; font-weight: 600; color: #334155;">
+                  📦 勾选归入此新分组的初始上游渠道 (选中的渠道将直属该组)：
                 </span>
                 <div style="display: flex; gap: 0.35rem;">
                   <button type="button" id="btnSelectAllNewGroupChs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选</button>
@@ -715,9 +719,26 @@
                 <!-- 由 app.js 动态渲染可用通道列表 -->
               </div>
             </div>
+
+            <!-- 创建动作提交栏 (位于勾选区下方，流程自然顺畅) -->
+            <div style="margin-top: 0.55rem; padding-top: 0.45rem; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 0.74rem; color: #64748b;">
+                已选择 <strong id="newGroupSelectedCount" style="color: #2563eb;">0</strong> 个初始通道
+              </span>
+              <button id="btnCreateNewGroup" class="btn btn-primary" style="font-size: 0.82rem; padding: 0.35rem 1rem; font-weight: 600; box-shadow: 0 1px 2px rgba(37,99,235,0.2);">
+                ➕ 确认创建新分组并绑定所选通道
+              </button>
+            </div>
           </div>
 
           <!-- 2. 分组全景卡片列表 -->
+          <div style="display: flex; justify-content: space-between; align-items: center; margin: 0.6rem 0 0.35rem 0;">
+            <div style="font-size: 0.84rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 0.35rem;">
+              <span>📋 现有业务销售分组列表</span>
+              <span id="allGroupsCountBadge" class="mono-badge" style="font-size: 0.7rem;">--</span>
+            </div>
+            <span style="font-size: 0.72rem; color: #64748b;">💡 如需为已有分组增删、调配上游通道，请点击卡片右下方的「👥 分配上游」</span>
+          </div>
           <div id="allGroupsCardsContainer" style="display: flex; flex-direction: column; gap: 0.55rem; max-height: 380px; overflow-y: auto; padding-right: 0.2rem;">
             <!-- 由 app.js 动态渲染各分组卡片 -->
           </div>

@@ -2742,9 +2742,11 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnCreateNewGroup')?.addEventListener('click', createNewGroup);
   document.getElementById('btnSelectAllNewGroupChs')?.addEventListener('click', () => {
     document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = true);
+    updateNewGroupSelectedCount();
   });
   document.getElementById('btnClearAllNewGroupChs')?.addEventListener('click', () => {
     document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = false);
+    updateNewGroupSelectedCount();
   });
   document.getElementById('btnRefreshAllGroupsList')?.addEventListener('click', async () => {
     try {
@@ -2868,12 +2870,19 @@ async function openAllGroupsModal() {
   await loadAllGroupsDetails();
 }
 
+function updateNewGroupSelectedCount() {
+  const count = document.querySelectorAll('input[name="newGroupChannel"]:checked').length;
+  const el = document.getElementById('newGroupSelectedCount');
+  if (el) el.textContent = count;
+}
+
 function renderNewGroupChannelSelector() {
   const container = document.getElementById('newGroupChannelsContainer');
   if (!container) return;
   const list = (typeof channelsData !== 'undefined' && Array.isArray(channelsData)) ? channelsData : [];
   if (!list || list.length === 0) {
     container.innerHTML = `<span style="color: #94a3b8; font-size: 0.75rem; grid-column: 1/-1;">暂无通道数据</span>`;
+    updateNewGroupSelectedCount();
     return;
   }
   container.innerHTML = list.map(c => {
@@ -2882,11 +2891,19 @@ function renderNewGroupChannelSelector() {
     const isOut = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
     const balColor = isOut ? '#ef4444' : (c.balanceStatus === 'low' ? '#f59e0b' : '#10b981');
     const balText = isOut ? '欠费' : bal;
+    const hasGroup = (c.groupsDetail && c.groupsDetail.length > 0) || (c.groups && c.groups.length > 0 && !c.groups.includes('未分配分组'));
+    const groupBadge = hasGroup 
+      ? `<span style="font-size: 0.62rem; color: #475569; background: #e2e8f0; padding: 0 4px; border-radius: 3px;">已有组</span>`
+      : `<span style="font-size: 0.62rem; color: #d97706; background: #fef3c7; padding: 0 4px; border-radius: 3px;">待分配</span>`;
+
     return `
       <label style="display: flex; align-items: center; gap: 0.35rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 0.3rem 0.45rem; cursor: pointer; font-size: 0.74rem; user-select: none;">
-        <input type="checkbox" name="newGroupChannel" value="${c.id}" style="cursor: pointer;" />
+        <input type="checkbox" name="newGroupChannel" value="${c.id}" onchange="updateNewGroupSelectedCount()" style="cursor: pointer;" />
         <div style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-          <strong style="color: #1e293b;">${c.name}</strong>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <strong style="color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${c.name}</strong>
+            ${groupBadge}
+          </div>
           <div style="font-size: 0.68rem; color: #64748b; display: flex; gap: 0.35rem;">
             <span>进价: ${cost}x</span>
             <span style="color: ${balColor};">余额: ${balText}</span>
@@ -2895,6 +2912,7 @@ function renderNewGroupChannelSelector() {
       </label>
     `;
   }).join('');
+  updateNewGroupSelectedCount();
 }
 
 function closeAllGroupsModal() {
@@ -2920,6 +2938,9 @@ async function loadAllGroupsDetails() {
 function renderAllGroupsCards(groupsList) {
   const container = document.getElementById('allGroupsCardsContainer');
   if (!container) return;
+
+  const countBadge = document.getElementById('allGroupsCountBadge');
+  if (countBadge) countBadge.textContent = `${(groupsList || []).length} 个`;
 
   if (!groupsList || groupsList.length === 0) {
     container.innerHTML = `<div style="text-align: center; padding: 1.5rem; color: #64748b; font-size: 0.8rem;">暂无业务分组</div>`;
@@ -3058,31 +3079,48 @@ async function handleDeleteGroup(groupId, groupName) {
 function openAssignAccountsModal(groupId, groupName) {
   const currentGroup = cachedGroupsDetailsData.find(g => String(g.id) === String(groupId));
   const currentAccIds = new Set((currentGroup?.accounts || []).map(a => String(a.id)));
+  const list = (typeof channelsData !== 'undefined' && Array.isArray(channelsData)) ? channelsData : [];
 
-  const accountRowsHtml = channelsData.map(ch => {
+  const accountRowsHtml = list.map(ch => {
     const isChecked = currentAccIds.has(String(ch.id));
+    const cost = formatRate(ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier);
+    const bal = ch.balance !== null && ch.balance !== undefined ? `$${Number(ch.balance).toFixed(2)}` : '未同步';
+    const isOut = (ch.balanceStatus === 'empty') || (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) <= 0.001);
+    const balColor = isOut ? '#ef4444' : (ch.balanceStatus === 'low' ? '#f59e0b' : '#10b981');
+    const balText = isOut ? '欠费' : bal;
+
     return `
-      <label style="display: flex; align-items: center; justify-content: space-between; padding: 0.35rem 0.6rem; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 5px; cursor: pointer;">
-        <div style="display: flex; align-items: center; gap: 0.45rem;">
-          <input type="checkbox" value="${ch.id}" class="assign-acc-checkbox" ${isChecked ? 'checked' : ''} />
-          <span style="font-size: 0.8rem; font-weight: 600; color: #1e293b;">${ch.name}</span>
+      <label class="assign-acc-row" data-name="${(ch.name || '').toLowerCase()}" style="display: flex; align-items: center; justify-content: space-between; padding: 0.35rem 0.6rem; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 5px; cursor: pointer; user-select: none;">
+        <div style="display: flex; align-items: center; gap: 0.45rem; flex: 1; overflow: hidden;">
+          <input type="checkbox" value="${ch.id}" class="assign-acc-checkbox" ${isChecked ? 'checked' : ''} style="cursor: pointer;" />
+          <span style="font-size: 0.8rem; font-weight: 600; color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${ch.name}</span>
         </div>
-        <span class="mono" style="font-size: 0.72rem; color: #64748b;">成本: ${formatRate(ch.costMultiplier || ch.multiplier)}x</span>
+        <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.72rem;">
+          <span class="mono" style="color: #64748b;">进价: ${cost}x</span>
+          <span style="color: ${balColor};">余额: ${balText}</span>
+        </div>
       </label>
     `;
   }).join('');
 
   const modalHtml = `
     <div id="assignAccountsModalBackdrop" class="modal-backdrop open" style="z-index: 1050;">
-      <div class="modal-dialog" style="max-width: 500px;">
+      <div class="modal-dialog" style="max-width: 520px;">
         <div class="dialog-content">
-          <div style="font-size: 1rem; font-weight: 700; color: #0f172a; margin-bottom: 0.2rem;">为分组 [${groupName}] 分配上游渠道</div>
-          <p style="font-size: 0.75rem; color: #64748b; margin-bottom: 0.6rem;">勾选归属于此业务销售分组的上游渠道：</p>
-          <div id="assignAccountsContainer" style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 260px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">
+          <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a; margin-bottom: 0.2rem;">为分组 [${groupName}] 分配上游渠道</div>
+          <p style="font-size: 0.75rem; color: #64748b; margin-bottom: 0.5rem;">勾选所有归属于此业务销售分组的上游渠道（共 ${list.length} 个通道可选）：</p>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; gap: 0.4rem;">
+            <input type="text" id="filterAssignAccsInput" placeholder="🔍 快速搜索渠道名称..." class="form-input" style="font-size: 0.76rem; padding: 0.2rem 0.5rem; flex: 1;" />
+            <div style="display: flex; gap: 0.35rem;">
+              <button type="button" id="btnSelectAllAssignAccs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 7px; height: 22px;">全选</button>
+              <button type="button" id="btnClearAllAssignAccs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 7px; height: 22px;">清空</button>
+            </div>
+          </div>
+          <div id="assignAccountsContainer" style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 280px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">
             ${accountRowsHtml}
           </div>
           <div class="dialog-actions" style="margin-top: 0.8rem; display: flex; gap: 0.5rem;">
-            <button id="btnSubmitAssignAccounts" class="btn btn-primary" style="flex: 1; justify-content: center;">保存分配</button>
+            <button id="btnSubmitAssignAccounts" class="btn btn-primary" style="flex: 1; justify-content: center; font-weight: 600;">保存分配结果</button>
             <button onclick="document.getElementById('assignAccountsModalBackdrop').remove()" class="btn btn-secondary">取消</button>
           </div>
         </div>
@@ -3093,6 +3131,26 @@ function openAssignAccountsModal(groupId, groupName) {
   const div = document.createElement('div');
   div.innerHTML = modalHtml;
   document.body.appendChild(div.firstElementChild);
+
+  document.getElementById('filterAssignAccsInput')?.addEventListener('input', (e) => {
+    const q = (e.target.value || '').trim().toLowerCase();
+    document.querySelectorAll('.assign-acc-row').forEach(row => {
+      const name = row.getAttribute('data-name') || '';
+      row.style.display = (!q || name.includes(q)) ? 'flex' : 'none';
+    });
+  });
+
+  document.getElementById('btnSelectAllAssignAccs')?.addEventListener('click', () => {
+    document.querySelectorAll('.assign-acc-checkbox').forEach(cb => {
+      if (cb.closest('.assign-acc-row').style.display !== 'none') cb.checked = true;
+    });
+  });
+
+  document.getElementById('btnClearAllAssignAccs')?.addEventListener('click', () => {
+    document.querySelectorAll('.assign-acc-checkbox').forEach(cb => {
+      if (cb.closest('.assign-acc-row').style.display !== 'none') cb.checked = false;
+    });
+  });
 
   document.getElementById('btnSubmitAssignAccounts')?.addEventListener('click', async () => {
     const cbs = document.querySelectorAll('.assign-acc-checkbox:checked');
