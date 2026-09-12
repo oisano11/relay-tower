@@ -4013,17 +4013,20 @@ async function loadAutoSwitchLogs() {
       } else if (log.triggerType === 'provider_error' || log.triggerType === 'hard_down') {
         badgeClass = 'as-tag-error';
         tagText = '上游报错';
-      } else if (log.triggerType === 'cost_recovery') {
+      } else if (log.triggerType === 'cost_recovery' || log.triggerType === 'auto_recover_lowest_cost') {
         badgeClass = 'as-tag-recovery';
-        tagText = '低价切回';
+        tagText = '充值回切';
       } else if (log.triggerType === 'manual_test') {
         badgeClass = 'as-tag-manual';
         tagText = '演练切换';
       }
 
-      const priceTagHtml = log.priceAdjusted 
-        ? `<span class="as-tag" style="background: #fef3c7; color: #b45309; border: 1px solid #fcd34d;" title="自动上调分组售价保毛利">改售价保毛利</span>` 
-        : '';
+      let priceTagHtml = '';
+      if (log.priceAdjusted) {
+        priceTagHtml = `<span class="as-tag" style="background: #fef3c7; color: #b45309; border: 1px solid #fcd34d;" title="自动上调分组售价保毛利">改售价保毛利</span>`;
+      } else if (log.priceRestored) {
+        priceTagHtml = `<span class="as-tag" style="background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0;" title="低价主线充值恢复，自动回调原售价">恢复原售价</span>`;
+      }
 
       return `
         <tr>

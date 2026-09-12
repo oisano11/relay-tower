@@ -887,7 +887,25 @@ class TelegramBotManager {
     const toInflight = toAct.inflight || 0;
 
     let message = '';
-    if (logEntry.priceAdjusted) {
+    if (logEntry.triggerType === 'auto_recover_lowest_cost' || logEntry.priceRestored) {
+      message = 
+        `🟢 <b>【中转塔台 · 低价主线充值恢复 · 自动切回主调并恢复原价】</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🔄 <b>切线路由:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
+        `🎯 <b>恢复原因:</b> ${logEntry.reason}\n` +
+        `💸 <b>进货成本降本:</b> <code>${logEntry.oldCost}x</code> ➔ <b><code>${logEntry.newCost}x</code></b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        (logEntry.priceRestored ? (
+          `📉 <b>【业务分组售价恢复原价】</b>\n` +
+          `• 调整分组: <b>${logEntry.groupName || '默认分组'}</b>\n` +
+          `• 紧急避险价: <code>${logEntry.oldSaleRate}x</code> (避险阶段已结束)\n` +
+          `• <b>恢复原售价:</b> <b><code>${logEntry.restoredSaleRate || logEntry.newSaleRate}x</code></b> (让利客户，重塑价格竞争力)\n` +
+          `• <b>核算新毛利率:</b> <b>+${logEntry.newMarginPercent}%</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n`
+        ) : '') +
+        `👥 <b>新主线负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
+        `🛡️ <i>闭环完成！Sub2API 调度路由与零售售价已即刻无缝生效。</i>`;
+    } else if (logEntry.priceAdjusted) {
       message = 
         `⚡ <b>【智能熔断切线 & 紧急改售价已生效】</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +

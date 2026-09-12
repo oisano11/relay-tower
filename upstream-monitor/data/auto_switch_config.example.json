@@ -11,7 +11,8 @@
   "consecutiveFailuresThreshold": 5,
   "strategy": "cost_first",
   "cooldownMinutes": 10,
-  "autoRecoverLowestCost": false,
+  "autoRecoverLowestCost": true,
+  "originalGroupSaleRates": {},
   "lastSwitchTime": null,
   "lastSwitchReason": null
 }
