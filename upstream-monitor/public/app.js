@@ -2739,8 +2739,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // 全站业务分组中枢打开、关闭、刷新、新建
   document.getElementById('btnOpenAllGroupsModal')?.addEventListener('click', openAllGroupsModal);
   document.getElementById('btnCloseAllGroupsModal')?.addEventListener('click', closeAllGroupsModal);
-  document.getElementById('btnRefreshAllGroupsList')?.addEventListener('click', loadAllGroupsDetails);
   document.getElementById('btnCreateNewGroup')?.addEventListener('click', createNewGroup);
+  document.getElementById('btnSelectAllNewGroupChs')?.addEventListener('click', () => {
+    document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = true);
+  });
+  document.getElementById('btnClearAllNewGroupChs')?.addEventListener('click', () => {
+    document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = false);
+  });
 
   // 点击背景关闭分组弹窗
   document.getElementById('channelGroupsModal')?.addEventListener('click', (e) => {
@@ -2849,7 +2854,36 @@ let cachedGroupsDetailsData = [];
 
 async function openAllGroupsModal() {
   document.getElementById('allGroupsModal').classList.add('open');
+  renderNewGroupChannelSelector();
   await loadAllGroupsDetails();
+}
+
+function renderNewGroupChannelSelector() {
+  const container = document.getElementById('newGroupChannelsContainer');
+  if (!container) return;
+  if (!currentChannels || currentChannels.length === 0) {
+    container.innerHTML = `<span style="color: #94a3b8; font-size: 0.75rem; grid-column: 1/-1;">暂无通道数据</span>`;
+    return;
+  }
+  container.innerHTML = currentChannels.map(c => {
+    const cost = formatRate(c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier);
+    const bal = c.balance !== null && c.balance !== undefined ? `$${Number(c.balance).toFixed(2)}` : '未同步';
+    const isOut = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
+    const balColor = isOut ? '#ef4444' : (c.balanceStatus === 'low' ? '#f59e0b' : '#10b981');
+    const balText = isOut ? '欠费' : bal;
+    return `
+      <label style="display: flex; align-items: center; gap: 0.35rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 0.3rem 0.45rem; cursor: pointer; font-size: 0.74rem; user-select: none;">
+        <input type="checkbox" name="newGroupChannel" value="${c.id}" style="cursor: pointer;" />
+        <div style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+          <strong style="color: #1e293b;">${c.name}</strong>
+          <div style="font-size: 0.68rem; color: #64748b; display: flex; gap: 0.35rem;">
+            <span>进价: ${cost}x</span>
+            <span style="color: ${balColor};">余额: ${balText}</span>
+          </div>
+        </div>
+      </label>
+    `;
+  }).join('');
 }
 
 function closeAllGroupsModal() {
@@ -2932,17 +2966,25 @@ async function createNewGroup() {
     return;
   }
 
+  const selectedChs = Array.from(document.querySelectorAll('input[name="newGroupChannel"]:checked')).map(cb => parseInt(cb.value, 10)).filter(id => !isNaN(id));
+  if (selectedChs.length === 0) {
+    if (!confirm(`提示：您尚未为业务分组【${name}】选择任何通道。\n根据平台规则，分组必须包含通道才能生效。\n\n是否仍要创建空分组？(建议取消并至少勾选一个通道)`)) {
+      return;
+    }
+  }
+
   try {
     const res = await fetch('/api/groups', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, rateMultiplier: rate })
+      body: JSON.stringify({ name, rateMultiplier: rate, accountIds: selectedChs })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '创建分组失败');
 
     showToast(data.message || `分组 [${name}] 创建成功！`, 'success');
     if (nameInput) nameInput.value = '';
+    document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = false);
     await loadChannels();
     await loadAllGroupsDetails();
   } catch (e) {
