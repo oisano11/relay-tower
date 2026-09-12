@@ -286,30 +286,80 @@ async function main() {
       return true;
     };
 
-    scanner.discoverUpstreamOfferings = async () => {
-      return [
-        {
-          type: 'channel',
-          name: '新降价上游',
-          vendor: 'OpenAI',
-          baseUrl: 'https://api.discount-openai.com',
-          costMultiplier: 0.04
-        }
-      ];
+    const origDiscover = scanner.discoverUpstreamOfferings;
+    try {
+      scanner.discoverUpstreamOfferings = async () => {
+        return [
+          {
+            type: 'channel',
+            name: '新降价上游',
+            vendor: 'OpenAI',
+            baseUrl: 'https://api.discount-openai.com',
+            costMultiplier: 0.04
+          }
+        ];
+      };
+
+      const scanRes = await scanner.runScan('自动化测试巡检');
+      assert.strictEqual(scanRes.success, true, '巡检应成功完成');
+      const report = scanRes.report;
+
+      assert.strictEqual(report.deactivatedChannels.length, 1, '应有 1 个通道被停用 (通道 201)');
+      assert.strictEqual(report.closedGroups.length, 1, '独苗组应被孤岛熔断关停');
+      assert.strictEqual(report.autoSyncedChannels.length, 1, '低价上游应被自动同步上线');
+      assert.ok(report.summaryText.includes('高危熔断'), '总结必须包含高危熔断预警');
+      assert.ok(report.summaryText.includes('低价直通上线'), '总结必须包含低价直通上线信息');
+
+      // 验证 Telegram 通知有被调用
+      assert.strictEqual(mockCtx._internal.telegramNotifications.length, 1, '必须向 Telegram 派发报告推送');
+    } finally {
+      scanner.discoverUpstreamOfferings = origDiscover;
+    }
+  });
+
+  // 测试 8：多上游供应商后台管理池遍历与模型/报价聚合
+  await runAsyncTest('多上游平台：管理池同时配置多个供应商时，引擎应遍历所有已启用平台并聚合模型', async () => {
+    const mockPanels = [
+      { id: 'p1', name: '金龙 New-API', backendUrl: 'https://jlaudeapi.com', enabled: true },
+      { id: 'p2', name: '子桐网络', backendUrl: 'https://sub2.zitongwl.cn', enabled: true },
+      { id: 'p3', name: 'LIKE API (已禁用)', backendUrl: 'https://like.api.com', enabled: false }
+    ];
+
+    const mockCtx = createMockContext();
+    mockCtx.getUpstreamPanels = () => mockPanels;
+    scanner.init(mockCtx);
+
+    // Mock fetch for the panels
+    const originalFetch = global.fetch;
+    global.fetch = async (url) => {
+      if (url.includes('jlaudeapi.com/api/user/models')) {
+        return { json: async () => ({ success: true, data: ['gpt-5.4', 'gemini-2.5-pro'] }) };
+      }
+      if (url.includes('jlaudeapi.com/api/pricing')) {
+        return { json: async () => ({ success: true, data: [{ model_name: 'gpt-5.4', model_ratio: 0.1 }] }) };
+      }
+      if (url.includes('sub2.zitongwl.cn/api/user/models')) {
+        return { json: async () => ({ success: true, data: ['deepseek-v4-pro', 'kimi-k3'] }) };
+      }
+      if (url.includes('sub2.zitongwl.cn/api/pricing')) {
+        return { json: async () => ({ success: true, data: [{ model_name: 'deepseek-v4-pro', model_ratio: 0.08 }] }) };
+      }
+      return { ok: false, status: 404 };
     };
 
-    const scanRes = await scanner.runScan('自动化测试巡检');
-    assert.strictEqual(scanRes.success, true, '巡检应成功完成');
-    const report = scanRes.report;
+    try {
+      const offerings = await scanner.discoverUpstreamOfferings([], null);
+      // 应包含来自 金龙 和 子桐 的模型，不包含禁用的 LIKE
+      const p1Offerings = offerings.filter(o => o.provider === '金龙 New-API');
+      const p2Offerings = offerings.filter(o => o.provider === '子桐网络');
+      const p3Offerings = offerings.filter(o => o.provider === 'LIKE API (已禁用)');
 
-    assert.strictEqual(report.deactivatedChannels.length, 1, '应有 1 个通道被停用 (通道 201)');
-    assert.strictEqual(report.closedGroups.length, 1, '独苗组应被孤岛熔断关停');
-    assert.strictEqual(report.autoSyncedChannels.length, 1, '低价上游应被自动同步上线');
-    assert.ok(report.summaryText.includes('高危熔断'), '总结必须包含高危熔断预警');
-    assert.ok(report.summaryText.includes('低价直通上线'), '总结必须包含低价直通上线信息');
-
-    // 验证 Telegram 通知有被调用
-    assert.strictEqual(mockCtx._internal.telegramNotifications.length, 1, '必须向 Telegram 派发报告推送');
+      assert.ok(p1Offerings.length > 0, '应成功拉取金龙平台的数据');
+      assert.ok(p2Offerings.length > 0, '应成功拉取子桐网络的数据');
+      assert.strictEqual(p3Offerings.length, 0, '已禁用的平台不应被拉取');
+    } finally {
+      global.fetch = originalFetch;
+    }
   });
 
   console.log(`\n========================================`);

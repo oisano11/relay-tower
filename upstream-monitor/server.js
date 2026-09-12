@@ -13,8 +13,47 @@ const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
 const ALERTS_FILE = path.join(DATA_DIR, 'alerts.json');
 const HISTORY_FILE = path.join(DATA_DIR, 'ratio_history.json');
 const UPSTREAM_PANEL_FILE = path.join(DATA_DIR, 'upstream_panel.json');
+const UPSTREAM_PANELS_FILE = path.join(DATA_DIR, 'upstream_panels.json');
 const UPSTREAM_MODELS_CACHE_FILE = path.join(DATA_DIR, 'upstream_models_cache.json');
-let upstreamPanelConfig = readJSON(UPSTREAM_PANEL_FILE, {
+
+// 兼容读取与多上游管理池加载
+function loadUpstreamPanels() {
+  let list = readJSON(UPSTREAM_PANELS_FILE, null);
+  if (!Array.isArray(list) || list.length === 0) {
+    list = [];
+    const jinlongFile = path.join(DATA_DIR, 'jinlong_backend.json');
+    let legacy = null;
+    if (fs.existsSync(jinlongFile)) {
+      legacy = readJSON(jinlongFile, null);
+    } else if (fs.existsSync(UPSTREAM_PANEL_FILE)) {
+      legacy = readJSON(UPSTREAM_PANEL_FILE, null);
+    }
+    if (legacy && legacy.backendUrl) {
+      list.push({
+        id: 'panel_jinlong',
+        name: '金龙 New-API (jlaudeapi.com)',
+        backendUrl: legacy.backendUrl,
+        authMode: legacy.authMode || 'credentials',
+        username: legacy.username || '',
+        password: legacy.password || '',
+        cookie: legacy.cookie || '',
+        userToken: legacy.userToken || '',
+        status: legacy.status || 'connected',
+        balanceUSD: (legacy.userInfo && legacy.userInfo.balanceUSD !== undefined) ? legacy.userInfo.balanceUSD : (legacy.balanceUSD || 0),
+        userInfo: legacy.userInfo || null,
+        models: legacy.models || [],
+        lastSyncTime: legacy.lastSyncTime || null,
+        lastError: legacy.lastError || null,
+        enabled: true
+      });
+      writeJSON(UPSTREAM_PANELS_FILE, list);
+    }
+  }
+  return list;
+}
+
+let upstreamPanels = loadUpstreamPanels();
+let upstreamPanelConfig = (upstreamPanels && upstreamPanels.length > 0) ? upstreamPanels[0] : {
   backendUrl: '',
   authMode: 'credentials',
   username: '',
@@ -26,7 +65,28 @@ let upstreamPanelConfig = readJSON(UPSTREAM_PANEL_FILE, {
   userInfo: null,
   models: [],
   lastError: null
-});
+};
+
+function syncUpstreamPanelConfigCompat() {
+  if (upstreamPanels && upstreamPanels.length > 0) {
+    upstreamPanelConfig = upstreamPanels[0];
+  } else {
+    upstreamPanelConfig = {
+      backendUrl: '',
+      authMode: 'credentials',
+      username: '',
+      password: '',
+      cookie: '',
+      userToken: '',
+      status: 'disconnected',
+      lastSyncTime: null,
+      userInfo: null,
+      models: [],
+      lastError: null
+    };
+  }
+  writeJSON(UPSTREAM_PANEL_FILE, upstreamPanelConfig);
+}
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const SSH_KEY = process.env.SSH_KEY || '';
@@ -420,22 +480,31 @@ async function fetchChannelBalance(channel) {
     }
   } catch (e) {}
 
-  // 2. 上游 New API 后台数据注入与自动查额
-  if (channel.panelSync || (upstreamPanelConfig.backendUrl && channel.baseUrl && channel.baseUrl.includes(upstreamPanelConfig.backendUrl))) {
+  // 2. 上游 New API / One API 后台管理池数据注入与自动查额
+  const matchedPanel = upstreamPanels.find(p => 
+    (channel.upstreamPanelId && p.id === channel.upstreamPanelId) ||
+    (channel.panelSync && p.id === 'panel_jinlong') ||
+    (p.backendUrl && channel.baseUrl && (
+      channel.baseUrl.replace(/\/+$/, '').includes(p.backendUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')) ||
+      p.backendUrl.replace(/\/+$/, '').includes(channel.baseUrl.replace(/^https?:\/\//, '').replace(/\/+$/, ''))
+    ))
+  );
+
+  if (matchedPanel) {
     try {
-      if (!upstreamPanelConfig.userInfo || upstreamPanelConfig.status !== 'connected' || (Date.now() - new Date(upstreamPanelConfig.lastSyncTime || 0).getTime() > 600000)) {
-        await syncUpstreamPanel(upstreamPanelConfig);
+      if (!matchedPanel.userInfo || matchedPanel.status !== 'connected' || (Date.now() - new Date(matchedPanel.lastSyncTime || 0).getTime() > 600000)) {
+        await syncSingleUpstreamPanel(matchedPanel);
       }
-      if (upstreamPanelConfig && upstreamPanelConfig.userInfo) {
+      if (matchedPanel.userInfo) {
         return {
-          balance: upstreamPanelConfig.userInfo.balanceUSD,
+          balance: matchedPanel.userInfo.balanceUSD,
           unit: 'USD',
-          status: upstreamPanelConfig.userInfo.balanceUSD < 5 ? (upstreamPanelConfig.userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok',
-          lastUpdated: upstreamPanelConfig.lastSyncTime || new Date().toISOString()
+          status: matchedPanel.userInfo.balanceUSD < 5 ? (matchedPanel.userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok',
+          lastUpdated: matchedPanel.lastSyncTime || new Date().toISOString()
         };
       }
     } catch (e) {
-      console.error('上游后台自动查额失败:', e.message);
+      console.error(`上游后台 [${matchedPanel.name}] 自动查额失败:`, e.message);
     }
   }
 
@@ -447,15 +516,12 @@ async function fetchChannelBalance(channel) {
   };
 }
 
-// 刷新全部通道余额
+// 刷新全部通道余额 (遍历所有上游后台管理池)
 async function refreshAllBalances() {
-  // 优先触发上游后台静默查额同步
   try {
-    if (upstreamPanelConfig.username && upstreamPanelConfig.password) {
-      await syncUpstreamPanel(upstreamPanelConfig);
-    }
+    await syncAllUpstreamPanels();
   } catch (e) {
-    console.error('上游后台刷新失败:', e.message);
+    console.error('上游后台管理池批量同步失败:', e.message);
   }
 
   const promises = state.channels.map(async (ch) => {
@@ -473,21 +539,38 @@ async function refreshAllBalances() {
   return state.channels;
 }
 
-// 上游 New API 后台同步核心逻辑 (支持 JWT Bearer 鉴权与直取配额)
-async function syncUpstreamPanel(params = {}) {
-  const backendUrl = (params.backendUrl || upstreamPanelConfig.backendUrl || '').replace(/\/+$/, '');
-  let cookie = params.cookie || upstreamPanelConfig.cookie || '';
-  let token = params.userToken || upstreamPanelConfig.userToken || '';
-  const username = params.username || upstreamPanelConfig.username || '';
-  const password = params.password || upstreamPanelConfig.password || '';
+// 脱敏上游供应商配置
+function maskPanel(p) {
+  if (!p) return p;
+  return {
+    ...p,
+    password: p.password ? '******' : '',
+    userToken: p.userToken ? (p.userToken.length > 8 ? p.userToken.slice(0, 6) + '****' : '****') : '',
+    cookie: p.cookie ? '******' : ''
+  };
+}
+
+// 单个上游 New API / One API 后台同步核心逻辑
+async function syncSingleUpstreamPanel(params = {}) {
+  const id = params.id || `panel_${Date.now()}`;
+  const backendUrl = (params.backendUrl || '').replace(/\/+$/, '');
+  if (!backendUrl) {
+    throw new Error('缺少上游后台 URL 地址');
+  }
+  const name = (params.name || '').trim() || (new URL(backendUrl).hostname || '上游后台');
+  let cookie = params.cookie || '';
+  let token = params.userToken || '';
+  const username = (params.username || '').trim();
+  const password = params.password || '';
   const authMode = params.authMode || (username && password ? 'credentials' : 'token_cookie');
+  const enabled = params.enabled !== false;
 
-  let userInfo = null;
-  let models = [];
+  let userInfo = params.userInfo || null;
+  let models = params.models || [];
 
-  // 若提供账号密码，自动登录获取 session 与 JWT access_token 以及 user 概览
-  if (username && password) {
-    try {
+  try {
+    // 若提供账号密码，自动登录获取 session 与 JWT access_token 以及 user 概览
+    if (username && password) {
       const loginRes = await fetch(`${backendUrl}/api/user/login`, {
         method: 'POST',
         headers: {
@@ -495,7 +578,7 @@ async function syncUpstreamPanel(params = {}) {
           'User-Agent': 'Mozilla/5.0'
         },
         body: JSON.stringify({ username, password }),
-        signal: AbortSignal.timeout(7000)
+        signal: AbortSignal.timeout(8000)
       });
       const loginData = await loginRes.json();
       if (!loginData.success) {
@@ -526,92 +609,145 @@ async function syncUpstreamPanel(params = {}) {
       if (setCookies && setCookies.length > 0 && setCookies[0]) {
         cookie = setCookies.map(c => (c || '').split(';')[0]).join('; ');
       }
-
-      upstreamPanelConfig.username = username;
-      upstreamPanelConfig.password = password;
-      upstreamPanelConfig.userToken = token;
-      upstreamPanelConfig.cookie = cookie;
-    } catch (err) {
-      upstreamPanelConfig.status = 'error';
-      upstreamPanelConfig.lastError = err.message;
-      writeJSON(UPSTREAM_PANEL_FILE, upstreamPanelConfig);
-      throw err;
     }
-  }
 
-  // 构建带 Bearer Token 的请求头
-  const reqHeaders = { 'User-Agent': 'Mozilla/5.0' };
-  if (token) reqHeaders['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
-  if (cookie) reqHeaders['Cookie'] = cookie;
+    // 构建带 Bearer Token 的请求头
+    const reqHeaders = { 'User-Agent': 'Mozilla/5.0' };
+    if (token) reqHeaders['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
+    if (cookie) reqHeaders['Cookie'] = cookie;
 
-  // 请求 /api/user/self 获取最新的详细个人中心信息
-  if (token) {
+    // 请求 /api/user/self 获取最新的详细个人中心信息
+    if (token || cookie) {
+      try {
+        const userRes = await fetch(`${backendUrl}/api/user/self`, {
+          headers: reqHeaders,
+          signal: AbortSignal.timeout(6000)
+        });
+        const userData = await userRes.json();
+        if (userData.success && userData.data) {
+          const quota = userData.data.quota || 0;
+          const balanceUSD = Number((quota / 500000).toFixed(2));
+          userInfo = {
+            id: userData.data.id,
+            username: userData.data.username || username,
+            role: userData.data.role,
+            quota,
+            balanceUSD,
+            usedQuota: userData.data.used_quota || 0
+          };
+        }
+      } catch (e) {
+        console.error(`上游后台 [${name}] /api/user/self 请求异常:`, e.message);
+      }
+    }
+
+    if (!userInfo) {
+      throw new Error(`未能从上游后台 [${name}] 获取到账户余额，请检查账号密码或授权状态`);
+    }
+
+    // 请求 /api/user/models 获取支持模型列表
     try {
-      const userRes = await fetch(`${backendUrl}/api/user/self`, {
+      const modelRes = await fetch(`${backendUrl}/api/user/models`, {
         headers: reqHeaders,
         signal: AbortSignal.timeout(5000)
       });
-      const userData = await userRes.json();
-      if (userData.success && userData.data) {
-        const quota = userData.data.quota || 0;
-        const balanceUSD = Number((quota / 500000).toFixed(2));
-        userInfo = {
-          id: userData.data.id,
-          username: userData.data.username || username,
-          role: userData.data.role,
-          quota,
-          balanceUSD,
-          usedQuota: userData.data.used_quota || 0
-        };
+      const modelData = await modelRes.json();
+      if (modelData.success && Array.isArray(modelData.data)) {
+        models = modelData.data;
       }
-    } catch (e) {
-      console.error('上游后台 /api/user/self 请求异常:', e.message);
+    } catch (e) {}
+
+    const resultPanel = {
+      id,
+      name,
+      backendUrl,
+      authMode,
+      username: username || (userInfo ? userInfo.username : ''),
+      password,
+      cookie,
+      userToken: token,
+      status: 'connected',
+      balanceUSD: userInfo.balanceUSD,
+      lastSyncTime: new Date().toISOString(),
+      userInfo,
+      models,
+      lastError: null,
+      enabled
+    };
+
+    const existingIdx = upstreamPanels.findIndex(p => p.id === id);
+    if (existingIdx >= 0) {
+      upstreamPanels[existingIdx] = resultPanel;
+    } else {
+      upstreamPanels.push(resultPanel);
     }
+    writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+    syncUpstreamPanelConfigCompat();
+    return resultPanel;
+  } catch (err) {
+    const existingIdx = upstreamPanels.findIndex(p => p.id === id);
+    const updated = {
+      id,
+      name,
+      backendUrl,
+      authMode,
+      username,
+      password,
+      cookie,
+      userToken: token,
+      status: 'error',
+      balanceUSD: params.balanceUSD || 0,
+      userInfo: params.userInfo || null,
+      models: params.models || [],
+      lastSyncTime: new Date().toISOString(),
+      lastError: err.message,
+      enabled
+    };
+    if (existingIdx >= 0) upstreamPanels[existingIdx] = updated;
+    else upstreamPanels.push(updated);
+    writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+    syncUpstreamPanelConfigCompat();
+    throw err;
   }
 
-  if (!userInfo) {
-    throw new Error('未能从上游后台获取到账户余额，请检查账号密码或授权状态');
-  }
-
-  // 请求 /api/user/models 获取支持模型列表
-  try {
-    const modelRes = await fetch(`${backendUrl}/api/user/models`, {
-      headers: reqHeaders,
-      signal: AbortSignal.timeout(4000)
-    });
-    const modelData = await modelRes.json();
-    if (modelData.success && Array.isArray(modelData.data)) {
-      models = modelData.data;
+  // 更新关联通道渠道数据中的余额信息
+  let channelsUpdated = false;
+  state.channels.forEach(c => {
+    const isMatch = (c.upstreamPanelId && c.upstreamPanelId === id) ||
+                    (c.panelSync === true && id === 'panel_jinlong') ||
+                    (c.baseUrl && backendUrl && c.baseUrl.includes(backendUrl.replace(/^https?:\/\//, '')));
+    if (isMatch) {
+      c.balance = userInfo.balanceUSD;
+      c.balanceUnit = 'USD';
+      c.balanceStatus = userInfo.balanceUSD < 5 ? (userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok';
+      c.balanceUpdated = resultPanel.lastSyncTime;
+      channelsUpdated = true;
     }
-  } catch (e) {}
+  });
 
-  upstreamPanelConfig = {
-    backendUrl,
-    authMode,
-    username: username || (userInfo ? userInfo.username : ''),
-    password,
-    cookie,
-    userToken: token,
-    status: 'connected',
-    lastSyncTime: new Date().toISOString(),
-    userInfo,
-    models,
-    lastError: null
-  };
-  writeJSON(UPSTREAM_PANEL_FILE, upstreamPanelConfig);
-
-  // 更新上游通道渠道数据中的余额信息
-  const jinlongChannel = state.channels.find(c => c.panelSync === true);
-  if (jinlongChannel && userInfo) {
-    jinlongChannel.balance = userInfo.balanceUSD;
-    jinlongChannel.balanceUnit = 'USD';
-    jinlongChannel.balanceStatus = userInfo.balanceUSD < 5 ? (userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok';
-    jinlongChannel.balanceUpdated = upstreamPanelConfig.lastSyncTime;
+  if (channelsUpdated) {
     writeJSON(CHANNELS_FILE, state);
     broadcastSSE('CHANNELS_UPDATED', state);
   }
 
-  return upstreamPanelConfig;
+  return resultPanel;
+}
+
+const syncUpstreamPanel = syncSingleUpstreamPanel;
+
+// 批量同步所有已启用的上游后台
+async function syncAllUpstreamPanels() {
+  const results = [];
+  for (const p of upstreamPanels) {
+    if (p.enabled === false) continue;
+    try {
+      const res = await syncSingleUpstreamPanel(p);
+      results.push({ id: p.id, name: p.name, success: true, balanceUSD: res.balanceUSD });
+    } catch (err) {
+      results.push({ id: p.id, name: p.name, success: false, error: err.message });
+    }
+  }
+  return results;
 }
 
 // 切换 Sub2API 上游真实 base_url
@@ -850,10 +986,15 @@ SELECT json_agg(t) FROM (
       let balanceUpdated = (existing && existing.balanceUpdated) ? existing.balanceUpdated : null;
       let balanceStatus = (existing && existing.balanceStatus) ? existing.balanceStatus : (balance !== null ? 'ok' : 'pending');
 
-      if (upstreamPanelConfig && upstreamPanelConfig.userInfo && (existing && existing.panelSync)) {
-        balance = upstreamPanelConfig.userInfo.balanceUSD;
+      const matchedAccPanel = upstreamPanels.find(p => 
+        (existing && existing.upstreamPanelId && p.id === existing.upstreamPanelId) ||
+        (existing && existing.panelSync && p.id === 'panel_jinlong') ||
+        (p.backendUrl && acc.base_url && acc.base_url.includes(p.backendUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')))
+      );
+      if (matchedAccPanel && matchedAccPanel.userInfo) {
+        balance = matchedAccPanel.userInfo.balanceUSD;
         balanceUnit = 'USD';
-        balanceUpdated = upstreamPanelConfig.lastSyncTime || new Date().toISOString();
+        balanceUpdated = matchedAccPanel.lastSyncTime || new Date().toISOString();
         balanceStatus = balance < 5 ? (balance <= 0 ? 'empty' : 'low') : 'ok';
       }
 
@@ -4579,36 +4720,170 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ====== 【新功能 3】上游 New-API 后台专属适配与同步路由 ======
+  // ====== 【新功能 3】多上游供应商后台管理池 (Multi-Upstream Panels) REST API ======
 
-  // 查询上游后台接入状态与资产概览
-  if (pathname === '/api/upstream-panel/status' && req.method === 'GET') {
-    const safePanel = {
-      ...upstreamPanelConfig,
-      password: upstreamPanelConfig.password ? '******' : '',
-      userToken: upstreamPanelConfig.userToken ? (upstreamPanelConfig.userToken.length > 8 ? upstreamPanelConfig.userToken.slice(0, 6) + '****' : '****') : '',
-      cookie: upstreamPanelConfig.cookie ? '******' : ''
-    };
+  // 获取全部上游后台配置列表与总体统计
+  if (pathname === '/api/upstream/panels' && req.method === 'GET') {
+    const safePanels = upstreamPanels.map(maskPanel);
+    const totalBalance = Number(upstreamPanels.reduce((sum, p) => sum + (Number(p.balanceUSD) || 0), 0).toFixed(2));
+    const connectedCount = upstreamPanels.filter(p => p.status === 'connected').length;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(safePanel));
+    res.end(JSON.stringify({
+      success: true,
+      panels: safePanels,
+      summary: {
+        total: upstreamPanels.length,
+        connected: connectedCount,
+        totalBalanceUSD: totalBalance
+      }
+    }));
     return;
   }
 
-  // 提交并连接上游后台 (账号密码 / Cookie / Token)
+  // 新增或更新上游后台配置 (带即时连通与查额验证)
+  if (pathname === '/api/upstream/panels' && req.method === 'POST') {
+    const body = await getBody();
+    if (!body || !body.backendUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: '请填写有效的上游后台地址 (URL)' }));
+      return;
+    }
+
+    // 若编辑模式下未修改密码/token，继承原值
+    if (body.id) {
+      const existing = upstreamPanels.find(p => p.id === body.id);
+      if (existing) {
+        if (!body.password || body.password === '******') body.password = existing.password;
+        if (!body.userToken || body.userToken.includes('****')) body.userToken = existing.userToken;
+        if (!body.cookie || body.cookie === '******') body.cookie = existing.cookie;
+      }
+    }
+
+    try {
+      const resultPanel = await syncSingleUpstreamPanel(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        message: `成功保存并连接上游后台 [${resultPanel.name}]`,
+        panel: maskPanel(resultPanel),
+        panels: upstreamPanels.map(maskPanel)
+      }));
+    } catch (err) {
+      // 即使连通测试报错，也保存以防用户重复输入，并返回错误说明
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: false,
+        error: err.message,
+        message: `配置已保存，但验证连接失败: ${err.message}`,
+        panels: upstreamPanels.map(maskPanel)
+      }));
+    }
+    return;
+  }
+
+  // 删除指定的上游后台
+  if ((pathname.startsWith('/api/upstream/panels/') && req.method === 'DELETE') ||
+      (pathname === '/api/upstream/panels/delete' && req.method === 'POST')) {
+    let targetId = pathname.replace('/api/upstream/panels/', '').trim();
+    if (req.method === 'POST') {
+      const body = await getBody();
+      targetId = body.id || targetId;
+    }
+
+    const prevCount = upstreamPanels.length;
+    upstreamPanels = upstreamPanels.filter(p => p.id !== targetId);
+    writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+    syncUpstreamPanelConfigCompat();
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      message: '上游平台已成功从管理池中移除',
+      deleted: prevCount !== upstreamPanels.length,
+      panels: upstreamPanels.map(maskPanel)
+    }));
+    return;
+  }
+
+  // 单独同步指定上游后台
+  if ((pathname.endsWith('/sync') && pathname.startsWith('/api/upstream/panels/') && req.method === 'POST') ||
+      (pathname === '/api/upstream/panels/sync' && req.method === 'POST')) {
+    let targetId = pathname.replace('/api/upstream/panels/', '').replace('/sync', '').trim();
+    if (req.method === 'POST' && (!targetId || targetId === 'sync')) {
+      const body = await getBody();
+      targetId = body.id || targetId;
+    }
+
+    const panel = upstreamPanels.find(p => p.id === targetId);
+    if (!panel) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: '指定的上游平台不存在' }));
+      return;
+    }
+
+    try {
+      const updated = await syncSingleUpstreamPanel(panel);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        message: `上游 [${updated.name}] 同步成功！余额: $${updated.balanceUSD}`,
+        panel: maskPanel(updated),
+        panels: upstreamPanels.map(maskPanel)
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message, panels: upstreamPanels.map(maskPanel) }));
+    }
+    return;
+  }
+
+  // 批量全量同步所有上游后台
+  if (pathname === '/api/upstream/panels/sync-all' && req.method === 'POST') {
+    const results = await syncAllUpstreamPanels();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      message: `已完成 ${results.length} 个上游平台的批量同步`,
+      results,
+      panels: upstreamPanels.map(maskPanel)
+    }));
+    return;
+  }
+
+  // 旧版单一上游后台兼容路由 (向下兼容原有代码与前端探针)
+  if (pathname === '/api/upstream-panel/status' && req.method === 'GET') {
+    const primaryPanel = upstreamPanels[0] || upstreamPanelConfig;
+    const safePanel = maskPanel(primaryPanel);
+    const totalBalance = Number(upstreamPanels.reduce((sum, p) => sum + (Number(p.balanceUSD) || 0), 0).toFixed(2));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ...safePanel,
+      totalPanels: upstreamPanels.length,
+      totalBalanceUSD: totalBalance,
+      panels: upstreamPanels.map(maskPanel)
+    }));
+    return;
+  }
+
   if (pathname === '/api/upstream-panel/connect' && req.method === 'POST') {
     const body = await getBody();
-    syncUpstreamPanel(body).then(config => {
+    if (!body.id && upstreamPanels.length > 0) {
+      body.id = upstreamPanels[0].id;
+    }
+    syncSingleUpstreamPanel(body).then(config => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
         message: '成功接入上游后台！已同步余额与倍率',
-        config
+        config: maskPanel(config),
+        panels: upstreamPanels.map(maskPanel)
       }));
     }).catch(err => {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: false,
-        error: err.message
+        error: err.message,
+        panels: upstreamPanels.map(maskPanel)
       }));
     });
     return;
@@ -4930,7 +5205,8 @@ upstreamScanner.init({
   invalidateSub2APIScheduler,
   broadcastSSE,
   telegram,
-  getUpstreamPanelConfig: () => upstreamPanelConfig,
+  getUpstreamPanels: () => upstreamPanels,
+  getUpstreamPanelConfig: () => (upstreamPanels[0] || upstreamPanelConfig),
   getUpstreamModelsCache: () => upstreamModelsCache,
   setUpstreamModelsCache: (cache) => {
     upstreamModelsCache = cache;

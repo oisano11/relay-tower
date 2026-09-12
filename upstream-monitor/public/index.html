@@ -521,64 +521,110 @@
       </div>
     </div>
 
-    <!-- 弹窗：上游 New API 后台专属接入与倍率/余额获取 -->
+    <!-- 弹窗：多上游供应商后台管理池 (New-API / One-API 多平台统一管理) -->
     <div id="jinlongModal" class="modal-backdrop">
-      <div class="modal-dialog" style="max-width: 540px;">
+      <div class="modal-dialog" style="max-width: 680px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #f0fdf4; color: #15803d; border-color: #bbf7d0;">New-API 后台直连接入</span>
-            <span style="font-size: 0.72rem; color: #64748b;">获取真实倍率与个人中心余额</span>
+            <span class="alert-type-badge" style="background: #f0fdf4; color: #15803d; border-color: #bbf7d0;">多上游供应商管理池</span>
+            <span style="font-size: 0.72rem; color: #64748b;">支持同时接入金龙 / 子桐 / LIKE / LAO 等多家平台</span>
           </div>
-          <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">接入上游后台 (New API)</h3>
-          <p style="font-size: 0.78rem; color: #64748b;">
-            对接上游 New-API / One-API Web 管理后台，自动提取个人中心钱包余额与各模型实际进货倍率。
+          <div style="display: flex; justify-content: space-between; align-items: baseline;">
+            <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">上游供应商后台管理中心</h3>
+            <div style="display: flex; gap: 0.4rem;">
+              <button id="btnOpenAddUpstreamForm" class="btn btn-sm btn-primary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;">
+                ➕ 添加新上游
+              </button>
+              <button id="btnSyncAllUpstreams" class="btn btn-sm btn-secondary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;">
+                ⟳ 刷新全部
+              </button>
+            </div>
+          </div>
+          <p style="font-size: 0.78rem; color: #64748b; margin-top: 2px;">
+            统一管理所有上游 New-API / One-API Web 运营后台，实时监控各平台钱包余额与模型库，驱动 3 小时定时差分巡检与熔断。
           </p>
 
-          <!-- 模式切换 -->
-          <div style="display: flex; gap: 0.5rem; margin-bottom: 0.8rem;">
-            <button id="btnJinlongTabCreds" class="dim-tab active" style="flex: 1; text-align: center;">方式一：账号密码登录</button>
-            <button id="btnJinlongTabCookie" class="dim-tab" style="flex: 1; text-align: center;">方式二：粘贴 Cookie / Token</button>
+          <!-- 统计总览条 -->
+          <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin: 0.6rem 0 0.8rem 0; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.6rem;">
+            <div style="text-align: center;">
+              <div style="font-size: 0.7rem; color: #64748b;">接入平台数</div>
+              <div id="upstreamSummaryTotal" style="font-size: 1.15rem; font-weight: 700; color: #0f172a;">0</div>
+            </div>
+            <div style="text-align: center; border-left: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0;">
+              <div style="font-size: 0.7rem; color: #64748b;">正常连接数</div>
+              <div id="upstreamSummaryConnected" style="font-size: 1.15rem; font-weight: 700; color: #10b981;">0</div>
+            </div>
+            <div style="text-align: center;">
+              <div style="font-size: 0.7rem; color: #64748b;">账户总余额</div>
+              <div id="upstreamSummaryBalance" style="font-size: 1.15rem; font-weight: 700; color: #059669;">$0.00</div>
+            </div>
           </div>
 
-          <!-- 表单区 -->
-          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.6rem;">
-            <div>
-              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">后台地址 (New API):</label>
-              <input type="text" id="jinlongBackendUrl" value="https://api.example.com" class="form-input" style="width: 100%; font-family: var(--font-mono); font-size: 0.85rem;" />
+          <!-- 添加 / 编辑上游折叠表单区 -->
+          <div id="upstreamFormContainer" style="display: none; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.85rem; margin-bottom: 0.8rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+              <strong id="upstreamFormTitle" style="color: #1e40af; font-size: 0.85rem;">➕ 添加新上游供应商</strong>
+              <button id="btnCancelUpstreamForm" class="btn btn-sm btn-ghost" style="padding: 2px 6px; font-size: 0.75rem;">✕ 取消</button>
+            </div>
+            <input type="hidden" id="upstreamFormId" value="" />
+            
+            <div style="display: grid; grid-template-columns: 1fr 1.2fr; gap: 0.5rem; margin-bottom: 0.5rem;">
+              <div>
+                <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">供应商名称:</label>
+                <input type="text" id="upstreamFormName" placeholder="例如: 子桐网络 / 金龙 / LIKE" class="form-input" style="width: 100%; font-size: 0.82rem;" />
+              </div>
+              <div>
+                <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">后台地址 (URL):</label>
+                <input type="text" id="upstreamFormBackendUrl" placeholder="https://api.example.com" class="form-input" style="width: 100%; font-family: var(--font-mono); font-size: 0.82rem;" />
+              </div>
+            </div>
+
+            <!-- 模式切换 -->
+            <div style="display: flex; gap: 0.4rem; margin-bottom: 0.5rem;">
+              <button id="btnUpstreamTabCreds" class="dim-tab active" style="flex: 1; text-align: center; padding: 0.25rem; font-size: 0.75rem;">方式一：账号密码登录</button>
+              <button id="btnUpstreamTabCookie" class="dim-tab" style="flex: 1; text-align: center; padding: 0.25rem; font-size: 0.75rem;">方式二：Cookie / Token</button>
             </div>
 
             <!-- 方式一：账号密码表单 -->
-            <div id="jinlongCredsForm">
-              <div style="display: flex; gap: 0.5rem;">
+            <div id="upstreamFormCredsBox">
+              <div style="display: flex; gap: 0.5rem; margin-bottom: 0.4rem;">
                 <div style="flex: 1;">
-                  <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">后台用户名 / 邮箱:</label>
-                  <input type="text" id="jinlongUsername" placeholder="登录上游后台的账号" class="form-input" style="width: 100%; font-size: 0.85rem;" />
+                  <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">后台账号 / 邮箱:</label>
+                  <input type="text" id="upstreamFormUsername" placeholder="登录后台的账号" class="form-input" style="width: 100%; font-size: 0.82rem;" />
                 </div>
                 <div style="flex: 1;">
-                  <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">密码:</label>
-                  <input type="password" id="jinlongPassword" placeholder="后台密码" class="form-input" style="width: 100%; font-size: 0.85rem;" />
+                  <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">密码:</label>
+                  <input type="password" id="upstreamFormPassword" placeholder="后台密码 (留空则不修改)" class="form-input" style="width: 100%; font-size: 0.82rem;" />
                 </div>
               </div>
             </div>
 
             <!-- 方式二：Cookie / Token 表单 -->
-            <div id="jinlongCookieForm" style="display: none;">
-              <label style="font-size: 0.78rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">浏览器会话 Cookie 或 Access Token:</label>
-              <textarea id="jinlongCookieOrToken" placeholder="例如: session=ey..." class="form-input" style="width: 100%; height: 60px; font-family: var(--font-mono); font-size: 0.75rem;"></textarea>
+            <div id="upstreamFormCookieBox" style="display: none; margin-bottom: 0.4rem;">
+              <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">浏览器会话 Cookie 或 Access Token:</label>
+              <textarea id="upstreamFormCookieOrToken" placeholder="例如: session=ey... 或 eyJhbGci..." class="form-input" style="width: 100%; height: 50px; font-family: var(--font-mono); font-size: 0.75rem;"></textarea>
             </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem;">
+              <label style="font-size: 0.76rem; color: #475569; display: flex; align-items: center; gap: 0.3rem; cursor: pointer;">
+                <input type="checkbox" id="upstreamFormEnabled" checked /> 启用此供应商（参与 3 小时定时巡检与查额）
+              </label>
+              <button id="btnSaveUpstreamPanel" class="btn btn-primary" style="font-size: 0.78rem; padding: 0.35rem 0.85rem;">
+                💾 保存并测试连接
+              </button>
+            </div>
+            
+            <div id="upstreamFormStatusBox" style="margin-top: 0.5rem; padding: 0.5rem; border-radius: 4px; font-size: 0.75rem; display: none;"></div>
           </div>
 
-          <!-- 状态与连接反馈 -->
-          <div id="jinlongStatusBox" style="margin-top: 0.7rem; padding: 0.6rem; border-radius: 6px; font-size: 0.78rem; display: none;">
-            <!-- 由 JS 填充连接成功或错误信息 -->
+          <!-- 上游供应商卡片列表 -->
+          <div id="upstreamsListContainer" style="max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.6rem; padding: 0.2rem;">
+            <!-- 由 app.js 动态渲染各上游平台卡片 -->
           </div>
 
           <div class="dialog-actions" style="margin-top: 0.8rem;">
-            <button id="btnSubmitJinlongConnect" class="btn btn-primary" style="flex: 1; justify-content: center;">
-              立即验证并同步资产
-            </button>
-            <button id="btnCloseJinlongModal" class="btn btn-secondary" style="justify-content: center;">
-              关闭
+            <button id="btnCloseJinlongModal" class="btn btn-secondary" style="width: 100%; justify-content: center;">
+              完成并关闭
             </button>
           </div>
         </div>

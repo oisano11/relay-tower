@@ -2118,19 +2118,27 @@ async function deleteBackupLine(channelId, url) {
   }
 }
 
-// ====== 【上游后台接入逻辑】 ======
+// ====== 【多上游供应商后台管理池逻辑】 ======
+let upstreamPanelsList = [];
+
 async function checkJinlongStatus() {
   try {
-    const res = await fetch('/api/upstream-panel/status');
-    const config = await res.json();
-    jinlongConfig = config;
+    const res = await fetch('/api/upstream/panels');
+    const data = await res.json();
+    if (!data.success) return;
+    upstreamPanelsList = data.panels || [];
 
     const pill = document.getElementById('jinlongStatusPill');
     if (!pill) return;
 
-    if (config && config.status === 'connected' && config.userInfo) {
-      pill.textContent = `已连接 $${config.userInfo.balanceUSD}`;
-      pill.classList.add('connected');
+    const summary = data.summary || { total: 0, connected: 0, totalBalanceUSD: 0 };
+    if (summary.total > 0) {
+      pill.textContent = `${summary.connected}/${summary.total}家正常 $${summary.totalBalanceUSD}`;
+      if (summary.connected > 0) {
+        pill.classList.add('connected');
+      } else {
+        pill.classList.remove('connected');
+      }
     } else {
       pill.textContent = '待配置';
       pill.classList.remove('connected');
@@ -2138,129 +2146,330 @@ async function checkJinlongStatus() {
   } catch (e) {}
 }
 
-function openJinlongModal() {
-  checkJinlongStatus().then(() => {
-    if (jinlongConfig) {
-      if (jinlongConfig.backendUrl) {
-        const u = document.getElementById('jinlongBackendUrl');
-        if (u) u.value = jinlongConfig.backendUrl;
-      }
-      if (jinlongConfig.username) {
-        const un = document.getElementById('jinlongUsername');
-        if (un) un.value = jinlongConfig.username;
-      }
-      if (jinlongConfig.cookie) {
-        const ck = document.getElementById('jinlongCookieOrToken');
-        if (ck) ck.value = jinlongConfig.cookie;
-      }
-      
-      const box = document.getElementById('jinlongStatusBox');
-      if (box && jinlongConfig.status === 'connected' && jinlongConfig.userInfo) {
-        box.style.display = 'block';
-        box.style.background = '#ecfdf5';
-        box.style.border = '1px solid #a7f3d0';
-        box.style.color = '#065f46';
-        box.innerHTML = `
-          <strong>✅ 上游后台连接正常</strong><br>
-          用户名: <strong>${jinlongConfig.userInfo.username}</strong> | 额度: <strong>${jinlongConfig.userInfo.quota}</strong> ($${jinlongConfig.userInfo.balanceUSD})<br>
-          同步时间: ${formatTime(jinlongConfig.lastSyncTime)}
-        `;
+async function loadUpstreamPanelsList() {
+  const container = document.getElementById('upstreamsListContainer');
+  if (!container) return;
+
+  try {
+    const res = await fetch('/api/upstream/panels');
+    const data = await res.json();
+    if (!data.success) {
+      container.innerHTML = `<div style="text-align: center; color: #ef4444; padding: 1.5rem; font-size: 0.8rem;">加载上游列表失败: ${data.error || '未知错误'}</div>`;
+      return;
+    }
+
+    upstreamPanelsList = data.panels || [];
+    const summary = data.summary || { total: 0, connected: 0, totalBalanceUSD: 0 };
+
+    // 更新总览统计
+    const elTotal = document.getElementById('upstreamSummaryTotal');
+    const elConnected = document.getElementById('upstreamSummaryConnected');
+    const elBal = document.getElementById('upstreamSummaryBalance');
+    if (elTotal) elTotal.textContent = summary.total;
+    if (elConnected) elConnected.textContent = summary.connected;
+    if (elBal) elBal.textContent = `$${summary.totalBalanceUSD}`;
+
+    // 更新导航徽章
+    const pill = document.getElementById('jinlongStatusPill');
+    if (pill) {
+      if (summary.total > 0) {
+        pill.textContent = `${summary.connected}/${summary.total}家正常 $${summary.totalBalanceUSD}`;
+        if (summary.connected > 0) pill.classList.add('connected');
+        else pill.classList.remove('connected');
+      } else {
+        pill.textContent = '待配置';
+        pill.classList.remove('connected');
       }
     }
-  });
+
+    if (upstreamPanelsList.length === 0) {
+      container.innerHTML = `
+        <div style="text-align: center; color: #64748b; padding: 2rem 1rem; border: 1px dashed #cbd5e1; border-radius: 8px;">
+          <div style="font-size: 1.8rem; margin-bottom: 0.4rem;">🔑</div>
+          <div style="font-size: 0.88rem; font-weight: 600; color: #334155;">暂无已接入的上游供应商后台</div>
+          <div style="font-size: 0.75rem; margin-top: 0.2rem; color: #94a3b8;">
+            点击右上角「➕ 添加新上游」接入金龙、子桐、LIKE、LAO、Auash 等 New-API 平台
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    container.innerHTML = upstreamPanelsList.map(p => {
+      const isConnected = p.status === 'connected';
+      const isError = p.status === 'error';
+      const isEnabled = p.enabled !== false;
+      const statusText = !isEnabled ? '已停用' : (isConnected ? '正常连通' : (isError ? `异常: ${p.lastError || '无法连接'}` : '未连接'));
+      const statusClass = !isEnabled ? 'disabled' : (isConnected ? 'connected' : (isError ? 'error' : 'disabled'));
+      const authDesc = p.authMode === 'credentials'
+        ? `账号: ${escapeHtml(p.username || '未填')}`
+        : 'Token / Cookie';
+      const modelsCount = p.models && Array.isArray(p.models) ? p.models.length : 0;
+      const syncTimeStr = p.lastSyncTime ? formatTimeAgo(p.lastSyncTime) : '从未同步';
+
+      return `
+        <div class="upstream-panel-card ${!isEnabled ? 'disabled' : ''}" data-panel-id="${escapeHtml(p.id)}">
+          <div class="upstream-card-header">
+            <div class="upstream-card-title">
+              <span>🌐</span>
+              <span>${escapeHtml(p.name || '未命名平台')}</span>
+              <span style="font-size: 0.72rem; font-weight: normal; color: #64748b; font-family: var(--font-mono);">${escapeHtml(p.backendUrl)}</span>
+            </div>
+            <div class="upstream-status-badge ${statusClass}">
+              <span>●</span> ${escapeHtml(statusText)}
+            </div>
+          </div>
+
+          <div class="upstream-card-body">
+            <div>
+              <div class="upstream-metric-label">钱包余额</div>
+              <div class="upstream-metric-val" style="color: #059669; font-size: 0.85rem;">
+                $${Number(p.balanceUSD || 0).toFixed(2)} USD
+              </div>
+            </div>
+            <div>
+              <div class="upstream-metric-label">支持模型</div>
+              <div class="upstream-metric-val">
+                ${modelsCount} 个模型
+              </div>
+            </div>
+            <div>
+              <div class="upstream-metric-label">认证模式</div>
+              <div class="upstream-metric-val" style="font-family: var(--font-mono); font-size: 0.72rem;">
+                ${authDesc}
+              </div>
+            </div>
+          </div>
+
+          <div class="upstream-card-footer">
+            <div>
+              <span>上次同步: ${syncTimeStr}</span>
+            </div>
+            <div class="upstream-card-actions">
+              <button class="upstream-btn-sm" onclick="syncSingleUpstream('${escapeHtml(p.id)}')">⟳ 同步</button>
+              <button class="upstream-btn-sm" onclick="openEditUpstreamForm('${escapeHtml(p.id)}')">✏️ 编辑</button>
+              <button class="upstream-btn-sm danger" onclick="deleteUpstreamPanel('${escapeHtml(p.id)}', '${escapeHtml(p.name || '')}')">🗑️ 删除</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (err) {
+    container.innerHTML = `<div style="text-align: center; color: #ef4444; padding: 1.5rem; font-size: 0.8rem;">网络错误: ${err.message}</div>`;
+  }
+}
+
+function openJinlongModal() {
   document.getElementById('jinlongModal').classList.add('open');
+  cancelUpstreamForm();
+  loadUpstreamPanelsList();
 }
 
 function closeJinlongModal() {
   document.getElementById('jinlongModal').classList.remove('open');
 }
 
-function switchJinlongTab(tab) {
-  const btnCreds = document.getElementById('btnJinlongTabCreds');
-  const btnCookie = document.getElementById('btnJinlongTabCookie');
-  const formCreds = document.getElementById('jinlongCredsForm');
-  const formCookie = document.getElementById('jinlongCookieForm');
+function switchUpstreamTab(tab) {
+  const btnCreds = document.getElementById('btnUpstreamTabCreds');
+  const btnCookie = document.getElementById('btnUpstreamTabCookie');
+  const boxCreds = document.getElementById('upstreamFormCredsBox');
+  const boxCookie = document.getElementById('upstreamFormCookieBox');
 
   if (tab === 'creds') {
     btnCreds?.classList.add('active');
     btnCookie?.classList.remove('active');
-    if (formCreds) formCreds.style.display = 'block';
-    if (formCookie) formCookie.style.display = 'none';
+    if (boxCreds) boxCreds.style.display = 'block';
+    if (boxCookie) boxCookie.style.display = 'none';
   } else {
     btnCookie?.classList.add('active');
     btnCreds?.classList.remove('active');
-    if (formCookie) formCookie.style.display = 'block';
-    if (formCreds) formCreds.style.display = 'none';
+    if (boxCookie) boxCookie.style.display = 'block';
+    if (boxCreds) boxCreds.style.display = 'none';
   }
 }
 
-async function submitJinlongConnect() {
-  const backendUrl = document.getElementById('jinlongBackendUrl')?.value.trim() || 'https://api.example.com';
-  const isCredsTab = document.getElementById('btnJinlongTabCreds')?.classList.contains('active');
+function openAddUpstreamForm() {
+  const form = document.getElementById('upstreamFormContainer');
+  if (!form) return;
+  form.style.display = 'block';
+  document.getElementById('upstreamFormTitle').textContent = '➕ 添加新上游供应商';
+  document.getElementById('upstreamFormId').value = '';
+  document.getElementById('upstreamFormName').value = '';
+  document.getElementById('upstreamFormBackendUrl').value = '';
+  document.getElementById('upstreamFormUsername').value = '';
+  document.getElementById('upstreamFormPassword').value = '';
+  document.getElementById('upstreamFormPassword').placeholder = '后台登录密码';
+  document.getElementById('upstreamFormCookieOrToken').value = '';
+  document.getElementById('upstreamFormEnabled').checked = true;
+  
+  const statusBox = document.getElementById('upstreamFormStatusBox');
+  if (statusBox) statusBox.style.display = 'none';
+  switchUpstreamTab('creds');
+}
 
-  const payload = { backendUrl };
+function openEditUpstreamForm(panelId) {
+  const panel = upstreamPanelsList.find(p => p.id === panelId);
+  if (!panel) return;
+
+  const form = document.getElementById('upstreamFormContainer');
+  if (!form) return;
+  form.style.display = 'block';
+  document.getElementById('upstreamFormTitle').textContent = `✏️ 编辑上游: ${panel.name || panel.backendUrl}`;
+  document.getElementById('upstreamFormId').value = panel.id;
+  document.getElementById('upstreamFormName').value = panel.name || '';
+  document.getElementById('upstreamFormBackendUrl').value = panel.backendUrl || '';
+  document.getElementById('upstreamFormUsername').value = panel.username || '';
+  document.getElementById('upstreamFormPassword').value = '';
+  document.getElementById('upstreamFormPassword').placeholder = '留空则保留原密码不变';
+  document.getElementById('upstreamFormCookieOrToken').value = panel.cookie || panel.userToken || '';
+  document.getElementById('upstreamFormEnabled').checked = panel.enabled !== false;
+
+  const statusBox = document.getElementById('upstreamFormStatusBox');
+  if (statusBox) statusBox.style.display = 'none';
+
+  if (panel.authMode === 'token_cookie') {
+    switchUpstreamTab('cookie');
+  } else {
+    switchUpstreamTab('creds');
+  }
+}
+
+function cancelUpstreamForm() {
+  const form = document.getElementById('upstreamFormContainer');
+  if (form) form.style.display = 'none';
+}
+
+async function saveUpstreamPanel() {
+  const id = document.getElementById('upstreamFormId')?.value.trim();
+  const name = document.getElementById('upstreamFormName')?.value.trim();
+  const backendUrl = document.getElementById('upstreamFormBackendUrl')?.value.trim();
+  const isCredsTab = document.getElementById('btnUpstreamTabCreds')?.classList.contains('active');
+  const enabled = document.getElementById('upstreamFormEnabled')?.checked;
+
+  if (!backendUrl) {
+    showToast('请填写上游后台地址 (URL)', 'error');
+    return;
+  }
+
+  const payload = {
+    id: id || undefined,
+    name: name || (new URL(backendUrl).hostname || '上游平台'),
+    backendUrl,
+    enabled
+  };
+
   if (isCredsTab) {
     payload.authMode = 'credentials';
-    payload.username = document.getElementById('jinlongUsername')?.value.trim();
-    payload.password = document.getElementById('jinlongPassword')?.value.trim();
-    if (!payload.username || !payload.password) {
-      showToast('请填写上游后台用户名和密码', 'error');
-      return;
-    }
+    payload.username = document.getElementById('upstreamFormUsername')?.value.trim();
+    payload.password = document.getElementById('upstreamFormPassword')?.value;
   } else {
     payload.authMode = 'token_cookie';
-    const ct = document.getElementById('jinlongCookieOrToken')?.value.trim();
-    if (!ct) {
-      showToast('请粘贴 Cookie 或 Token', 'error');
-      return;
-    }
-    if (ct.includes('session=') || ct.includes('=')) {
-      payload.cookie = ct;
-    } else {
-      payload.userToken = ct;
+    const ct = document.getElementById('upstreamFormCookieOrToken')?.value.trim();
+    if (ct) {
+      if (ct.includes('session=') || ct.includes('=')) {
+        payload.cookie = ct;
+      } else {
+        payload.userToken = ct;
+      }
     }
   }
 
-  const btn = document.getElementById('btnSubmitJinlongConnect');
-  const statusBox = document.getElementById('jinlongStatusBox');
-  if (btn) btn.textContent = '正在验证连接...';
+  const btn = document.getElementById('btnSaveUpstreamPanel');
+  const statusBox = document.getElementById('upstreamFormStatusBox');
+  if (btn) btn.textContent = '⏳ 正在验证连接...';
 
   try {
-    const res = await fetch('/api/upstream-panel/connect', {
+    const res = await fetch('/api/upstream/panels', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
     const data = await res.json();
     if (data.success) {
-      showToast('上游后台连接成功！余额与倍率已同步', 'success');
-      if (statusBox) {
-        statusBox.style.display = 'block';
-        statusBox.style.background = '#ecfdf5';
-        statusBox.style.border = '1px solid #a7f3d0';
-        statusBox.style.color = '#065f46';
-        statusBox.innerHTML = `
-          <strong>✅ 成功连通上游后台！</strong><br>
-          账号: <strong>${data.config.userInfo.username}</strong> | 钱包余额: <strong>$${data.config.userInfo.balanceUSD} USD</strong><br>
-          已将数据同步至对应上游渠道！
-        `;
-      }
+      showToast(data.message || '上游配置保存成功！', 'success');
+      cancelUpstreamForm();
+      await loadUpstreamPanelsList();
       await loadChannels();
-      checkJinlongStatus();
     } else {
       if (statusBox) {
         statusBox.style.display = 'block';
         statusBox.style.background = '#fef2f2';
         statusBox.style.border = '1px solid #fecaca';
         statusBox.style.color = '#991b1b';
-        statusBox.innerHTML = `❌ 连接失败: ${data.error}`;
+        statusBox.innerHTML = `⚠️ ${data.message || data.error}`;
       }
-      showToast('连接失败: ' + data.error, 'error');
+      showToast(data.message || '连接测试未通过', 'warning');
+      await loadUpstreamPanelsList();
     }
   } catch (err) {
-    showToast('请求异常: ' + err.message, 'error');
+    showToast('保存异常: ' + err.message, 'error');
   } finally {
-    if (btn) btn.textContent = '立即验证并同步资产';
+    if (btn) btn.textContent = '💾 保存并测试连接';
+  }
+}
+
+async function deleteUpstreamPanel(panelId, panelName) {
+  if (!confirm(`确定要从管理池中移除上游 [${panelName || panelId}] 吗？`)) {
+    return;
+  }
+  try {
+    const res = await fetch('/api/upstream/panels/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: panelId })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(data.message || '上游已删除', 'info');
+      await loadUpstreamPanelsList();
+      await loadChannels();
+    } else {
+      showToast('删除失败: ' + data.error, 'error');
+    }
+  } catch (e) {
+    showToast('删除请求失败: ' + e.message, 'error');
+  }
+}
+
+async function syncSingleUpstream(panelId) {
+  showToast('正在同步上游资产...', 'info');
+  try {
+    const res = await fetch('/api/upstream/panels/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: panelId })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(data.message || '同步完成', 'success');
+      await loadUpstreamPanelsList();
+      await loadChannels();
+    } else {
+      showToast('同步失败: ' + data.error, 'error');
+      await loadUpstreamPanelsList();
+    }
+  } catch (e) {
+    showToast('同步请求失败: ' + e.message, 'error');
+  }
+}
+
+async function syncAllUpstreams() {
+  const btn = document.getElementById('btnSyncAllUpstreams');
+  if (btn) btn.textContent = '⏳ 刷新中...';
+  try {
+    const res = await fetch('/api/upstream/panels/sync-all', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      showToast(data.message || '全部上游已刷新完成', 'success');
+      await loadUpstreamPanelsList();
+      await loadChannels();
+    } else {
+      showToast('刷新失败: ' + data.error, 'error');
+    }
+  } catch (e) {
+    showToast('批量刷新异常: ' + e.message, 'error');
+  } finally {
+    if (btn) btn.textContent = '⟳ 刷新全部';
   }
 }
 
@@ -2294,12 +2503,15 @@ document.addEventListener('DOMContentLoaded', () => {
   // 刷新全量余额
   document.getElementById('btnRefreshBalances')?.addEventListener('click', refreshAllBalances);
 
-  // 上游后台弹窗控制
+  // 上游供应商后台管理池弹窗控制
   document.getElementById('btnOpenJinlongModal')?.addEventListener('click', openJinlongModal);
   document.getElementById('btnCloseJinlongModal')?.addEventListener('click', closeJinlongModal);
-  document.getElementById('btnJinlongTabCreds')?.addEventListener('click', () => switchJinlongTab('creds'));
-  document.getElementById('btnJinlongTabCookie')?.addEventListener('click', () => switchJinlongTab('cookie'));
-  document.getElementById('btnSubmitJinlongConnect')?.addEventListener('click', submitJinlongConnect);
+  document.getElementById('btnOpenAddUpstreamForm')?.addEventListener('click', openAddUpstreamForm);
+  document.getElementById('btnCancelUpstreamForm')?.addEventListener('click', cancelUpstreamForm);
+  document.getElementById('btnUpstreamTabCreds')?.addEventListener('click', () => switchUpstreamTab('creds'));
+  document.getElementById('btnUpstreamTabCookie')?.addEventListener('click', () => switchUpstreamTab('cookie'));
+  document.getElementById('btnSaveUpstreamPanel')?.addEventListener('click', saveUpstreamPanel);
+  document.getElementById('btnSyncAllUpstreams')?.addEventListener('click', syncAllUpstreams);
 
   // 线路管理弹窗控制
   document.getElementById('btnCloseLinesModal')?.addEventListener('click', closeLinesModal);
