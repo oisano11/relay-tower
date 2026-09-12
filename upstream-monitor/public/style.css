@@ -1143,6 +1143,42 @@ body {
   border-color: #fecdd3;
 }
 
+/* 点击定位跳转高亮聚焦 */
+.channel-strip.strip-highlight-focus {
+  position: relative;
+  z-index: 20;
+  border-color: #ef4444 !important;
+  background: #fff1f2 !important;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.45), 0 8px 24px rgba(239, 68, 68, 0.25) !important;
+  animation: stripJumpGlow 1.6s ease-in-out infinite alternate;
+  transform: scale(1.006);
+}
+
+@keyframes stripJumpGlow {
+  0% {
+    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.45), 0 8px 20px rgba(239, 68, 68, 0.2);
+  }
+  100% {
+    box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.8), 0 12px 30px rgba(239, 68, 68, 0.4);
+  }
+}
+
+/* 高亮时突出呼吸展示核心调整按钮：调度开关、改售价、改进价 */
+.channel-strip.strip-highlight-focus .toggle-switch-btn {
+  box-shadow: 0 0 0 2px #ef4444, 0 2px 8px rgba(239, 68, 68, 0.35) !important;
+  animation: pulse-action-btn 0.9s ease-in-out infinite alternate;
+}
+
+.channel-strip.strip-highlight-focus .btn-micro-edit {
+  box-shadow: 0 0 0 2px #ef4444, 0 2px 8px rgba(239, 68, 68, 0.35) !important;
+  animation: pulse-action-btn 0.9s ease-in-out infinite alternate;
+}
+
+@keyframes pulse-action-btn {
+  from { transform: scale(1); }
+  to { transform: scale(1.08); }
+}
+
 /* 列 1: 状态指示点 */
 .strip-col-status {
   display: flex;
@@ -3493,6 +3529,16 @@ body {
   background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
   border: 1px solid #86efac;
   color: #15803d;
+  cursor: pointer;
+  user-select: none;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+.ops-status-badge.badge-risk:hover {
+  transform: translateY(-1.5px);
+  filter: brightness(1.04);
+}
+.ops-status-badge.badge-risk:active {
+  transform: translateY(1px);
 }
 .badge-risk strong {
   color: #15803d !important;
@@ -3507,6 +3553,37 @@ body {
 }
 .card-loss-danger strong {
   color: #b91c1c !important;
+}
+
+.badge-jump-hint {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.66rem;
+  font-weight: 700;
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+  background: rgba(239, 68, 68, 0.12);
+  color: #b91c1c;
+  margin-left: 0.25rem;
+  line-height: 1.3;
+}
+.card-loss-danger .badge-jump-hint {
+  background: #ef4444;
+  color: #ffffff;
+  box-shadow: 0 1px 3px rgba(239, 68, 68, 0.4);
+}
+
+/* 活跃分类筛选中的倒贴 Pill */
+.filter-pill.pill-active-loss {
+  background: #fef2f2 !important;
+  color: #b91c1c !important;
+  border-color: #fca5a5 !important;
+  font-weight: 700;
+}
+.filter-pill.pill-active-loss.active {
+  background: #ef4444 !important;
+  color: #ffffff !important;
+  border-color: #dc2626 !important;
 }
 
 @keyframes pulse-danger {
@@ -3995,4 +4072,24 @@ body {
   border-color: #7dd3fc;
   color: #0284c7;
 }
+
+/* ====== 🔄 上游通道 3 小时自动巡检与同步中枢样式 ====== */
+.scan-metric-card {
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.scan-metric-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
+}
+
+@keyframes pulseRed {
+  0% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.1); opacity: 0.85; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+#scanPendingBadge {
+  animation: pulseRed 2s infinite ease-in-out;
+}
+
 

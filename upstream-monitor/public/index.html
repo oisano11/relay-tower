@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>天枢 Aegis | 智能上游调度与利润风控中控台</title>
+  <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="stylesheet" href="style.css?v=20260906_users">
 </head>
@@ -16,7 +16,7 @@
           <img src="favicon.png" style="width: 30px; height: 30px; border-radius: 7px; box-shadow: 0 2px 8px rgba(0,0,0,0.25);">
         </div>
         <div class="brand-text">
-          <h1>天枢 Aegis <span>智能调度与风控中控台</span></h1>
+          <h1>中转塔台 · Relay Tower <span>智能调度与风控中控台</span></h1>
         </div>
       </div>
 
@@ -60,6 +60,9 @@
         </button>
         <button id="btnOpenTelegramModal" class="btn btn-glass" title="配置 Telegram 机器人推送与手机端一键切线">
           <span style="color: #0284c7;">✈️</span> Telegram <span id="tgHeaderStatusPill" class="auto-switch-status-pill on">已连接</span>
+        </button>
+        <button id="btnOpenUpstreamScanModal" class="btn btn-glass" title="查看 3 小时上游通道巡检、差分同步、孤岛分组熔断与待办审批">
+          <span style="color: #6366f1;">🔄</span> 上游巡检 <span id="scanPendingBadge" class="auto-switch-status-pill on" style="display: none; background: #ef4444; color: #fff; padding: 1px 6px; border-radius: 999px; font-weight: 700;">0</span>
         </button>
         <button id="btnOpenAlertsDrawer" class="btn btn-glass btn-alerts-box" title="打开报错与告警信息盒 (查看全部上游调价、自动切线熔断与报错流水)">
           <span class="bell-icon" id="alertsBellIcon">🔔</span> 报错信息盒 <span id="alertsBadgeCount" class="alerts-badge-count" style="display: none;">0</span>
@@ -149,10 +152,11 @@
               <strong id="metricEnabledCount" class="mono">-- / 18 开</strong>
             </div>
 
-            <div class="ops-status-badge badge-risk" id="cardLossWarning" title="倒贴风险隐患排查">
+            <div class="ops-status-badge badge-risk" id="cardLossWarning" title="点击直接定位跳转至倒贴渠道进行调整" onclick="jumpToProblemChannel()">
               <span class="ops-badge-icon">🛡️</span>
               <strong id="metricLossCount">0 倒贴</strong>
               <span id="metricLossBadge" style="display: none;">安全</span>
+              <span class="badge-jump-hint" id="metricLossJumpHint" style="display: none;">定位 ↗</span>
             </div>
 
             <div class="ops-status-badge badge-margin hide-on-compact" title="当前开启渠道综合加权预估毛利率">
@@ -796,12 +800,26 @@
 
               <div class="as-config-row">
                 <div class="as-config-info">
-                  <span class="as-config-label">🔒 单主调严格独占（严禁主副调双开）</span>
-                  <span class="as-config-desc">同业务分组仅开启当前主调调度，所有副调强制关停冷备。物理杜绝请求分流，彻底锁死 Prompt Cache 命中率！切线时原子互斥交接</span>
+                  <span class="as-config-label">🔒 业务组严格单主独占（严禁同组多渠道同时开启）</span>
+                  <span class="as-config-desc">全站所有业务分组严格仅开启 1 个主调，所有副调强制关停冷备。物理杜绝同组多开分流，自动切线或换组时原子关闭同组其余全部渠道！</span>
                 </div>
                 <button id="btnToggleSingleActive" class="toggle-switch-btn is-on">
                   <span>●</span> <span>已开启独占</span>
                 </button>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">👑 人工主调锁定策略</span>
+                  <span class="as-config-desc">控制人工手动指定主调后的行为：可选择【容灾接管】（日常锁定防乱变，确诊严重宕机才切）、【绝对锁死】（永不换）、或【自由轮换】</span>
+                </div>
+                <select id="selectManualLockPolicy" class="form-input mono" style="width: 215px; font-weight: 700;">
+                  <option value="failover_allowed" selected>🛡️ 容灾接管 (推荐·宕机可切)</option>
+                  <option value="strict_lock">🔒 绝对锁死 (人工锁死·永不换)</option>
+                  <option value="disabled">🔄 自由轮换 (不锁定·算法自治)</option>
+                </select>
               </div>
 
               <div class="as-divider"></div>
@@ -953,7 +971,7 @@
             <div style="display: flex; justify-content: space-between; align-items: center;">
               <div>
                 <div style="font-weight: 700; font-size: 0.95rem; color: #0f172a; display: flex; align-items: center; gap: 0.4rem;">
-                  <span id="tgBotDisplayName">天枢</span>
+                  <span id="tgBotDisplayName">中转塔台</span>
                   <a id="tgBotLink" href="https://t.me/tianshuzhongzhuan_bot" target="_blank" class="mono" style="color: #0284c7; font-size: 0.82rem; text-decoration: none;">@tianshuzhongzhuan_bot</a>
                 </div>
                 <div id="tgAdminStatusText" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">
@@ -1610,6 +1628,118 @@
       </div>
     </div>
 
+    <!-- 弹窗：上游通道 3 小时自动巡检、差分同步、孤岛分组熔断与待办审批大盘 -->
+    <div id="upstreamScanReportModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 820px; max-height: 90vh; display: flex; flex-direction: column;">
+        <div class="dialog-content" style="display: flex; flex-direction: column; max-height: 90vh; overflow: hidden; padding: 0;">
+          
+          <!-- Modal Header -->
+          <div style="padding: 1.25rem 1.5rem; border-bottom: 1px solid #e2e8f0; background: #ffffff; display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+              <div style="width: 40px; height: 40px; border-radius: 10px; background: #eef2ff; color: #4f46e5; display: flex; align-items: center; justify-content: center; font-size: 1.35rem; border: 1px solid #c7d2fe;">
+                🔄
+              </div>
+              <div>
+                <h3 style="margin: 0; color: #0f172a; font-size: 1.15rem; font-weight: 700; display: flex; align-items: center; gap: 0.5rem;">
+                  上游通道 3h 自动化巡检与同步中枢
+                  <span id="scanModalStatusBadge" style="font-size: 0.72rem; padding: 2px 8px; border-radius: 999px; background: #ecfdf5; color: #059669; font-weight: 600;">已就绪</span>
+                </h3>
+                <p style="margin: 3px 0 0 0; font-size: 0.76rem; color: #64748b;" id="scanModalSubTitle">
+                  自动探活与比对差分 · 停用与孤岛熔断 · 低价自动同步 (+20%) · 同价/新模型人工请示
+                </p>
+              </div>
+            </div>
+            <button type="button" class="btn-modal-close" onclick="closeUpstreamScanModal()" style="background: none; border: none; font-size: 1.3rem; color: #94a3b8; cursor: pointer;">✕</button>
+          </div>
+
+          <!-- Modal Scrollable Body -->
+          <div style="flex: 1; overflow-y: auto; padding: 1.25rem 1.5rem; display: flex; flex-direction: column; gap: 1rem; background: #f8fafc;">
+            
+            <!-- 统计概览胶囊栏 -->
+            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.5rem;">
+              <div class="scan-metric-card" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 0.72rem; color: #64748b;">探测通道</div>
+                <div id="metricTotalProbed" class="mono" style="font-size: 1.25rem; font-weight: 700; color: #0f172a;">--</div>
+              </div>
+              <div class="scan-metric-card" style="background: #ffffff; border: 1px solid #fee2e2; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 0.72rem; color: #dc2626;">停用通道</div>
+                <div id="metricDeactivated" class="mono" style="font-size: 1.25rem; font-weight: 700; color: #dc2626;">--</div>
+              </div>
+              <div class="scan-metric-card" style="background: #ffffff; border: 1px solid #fecaca; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 0.72rem; color: #991b1b;">熔断关停分组</div>
+                <div id="metricClosedGroups" class="mono" style="font-size: 1.25rem; font-weight: 700; color: #991b1b;">--</div>
+              </div>
+              <div class="scan-metric-card" style="background: #ffffff; border: 1px solid #d1fae5; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 0.72rem; color: #059669;">自动低价上线</div>
+                <div id="metricAutoSynced" class="mono" style="font-size: 1.25rem; font-weight: 700; color: #059669;">--</div>
+              </div>
+              <div class="scan-metric-card" style="background: #ffffff; border: 1px solid #fef3c7; border-radius: 8px; padding: 0.75rem; text-align: center;">
+                <div style="font-size: 0.72rem; color: #d97706;">待审批请示</div>
+                <div id="metricPendingActions" class="mono" style="font-size: 1.25rem; font-weight: 700; color: #d97706;">0</div>
+              </div>
+            </div>
+
+            <!-- 待审批请示区域 (高亮任务队列) -->
+            <div id="scanPendingSection" style="background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; padding: 1rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                <strong style="color: #92400e; font-size: 0.88rem; display: flex; align-items: center; gap: 0.4rem;">
+                  🔔 待管理员决策请示事项 (<span id="scanPendingCountText">0</span> 项)
+                </strong>
+                <span style="font-size: 0.72rem; color: #b45309;">规则 2b 同价通道 & 规则 2c 新模型需人工把关确认</span>
+              </div>
+              <div id="scanPendingList" style="display: flex; flex-direction: column; gap: 0.5rem;">
+                <!-- 动态填充待审批卡片 -->
+                <div style="font-size: 0.78rem; color: #78350f; padding: 0.5rem 0;">🎉 当前暂无待处理审批项，所有通道与模型运转良好！</div>
+              </div>
+            </div>
+
+            <!-- 本次巡检明细卡片 -->
+            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+                <strong style="color: #0f172a; font-size: 0.88rem; display: flex; align-items: center; gap: 0.4rem;">
+                  📋 最近巡检执行结果与事件审计
+                </strong>
+                <span id="scanLastRunTime" style="font-size: 0.72rem; color: #64748b;" class="mono">上次巡检: --</span>
+              </div>
+              <div id="scanEventsContainer" style="display: flex; flex-direction: column; gap: 0.5rem; max-height: 220px; overflow-y: auto;">
+                <!-- 由 app.js 填充 -->
+              </div>
+            </div>
+
+            <!-- 巡检机制与定价配置参数栏 -->
+            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.85rem; display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; color: #334155; flex-wrap: wrap; gap: 0.5rem;">
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <span>⏱️ <b>定时周期:</b> <code>3 小时/次</code></span>
+                <span style="color: #cbd5e1;">|</span>
+                <span>💰 <b>自动定价上浮:</b> <code>原价 +20%</code></span>
+                <span style="color: #cbd5e1;">|</span>
+                <span>✈️ <b>Telegram 同步推送:</b> <code>已开启</code></span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <span id="scanNextRunTime" style="font-size: 0.72rem; color: #64748b;" class="mono">下次巡检: 计算中...</span>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Modal Footer -->
+          <div style="padding: 1rem 1.5rem; border-top: 1px solid #e2e8f0; background: #ffffff; display: flex; justify-content: space-between; align-items: center;">
+            <div style="font-size: 0.74rem; color: #64748b;">
+              💡 停用无备选孤岛自动关停 · 低价直接建号上线 · Telegram 手机端同步支持一键操作
+            </div>
+            <div style="display: flex; gap: 0.5rem;">
+              <button id="btnTriggerScanNow" class="btn btn-primary" style="background: #4f46e5; border-color: #4f46e5; font-size: 0.82rem; padding: 0.45rem 1rem;">
+                ⚡ 立即执行全量扫描
+              </button>
+              <button type="button" class="btn btn-secondary" onclick="closeUpstreamScanModal()" style="font-size: 0.82rem; padding: 0.45rem 1rem;">
+                关闭
+              </button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
 
     <!-- 全局防遮挡悬浮责任归因卡片 (小叹号 Tooltip) -->
     <div id="globalFloatingTooltip" class="floating-tooltip-card" style="display: none;">

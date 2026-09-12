@@ -90,6 +90,7 @@ class TelegramBotManager {
               { command: 'auto', description: '⚡ 自动故障切线与成本熔断保护' },
               { command: 'rates', description: '💰 查看所有渠道进货倍率天梯榜' },
               { command: 'check', description: '🔍 立即触发全网探活与测速巡检' },
+              { command: 'scan', description: '🔄 立即触发上游3h通道扫描与差分巡检' },
               { command: 'help', description: '❓ 查看命令菜单与帮助说明' }
             ]
           });
@@ -362,6 +363,8 @@ class TelegramBotManager {
       await this.sendRatesList(chatId);
     } else if (cmd === '/check' || text === '测速' || text === '巡检') {
       await this.executeForceCheck(chatId);
+    } else if (cmd === '/scan' || text === '扫描' || text === '上游巡检') {
+      await this.executeUpstreamScan(chatId);
     } else {
       await this.sendMessage(chatId, 
         `💡 未知指令：<code>${text}</code>\n` +
@@ -370,7 +373,7 @@ class TelegramBotManager {
           reply_markup: {
             inline_keyboard: [
               [{ text: '📊 查看大盘', callback_data: 'cmd:status' }, { text: '👥 线路负载', callback_data: 'cmd:load' }],
-              [{ text: '🔀 换线菜单', callback_data: 'cmd:switch' }]
+              [{ text: '🔀 换线菜单', callback_data: 'cmd:switch' }, { text: '🔄 上游巡检', callback_data: 'cmd:scan' }]
             ]
           }
         }
@@ -418,6 +421,15 @@ class TelegramBotManager {
     } else if (data === 'cmd:check') {
       await this.answerCallbackQuery(queryId, { text: '🔄 正在触发全网测速巡检...' });
       await this.executeForceCheck(chatId);
+    } else if (data === 'cmd:scan') {
+      await this.answerCallbackQuery(queryId, { text: '🔄 正在启动上游3h通道巡检扫描...' });
+      await this.executeUpstreamScan(chatId);
+    } else if (data.startsWith('scan_act:approve:')) {
+      const actionId = data.replace('scan_act:approve:', '');
+      await this.handleActionResolve(chatId, queryId, actionId, 'approve');
+    } else if (data.startsWith('scan_act:reject:')) {
+      const actionId = data.replace('scan_act:reject:', '');
+      await this.handleActionResolve(chatId, queryId, actionId, 'reject');
     } else if (data.startsWith('switch:')) {
       const channelId = data.replace('switch:', '');
       await this.handleDoSwitch(chatId, queryId, channelId, query.message.message_id);
@@ -442,7 +454,7 @@ class TelegramBotManager {
     const inflight = act.inflight || 0;
 
     const text = 
-      `🤖 <b>天枢 · 中转站智能调度中枢</b>\n` +
+      `🤖 <b>中转塔台 · 智能调度中枢</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🌟 <b>当前主力出海:</b> <b>${active.name || '--'}</b> (<code>${active.multiplier || '--'}x</code>)\n` +
       `👥 <b>主力在线负载:</b> <b>${u15m}</b> 人在线 · <b>${inflight}</b> 个在途并发\n` +
@@ -724,17 +736,19 @@ class TelegramBotManager {
   // 发送自动切线设置菜单
   async sendAutoSwitchMenu(chatId, editMessageId = null) {
     const autoConfig = this.context.getAutoSwitchConfig();
+    const policyDesc = autoConfig.manualLockPolicy === 'strict_lock' ? '🔒 绝对锁死' : (autoConfig.manualLockPolicy === 'disabled' ? '🔄 自由轮换' : '🛡️ 容灾接管 (推荐)');
 
     const text = 
       `⚡ <b>【全站统一自动切线与容灾保护】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `运行状态: <b>${autoConfig.enabled ? '🟢 已开启' : '🔴 已暂停'}</b>\n` +
+      `单主独占: <b>${autoConfig.singleActiveExclusive !== false ? '🔒 全组独占 (同组严禁多开)' : '⚠️ 允许双开分流'}</b>\n` +
+      `锁定策略: <b>${policyDesc}</b>\n` +
       `核心主线: 💰 <b>以不赔钱为第一主线，谁便宜谁是主调</b>\n` +
-      `调换副调: 📊 <b>主调成功率不足 80% (<80%) 或连续硬故障才切</b>\n` +
-      `分层保护: 🛡️ <b>调换副调，保底尤慎重 (副调可用绝不动用保底)</b>\n` +
-      `防抖冷静: ⏱️ <b>10 分钟防抖冷却 (20 分钟防死循环)</b>\n` +
+      `调换门槛: 📊 <b>失败率 ≥${autoConfig.failRateThreshold || 50}% 或连续硬报错 ≥${autoConfig.consecutiveFailuresThreshold || 5}次才切</b>\n` +
+      `防抖冷静: ⏱️ <b>${autoConfig.cooldownMinutes || 10} 分钟防抖冷却</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `💡 <i>全站执行单一基准调度法则，不设第二套冲突规则。</i>`;
+      `💡 <i>全站业务分组严格独立，自动切线时原子互斥关闭同组其余全部渠道。</i>`;
 
     const reply_markup = {
       inline_keyboard: [
@@ -863,7 +877,7 @@ class TelegramBotManager {
     await this.broadcastToAdmins(message, { reply_markup });
   }
 
-  // 2. 自动切线触发通知
+  // 2. 自动切线触发通知 (包含改售价保毛利与断流应急)
   async notifyAutoSwitch(logEntry, toChannel) {
     if (!this.config.enabled || !this.config.notifyOnAutoSwitch) return;
     if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
@@ -872,16 +886,35 @@ class TelegramBotManager {
     const toUsers = toAct.activeUsers15m || 0;
     const toInflight = toAct.inflight || 0;
 
-    const message = 
-      `⚡ <b>【智能自动熔断切线触发】</b>\n` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `🔄 <b>切线动作:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
-      `🎯 <b>触发原因:</b> ${logEntry.reason}\n` +
-      `💸 <b>进货倍率:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
-      `👥 <b>新通道当前负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
-      `${logEntry.oldTtft ? `⏱️ <b>延迟对比:</b> <code>${logEntry.oldTtft}ms</code> ➔ <code>${logEntry.newTtft || '--'}ms</code>\n` : ''}` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `✅ <i>Sub2API 调度网关已即时切换至新通道！</i>`;
+    let message = '';
+    if (logEntry.priceAdjusted) {
+      message = 
+        `⚡ <b>【智能熔断切线 & 紧急改售价已生效】</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🔄 <b>切线路由:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
+        `🎯 <b>触发原因:</b> ${logEntry.reason}\n` +
+        `💸 <b>进货成本:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📈 <b>【业务分组售价自动调优保毛利】</b>\n` +
+        `• 调整分组: <b>${logEntry.groupName || '默认分组'}</b>\n` +
+        `• 原销售价: <code>${logEntry.oldSaleRate}x</code> (低于新进货成本，已自动调价防倒贴)\n` +
+        `• <b>新销售价:</b> <code>${logEntry.newSaleRate}x</code> (按上游进价 +20% 自动上调)\n` +
+        `• <b>核算新毛利率:</b> <b>+${logEntry.newMarginPercent}%</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👥 <b>新通道负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
+        `🛡️ <i>坚决不赔钱！线上售价与中转路由已即刻同步生效。</i>`;
+    } else {
+      message = 
+        `⚡ <b>【智能自动熔断切线触发】</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🔄 <b>切线动作:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
+        `🎯 <b>触发原因:</b> ${logEntry.reason}\n` +
+        `💸 <b>进货倍率:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
+        `👥 <b>新通道当前负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
+        `${logEntry.oldTtft ? `⏱️ <b>延迟对比:</b> <code>${logEntry.oldTtft}ms</code> ➔ <code>${logEntry.newTtft || '--'}ms</code>\n` : ''}` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `✅ <i>Sub2API 调度网关已即时切换至新通道！</i>`;
+    }
 
     const reply_markup = {
       inline_keyboard: [
@@ -948,6 +981,82 @@ class TelegramBotManager {
     });
   }
 
+  // 5. 手动执行上游扫描
+  async executeUpstreamScan(chatId) {
+    if (typeof this.context.triggerUpstreamScan !== 'function') {
+      await this.sendMessage(chatId, '⚠️ 上游扫描引擎尚未就绪或未挂载。');
+      return;
+    }
+    const waitMsg = await this.sendMessage(chatId, '⏳ <b>正在启动 3h 周期全量上游通道与价格巡检扫描...</b>\n请稍候片刻。');
+    try {
+      const res = await this.context.triggerUpstreamScan('Telegram /scan 指令');
+      if (res.success && res.report) {
+        if (waitMsg && waitMsg.message_id) {
+          try {
+            await this.apiRequest('deleteMessage', { chat_id: chatId, message_id: waitMsg.message_id });
+          } catch (e) {}
+        }
+      } else {
+        await this.sendMessage(chatId, `❌ 巡检失败: ${res.error || res.message || '未知错误'}`);
+      }
+    } catch (err) {
+      await this.sendMessage(chatId, `❌ 执行巡检异常: ${err.message}`);
+    }
+  }
+
+  // 6. 处理待办决策 (同意 / 拒绝)
+  async handleActionResolve(chatId, queryId, actionId, decision) {
+    if (typeof this.context.resolveUpstreamAction !== 'function') {
+      await this.answerCallbackQuery(queryId, { text: '⚠️ 审批处理接口未就绪', show_alert: true });
+      return;
+    }
+    try {
+      const res = await this.context.resolveUpstreamAction(actionId, decision, 'Telegram 审批');
+      if (res.success) {
+        await this.answerCallbackQuery(queryId, { 
+          text: decision === 'approve' ? '✅ 审批已通过并已执行！' : '❌ 已忽略该操作', 
+          show_alert: true 
+        });
+        await this.sendMessage(chatId, `🔔 <b>【上游审批已处理】</b>\n${res.message}`);
+      } else {
+        await this.answerCallbackQuery(queryId, { text: `⚠️ ${res.message}`, show_alert: true });
+      }
+    } catch (e) {
+      await this.answerCallbackQuery(queryId, { text: `❌ 异常: ${e.message}`, show_alert: true });
+    }
+  }
+
+  // 7. 推送上游通道巡检报告与一键审批按钮
+  async notifyScanReport(report, pendingActions = []) {
+    if (!this.config.enabled) return;
+    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
+
+    const keyboard = [];
+
+    // 为每个待处理项提供一键审批按钮 (最多 4 项避免键盘过长)
+    if (Array.isArray(pendingActions) && pendingActions.length > 0) {
+      const displayActions = pendingActions.slice(0, 4);
+      displayActions.forEach(act => {
+        const title = act.type === 'same_price_channel' 
+          ? `同意同价: ${act.name} (+20%)` 
+          : `开启模型: ${act.modelName}`;
+        keyboard.push([
+          { text: `✅ ${title}`, callback_data: `scan_act:approve:${act.id}` },
+          { text: `❌ 忽略`, callback_data: `scan_act:reject:${act.id}` }
+        ]);
+      });
+    }
+
+    keyboard.push([
+      { text: '🔄 再次扫描', callback_data: 'cmd:scan' },
+      { text: '📊 查看大盘', callback_data: 'cmd:status' }
+    ]);
+
+    await this.broadcastToAdmins(report.summaryText || '上游扫描巡检完成', {
+      reply_markup: { inline_keyboard: keyboard }
+    });
+  }
+
   // 发送给所有绑定的管理员
   async broadcastToAdmins(text, options = {}) {
     if (!this.config.adminChatIds || !Array.isArray(this.config.adminChatIds)) return;
@@ -999,7 +1108,7 @@ class TelegramBotManager {
     const text = 
       `🎉 <b>【中转塔台 Telegram 机器人测试成功】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `🤖 <b>机器人:</b> ${this.botInfo ? `${this.botInfo.first_name} (@${this.botInfo.username})` : '天枢'}\n` +
+      `🤖 <b>机器人:</b> ${this.botInfo ? `${this.botInfo.first_name} (@${this.botInfo.username})` : '中转塔台'}\n` +
       `🕒 <b>测试时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n` +
       `📡 <b>中控台状态:</b> 连通性良好，双向通信正常！\n` +
       `━━━━━━━━━━━━━━━━━━\n` +

@@ -251,9 +251,17 @@ function renderOverviewMetrics() {
   const totalLoss = profitSummary.totalLossCount !== undefined ? profitSummary.totalLossCount : channelsData.filter(c => c.isLoss).length;
   const activeLoss = profitSummary.activeLossCount !== undefined ? profitSummary.activeLossCount : channelsData.filter(c => c.schedulable && c.isLoss).length;
   const cardLoss = document.getElementById('cardLossWarning');
+  const jumpHint = document.getElementById('metricLossJumpHint');
 
   if (activeLoss > 0) {
-    if (cardLoss) cardLoss.classList.add('card-loss-danger');
+    if (cardLoss) {
+      cardLoss.classList.add('card-loss-danger');
+      cardLoss.title = `🚨 发现 ${activeLoss} 条开启调度的通道正在倒贴亏损！点击直接跳转定位调整`;
+    }
+    if (jumpHint) {
+      jumpHint.style.display = 'inline-block';
+      jumpHint.textContent = '定位 ↗';
+    }
     document.getElementById('metricLossCount').textContent = `🚨 ${activeLoss} 条调度中倒贴!`;
     document.getElementById('metricLossCount').style.color = 'var(--color-red)';
     document.getElementById('metricLossBadge').textContent = '高危扣费中';
@@ -263,7 +271,14 @@ function renderOverviewMetrics() {
     document.getElementById('metricLossFooterText').textContent = `倒贴中: ${activeLossNames} (建议停用或提价)`;
     document.getElementById('metricLossFooterText').style.color = '#f87171';
   } else if (totalLoss > 0) {
-    if (cardLoss) cardLoss.classList.remove('card-loss-danger');
+    if (cardLoss) {
+      cardLoss.classList.remove('card-loss-danger');
+      cardLoss.title = `⚠️ 发现 ${totalLoss} 条潜在倒贴通道（已隔离停用）。点击直接跳转定位查看`;
+    }
+    if (jumpHint) {
+      jumpHint.style.display = 'inline-block';
+      jumpHint.textContent = '定位 ↗';
+    }
     document.getElementById('metricLossCount').textContent = `${totalLoss} 条潜在倒贴`;
     document.getElementById('metricLossCount').style.color = '#fbbf24';
     document.getElementById('metricLossBadge').textContent = '已隔离停用';
@@ -273,7 +288,11 @@ function renderOverviewMetrics() {
     document.getElementById('metricLossFooterText').textContent = `隐患通道: ${lossNames} (停用中)`;
     document.getElementById('metricLossFooterText').style.color = '#a1a1aa';
   } else {
-    if (cardLoss) cardLoss.classList.remove('card-loss-danger');
+    if (cardLoss) {
+      cardLoss.classList.remove('card-loss-danger');
+      cardLoss.title = '所有上游进价均低于销售价，定价结构健康。点击可检查渠道列表';
+    }
+    if (jumpHint) jumpHint.style.display = 'none';
     document.getElementById('metricLossCount').textContent = `0 条倒贴`;
     document.getElementById('metricLossCount').style.color = 'var(--color-green)';
     document.getElementById('metricLossBadge').textContent = '成本安全';
@@ -380,6 +399,7 @@ function renderFilterPills() {
     let subCount = 0;
     let idleCount = 0;
     let disabledCount = 0;
+    let lossCount = 0;
 
     channelsData.forEach(c => {
       const ua = c.userActivity || {};
@@ -387,7 +407,9 @@ function renderFilterPills() {
       const isOnline = (ua.activeUsers15m > 0);
       const isSchedulable = !!c.schedulable;
       const p = Number(c.priority);
+      const isLoss = c.isLoss || ((c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier) > (c.saleMultiplier !== undefined ? c.saleMultiplier : 1.0));
 
+      if (isLoss) lossCount++;
       if (hasTraffic) hasTrafficCount++;
       if (isOnline) onlineCount++;
       if (isSchedulable) schedulableCount++;
@@ -398,7 +420,11 @@ function renderFilterPills() {
       if (!isSchedulable) disabledCount++;
     });
 
-    const activePills = [
+    const activePills = [];
+    if (lossCount > 0) {
+      activePills.push({ key: 'loss', label: `🚨 倒贴亏损 (${lossCount})`, badgeClass: 'pill-active-loss' });
+    }
+    activePills.push(
       { key: 'has_traffic', label: `🔥 活跃有调用 (${hasTrafficCount})`, badgeClass: 'pill-active-hot' },
       { key: 'online', label: `🟢 在线使用中 (${onlineCount})`, badgeClass: 'pill-active-online' },
       { key: 'schedulable', label: `⚡ 调度开启中 (${schedulableCount})`, badgeClass: 'pill-active-sched' },
@@ -407,7 +433,7 @@ function renderFilterPills() {
       { key: 'idle', label: `💤 待机静默无调用 (${idleCount})`, badgeClass: 'pill-active-idle' },
       { key: 'disabled', label: `🚫 已停用通道 (${disabledCount})`, badgeClass: 'pill-active-disabled' },
       { key: 'all', label: `全部渠道 (${channelsData.length})`, badgeClass: '' }
-    ];
+    );
 
     container.innerHTML = activePills.map(p => {
       return `
@@ -490,6 +516,7 @@ function renderChannels() {
         const hasTraffic = (ua.calls24h > 0) || (ua.activeUsers15m > 0) || (ua.activeUsers24h > 0);
         const isOnline = (ua.activeUsers15m > 0);
         const p = Number(c.priority);
+        if (currentFilterPill === 'loss' && !(c.isLoss || ((c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier) > (c.saleMultiplier !== undefined ? c.saleMultiplier : 1.0)))) return false;
         if (currentFilterPill === 'has_traffic' && !hasTraffic) return false;
         if (currentFilterPill === 'online' && !isOnline) return false;
         if (currentFilterPill === 'schedulable' && !c.schedulable) return false;
@@ -605,13 +632,16 @@ function renderChannels() {
         warningBanner.innerHTML = `
           <div class="asw-icon">⚠️</div>
           <div class="asw-content">
-            <div class="asw-title"><strong>【正在调度】上游异常警报：</strong>当前开启调度的通道 <strong>[${escapeHtml(firstProb.name)}]</strong> 存在稳定性异常！</div>
+            <div class="asw-title" style="cursor: pointer;" onclick="jumpToProblemChannel('${firstProb.id}')" title="点击直接定位跳转至该异常渠道"><strong>【正在调度】上游异常警报：</strong>当前开启调度的通道 <strong>[${escapeHtml(firstProb.name)}]</strong> 存在稳定性异常！ <span style="font-size: 0.72rem; color: #b91c1c; font-weight: normal; text-decoration: underline;">(点击定位)</span></div>
             <div class="asw-desc">
               过去 24 小时在 <strong>${escapeHtml(s.worstModel || '部分模型')}</strong> 发生 <strong>${s.totalErr || 0}</strong> 次错误，成功率仅 <strong>${s.successRate || 0}%</strong>。
               <span style="color: #b91c1c; font-weight: 600; margin-left: 0.35rem;">判定归属：${escapeHtml(s.tooltipTitle || '上游服务商责任')}</span>
             </div>
           </div>
           <div class="asw-actions" style="display: flex; align-items: center; gap: 0.4rem;">
+            <button class="btn btn-warning" onclick="jumpToProblemChannel('${firstProb.id}')" style="font-size: 0.76rem; padding: 0.25rem 0.65rem;" title="直接定位跳转到该渠道卡片">
+              📍 定位渠道
+            </button>
             <button class="btn btn-warning" onclick="openModelStabilityModal('${firstProb.id}')" style="font-size: 0.76rem; padding: 0.25rem 0.65rem;">
               📊 查看模型明细
             </button>
@@ -973,6 +1003,166 @@ function renderStripsView(enabledChannels, standbyChannels) {
 
   container.innerHTML = html;
 }
+
+// =========================================================================
+// 【核心功能】点击顶部倒贴/故障警报直接平滑跳转定位到问题渠道并高亮聚焦
+// =========================================================================
+window._currentProblemJumpIndex = 0;
+window._lastProblemJumpTime = 0;
+
+function jumpToProblemChannel(targetChannelId = null) {
+  if (!channelsData || !channelsData.length) {
+    showToast('暂无渠道数据', 'warning');
+    return;
+  }
+
+  let target = null;
+  let problemList = [];
+
+  if (targetChannelId) {
+    target = channelsData.find(c => String(c.id) === String(targetChannelId));
+    if (!target) {
+      showToast(`未找到指定渠道 ID: ${targetChannelId}`, 'warning');
+      return;
+    }
+  } else {
+    // 自动收集有问题的渠道列表
+    // 优先级 1: 正在调度中倒贴亏损 (高危产生实际亏损)
+    const activeLossList = channelsData.filter(c => {
+      const cost = c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier;
+      const sale = c.saleMultiplier !== undefined ? c.saleMultiplier : 1.0;
+      return c.schedulable && (c.isLoss || cost > sale);
+    });
+
+    // 优先级 2: 潜在倒贴通道 (未开启但进货大于售价)
+    const standbyLossList = channelsData.filter(c => {
+      const cost = c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier;
+      const sale = c.saleMultiplier !== undefined ? c.saleMultiplier : 1.0;
+      return !c.schedulable && (c.isLoss || cost > sale);
+    });
+
+    // 优先级 3: 调度中但稳定性高危/报错较多的通道
+    const activeProblemList = channelsData.filter(c => {
+      const s = c.stability;
+      return c.schedulable && s && (s.level === 'danger' || (s.faultOwner === 'provider' && s.totalErr > 0));
+    });
+
+    if (activeLossList.length > 0) {
+      problemList = activeLossList;
+    } else if (standbyLossList.length > 0) {
+      problemList = standbyLossList;
+    } else if (activeProblemList.length > 0) {
+      problemList = activeProblemList;
+    }
+
+    if (problemList.length === 0) {
+      showToast('🎉 当前暂无倒贴或异常上游通道，所有渠道运行健康！', 'success');
+      return;
+    }
+
+    // 连续点击多条轮换定位 (8秒内连续点击切换下一条)
+    const now = Date.now();
+    if (window._lastProblemJumpTime && (now - window._lastProblemJumpTime < 8000)) {
+      window._currentProblemJumpIndex = (window._currentProblemJumpIndex + 1) % problemList.length;
+    } else {
+      window._currentProblemJumpIndex = 0;
+    }
+    window._lastProblemJumpTime = now;
+
+    target = problemList[window._currentProblemJumpIndex];
+  }
+
+  // 确保目标渠道在 DOM 中渲染：
+  // 1. 如果搜索框有过滤内容导致目标渠道不匹配，清除搜索框
+  const searchInput = document.getElementById('channelSearchInput');
+  let needRerender = false;
+  if (searchInput && searchInput.value.trim()) {
+    const s = searchInput.value.trim().toLowerCase();
+    const matchName = target.name && target.name.toLowerCase().includes(s);
+    const matchUrl = target.baseUrl && target.baseUrl.toLowerCase().includes(s);
+    const matchVendor = target.vendor && target.vendor.toLowerCase().includes(s);
+    const matchGroup = target.groups && target.groups.some(g => g.toLowerCase().includes(s));
+    if (!matchName && !matchUrl && !matchVendor && !matchGroup) {
+      searchInput.value = '';
+      needRerender = true;
+    }
+  }
+
+  // 2. 如果当前筛选 Pill 过滤掉了目标渠道，重置为 'all'
+  if (currentFilterPill !== 'all') {
+    let isFilteredOut = false;
+    if (currentDimension === 'vendor' && target.vendor !== currentFilterPill) isFilteredOut = true;
+    if (currentDimension === 'provider' && target.provider !== currentFilterPill) isFilteredOut = true;
+    if (currentDimension === 'group' && !(target.groups && target.groups.includes(currentFilterPill))) isFilteredOut = true;
+    if (currentDimension === 'active') {
+      const p = Number(target.priority);
+      const ua = target.userActivity || {};
+      const hasTraffic = (ua.calls24h > 0) || (ua.activeUsers15m > 0) || (ua.activeUsers24h > 0);
+      const isOnline = (ua.activeUsers15m > 0);
+      if (currentFilterPill === 'loss' && !target.isLoss) isFilteredOut = true;
+      if (currentFilterPill === 'has_traffic' && !hasTraffic) isFilteredOut = true;
+      if (currentFilterPill === 'online' && !isOnline) isFilteredOut = true;
+      if (currentFilterPill === 'schedulable' && !target.schedulable) isFilteredOut = true;
+      if (currentFilterPill === 'main' && p < 100) isFilteredOut = true;
+      if (currentFilterPill === 'sub' && (p < 10 || p >= 100)) isFilteredOut = true;
+      if (currentFilterPill === 'idle' && (hasTraffic || !target.schedulable)) isFilteredOut = true;
+      if (currentFilterPill === 'disabled' && target.schedulable) isFilteredOut = true;
+    }
+
+    if (isFilteredOut) {
+      currentFilterPill = 'all';
+      needRerender = true;
+    }
+  }
+
+  if (needRerender || !document.querySelector(`.channel-strip[data-id="${target.id}"]`)) {
+    renderFilterPills();
+    renderChannels();
+  }
+
+  // 执行平滑滚动与高亮
+  setTimeout(() => {
+    const stripEl = document.querySelector(`.channel-strip[data-id="${target.id}"]`);
+    if (!stripEl) {
+      showToast(`已找到渠道 [${target.name}]，但在当前视图下定位异常`, 'warning');
+      return;
+    }
+
+    // 平滑居中滚动
+    stripEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    // 移除其他已有高亮
+    document.querySelectorAll('.channel-strip.strip-highlight-focus').forEach(el => {
+      el.classList.remove('strip-highlight-focus');
+    });
+
+    // 施加强调高亮类
+    stripEl.classList.add('strip-highlight-focus');
+
+    // 4.5 秒后自动平滑移除高亮
+    setTimeout(() => {
+      stripEl.classList.remove('strip-highlight-focus');
+    }, 4500);
+
+    // 提示信息
+    const cost = target.costMultiplier !== undefined ? formatRate(target.costMultiplier) : formatRate(target.multiplier);
+    const sale = target.saleMultiplier !== undefined ? formatRate(target.saleMultiplier) : '1.00';
+    const margin = target.marginPercent !== undefined ? target.marginPercent : 0;
+    const countInfo = problemList.length > 1 ? ` (${window._currentProblemJumpIndex + 1}/${problemList.length})` : '';
+
+    if (target.schedulable && (target.isLoss || Number(cost) > Number(sale))) {
+      showToast(`🚨 [已定位倒贴${countInfo}]【${target.name}】进货 ${cost}x > 售 ${sale}x (倒贴 ${margin}%)！建议立即停用或改价`, 'error');
+    } else if (target.isLoss || Number(cost) > Number(sale)) {
+      showToast(`⚠️ [已定位潜在倒贴${countInfo}]【${target.name}】进货 ${cost}x > 售 ${sale}x，当前已隔离停用`, 'warning');
+    } else if (target.stability && target.stability.totalErr > 0) {
+      showToast(`⚠️ [已定位异常渠道${countInfo}]【${target.name}】24h报错 ${target.stability.totalErr}次，建议查看模型明细或切线路`, 'warning');
+    } else {
+      showToast(`📍 已定位到渠道${countInfo}：【${target.name}】`, 'info');
+    }
+  }, 60);
+}
+
+window.jumpToProblemChannel = jumpToProblemChannel;
 
 // 【核心功能 1】同时开多条：切换单个上游调度开关 (开启/停用)
 async function toggleChannelSchedulable(channelId, newSchedulable) {
@@ -1714,6 +1904,24 @@ function setupSSE() {
       autoSwitchConfig = JSON.parse(event.data);
       updateAutoSwitchHeaderBadge();
     } catch (e) {}
+  });
+
+  evtSource.addEventListener('UPSTREAM_SCAN_REPORT', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      handleUpstreamScanReportSSE(payload);
+    } catch (e) {
+      console.error('处理上游巡检报告出错:', e);
+    }
+  });
+
+  evtSource.addEventListener('UPSTREAM_ACTION_RESOLVED', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      handleUpstreamActionResolvedSSE(payload);
+    } catch (e) {
+      console.error('处理上游审批决议出错:', e);
+    }
   });
 
   evtSource.onerror = () => {
@@ -3658,6 +3866,11 @@ function syncAutoSwitchForm() {
   if (selectConsecutive && autoSwitchConfig.consecutiveFailuresThreshold !== undefined) {
     selectConsecutive.value = String(autoSwitchConfig.consecutiveFailuresThreshold);
   }
+
+  const selectManualPolicy = document.getElementById('selectManualLockPolicy');
+  if (selectManualPolicy && autoSwitchConfig.manualLockPolicy) {
+    selectManualPolicy.value = autoSwitchConfig.manualLockPolicy;
+  }
 }
 
 function openAutoSwitchModal() {
@@ -3692,6 +3905,7 @@ async function saveAutoSwitchConfig() {
   const cooldownMinutes = Number(document.getElementById('selectCooldownMinutes')?.value) || 10;
   const minSampleSize = Number(document.getElementById('selectMinSampleSize')?.value) || 5;
   const consecutiveFailuresThreshold = Number(document.getElementById('selectConsecutiveFailures')?.value) || 5;
+  const manualLockPolicy = document.getElementById('selectManualLockPolicy')?.value || 'failover_allowed';
 
   const saveBtn = document.getElementById('btnSaveAutoSwitchConfig');
   if (saveBtn) {
@@ -3706,6 +3920,7 @@ async function saveAutoSwitchConfig() {
       body: JSON.stringify({
         enabled,
         singleActiveExclusive,
+        manualLockPolicy,
         mode: 'unified_cost_first',
         promptCacheLock,
         antiFlappingLock,
@@ -3792,7 +4007,10 @@ async function loadAutoSwitchLogs() {
 
       let badgeClass = 'as-tag-timeout';
       let tagText = '首字超时';
-      if (log.triggerType === 'provider_error') {
+      if (log.triggerType === 'balance_empty' || (log.reason && log.reason.includes('余额'))) {
+        badgeClass = 'as-tag-error';
+        tagText = '余额耗尽';
+      } else if (log.triggerType === 'provider_error' || log.triggerType === 'hard_down') {
         badgeClass = 'as-tag-error';
         tagText = '上游报错';
       } else if (log.triggerType === 'cost_recovery') {
@@ -3803,6 +4021,10 @@ async function loadAutoSwitchLogs() {
         tagText = '演练切换';
       }
 
+      const priceTagHtml = log.priceAdjusted 
+        ? `<span class="as-tag" style="background: #fef3c7; color: #b45309; border: 1px solid #fcd34d;" title="自动上调分组售价保毛利">改售价保毛利</span>` 
+        : '';
+
       return `
         <tr>
           <td style="font-size: 0.73rem; color: #64748b; white-space: nowrap;">
@@ -3810,8 +4032,9 @@ async function loadAutoSwitchLogs() {
             <div style="font-weight: 700; color: #1e293b;">${escapeHtml(timeStr)}</div>
           </td>
           <td>
-            <div style="display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.2rem;">
+            <div style="display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.2rem; flex-wrap: wrap;">
               <span class="as-tag ${badgeClass}">${tagText}</span>
+              ${priceTagHtml}
               <span style="font-size: 0.78rem; font-weight: 600; color: #1e293b;">${escapeHtml(log.fromName)} ➔ ${escapeHtml(log.toName)}</span>
             </div>
             <div style="font-size: 0.72rem; color: #64748b; line-height: 1.35;">${escapeHtml(log.reason || '')}</div>
@@ -3892,7 +4115,7 @@ function syncTelegramUI() {
   const botNameEl = document.getElementById('tgBotDisplayName');
   const botLinkEl = document.getElementById('tgBotLink');
   if (d.botInfo) {
-    if (botNameEl) botNameEl.textContent = d.botInfo.first_name || '天枢';
+    if (botNameEl) botNameEl.textContent = d.botInfo.first_name || '中转塔台';
     if (botLinkEl) {
       botLinkEl.textContent = `@${d.botInfo.username}`;
       botLinkEl.href = `https://t.me/${d.botInfo.username}`;
@@ -4925,9 +5148,306 @@ window.setPresetConcurrency = setPresetConcurrency;
 window.setChannelRole = setChannelRole;
 window.triggerAutoQualifyByCost = triggerAutoQualifyByCost;
 
-// 页面加载完成后自动初始化财务看板事件
+// ====== 🔄 上游通道 3 小时巡检、差分同步与审批中枢控制逻辑 ======
+
+let currentScannerData = null;
+
+async function fetchUpstreamScannerStatus() {
+  try {
+    const res = await fetch('/api/upstream/scanner/status');
+    if (res.ok) {
+      const data = await res.json();
+      currentScannerData = data;
+      updateScannerPendingBadge(data.pendingActions || []);
+      return data;
+    }
+  } catch (err) {
+    console.error('获取上游巡检状态失败:', err);
+  }
+  return null;
+}
+
+function updateScannerPendingBadge(pendingActions) {
+  const badge = document.getElementById('scanPendingBadge');
+  if (!badge) return;
+  const count = Array.isArray(pendingActions) ? pendingActions.length : 0;
+  if (count > 0) {
+    badge.textContent = count;
+    badge.style.display = 'inline-block';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+async function openUpstreamScanModal() {
+  const modal = document.getElementById('upstreamScanReportModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  const data = await fetchUpstreamScannerStatus();
+  if (data) {
+    renderUpstreamScanModal(data);
+  }
+}
+
+function closeUpstreamScanModal() {
+  const modal = document.getElementById('upstreamScanReportModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function renderUpstreamScanModal(data) {
+  if (!data) return;
+  const config = data.config || {};
+  const report = data.latestReport || {};
+  const pending = data.pendingActions || [];
+
+  // 1. 统计卡片
+  const elProbed = document.getElementById('metricTotalProbed');
+  const elDeact = document.getElementById('metricDeactivated');
+  const elClosed = document.getElementById('metricClosedGroups');
+  const elSynced = document.getElementById('metricAutoSynced');
+  const elPending = document.getElementById('metricPendingActions');
+
+  if (elProbed) elProbed.textContent = report.totalProbed !== undefined ? report.totalProbed : (channelsData || []).length;
+  if (elDeact) elDeact.textContent = (report.deactivatedChannels || []).length;
+  if (elClosed) elClosed.textContent = (report.closedGroups || []).length;
+  if (elSynced) elSynced.textContent = (report.autoSyncedChannels || []).length;
+  if (elPending) elPending.textContent = pending.length;
+
+  // 2. 待审批任务区域
+  const pendingContainer = document.getElementById('scanPendingList');
+  const countText = document.getElementById('scanPendingCountText');
+  if (countText) countText.textContent = pending.length;
+
+  if (pendingContainer) {
+    if (pending.length === 0) {
+      pendingContainer.innerHTML = `<div style="font-size: 0.8rem; color: #92400e; padding: 0.6rem 0; text-align: center;">🎉 当前无待审请示，上游各通道与模型运行正常！</div>`;
+    } else {
+      pendingContainer.innerHTML = pending.map(item => {
+        if (item.type === 'same_price_channel') {
+          return `
+            <div style="background: #ffffff; border: 1px solid #fde68a; border-radius: 6px; padding: 0.75rem; display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+              <div style="flex: 1; min-width: 260px;">
+                <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.25rem;">
+                  <span style="background: #fef3c7; color: #b45309; font-size: 0.72rem; padding: 1px 6px; border-radius: 4px; font-weight: 700;">同价新通道待审</span>
+                  <strong style="color: #0f172a; font-size: 0.88rem;">${escapeHtml(item.name || '新通道')}</strong>
+                  <span style="font-size: 0.74rem; color: #64748b;">(${escapeHtml(item.vendor || '通用')})</span>
+                </div>
+                <div style="font-size: 0.76rem; color: #475569; line-height: 1.4;">
+                  进价: <code class="mono" style="color: #d97706; font-weight: 700;">${item.costMultiplier}x</code> · 建议售价: <code class="mono" style="color: #059669; font-weight: 700;">${item.suggestedSaleMultiplier}x</code> (+20%)
+                </div>
+              </div>
+              <div style="display: flex; gap: 0.4rem;">
+                <button type="button" class="btn btn-primary" onclick="resolvePendingAction('${item.id}', 'approve')" style="font-size: 0.76rem; padding: 0.35rem 0.75rem; background: #059669; border-color: #059669;">
+                  ✅ 确认同步建号建组
+                </button>
+                <button type="button" class="btn btn-secondary" onclick="resolvePendingAction('${item.id}', 'reject')" style="font-size: 0.76rem; padding: 0.35rem 0.65rem;">
+                  ❌ 忽略
+                </button>
+              </div>
+            </div>
+          `;
+        } else if (item.type === 'enable_new_model') {
+          return `
+            <div style="background: #ffffff; border: 1px solid #ddd6fe; border-radius: 6px; padding: 0.75rem; display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+              <div style="flex: 1; min-width: 260px;">
+                <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.25rem;">
+                  <span style="background: #ede9fe; color: #6d28d9; font-size: 0.72rem; padding: 1px 6px; border-radius: 4px; font-weight: 700;">全新模型待开启</span>
+                  <strong style="color: #0f172a; font-size: 0.88rem; font-family: monospace;">${escapeHtml(item.modelName)}</strong>
+                </div>
+                <div style="font-size: 0.76rem; color: #475569;">
+                  已同步模型元数据及通道映射，默认处于未开启保护状态。
+                </div>
+              </div>
+              <div style="display: flex; gap: 0.4rem;">
+                <button type="button" class="btn btn-primary" onclick="resolvePendingAction('${item.id}', 'approve')" style="font-size: 0.76rem; padding: 0.35rem 0.75rem; background: #4f46e5; border-color: #4f46e5;">
+                  🚀 立即开启对外服务
+                </button>
+                <button type="button" class="btn btn-secondary" onclick="resolvePendingAction('${item.id}', 'reject')" style="font-size: 0.76rem; padding: 0.35rem 0.65rem;">
+                  ⏸️ 暂缓
+                </button>
+              </div>
+            </div>
+          `;
+        }
+        return '';
+      }).join('');
+    }
+  }
+
+  // 3. 审计事件流
+  const eventsContainer = document.getElementById('scanEventsContainer');
+  if (eventsContainer) {
+    const events = [];
+
+    if (Array.isArray(report.closedGroups) && report.closedGroups.length > 0) {
+      report.closedGroups.forEach(g => {
+        events.push(`
+          <div style="padding: 6px 10px; background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; font-size: 0.78rem; color: #991b1b; display: flex; justify-content: space-between; align-items: center;">
+            <span>🚨 <b>【孤岛分组自动关停】</b> 业务组 [<b>${escapeHtml(g.groupName)}</b>] 因唯一通道关停且无其他备选，已自动阻断下线</span>
+            <span class="mono" style="font-size: 0.7rem; color: #dc2626;">高危熔断</span>
+          </div>
+        `);
+      });
+    }
+
+    if (Array.isArray(report.deactivatedChannels) && report.deactivatedChannels.length > 0) {
+      report.deactivatedChannels.forEach(c => {
+        events.push(`
+          <div style="padding: 6px 10px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; font-size: 0.78rem; color: #92400e; display: flex; justify-content: space-between; align-items: center;">
+            <span>🛑 <b>【通道停用】</b> 通道 [<b>${escapeHtml(c.name)}</b>] (${c.multiplier}x) 上游探针不可达，已停止对外调度</span>
+            <span class="mono" style="font-size: 0.7rem; color: #b45309;">已摘除</span>
+          </div>
+        `);
+      });
+    }
+
+    if (Array.isArray(report.autoSyncedChannels) && report.autoSyncedChannels.length > 0) {
+      report.autoSyncedChannels.forEach(c => {
+        events.push(`
+          <div style="padding: 6px 10px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 6px; font-size: 0.78rem; color: #065f46; display: flex; justify-content: space-between; align-items: center;">
+            <span>🟢 <b>【低价直接同步】</b> 新通道 [<b>${escapeHtml(c.name)}</b>] 进价 <code>${c.costMultiplier}x</code> 优惠，已自动建号建组按 +20% 定价 (<code>${c.saleMultiplier}x</code>) 上线！</span>
+            <span class="mono" style="font-size: 0.7rem; color: #059669;">+20%自动定价</span>
+          </div>
+        `);
+      });
+    }
+
+    if (Array.isArray(report.survivedGroups) && report.survivedGroups.length > 0) {
+      report.survivedGroups.forEach(s => {
+        events.push(`
+          <div style="padding: 6px 10px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; font-size: 0.78rem; color: #166534;">
+            🛡️ <b>【备用通道接管】</b> 业务组 [${escapeHtml(s.groupName)}] 虽然有通道关停，但仍有 ${s.remainingFallbacks} 个健康备选通道无缝兜底，业务正常运转。
+          </div>
+        `);
+      });
+    }
+
+    if (events.length === 0) {
+      events.push(`
+        <div style="padding: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.78rem; color: #64748b; text-align: center;">
+          ✅ 全网上游接口与探针连通良好，各业务组运行平稳，无异常停用或变动。
+        </div>
+      `);
+    }
+
+    eventsContainer.innerHTML = events.join('');
+  }
+
+  // 4. 时间指示
+  const elLastRun = document.getElementById('scanLastRunTime');
+  const elNextRun = document.getElementById('scanNextRunTime');
+  if (elLastRun) {
+    elLastRun.textContent = `上次巡检: ${report.endTime ? formatTime(report.endTime) : (config.lastScanTime ? formatTime(config.lastScanTime) : '尚未执行')}`;
+  }
+  if (elNextRun) {
+    elNextRun.textContent = `下次巡检: ${config.nextScanTime ? formatTime(config.nextScanTime) : '3 小时周期'}`;
+  }
+}
+
+async function resolvePendingAction(actionId, decision) {
+  try {
+    const res = await fetch('/api/upstream/scanner/resolve-action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actionId, decision })
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(result.message, 'success');
+      fetchUpstreamScannerStatus().then(renderUpstreamScanModal);
+      loadChannels();
+    } else {
+      showToast(result.message || '操作失败', 'error');
+    }
+  } catch (err) {
+    showToast(`操作异常: ${err.message}`, 'error');
+  }
+}
+
+async function triggerManualUpstreamScan() {
+  const btn = document.getElementById('btnTriggerScanNow');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '⏳ 巡检扫描中...';
+  }
+  showToast('🔄 已启动上游 3h 周期通道与差分扫描，正在探测各供应商...', 'info');
+
+  try {
+    const res = await fetch('/api/upstream/scanner/trigger', { method: 'POST' });
+    const result = await res.json();
+    if (result.success && result.report) {
+      showToast('✅ 上游全量巡检与差分比对完成！', 'success');
+      currentScannerData = {
+        config: currentScannerData?.config || {},
+        latestReport: result.report,
+        pendingActions: await (await fetch('/api/upstream/scanner/status')).json().then(d => d.pendingActions)
+      };
+      renderUpstreamScanModal(currentScannerData);
+      loadChannels();
+    } else {
+      showToast(result.error || result.message || '巡检异常', 'error');
+    }
+  } catch (err) {
+    showToast(`触发扫描失败: ${err.message}`, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '⚡ 立即执行全量扫描';
+    }
+  }
+}
+
+function handleUpstreamScanReportSSE(payload) {
+  const report = payload.report;
+  const pending = payload.pendingActions || [];
+  updateScannerPendingBadge(pending);
+
+  // 若有变动（通道停用、孤岛关停、自动低价上线、待审请示），自动居中弹出报告框！
+  const hasEvents = (report.deactivatedChannels?.length > 0) ||
+                    (report.closedGroups?.length > 0) ||
+                    (report.autoSyncedChannels?.length > 0) ||
+                    (pending.length > 0);
+
+  if (hasEvents) {
+    openUpstreamScanModal();
+  } else {
+    // 仅更新后台数据
+    if (document.getElementById('upstreamScanReportModal')?.style.display === 'flex') {
+      fetchUpstreamScannerStatus().then(renderUpstreamScanModal);
+    }
+  }
+}
+
+function handleUpstreamActionResolvedSSE(payload) {
+  updateScannerPendingBadge(payload.pendingActions || []);
+  if (document.getElementById('upstreamScanReportModal')?.style.display === 'flex') {
+    fetchUpstreamScannerStatus().then(renderUpstreamScanModal);
+  }
+}
+
+function initUpstreamScannerUI() {
+  document.getElementById('btnOpenUpstreamScanModal')?.addEventListener('click', openUpstreamScanModal);
+  document.getElementById('btnTriggerScanNow')?.addEventListener('click', triggerManualUpstreamScan);
+  document.getElementById('upstreamScanReportModal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'upstreamScanReportModal') closeUpstreamScanModal();
+  });
+  // 首次拉取状态更新徽标
+  fetchUpstreamScannerStatus();
+}
+
+window.openUpstreamScanModal = openUpstreamScanModal;
+window.closeUpstreamScanModal = closeUpstreamScanModal;
+window.resolvePendingAction = resolvePendingAction;
+window.triggerManualUpstreamScan = triggerManualUpstreamScan;
+
+// 页面加载完成后自动初始化财务看板与上游巡检中枢事件
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initUserFinancesEvents);
+  document.addEventListener('DOMContentLoaded', () => {
+    initUserFinancesEvents();
+    initUpstreamScannerUI();
+  });
 } else {
   initUserFinancesEvents();
+  initUpstreamScannerUI();
 }
+
