@@ -2214,6 +2214,131 @@ body {
   border-color: #a7f3d0;
 }
 
+/* 多上游供应商管理卡片体系 */
+.upstream-panel-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.75rem 0.85rem;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: all 0.2s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.upstream-panel-card:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.upstream-panel-card.disabled {
+  opacity: 0.65;
+  background: #f8fafc;
+}
+
+.upstream-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.upstream-card-title {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: #0f172a;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.upstream-status-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.upstream-status-badge.connected {
+  background: #ecfdf5;
+  color: #059669;
+  border: 1px solid #a7f3d0;
+}
+
+.upstream-status-badge.error {
+  background: #fef2f2;
+  color: #dc2626;
+  border: 1px solid #fecaca;
+}
+
+.upstream-status-badge.disabled {
+  background: #f1f5f9;
+  color: #64748b;
+  border: 1px solid #cbd5e1;
+}
+
+.upstream-card-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.4rem;
+  background: #f8fafc;
+  border: 1px solid #f1f5f9;
+  border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  font-size: 0.74rem;
+}
+
+.upstream-metric-label {
+  color: #64748b;
+  font-size: 0.68rem;
+}
+
+.upstream-metric-val {
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.upstream-card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.72rem;
+  color: #64748b;
+  border-top: 1px dashed #f1f5f9;
+  padding-top: 0.4rem;
+}
+
+.upstream-card-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.upstream-btn-sm {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  color: #334155;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.upstream-btn-sm:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.upstream-btn-sm.danger:hover {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+
 /* 线路选择微型按钮 */
 .strip-lines-btn {
   background: #f8fafc;

@@ -469,14 +469,26 @@ class UpstreamScanner {
   async discoverUpstreamOfferings(channels, upstreamPanel) {
     const offerings = [];
 
-    // 1. 如果配置了 New-API 后台 (upstreamPanel)，直接拉取 /api/pricing 与 /api/user/models
-    if (upstreamPanel && upstreamPanel.backendUrl) {
-      const panelUrl = upstreamPanel.backendUrl.replace(/\/+$/, '');
+    // 1. 遍历上游后台管理池 (New-API / One-API)
+    let panels = [];
+    if (this.context.getUpstreamPanels && typeof this.context.getUpstreamPanels === 'function') {
+      panels = this.context.getUpstreamPanels() || [];
+    } else if (upstreamPanel && upstreamPanel.backendUrl) {
+      panels = [upstreamPanel];
+    }
+
+    for (const panel of panels) {
+      if (panel.enabled === false || !panel.backendUrl) continue;
+      const panelUrl = panel.backendUrl.replace(/\/+$/, '');
+      const panelName = panel.name || 'New-API 上游';
       const headers = { 'User-Agent': 'Mozilla/5.0 RelayTowerScanner' };
-      if (upstreamPanel.userToken) {
-        headers['Authorization'] = upstreamPanel.userToken.startsWith('Bearer ')
-          ? upstreamPanel.userToken
-          : `Bearer ${upstreamPanel.userToken}`;
+      if (panel.userToken) {
+        headers['Authorization'] = panel.userToken.startsWith('Bearer ')
+          ? panel.userToken
+          : `Bearer ${panel.userToken}`;
+      }
+      if (panel.cookie) {
+        headers['Cookie'] = panel.cookie;
       }
 
       // (a) 拉取模型列表
@@ -491,7 +503,8 @@ class UpstreamScanner {
             offerings.push({
               type: 'model',
               modelName: typeof m === 'string' ? m : m.id || m.name,
-              provider: 'New-API 上游',
+              provider: panelName,
+              panelId: panel.id,
               baseUrl: panelUrl,
               multiplier: 1.0
             });
@@ -512,7 +525,8 @@ class UpstreamScanner {
               offerings.push({
                 type: 'model',
                 modelName: item.model_name,
-                provider: item.owner_by || 'New-API 上游',
+                provider: item.owner_by || panelName,
+                panelId: panel.id,
                 baseUrl: panelUrl,
                 multiplier: item.model_ratio || 1.0
               });
