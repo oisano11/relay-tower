@@ -36,6 +36,7 @@ const SSH_USER = process.env.SSH_USER || 'root';
 
 const auth = require('./auth');
 const telegram = require('./telegram');
+const upstreamScanner = require('./upstream_scanner');
 const IS_VPS = process.env.IS_VPS === 'true';
 
 // 通用数据库查询封装 (在 VPS 本地直接运行 docker exec，避免远程 SSH 延迟；本地则通过 SSH)
@@ -154,6 +155,7 @@ let autoSwitchConfig = readJSON(AUTO_SWITCH_CONFIG_FILE, {
   promptCacheLock: true, // 核心：Prompt Cache 优先保护锁 (杜绝偶发报错误切主线)
   antiFlappingLock: true, // 核心：20分钟防乒乓横跳锁定 (杜绝两线来回死循环)
   singleActiveExclusive: true, // 核心：单主严格独占，副调冷备停调 (杜绝双开分流破坏 Prompt Cache)
+  manualLockPolicy: 'failover_allowed', // 'failover_allowed' (容灾接管·推荐) | 'strict_lock' (绝对锁死) | 'disabled' (自由轮换)
   ttftThresholdMs: 30000,
   failRateThreshold: 50, // 失败率达到 50% 以上才切线，保护全站 Prompt Cache
   minSampleSize: 10,     // 最小有效样本量，拒绝 1~2 次偶发报错即切线
@@ -908,7 +910,8 @@ SELECT json_agg(t) FROM (
         balance,
         balanceUnit,
         balanceUpdated,
-        balanceStatus
+        balanceStatus,
+        manualLocked: existing ? Boolean(existing.manualLocked) : (String(state.manualLockedChannelId) === String(acc.id))
       };
 
       if (existing && Math.abs(oldMultiplier - newMultiplier) > 0.0001) {
@@ -1008,45 +1011,100 @@ function setRemoteActiveSub2APIAccount(accountId) {
   return setRemoteAccountRole(accountId, 'main');
 }
 
-// 🔒 强制执行“单主严格独占，副调冷备关停”检查与修复 (杜绝双开破坏 Prompt Cache)
+// 🔒 全局全业务组强制执行“单主严格独占，同组严禁多开”检查与修复 (杜绝任何分组多渠道同时开启分流破坏 Prompt Cache)
 function enforceSingleActiveState() {
   if (autoSwitchConfig.singleActiveExclusive === false) return;
-  const activeChannel = state.channels.find(c => String(c.id) === String(state.activeChannelId));
-  if (!activeChannel) return;
 
-  const targetGroupIds = (activeChannel.groupsDetail || []).map(g => g.id).filter(Boolean);
-  if (activeChannel.primaryGroupId) targetGroupIds.push(activeChannel.primaryGroupId);
-  if (targetGroupIds.length === 0) return;
-
-  let changed = false;
-  const disableIds = [];
+  // 1. 收集全站所有业务分组 ID
+  const allGroupIds = new Set();
+  (state.allGroups || []).forEach(g => { if (g.id) allGroupIds.add(g.id); });
   state.channels.forEach(c => {
-    if (String(c.id) === String(activeChannel.id)) {
-      if (!c.schedulable || c.priority !== 100) {
-        c.schedulable = true;
-        c.priority = 100;
-        c.isActive = true;
-        changed = true;
-      }
-    } else {
-      const sharedGroup = (c.groupsDetail || []).some(g => targetGroupIds.includes(g.id)) || (c.primaryGroupId && targetGroupIds.includes(c.primaryGroupId));
-      if (sharedGroup && c.schedulable) {
-        c.schedulable = false;
-        c.isActive = false;
-        c.priority = Math.min(10, c.priority || 10);
-        disableIds.push(c.id);
-        changed = true;
-      }
-    }
+    if (c.primaryGroupId) allGroupIds.add(c.primaryGroupId);
+    (c.groupsDetail || []).forEach(g => { if (g.id) allGroupIds.add(g.id); });
   });
 
-  if (disableIds.length > 0) {
-    const cleanIds = disableIds.map(id => parseInt(id, 10)).join(',');
-    const sql = `UPDATE accounts SET schedulable = false WHERE id IN (${cleanIds});`;
-    executeRemoteSQL(sql);
-    invalidateSub2APIScheduler(disableIds);
-    console.log(`🔒 [单主独占保护] 已自动将同组副调通道 [${disableIds.join(', ')}] 设为冷备关停 (schedulable=false)，彻底杜绝双开分流，保障全站 Prompt Cache！`);
+  let changed = false;
+  const disableIds = new Set();
+  const enableIds = new Set();
+
+  for (const groupId of allGroupIds) {
+    // 找出挂在该分组下的所有通道
+    const groupChannels = state.channels.filter(c => {
+      const inDetail = (c.groupsDetail || []).some(g => g.id === groupId);
+      const isPrimary = c.primaryGroupId === groupId;
+      return inDetail || isPrimary;
+    });
+
+    if (groupChannels.length <= 1) continue;
+
+    // 检查该组内是否有多个开启调度的通道
+    // 选拔该组的唯一主调：
+    // 1. 优先人工锁定的在线通道 (manualLocked)
+    // 2. 其次已有 priority >= 100 且在线的通道
+    // 3. 其次已有 schedulable = true 且在线的通道
+    // 4. 否则按进货价选最便宜的健康通道
+    let chosenMain = groupChannels.find(c => c.manualLocked && c.status !== 'offline');
+    if (!chosenMain) {
+      chosenMain = groupChannels.find(c => Number(c.priority) >= 100 && c.schedulable && c.status !== 'offline');
+    }
+    if (!chosenMain) {
+      chosenMain = groupChannels.find(c => Number(c.priority) >= 100 && c.status !== 'offline');
+    }
+    if (!chosenMain) {
+      chosenMain = groupChannels.find(c => c.schedulable && c.status !== 'offline');
+    }
+    if (!chosenMain) {
+      const candidates = groupChannels.filter(c => c.status !== 'offline' && !c.isLoss);
+      candidates.sort((a, b) => {
+        const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
+        const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
+        return costA - costB;
+      });
+      chosenMain = candidates[0] || groupChannels[0];
+    }
+
+    if (!chosenMain) continue;
+
+    // 确保主调激活为 priority = 100, schedulable = true
+    if (!chosenMain.schedulable || Number(chosenMain.priority) !== 100) {
+      chosenMain.schedulable = true;
+      chosenMain.priority = 100;
+      chosenMain.isActive = true;
+      enableIds.add(chosenMain.id);
+      changed = true;
+    }
+
+    // 确保同组其余所有通道全部冷备关停，严禁多渠道同时开启！
+    groupChannels.forEach(c => {
+      if (String(c.id) !== String(chosenMain.id)) {
+        if (c.schedulable || Number(c.priority) > 10 || c.isActive) {
+          c.schedulable = false;
+          c.isActive = false;
+          c.priority = Math.min(10, Number(c.priority) || 10);
+          disableIds.add(c.id);
+          changed = true;
+        }
+      }
+    });
   }
+
+  // 执行 Sub2API 远程数据库批量原子同步
+  if (disableIds.size > 0 || enableIds.size > 0) {
+    let sql = '';
+    if (disableIds.size > 0) {
+      const cleanDisable = Array.from(disableIds).map(id => parseInt(id, 10)).join(',');
+      sql += `UPDATE accounts SET schedulable = false, priority = LEAST(priority, 10) WHERE id IN (${cleanDisable}); `;
+    }
+    if (enableIds.size > 0) {
+      const cleanEnable = Array.from(enableIds).map(id => parseInt(id, 10)).join(',');
+      sql += `UPDATE accounts SET schedulable = true, priority = 100 WHERE id IN (${cleanEnable}); `;
+    }
+    executeRemoteSQL(sql);
+    const affectedIds = Array.from(new Set([...disableIds, ...enableIds]));
+    invalidateSub2APIScheduler(affectedIds);
+    console.log(`🔒 [全站多组单主独占] 已同步巡检全站 ${allGroupIds.size} 个业务分组：同组严禁多开，关停副调 [${Array.from(disableIds).join(', ')}]，激活主调 [${Array.from(enableIds).join(', ')}]！`);
+  }
+
   if (changed) {
     writeJSON(CHANNELS_FILE, state);
   }
@@ -1077,17 +1135,20 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
 
   if (role === 'main') {
     state.activeChannelId = String(targetId);
+    state.manualLockedChannelId = String(targetId); // 🔒 管理员手动指定主调：锁定该通道，绝不允许后台自动巡检将其擅自降级为副调
     state.channels.forEach(c => {
       if (String(c.id) === String(targetId)) {
         c.priority = 100;
         c.isActive = true;
         c.schedulable = true;
+        c.manualLocked = true;
       } else {
         // 同业务分组内的其他旧主调降为副调(10)，若开启单主独占则彻底关停调度(schedulable=false)
         const sharedGroup = (c.groupsDetail || []).some(g => targetGroupIds.includes(g.id)) || (c.primaryGroupId && targetGroupIds.includes(c.primaryGroupId));
         if (sharedGroup) {
           c.priority = 10;
           c.isActive = false;
+          c.manualLocked = false;
           if (isSingleActive) {
             c.schedulable = false; // 🔒 关停副调调度，杜绝双开破坏 Prompt Cache
           }
@@ -1096,11 +1157,20 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
         }
       }
     });
+
+    // 同步刷新切线保护时间戳与原因，为手动操作建立冷却与锁定记录
+    autoSwitchConfig.lastSwitchTime = new Date().toISOString();
+    autoSwitchConfig.lastSwitchReason = `管理员手动指定 [${targetChannel.name}] 为主调 (操作人: ${operator})，已启用主调锁定保护`;
+    writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
   } else if (role === 'sub') {
+    if (String(state.manualLockedChannelId) === String(targetId)) {
+      state.manualLockedChannelId = null;
+    }
     state.channels.forEach(c => {
       if (String(c.id) === String(targetId)) {
         c.priority = 10;
         c.isActive = false;
+        c.manualLocked = false;
         c.schedulable = !isSingleActive;
       }
     });
@@ -2607,15 +2677,34 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
   const oldId = String(fromChannel.id);
   const targetId = String(toChannel.id);
   const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
-  // 调度角色实时交接：旧主调降为副调 (priority 10)，新通道升级为主调 (priority 100)
-  fromChannel.priority = 10;
-  fromChannel.isActive = false;
-  if (isSingleActive) {
-    fromChannel.schedulable = false; // 🔒 关停旧主调调度，物理杜绝主副调同时开着导致分流！
-  }
+
+  // 1. 获取目标通道所属业务分组
+  const targetGroupIds = (toChannel.groupsDetail || []).map(g => g.id).filter(Boolean);
+  if (toChannel.primaryGroupId) targetGroupIds.push(toChannel.primaryGroupId);
+
+  // 2. 调度角色实时交接：新通道升级为主调 (priority 100, schedulable = true)
   toChannel.priority = 100;
   toChannel.isActive = true;
   toChannel.schedulable = true;
+
+  // 3. 🔒 自动换组/切线时：同业务组内绝对不能同时开启多个渠道！
+  // 将同组的所有其他通道 (包括旧主调及同组任何其他副调) 强制物理关停调度 (schedulable = false)
+  const disabledInGroupIds = [];
+  state.channels.forEach(c => {
+    if (String(c.id) === targetId) return;
+    const sameGroup = (c.groupsDetail || []).some(g => targetGroupIds.includes(g.id)) || 
+                      (c.primaryGroupId && targetGroupIds.includes(c.primaryGroupId)) ||
+                      String(c.id) === oldId;
+    if (sameGroup) {
+      c.priority = Math.min(10, Number(c.priority) || 10);
+      c.isActive = false;
+      c.manualLocked = false;
+      if (isSingleActive) {
+        c.schedulable = false; // 🔒 严格保证同一分组内绝无第二个开启的渠道
+        disabledInGroupIds.push(c.id);
+      }
+    }
+  });
 
   if (String(state.activeChannelId) === oldId || !state.activeChannelId) {
     state.activeChannelId = targetId;
@@ -2623,13 +2712,25 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
 
   writeJSON(CHANNELS_FILE, state);
 
-  // 同步 Sub2API 数据库：原子互斥切换 (单主独占模式下关闭旧通道调度)
+  // 4. 同步 Sub2API 数据库：原子互斥切换 (单主独占模式下关闭同组所有其他通道调度)
   const sql = isSingleActive
-    ? `UPDATE accounts SET schedulable = false, priority = 10 WHERE id = ${oldId}; UPDATE accounts SET schedulable = true, priority = 100 WHERE id = ${targetId};`
+    ? `UPDATE accounts SET schedulable = true, priority = 100 WHERE id = ${targetId};
+       UPDATE accounts SET schedulable = false, priority = LEAST(priority, 10) 
+       WHERE id != ${targetId} 
+         AND (
+           id IN (
+             SELECT account_id FROM account_groups WHERE group_id IN (
+               SELECT group_id FROM account_groups WHERE account_id = ${targetId}
+             )
+           )
+           OR id = ${oldId}
+           OR NOT EXISTS (SELECT 1 FROM account_groups WHERE account_id = ${targetId})
+         );`
     : `UPDATE accounts SET priority = 10 WHERE id = ${oldId}; UPDATE accounts SET priority = 100, schedulable = true WHERE id = ${targetId};`;
   const remoteOk = executeRemoteSQL(sql);
   if (remoteOk) {
-    invalidateSub2APIScheduler([oldId, targetId]);
+    const affected = Array.from(new Set([oldId, targetId, ...disabledInGroupIds]));
+    invalidateSub2APIScheduler(affected);
     lastSub2APISignature = getSub2APISignature();
   }
 
@@ -2647,7 +2748,13 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
     newCost: meta.newCost !== undefined ? meta.newCost : toChannel.multiplier,
     oldTtft: meta.oldTtft || null,
     newTtft: meta.newTtft || null,
-    remoteSynced: remoteOk
+    remoteSynced: remoteOk,
+    priceAdjusted: Boolean(meta.priceAdjusted),
+    groupName: meta.groupName || null,
+    groupId: meta.groupId || null,
+    oldSaleRate: meta.oldSaleRate || null,
+    newSaleRate: meta.newSaleRate || null,
+    newMarginPercent: meta.newMarginPercent || null
   };
 
   autoSwitchLogs.unshift(logEntry);
@@ -2710,44 +2817,80 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate 
   const consecutiveFailuresThreshold = autoSwitchConfig.consecutiveFailuresThreshold !== undefined ? autoSwitchConfig.consecutiveFailuresThreshold : 5;
   const cooldownMs = (autoSwitchConfig.cooldownMinutes || 10) * 60 * 1000;
 
-  // 1. 找出所有正在担任【主调】(priority >= 100) 的上游通道，全面巡检全站各业务组
-  let primaryChannels = state.channels.filter(c => Number(c.priority) >= 100);
-  if (primaryChannels.length === 0) {
+  // 1. 全面收集全站各业务组中正在承接流量的通道：
+  // 包含主调 (priority >= 100) 以及所有正在开启调度 (schedulable = true) 的通道 (如业务组中独立承担流量的副调通道)
+  const activeMap = new Map();
+  state.channels.forEach(c => {
+    if (Number(c.priority) >= 100 || c.schedulable) {
+      activeMap.set(String(c.id), c);
+    }
+  });
+  let activeChannelsToInspect = Array.from(activeMap.values());
+  if (activeChannelsToInspect.length === 0) {
     const fallbackMain = state.channels.find(c => String(c.id) === String(state.activeChannelId)) || state.channels[0];
-    if (fallbackMain) primaryChannels = [fallbackMain];
+    if (fallbackMain) activeChannelsToInspect = [fallbackMain];
   }
 
-  if (primaryChannels.length === 0) {
-    return { executed: false, reason: '未找到任何在运行的主调通道' };
+  if (activeChannelsToInspect.length === 0) {
+    return { executed: false, reason: '未找到任何正在运行的调度通道' };
   }
 
   const switchReports = [];
   const stableDetails = [];
 
-  for (const currentActive of primaryChannels) {
+  for (const currentActive of activeChannelsToInspect) {
+    const isChannelOffline = currentActive.status === 'offline';
+    // 检查账户钱包余额是否已见底归零 ($0.00 / empty)
+    const isOutOfBalance = (currentActive.balanceStatus === 'empty') || 
+      (currentActive.balance !== null && currentActive.balance !== undefined && Number(currentActive.balance) <= 0.001);
+
+    // 🔒 管理员人工锁定策略检查 (支持选项：failover_allowed 容灾接管 | strict_lock 绝对锁死 | disabled 自由轮换)
+    const manualLockPolicy = autoSwitchConfig.manualLockPolicy || 'failover_allowed';
+    const isManualLocked = Boolean(currentActive.manualLocked) || (state.manualLockedChannelId && String(state.manualLockedChannelId) === String(currentActive.id));
+
+    if (isManualLocked && !forceEvaluate) {
+      if (manualLockPolicy === 'strict_lock') {
+        // 绝对锁死：无论发生任何情况均不自动切换
+        stableDetails.push(`[${currentActive.name}]: 管理员已手动严格锁死主调 (strict_lock)，自动切线引擎已跳过。`);
+        continue;
+      } else if (manualLockPolicy === 'failover_allowed') {
+        // 容灾接管 (推荐)：平时坚决不因价格低或历史报错自动换；但遭遇真实确诊硬故障 (离线/欠费/连续硬报错超标) 时允许副调熔断接管！
+        const activeStabEarly = getChannelStabilitySummary(currentActive.id, stabilityMap);
+        const earlyErr = activeStabEarly.totalErr || 0;
+        const isTrueDown = isChannelOffline || isOutOfBalance || (activeStabEarly.faultOwner === 'provider' && earlyErr >= consecutiveFailuresThreshold);
+        if (!isTrueDown) {
+          stableDetails.push(`[${currentActive.name}]: 管理员已手动指定为主调 (failover_allowed)，当前未达确诊严重宕机门槛，锁定主调。`);
+          continue;
+        }
+      }
+      // 若 manualLockPolicy === 'disabled' 则不进行人工锁定拦截，按算法自由轮换
+    }
+
     const activeStab = getChannelStabilitySummary(currentActive.id, stabilityMap);
     const totalCalls = activeStab.totalCalls || 0;
     const totalErr = activeStab.totalErr || 0;
     const failRate = totalCalls > 0 ? Number(((totalErr / totalCalls) * 100).toFixed(1)) : 0;
     const succRate = activeStab.successRate !== null ? activeStab.successRate : (totalCalls > 0 ? 100 - failRate : 100);
 
-    // 【核心切线触发硬门槛】：只有在主调失败率超出门槛 (默认 >= 50%) 或连续硬报错达到阈值时才调换副调！
+    // 【核心切线触发硬门槛】：
+    // a. 余额耗尽 ($0.00 / empty)
+    // b. 节点离线 (offline)
+    // c. 失败率超标 (>= 50%) 或连续硬报错超标 (>= 5)
     const isHighFailRate = (totalCalls >= minSampleSize) && (failRate >= failRateThreshold);
     const isHardDown = (activeStab.faultOwner === 'provider' && totalErr >= consecutiveFailuresThreshold);
-    const isChannelOffline = currentActive.status === 'offline';
     const isProviderFailing = isHighFailRate || isHardDown;
 
-    if (!isProviderFailing && !isChannelOffline) {
-      stableDetails.push(`[${currentActive.name}]: 运行稳定 (失败率 ${failRate}% < ${failRateThreshold}%, 样本数 ${totalCalls}/${minSampleSize})`);
+    if (!isProviderFailing && !isChannelOffline && !isOutOfBalance) {
+      stableDetails.push(`[${currentActive.name}]: 运行稳定 (余额充足, 失败率 ${failRate}% < ${failRateThreshold}%, 样本数 ${totalCalls}/${minSampleSize})`);
       continue;
     }
 
-
-    // 防频繁切换冷静期检查 (默认 10 分钟防抖，保护 Prompt Cache)
-    if (!forceEvaluate && autoSwitchConfig.lastSwitchTime) {
+    // 防频繁切换冷静期检查：
+    // 紧急断流故障 (余额耗尽 / 离线 / 严重硬报错) 坚决跳过冷静期立即熔断切线，杜绝让用户面对不可用通道！
+    const isCriticalDown = isOutOfBalance || isChannelOffline || (isHardDown && (totalErr >= consecutiveFailuresThreshold * 2));
+    if (!forceEvaluate && !isCriticalDown && autoSwitchConfig.lastSwitchTime) {
       const lastSwitch = new Date(autoSwitchConfig.lastSwitchTime).getTime();
-      const isCriticalDown = isHardDown && (totalErr >= consecutiveFailuresThreshold * 2);
-      if ((now - lastSwitch < cooldownMs) && !isCriticalDown) {
+      if ((now - lastSwitch < cooldownMs)) {
         const remainSec = Math.round((cooldownMs - (now - lastSwitch)) / 1000);
         return { executed: false, inCooldown: true, remainingSeconds: remainSec, reason: `处于防频繁切换冷静期中 (剩余 ${remainSec} 秒)` };
       }
@@ -2766,14 +2909,16 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate 
     });
 
     if (candidatePool.length === 0) {
-      console.warn(`[自动切线] 主调 [${currentActive.name}] 故障，但未找到同组备选通道`);
+      console.warn(`[自动切线] 通道 [${currentActive.name}] 故障/断流，但未找到同组备选通道`);
       continue;
     }
 
-    // 【法则 1：以不赔钱为第一主线】(isLoss === false)，并排除掉线与不健康通道
-    const safeCandidates = candidatePool.filter(c => {
-      if (c.isLoss) return false; // 坚决不赔钱！倒贴通道绝不调度
+    // 排除已离线、同样没余额、以及严重故障的不可用通道
+    const healthyCandidates = candidatePool.filter(c => {
       if (c.status === 'offline') return false;
+      const candOutOfBalance = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
+      if (candOutOfBalance) return false;
+
       const s = getChannelStabilitySummary(c.id, stabilityMap);
       const sCalls = s.totalCalls || 0;
       const sErr = s.totalErr || 0;
@@ -2784,56 +2929,104 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate 
       return true;
     });
 
-    if (safeCandidates.length === 0) {
-      console.warn(`[自动切线] 主调 [${currentActive.name}] 故障，但同组备选通道均处于倒贴亏损或故障状态，为保毛利放弃切换`);
+    if (healthyCandidates.length === 0) {
+      console.warn(`[自动切线] 通道 [${currentActive.name}] 故障/断流，但同组无健康可用备选`);
       continue;
     }
 
-    // 【法则 2：调换副调，保底尤慎重！】副调可用绝不动用保底通道
-    const subCandidates = safeCandidates.filter(c => Number(c.priority) >= 10);
-    const fallbackCandidates = safeCandidates.filter(c => Number(c.priority) <= 1);
+    // 【核心法则：以不赔钱为第一主线】
+    // 先检查是否有现成不倒贴的通道 (c.isLoss === false)
+    const safeCandidates = healthyCandidates.filter(c => !c.isLoss);
 
-    let targetTier = [];
-    let isUsingFallback = false;
+    let bestCandidate = null;
+    let priceAdjusted = false;
+    let adjustedGroupInfo = null;
 
-    if (subCandidates.length > 0) {
-      targetTier = subCandidates;
-    } else if (fallbackCandidates.length > 0) {
-      targetTier = fallbackCandidates;
-      isUsingFallback = true;
+    if (safeCandidates.length > 0) {
+      // 调换副调，保底尤慎重！优先副调 (priority >= 10)，若无再启用保底 (priority <= 1)
+      const subCandidates = safeCandidates.filter(c => Number(c.priority) >= 10);
+      const fallbackCandidates = safeCandidates.filter(c => Number(c.priority) <= 1);
+      const targetTier = subCandidates.length > 0 ? subCandidates : fallbackCandidates;
+
+      // 谁便宜谁优先：按进货成本由低到高排列
+      targetTier.sort((a, b) => {
+        const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
+        const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
+        return costA - costB;
+      });
+      bestCandidate = targetTier[0];
     } else {
+      // 【重点新增】：同组备选通道全都高于当前对外售价 (如果直接跳转会赔钱倒贴)！
+      // 坚决执行用户原则：如果跳转的话会赔钱，那就直接自动改售价，变成不赔钱 (上游成本 +15%~20%)！
+      healthyCandidates.sort((a, b) => {
+        const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
+        const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
+        return costA - costB;
+      });
+      bestCandidate = healthyCandidates[0];
+      const bestCandidateCost = bestCandidate.costMultiplier !== undefined ? bestCandidate.costMultiplier : bestCandidate.multiplier;
+
+      // 查找所属业务分组
+      const targetGroup = (currentActive.groupsDetail || []).find(g => (bestCandidate.groupsDetail || []).some(bg => bg.id === g.id))
+        || currentActive.groupsDetail?.[0]
+        || bestCandidate.groupsDetail?.[0];
+
+      if (targetGroup && targetGroup.id) {
+        // 按照上游成本上浮 20% (折合 16.7% 纯毛利率，精确满足用户指定的 15%~20% 区间)
+        const markupRate = 1.20;
+        const newSaleRate = Number((bestCandidateCost * markupRate).toFixed(4));
+        const oldSaleRate = Number((targetGroup.sale_rate || currentActive.saleMultiplier || 1.0).toFixed(4));
+        const spread = Number((newSaleRate - bestCandidateCost).toFixed(4));
+        const marginPercent = Number(((spread / newSaleRate) * 100).toFixed(1));
+
+        console.log(`⚡ [自动改售价] 备选渠道 [${bestCandidate.name}] 成本 (${bestCandidateCost}x) 高于分组 [${targetGroup.name}] 售价 (${oldSaleRate}x)；自动将售价调整为 ${newSaleRate}x (保毛利 +${marginPercent}%)`);
+        updateRemoteGroupSaleRate(targetGroup.id, newSaleRate);
+        syncRealSub2APIAccounts();
+
+        priceAdjusted = true;
+        adjustedGroupInfo = {
+          groupId: targetGroup.id,
+          groupName: targetGroup.name,
+          oldSaleRate,
+          newSaleRate,
+          newMarginPercent: marginPercent,
+          spread
+        };
+      }
+    }
+
+    if (!bestCandidate) {
       continue;
     }
 
-    // 【法则 3：谁便宜谁优先，按照价格来是第一要素！】严格按进货成本由低到高排序
-    targetTier.sort((a, b) => {
-      const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
-      const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
-      return costA - costB;
-    });
-
-    const bestCandidate = targetTier[0];
     const bestCandidateCost = bestCandidate.costMultiplier !== undefined ? bestCandidate.costMultiplier : bestCandidate.multiplier;
+    const isUsingFallback = Number(bestCandidate.priority) <= 1;
 
     let switchDetail = '';
-    if (isUsingFallback) {
-      switchDetail = `⚠️ 极其慎重启用保底：原主调 [${currentActive.name}] (失败率: ${failRate}%) 与全部副调均不可用 -> 底线紧急启用保底通道 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
+    if (priceAdjusted && adjustedGroupInfo) {
+      switchDetail = `【${isOutOfBalance ? '余额断流' : '故障换线'}+自动改售价】原渠道 [${currentActive.name}] ${isOutOfBalance ? '余额已耗尽 ($0.00)' : '发生故障'}，备选渠道 [${bestCandidate.name}] 进货 (${bestCandidateCost}x) > 原售价 (${adjustedGroupInfo.oldSaleRate}x)；已自动将【${adjustedGroupInfo.groupName}】对外售价上调至 ${adjustedGroupInfo.newSaleRate}x (保毛利 +${adjustedGroupInfo.newMarginPercent}%) 并完成切线！`;
+    } else if (isOutOfBalance) {
+      switchDetail = `【余额断流紧急切线】原渠道 [${currentActive.name}] 余额已耗尽 ($0.00) -> 紧急调换至可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
+    } else if (isUsingFallback) {
+      switchDetail = `⚠️ 极其慎重启用保底：原通道 [${currentActive.name}] (失败率: ${failRate}%) 与全部副调均不可用 -> 底线紧急启用保底通道 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
     } else if (isHighFailRate) {
-      switchDetail = `主调失败率超标调换副调：原主调 [${currentActive.name}] 失败率升至 ${failRate}% (≥${failRateThreshold}% 门槛，样本数: ${totalCalls} 次) -> 调换至最便宜可用副调 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
+      switchDetail = `主调失败率超标调换副调：原主调 [${currentActive.name}] 失败率升至 ${failRate}% (≥${failRateThreshold}%) -> 调换至最便宜可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
     } else if (isHardDown) {
-      switchDetail = `主调连续硬故障调换副调：原主调 [${currentActive.name}] 出现连续上游报错 (${totalErr} 次) -> 调换至最便宜可用副调 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
+      switchDetail = `主调连续硬故障调换副调：原主调 [${currentActive.name}] 出现连续上游报错 (${totalErr} 次) -> 调换至最便宜可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
     } else if (isChannelOffline) {
-      switchDetail = `主调离线调换副调：原主调 [${currentActive.name}] 已处于离线状态 -> 调换至最便宜可用副调 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
+      switchDetail = `主调离线调换副调：原主调 [${currentActive.name}] 已处于离线状态 -> 调换至最便宜可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
     } else {
       switchDetail = triggerReason || `按成本第一要素调换至最优副调 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
     }
 
     const switchRes = executeAutoSwitch(currentActive, bestCandidate, switchDetail, {
-      triggerType: isUsingFallback ? 'emergency_fallback' : (isHighFailRate ? 'fail_rate_threshold' : 'hard_down'),
+      triggerType: isOutOfBalance ? 'balance_empty' : (isUsingFallback ? 'emergency_fallback' : (isHighFailRate ? 'fail_rate_threshold' : 'hard_down')),
       oldCost: currentCost,
       newCost: bestCandidateCost,
       oldTtft: activeStab.avgTtftMs,
-      newTtft: bestCandidate.latency || null
+      newTtft: bestCandidate.latency || null,
+      priceAdjusted,
+      ...(adjustedGroupInfo || {})
     });
 
     switchReports.push(switchRes);
@@ -2845,7 +3038,7 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate 
 
   return {
     executed: false,
-    reason: `所有业务主调稳定运行 (失败率均 < ${failRateThreshold}%)，未达切副调门槛，坚决锁定主调力保 Prompt Cache 与低价利润。`,
+    reason: `全站各业务组调度通道稳定运行，未达切线门槛，坚决保持路由力保 Prompt Cache 与毛利。`,
     details: stableDetails
   };
 }
@@ -4311,6 +4504,7 @@ const server = http.createServer(async (req, res) => {
     if (body.minSampleSize !== undefined) autoSwitchConfig.minSampleSize = Math.max(1, Number(body.minSampleSize) || 10);
     if (body.consecutiveFailuresThreshold !== undefined) autoSwitchConfig.consecutiveFailuresThreshold = Math.max(1, Number(body.consecutiveFailuresThreshold) || 5);
     if (body.autoRecoverLowestCost !== undefined) autoSwitchConfig.autoRecoverLowestCost = Boolean(body.autoRecoverLowestCost);
+    if (body.manualLockPolicy) autoSwitchConfig.manualLockPolicy = body.manualLockPolicy;
 
     // 🔒 若开启了单主独占，立即执行一次同步检测与清理，确保同组内无双开副调
     if (autoSwitchConfig.singleActiveExclusive) {
@@ -4353,6 +4547,71 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
+    return;
+  }
+
+  // ====== 📡 上游通道 3 小时自动巡检、差分同步与审批路由 ======
+
+  // 获取扫描器配置、最近报告与待办项
+  if (pathname === '/api/upstream/scanner/status' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      config: upstreamScanner.config,
+      latestReport: upstreamScanner.getLatestReport(),
+      pendingActions: upstreamScanner.getPendingActions(),
+      reports: (upstreamScanner.reports || []).slice(0, 10)
+    }));
+    return;
+  }
+
+  // 手动触发全量扫描
+  if (pathname === '/api/upstream/scanner/trigger' && req.method === 'POST') {
+    upstreamScanner.runScan('Web 控制台手动触发').then(result => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(err => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    });
+    return;
+  }
+
+  // 审批决策处理 (同意 / 拒绝)
+  if (pathname === '/api/upstream/scanner/resolve-action' && req.method === 'POST') {
+    const body = await getBody();
+    const actionId = body.actionId || body.id;
+    const decision = body.decision || 'approve';
+    upstreamScanner.resolveAction(actionId, decision, 'Web 控制台').then(result => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(err => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    });
+    return;
+  }
+
+  // 保存扫描器配置
+  if (pathname === '/api/upstream/scanner/config' && req.method === 'POST') {
+    const body = await getBody();
+    const newConfig = upstreamScanner.saveConfig(body);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      message: '上游巡检配置已更新！',
+      config: newConfig
+    }));
+    return;
+  }
+
+  // 获取巡检历史报告
+  if (pathname === '/api/upstream/scanner/reports' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      reports: upstreamScanner.reports || []
+    }));
     return;
   }
 
@@ -4521,6 +4780,26 @@ if (initialAccounts) {
   }
 }
 
+// 初始化上游通道 3 小时自动扫描巡检引擎
+upstreamScanner.init({
+  getState: () => state,
+  saveState: (newState) => {
+    state = newState;
+    writeJSON(CHANNELS_FILE, state);
+  },
+  execPsql,
+  executeRemoteSQL,
+  invalidateSub2APIScheduler,
+  broadcastSSE,
+  telegram,
+  getUpstreamPanelConfig: () => upstreamPanelConfig,
+  getUpstreamModelsCache: () => upstreamModelsCache,
+  setUpstreamModelsCache: (cache) => {
+    upstreamModelsCache = cache;
+    writeJSON(UPSTREAM_MODELS_CACHE_FILE, upstreamModelsCache);
+  }
+});
+
 // 初始化 Telegram 机器人与移动调度引擎
 telegram.init({
   getState: () => ({
@@ -4544,6 +4823,12 @@ telegram.init({
     broadcastSSE('CHANNELS_UPDATED', state);
     return { success: true };
   },
+  triggerUpstreamScan: async (source) => {
+    return upstreamScanner.runScan(source);
+  },
+  resolveUpstreamAction: async (actionId, decision, operator) => {
+    return upstreamScanner.resolveAction(actionId, decision, operator);
+  },
   verifyPassword: (pwd) => auth.verifyPassword(pwd)
 });
 
@@ -4552,6 +4837,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 中转站上游监控中控台已启动: http://0.0.0.0:${PORT}`);
   console.log(`📡 统一转发入口: http://localhost:${PORT}/v1`);
   console.log(`⏱️ 自动巡检频率: 倍率每 ${state.autoPollIntervalSeconds} 秒 (5分钟) 检测一次，账户余额每 600 秒 (10分钟) 检测一次`);
+  console.log(`📡 上游自动化扫描: 每 ${upstreamScanner.config.intervalHours} 小时自动执行一次差分比对与熔断保护`);
   console.log(`✈️ Telegram Bot 移动端调度: 待机监听中`);
   console.log(`====================================================`);
   startFastSyncWatcher();

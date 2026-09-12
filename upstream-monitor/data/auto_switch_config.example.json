@@ -4,6 +4,7 @@
   "promptCacheLock": true,
   "antiFlappingLock": true,
   "singleActiveExclusive": true,
+  "manualLockPolicy": "failover_allowed",
   "ttftThresholdMs": 30000,
   "failRateThreshold": 50,
   "minSampleSize": 10,
