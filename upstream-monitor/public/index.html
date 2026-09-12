@@ -685,9 +685,27 @@
             <ul style="font-size: 0.78rem; color: #15803d; line-height: 1.5; padding-left: 1.2rem; margin: 0;">
               <li><strong>访问鉴权</strong>：HMAC-SHA256 加密 Token 保护</li>
               <li><strong>防暴力破解</strong>：输错 5 次自动锁定 IP 15 分钟</li>
+              <li><strong>网关防盗刷</strong>：/v1 外部调用强制校验 Gateway-Key</li>
               <li><strong>敏感凭证脱敏</strong>：API Key 与密码绝不明文传输</li>
-              <li><strong>数据库直通保护</strong>：参数化指令调用，杜绝注入</li>
             </ul>
+          </div>
+
+          <!-- 网关调用 API Key 管理模块 -->
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; margin-bottom: 1.25rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <span style="font-size: 0.85rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 5px;">
+                <span>🔑</span> 网关接入密钥 (Gateway Key)
+              </span>
+              <span style="font-size: 0.7rem; background: #e0f2fe; color: #0369a1; padding: 2px 6px; border-radius: 4px; font-weight: 600;">保护 /v1 代理入口</span>
+            </div>
+            <p style="font-size: 0.75rem; color: #64748b; margin-bottom: 8px; line-height: 1.4;">
+              外部客户端（Claude Code CLI、Cursor、Chatbox 等）调用 <code style="background: #e2e8f0; padding: 1px 4px; border-radius: 3px; font-size: 0.72rem;">/v1</code> 时需填入此密钥，防止他人白嫖上游额度。
+            </p>
+            <div style="display: flex; gap: 6px; align-items: center;">
+              <input type="text" id="inputGatewayApiKey" class="form-input" readonly style="font-family: monospace; font-size: 0.8rem; background: #fff; flex: 1; letter-spacing: 0.5px;" value="正在加载密钥..." />
+              <button type="button" id="btnCopyGatewayKey" class="btn btn-secondary" style="white-space: nowrap; font-size: 0.76rem; padding: 0.35rem 0.65rem;">复制</button>
+              <button type="button" id="btnResetGatewayKey" class="btn btn-warning-glass" style="white-space: nowrap; font-size: 0.76rem; padding: 0.35rem 0.65rem;" title="重新随机生成一个全新网关密钥">重置</button>
+            </div>
           </div>
 
           <form id="formChangePassword">

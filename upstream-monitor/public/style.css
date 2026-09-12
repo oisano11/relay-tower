@@ -229,7 +229,7 @@ body {
   align-items: center;
   gap: 0.35rem;
   flex-shrink: 0;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
 }
 
 .gateway-status .mono-code {
@@ -2345,7 +2345,35 @@ body {
 @media (max-width: 860px) {
   .top-nav {
     flex-direction: column;
-    align-items: flex-start;
+    align-items: stretch;
+    padding: 0.65rem 0.85rem;
+    gap: 0.6rem;
+    max-width: 100vw;
+    box-sizing: border-box;
+  }
+  .header-actions {
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .header-actions .btn, .header-actions .gateway-status, .header-actions .poller-badge {
+    flex: 1 1 auto;
+    justify-content: center;
+    font-size: 0.72rem;
+    padding: 0.28rem 0.45rem;
+  }
+  .header-center {
+    width: 100%;
+  }
+  .quick-switcher-badge {
+    width: 100%;
+    justify-content: space-between;
+    box-sizing: border-box;
+  }
+  .quick-switcher-badge .channel-dropdown {
+    flex: 1;
+    min-width: 0;
   }
   .strips-header-bar {
     display: none;
@@ -2355,13 +2383,22 @@ body {
     flex-direction: column;
     align-items: stretch;
     gap: 0.5rem;
-    min-width: 0;
+    min-width: 0 !important;
+    width: 100% !important;
+    box-sizing: border-box;
   }
   .channel-section-header, .vendor-subgroup-header {
-    min-width: 0;
+    min-width: 0 !important;
+    width: 100% !important;
+    box-sizing: border-box;
   }
   .calc-inputs-row {
     flex-direction: column;
+  }
+  .ops-ribbon-bar, .ops-ribbon-group {
+    flex-wrap: wrap;
+    max-width: 100%;
+    box-sizing: border-box;
   }
 }
 

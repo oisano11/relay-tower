@@ -102,15 +102,32 @@ function initAuthConfig() {
       salt,
       secret,
       initialPasswordHint: defaultPassword,
+      gatewayApiKey: process.env.GATEWAY_API_KEY || ('sk-relay-' + crypto.randomBytes(16).toString('hex')),
+      allowLoopbackWithoutKey: true,
       updatedAt: new Date().toISOString()
     };
 
     fs.writeFileSync(AUTH_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
     console.log('----------------------------------------------------');
-    console.log('🔐 [安全中控台] 初始密码已生成:');
+    console.log('🔐 [安全中控台] 初始凭据已生成:');
     console.log(`🔑 管理密码: ${defaultPassword}`);
+    console.log(`📡 网关密钥: ${config.gatewayApiKey}`);
     console.log('📌 请登录后在右上角安全设置中及时修改！');
     console.log('----------------------------------------------------');
+  }
+
+  // 补齐历史配置中可能缺失的网关密钥字段
+  let configChanged = false;
+  if (!config.gatewayApiKey) {
+    config.gatewayApiKey = process.env.GATEWAY_API_KEY || ('sk-relay-' + crypto.randomBytes(16).toString('hex'));
+    configChanged = true;
+  }
+  if (config.allowLoopbackWithoutKey === undefined) {
+    config.allowLoopbackWithoutKey = true;
+    configChanged = true;
+  }
+  if (configChanged) {
+    fs.writeFileSync(AUTH_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
   }
 
   return config;
@@ -312,6 +329,65 @@ function checkRequestAuth(req) {
   return validateToken(token);
 }
 
+// 获取网关 API Key (供客户端调用 /v1/* 代理使用)
+function getGatewayApiKey() {
+  return process.env.GATEWAY_API_KEY || authConfig.gatewayApiKey || '';
+}
+
+// 修改/重置网关 API Key
+function setGatewayApiKey(newKey) {
+  if (!newKey || typeof newKey !== 'string' || newKey.length < 8) {
+    return { success: false, error: '网关 API Key 长度至少需要 8 位' };
+  }
+  authConfig.gatewayApiKey = newKey.trim();
+  authConfig.updatedAt = new Date().toISOString();
+  fs.writeFileSync(AUTH_FILE, JSON.stringify(authConfig, null, 2), { mode: 0o600 });
+  return { success: true, gatewayApiKey: authConfig.gatewayApiKey };
+}
+
+// 检查客户端 IP 是否为本地受信回环地址
+function isLoopbackIp(ip) {
+  if (!ip) return false;
+  return ip === '127.0.0.1' || ip === '::1' || ip === 'localhost' || ip === '::ffff:127.0.0.1';
+}
+
+// 核心：网关代理 (/v1/*) 安全拦截校验
+function verifyGatewayRequest(req) {
+  const clientIp = getClientIp(req);
+
+  // 1. 本地免密直通：若开启了本地回环免密，且来自 127.0.0.1/localhost，直接放行
+  if (authConfig.allowLoopbackWithoutKey !== false && isLoopbackIp(clientIp)) {
+    return { authorized: true, reason: 'loopback', clientIp };
+  }
+
+  // 2. 控制台会话通过：已登录中控台的前端发起的探测与测试请求放行
+  const session = checkRequestAuth(req);
+  if (session) {
+    return { authorized: true, reason: 'session', clientIp };
+  }
+
+  // 3. 校验请求头 Authorization: Bearer <gatewayApiKey>
+  const gatewayKey = getGatewayApiKey();
+  if (gatewayKey && req.headers['authorization']) {
+    const parts = req.headers['authorization'].split(' ');
+    if (parts.length === 2 && parts[0].toLowerCase() === 'bearer') {
+      const token = parts[1].trim();
+      if (token === gatewayKey) {
+        return { authorized: true, reason: 'gateway_key', clientIp };
+      }
+    }
+  }
+
+  // 4. 校验请求头 x-api-key: <gatewayApiKey>
+  if (gatewayKey && req.headers['x-api-key']) {
+    if (req.headers['x-api-key'].trim() === gatewayKey) {
+      return { authorized: true, reason: 'x_api_key', clientIp };
+    }
+  }
+
+  return { authorized: false, reason: 'unauthorized', clientIp };
+}
+
 // 定期清理过期 session
 const sessionCleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -337,5 +413,9 @@ module.exports = {
   destroySession,
   validateToken,
   checkRequestAuth,
-  parseCookies
+  parseCookies,
+  getGatewayApiKey,
+  setGatewayApiKey,
+  isLoopbackIp,
+  verifyGatewayRequest
 };

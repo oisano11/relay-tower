@@ -120,7 +120,9 @@ function readJSON(filePath, defaultValue) {
 
 function writeJSON(filePath, data) {
   try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    const tmpPath = `${filePath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
+    fs.renameSync(tmpPath, filePath);
   } catch (err) {
     console.error(`Error writing ${filePath}:`, err);
   }
@@ -1221,31 +1223,37 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
       return costA - costB;
     });
 
+    const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
+
     profitable.forEach((ch, index) => {
       let role = 'sub';
       let priority = 10;
+      let schedulable = true;
       if (index === 0) {
         // 谁最便宜谁是主调！
         role = 'main';
         priority = 100;
         ch.isActive = true;
+        schedulable = true;
         state.activeChannelId = String(ch.id);
       } else if (index === 1) {
         // 次便宜者为副调！
         role = 'sub';
         priority = 10;
         ch.isActive = false;
+        schedulable = !isSingleActive; // 🔒 Prompt Cache 锁定保护：开启单主独占时副调冷备停调
       } else {
         // 其余备用保障者为保底（保底尤慎重）！
         role = 'fallback';
         priority = 1;
         ch.isActive = false;
+        schedulable = !isSingleActive; // 🔒 Prompt Cache 锁定保护：开启单主独占时保底冷备停调
       }
 
       ch.priority = priority;
-      ch.schedulable = true;
+      ch.schedulable = schedulable;
       assignedRoles[ch.id] = { role, priority, name: ch.name, group: group.name, cost: ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier };
-      updates.push({ accountId: ch.id, priority, schedulable: true });
+      updates.push({ accountId: ch.id, priority, schedulable });
     });
   });
 
@@ -3015,11 +3023,50 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 获取/修改网关 API Key (需已登录)
+  if (pathname === '/api/auth/gateway-key' && req.method === 'GET') {
+    const session = auth.checkRequestAuth(req);
+    if (!session) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized', message: '请先登录中控台' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      gatewayApiKey: auth.getGatewayApiKey()
+    }));
+    return;
+  }
+
+  if (pathname === '/api/auth/gateway-key' && req.method === 'POST') {
+    const session = auth.checkRequestAuth(req);
+    if (!session) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized', message: '请先登录中控台' }));
+      return;
+    }
+    const body = await getBody();
+    const result = auth.setGatewayApiKey(body.gatewayApiKey);
+    if (!result.success) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      gatewayApiKey: result.gatewayApiKey,
+      message: '网关 API Key 更新成功！'
+    }));
+    return;
+  }
+
   // 5. 鉴权校验：未授权访问一律拦截并重定向/返回 401
   const session = auth.checkRequestAuth(req);
   if (!isPublicRoute && !session) {
-    // 页面访问 -> 强制重定向至专属登录页
-    if (pathname === '/' || pathname === '/index.html') {
+    // 页面与敏感脚本访问 -> 强制重定向至专属登录页
+    if (pathname === '/' || pathname === '/index.html' || pathname === '/app.js') {
       res.writeHead(302, { 'Location': '/login.html' });
       res.end();
       return;
@@ -3050,6 +3097,20 @@ const server = http.createServer(async (req, res) => {
 
   // 2. 本地代理转发网关 (/v1/*)
   if (pathname.startsWith('/v1/')) {
+    // 🛡️ 网关代理安全鉴权拦截：杜绝未授权外部访问白嫖上游商业 API
+    const gatewayAuth = auth.verifyGatewayRequest(req);
+    if (!gatewayAuth.authorized) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({
+        error: {
+          message: '未授权调用中转代理网关: 请在请求头中携带合法 Authorization: Bearer <Gateway-Key> 或 x-api-key。管理员可在控制台【安全设置】查看专属网关密钥。',
+          type: 'invalid_request_error',
+          code: 'unauthorized_gateway_access'
+        }
+      }));
+      return;
+    }
+
     const activeChannel = state.channels.find(c => String(c.id) === String(state.activeChannelId)) || state.channels[0];
     
     if (activeChannel && activeChannel.baseUrl && activeChannel.baseUrl.startsWith('http') && activeChannel.apiKey) {
@@ -3078,26 +3139,19 @@ const server = http.createServer(async (req, res) => {
         });
 
         upReq.on('error', (err) => {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          console.error(`[Gateway Proxy Error] 调度上游通道 [${activeChannel.name}] 出现异常:`, err.message);
+          res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({
-            id: 'chatcmpl-fallback-' + Date.now(),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: 'gpt-4o',
-            routed_channel: {
-              id: activeChannel.id,
-              name: activeChannel.name,
-              multiplier: activeChannel.multiplier,
-              base_url: activeChannel.baseUrl
-            },
-            choices: [{
-              index: 0,
-              message: {
-                role: 'assistant',
-                content: `【中转站真实上游通道生效验证】\n当前流量已成功调度至：[${activeChannel.name}]\n所属地址：${activeChannel.baseUrl}\n进货倍率：${activeChannel.multiplier}x`
-              },
-              finish_reason: 'stop'
-            }]
+            error: {
+              message: `上游服务通道 [${activeChannel.name}] 响应失败或网络不可达: ${err.message}`,
+              type: 'upstream_gateway_error',
+              code: 502,
+              channel: {
+                id: activeChannel.id,
+                name: activeChannel.name,
+                multiplier: activeChannel.multiplier
+              }
+            }
           }));
         });
 
@@ -3106,29 +3160,25 @@ const server = http.createServer(async (req, res) => {
         return;
       } catch (e) {
         console.error('Proxy error:', e);
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          error: {
+            message: `网关内部转发异常: ${e.message}`,
+            type: 'internal_gateway_error',
+            code: 500
+          }
+        }));
+        return;
       }
     }
 
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
-      id: 'chatcmpl-sub2api-' + Date.now(),
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: 'gpt-4o',
-      routed_channel: {
-        id: activeChannel ? activeChannel.id : 'unknown',
-        name: activeChannel ? activeChannel.name : '未配置',
-        multiplier: activeChannel ? activeChannel.multiplier : 1.0,
-        base_url: activeChannel ? activeChannel.baseUrl : ''
-      },
-      choices: [{
-        index: 0,
-        message: {
-          role: 'assistant',
-          content: `【中转站真实上游通道生效验证】\n当前流量已成功调度至：[${activeChannel ? activeChannel.name : '未知'}]\n当前进货倍率：${activeChannel ? activeChannel.multiplier : 1.0}x`
-        },
-        finish_reason: 'stop'
-      }]
+      error: {
+        message: '当前网关调度池暂无可用的有效上游通道，请先在中控台配置并开启上游渠道！',
+        type: 'service_unavailable',
+        code: 503
+      }
     }));
     return;
   }

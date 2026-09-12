@@ -2646,8 +2646,63 @@ const btnCancelSecurityModal = document.getElementById('btnCancelSecurityModal')
 const formChangePassword = document.getElementById('formChangePassword');
 const btnLogout = document.getElementById('btnLogout');
 
+// 加载网关 API Key
+async function loadGatewayApiKey() {
+  const input = document.getElementById('inputGatewayApiKey');
+  if (!input) return;
+  try {
+    const res = await fetch('/api/auth/gateway-key');
+    const data = await res.json();
+    if (data.success && data.gatewayApiKey) {
+      input.value = data.gatewayApiKey;
+    } else {
+      input.value = '获取失败';
+    }
+  } catch (e) {
+    input.value = '加载异常';
+  }
+}
+
 btnOpenSecurityModal?.addEventListener('click', () => {
   if (securityModal) securityModal.style.display = 'flex';
+  loadGatewayApiKey();
+});
+
+document.getElementById('btnCopyGatewayKey')?.addEventListener('click', () => {
+  const input = document.getElementById('inputGatewayApiKey');
+  if (!input || !input.value) return;
+  navigator.clipboard.writeText(input.value).then(() => {
+    showToast('网关 API Key 已成功复制到剪贴板！', 'success');
+  }).catch(() => {
+    input.select();
+    document.execCommand('copy');
+    showToast('网关 API Key 已复制！', 'success');
+  });
+});
+
+document.getElementById('btnResetGatewayKey')?.addEventListener('click', async () => {
+  if (!confirm('重置后旧网关密钥将立即失效，所有已配置客户端（如 Cursor、Claude Code）必须更新为此新密钥才能继续接入。确认重置？')) return;
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let rand = '';
+  for (let i = 0; i < 32; i++) rand += chars.charAt(Math.floor(Math.random() * chars.length));
+  const newKey = 'sk-relay-' + rand;
+  try {
+    const res = await fetch('/api/auth/gateway-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gatewayApiKey: newKey })
+    });
+    const data = await res.json();
+    if (data.success) {
+      const input = document.getElementById('inputGatewayApiKey');
+      if (input) input.value = data.gatewayApiKey;
+      showToast('网关 API Key 重置成功！', 'success');
+    } else {
+      showToast(data.error || '重置失败', 'error');
+    }
+  } catch (e) {
+    showToast('重置请求异常: ' + e.message, 'error');
+  }
 });
 
 btnCloseSecurityModal?.addEventListener('click', () => {

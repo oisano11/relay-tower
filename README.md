@@ -71,9 +71,13 @@
 - **物理锁死 Prompt Cache**：确保高频对话与长上下文 AI 编程（Claude Code CLI、Cursor、DeepSeek）每次请求均精确命中同一上游实例缓存，**削减高达 70%+ 的 Token 资费并大幅缩短响应时间**。
 - **原子互斥交接**：切线操作（手动切换或自动熔断）执行原子 SQL 事务，瞬间关停旧主调、激活新主调，切线瞬间零分流冗余。
 
-### 4. ⚡ 零停机智能反向代理网关 (Smart Proxy Gateway)
+### 4. ⚡ 零停机安全智能反向代理网关 (Smart Proxy Gateway)
 - **统一接入终结点**：对外开放统一端口 `http://localhost:3300/v1`。
 - **毫秒级无感切换**：客户端（Claude Code CLI、Cursor、CC Switch、Chatbox、NextChat）配置此端口后，中控台无论如何切换上游，客户端**无需重启、无需修改配置，零停机毫秒级即时生效**。
+- **🛡️ 专属网关密钥鉴权 (Gateway Key)**：外部请求调用 `/v1/*` 强制校验 `Authorization: Bearer <Gateway-Key>` 或 `x-api-key`，杜绝未授权外部访问盗刷上游高价值商业 Token；本地回环 (`127.0.0.1`) 自动放行。密钥可在中控台【安全设置】随时查看、复制与重置。
+- **⚡ 标准 HTTP 502/503 异常透传**：彻底杜绝 Mock 伪造 200 假响应。上游连接失败返回 `502 Bad Gateway`，无可用上游返回 `503 Service Unavailable`，确保客户端自动触发错误重试。
+- **🔒 独家单主 Prompt Cache 排他保护**：即使开启按成本自动准入，系统亦自动保留副调与备用渠道的冷备状态 (`schedulable=false`)，避免多节点轮询导致缓存击穿。
+- **💾 操作系统级原子写盘**：配置持久化采用 `.tmp` + `renameSync` 原子替换，规避高并发和异常关机时的 JSON 文件截断风险。
 - **内置代理分流验证器**：中控台内嵌真实请求测试器，可随时模拟客户端调用，即时核验当前生效通道的分流效果。
 
 ### 5. ✈️ Telegram 机器人离机中控 (Telegram Bot Remote Console)
@@ -224,7 +228,10 @@ node server.js
 
 ## 💻 客户端无缝接入指南
 
-将常用 AI 工具的 Base URL 指向中控台网关 `http://localhost:3300/v1`，即可畅享**单主独占 Prompt Cache 保护**与**零停机热切换**：
+将常用 AI 工具的 Base URL 指向中控台网关 `http://localhost:3300/v1`，即可畅享**单主独占 Prompt Cache 保护**与**零停机热切换**。
+
+> [!TIP]
+> **网关密钥获取**：示例中的 `sk-your-relay-key` 为网关接入密钥（Gateway API Key），可在控制台顶栏【安全设置】弹窗中一键查看、复制或重置。若客户端与服务部署在同一台机器通过 `127.0.0.1` 访问，系统默认免密放行。
 
 ### 1. Claude Code CLI
 ```bash

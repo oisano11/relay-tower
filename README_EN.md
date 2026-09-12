@@ -71,9 +71,13 @@ Developers and operators managing AI model API proxies constantly face critical 
 - **Maximizes Prompt Cache Hit Rate**: Ensures continuous context requests (Claude Code, Cursor, DeepSeek) consistently hit the exact same upstream instance, **slashing prompt token expenses by up to 70%+ while reducing latency**.
 - **Atomic Mutex Handover**: Manual or automated failover performs an atomic SQL transaction, ensuring zero multi-channel overlap during transitions.
 
-### 4. ⚡ Zero-Downtime Smart Reverse Proxy Gateway
+### 4. ⚡ Secure Zero-Downtime Smart Reverse Proxy Gateway
 - **Unified Ingress**: Exposes a unified endpoint at `http://localhost:3300/v1`.
 - **Zero Client Interruption**: Any tool pointing to this address switches upstream providers instantly with **zero downtime and zero configuration changes**.
+- **🛡️ Gateway API Key Authentication**: Calls to `/v1/*` from external clients require a valid `Authorization: Bearer <Gateway-Key>` or `x-api-key` header to prevent unauthorized credit draining. Local loopback (`127.0.0.1`) requests pass seamlessly. The Gateway Key can be viewed, copied, and reset directly in the Security Modal.
+- **⚡ Standardized HTTP 502/503 Errors**: Fully eliminates misleading mock 200 assistant messages. Returns standard `502 Bad Gateway` on upstream failure and `503 Service Unavailable` when no channel is active, properly triggering client retries.
+- **🔒 Exclusive Prompt Cache Affinity**: Auto-qualification by cost preserves the cold-standby status (`schedulable=false`) of secondary routes to prevent cache breakdown across multiple nodes.
+- **💾 OS-Level Atomic File Writes**: Uses `.tmp` + `renameSync` to guarantee zero JSON corruption during concurrent writes or sudden reboots.
 - **Integrated Test Bench**: Verify routing and stream output directly from the web console.
 
 ### 5. ✈️ Telegram Bot Remote Console
@@ -224,7 +228,10 @@ Navigate to `http://localhost:3300`. An initial admin password will be generated
 
 ## 💻 Client Integration Guide
 
-Point your client tools to `http://localhost:3300/v1` to benefit from **Prompt Cache Affinity** and **Zero-Downtime Hot Switching**:
+Point your client tools to `http://localhost:3300/v1` to benefit from **Prompt Cache Affinity** and **Zero-Downtime Hot Switching**.
+
+> [!TIP]
+> **Gateway Key**: In the examples below, `sk-your-relay-key` represents the Gateway API Key. You can view, copy, or reset it anytime in the **Security Center** modal on the top bar. Requests made locally from `127.0.0.1` pass through without requiring a key by default.
 
 ### 1. Claude Code CLI
 ```bash
