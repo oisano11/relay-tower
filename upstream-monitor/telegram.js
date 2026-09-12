@@ -19,6 +19,15 @@ const DEFAULT_CONFIG = {
   proxy: '' // 如 http://127.0.0.1:7890
 };
 
+// 转义 HTML 特殊字符以适配 Telegram HTML 模式
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 class TelegramBotManager {
   constructor() {
     this.config = this.loadConfig();
@@ -886,18 +895,23 @@ class TelegramBotManager {
     const toUsers = toAct.activeUsers15m || 0;
     const toInflight = toAct.inflight || 0;
 
+    const safeFrom = escapeHtml(logEntry.fromName);
+    const safeTo = escapeHtml(logEntry.toName);
+    const safeReason = escapeHtml(logEntry.reason);
+    const safeGroup = escapeHtml(logEntry.groupName || '默认分组');
+
     let message = '';
     if (logEntry.triggerType === 'auto_recover_lowest_cost' || logEntry.priceRestored) {
       message = 
         `🟢 <b>【中转塔台 · 低价主线充值恢复 · 自动切回主调并恢复原价】</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `🔄 <b>切线路由:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
-        `🎯 <b>恢复原因:</b> ${logEntry.reason}\n` +
+        `🔄 <b>切线路由:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
+        `🎯 <b>恢复原因:</b> ${safeReason}\n` +
         `💸 <b>进货成本降本:</b> <code>${logEntry.oldCost}x</code> ➔ <b><code>${logEntry.newCost}x</code></b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         (logEntry.priceRestored ? (
           `📉 <b>【业务分组售价恢复原价】</b>\n` +
-          `• 调整分组: <b>${logEntry.groupName || '默认分组'}</b>\n` +
+          `• 调整分组: <b>${safeGroup}</b>\n` +
           `• 紧急避险价: <code>${logEntry.oldSaleRate}x</code> (避险阶段已结束)\n` +
           `• <b>恢复原售价:</b> <b><code>${logEntry.restoredSaleRate || logEntry.newSaleRate}x</code></b> (让利客户，重塑价格竞争力)\n` +
           `• <b>核算新毛利率:</b> <b>+${logEntry.newMarginPercent}%</b>\n` +
@@ -909,12 +923,12 @@ class TelegramBotManager {
       message = 
         `⚡ <b>【智能熔断切线 & 紧急改售价已生效】</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `🔄 <b>切线路由:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
-        `🎯 <b>触发原因:</b> ${logEntry.reason}\n` +
+        `🔄 <b>切线路由:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
+        `🎯 <b>触发原因:</b> ${safeReason}\n` +
         `💸 <b>进货成本:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `📈 <b>【业务分组售价自动调优保毛利】</b>\n` +
-        `• 调整分组: <b>${logEntry.groupName || '默认分组'}</b>\n` +
+        `• 调整分组: <b>${safeGroup}</b>\n` +
         `• 原销售价: <code>${logEntry.oldSaleRate}x</code> (低于新进货成本，已自动调价防倒贴)\n` +
         `• <b>新销售价:</b> <code>${logEntry.newSaleRate}x</code> (按上游进价 +20% 自动上调)\n` +
         `• <b>核算新毛利率:</b> <b>+${logEntry.newMarginPercent}%</b>\n` +
@@ -925,8 +939,8 @@ class TelegramBotManager {
       message = 
         `⚡ <b>【智能自动熔断切线触发】</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `🔄 <b>切线动作:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
-        `🎯 <b>触发原因:</b> ${logEntry.reason}\n` +
+        `🔄 <b>切线动作:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
+        `🎯 <b>触发原因:</b> ${safeReason}\n` +
         `💸 <b>进货倍率:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
         `👥 <b>新通道当前负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
         `${logEntry.oldTtft ? `⏱️ <b>延迟对比:</b> <code>${logEntry.oldTtft}ms</code> ➔ <code>${logEntry.newTtft || '--'}ms</code>\n` : ''}` +
@@ -1089,23 +1103,54 @@ class TelegramBotManager {
 
   // 发送消息核心方法
   async sendMessage(chatId, text, options = {}) {
-    return this.apiRequest('sendMessage', {
-      chat_id: chatId,
-      text: text,
-      parse_mode: 'HTML',
-      ...options
-    });
+    try {
+      return await this.apiRequest('sendMessage', {
+        chat_id: chatId,
+        text: text,
+        parse_mode: 'HTML',
+        ...options
+      });
+    } catch (err) {
+      if (err.message && (err.message.includes("can't parse entities") || err.message.includes('parse entities') || err.message.includes('Bad Request'))) {
+        console.warn(`[Telegram] HTML解析失败，尝试降级为纯文本重试: ${err.message}`);
+        const plainText = text.replace(/<[^>]+>/g, '');
+        const fallbackOpts = { ...options };
+        delete fallbackOpts.parse_mode;
+        return await this.apiRequest('sendMessage', {
+          chat_id: chatId,
+          text: plainText,
+          ...fallbackOpts
+        });
+      }
+      throw err;
+    }
   }
 
   // 编辑消息核心方法
   async editMessageText(chatId, messageId, text, options = {}) {
-    return this.apiRequest('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text: text,
-      parse_mode: 'HTML',
-      ...options
-    });
+    try {
+      return await this.apiRequest('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: text,
+        parse_mode: 'HTML',
+        ...options
+      });
+    } catch (err) {
+      if (err.message && (err.message.includes("can't parse entities") || err.message.includes('parse entities') || err.message.includes('Bad Request'))) {
+        console.warn(`[Telegram] HTML编辑解析失败，尝试降级为纯文本重试: ${err.message}`);
+        const plainText = text.replace(/<[^>]+>/g, '');
+        const fallbackOpts = { ...options };
+        delete fallbackOpts.parse_mode;
+        return await this.apiRequest('editMessageText', {
+          chat_id: chatId,
+          message_id: messageId,
+          text: plainText,
+          ...fallbackOpts
+        });
+      }
+      throw err;
+    }
   }
 
   // 回应内联按钮点击 (弹 Toast)
