@@ -200,11 +200,12 @@ class TelegramBotManager {
     }
   }
 
-  // 校验权限
-  isAdmin(chatId) {
-    if (!chatId) return false;
-    const strId = String(chatId);
-    return Array.isArray(this.config.adminChatIds) && this.config.adminChatIds.includes(strId);
+  // 校验权限（兼容类型转换与前后空格）
+  isAdmin(id) {
+    if (!id) return false;
+    const strId = String(id).trim();
+    if (!Array.isArray(this.config.adminChatIds)) return false;
+    return this.config.adminChatIds.some(adminId => String(adminId).trim() === strId);
   }
 
   // 更新处理主入口
@@ -220,19 +221,26 @@ class TelegramBotManager {
   async handleMessage(msg) {
     if (!msg || !msg.text) return;
     const chatId = msg.chat.id;
+    const fromId = msg.from ? msg.from.id : chatId;
     const text = msg.text.trim();
     const strChatId = String(chatId);
+    const strFromId = String(fromId);
+
+    console.log(`[Telegram] 收到消息 - ChatID: ${strChatId}, FromID: ${strFromId}, 用户: @${msg.from?.username || '无'}, 内容: "${text}"`);
 
     // 1. 管理员自动绑定逻辑 (首次无管理员时，发任意消息或 /start 即可直接绑定)
     if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) {
       this.config.adminChatIds = [strChatId];
+      if (strFromId !== strChatId && !this.config.adminChatIds.includes(strFromId)) {
+        this.config.adminChatIds.push(strFromId);
+      }
       this.saveConfig(this.config);
-      console.log(`🎉 [Telegram] 已自动将 Chat ID ${strChatId} 绑定为超级管理员！`);
+      console.log(`🎉 [Telegram] 已自动将 Chat ID ${strChatId} / ${strFromId} 绑定为超级管理员！`);
       await this.sendMessage(chatId, 
         `🎉 <b>恭喜！您已成功绑定为中控台超级管理员！</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `👤 管理员: <b>${msg.from.first_name || '用户'}</b> (@${msg.from.username || '无用户名'})\n` +
-        `🆔 Chat ID: <code>${strChatId}</code>\n` +
+        `👤 管理员: <b>${msg.from?.first_name || '用户'}</b> (@${msg.from?.username || '无用户名'})\n` +
+        `🆔 Chat ID: <code>${strChatId}</code>` + (strFromId !== strChatId ? ` (User ID: <code>${strFromId}</code>)` : '') + `\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `现在您可以随时接收上游变价推送，并直接在手机端点击按钮进行切线调度！\n` +
         `👇 发送 /help 或点击下方菜单开始使用。`,
@@ -248,26 +256,77 @@ class TelegramBotManager {
       return;
     }
 
-    // 2. 权限校验
-    if (!this.isAdmin(chatId)) {
-      // 允许输入 /bind 尝试绑定
-      if (text.startsWith('/bind')) {
-        await this.sendMessage(chatId, 
-          `🔒 <b>中控台权限锁定</b>\n` +
-          `当前系统已存在指定管理员。您的 Chat ID 是：<code>${strChatId}</code>\n` +
-          `请联系现有管理员在中控台 Web 界面中将此 Chat ID 加入白名单。`
-        );
-      } else {
-        await this.sendMessage(chatId, 
-          `⛔ <b>未授权访问</b>\n` +
-          `抱歉，您的 Telegram 账号未在中控台授权列表中。\n` +
-          `您的 Chat ID 为: <code>${strChatId}</code>`
-        );
+    // 2. 动态快捷认证绑定指令：/bind <管理密码>
+    if (text.startsWith('/bind')) {
+      const parts = text.split(/\s+/);
+      if (parts.length > 1) {
+        const inputPwd = parts.slice(1).join(' ').trim();
+        const verifyFn = this.context.verifyPassword;
+        if (typeof verifyFn === 'function' && verifyFn(inputPwd)) {
+          // 密码正确！授权绑定当前 Chat ID 与 From ID
+          let added = false;
+          if (!this.isAdmin(strChatId)) {
+            this.config.adminChatIds.push(strChatId);
+            added = true;
+          }
+          if (strFromId && !this.isAdmin(strFromId)) {
+            this.config.adminChatIds.push(strFromId);
+            added = true;
+          }
+          if (added) {
+            this.saveConfig(this.config);
+          }
+          console.log(`🎉 [Telegram] 密码核验成功！已授权管理员: Chat ID ${strChatId} (From ID: ${strFromId})`);
+          await this.sendMessage(chatId,
+            `🎉 <b>管理员密码核验成功！</b>\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `👤 用户: <b>${msg.from?.first_name || '管理员'}</b> (@${msg.from?.username || '无'})\n` +
+            `🆔 已授权 ID: <code>${strChatId}</code>` + (strFromId !== strChatId ? ` / <code>${strFromId}</code>` : '') + `\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `您已成功获得中控台最高调度权限！可随时点击下方快捷按钮或发送 /status、/switch 等指令。`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '📊 查看大盘状态', callback_data: 'cmd:status' }, { text: '🔀 一键切换线路', callback_data: 'cmd:switch' }],
+                  [{ text: '⚡ 自动切线设置', callback_data: 'cmd:auto' }, { text: '🔍 立即全网测速', callback_data: 'cmd:check' }]
+                ]
+              }
+            }
+          );
+          return;
+        } else {
+          console.warn(`⚠️ [Telegram] 用户尝试绑定失败：管理密码不匹配 (Chat: ${strChatId}, From: ${strFromId})`);
+          await this.sendMessage(chatId,
+            `❌ <b>管理密码错误</b>\n` +
+            `输入的管理密码验证失败，无法完成授权。\n\n` +
+            `💡 请核对中控台 Web 管理员密码后重新发送：\n` +
+            `<code>/bind &lt;中控台管理密码&gt;</code>`
+          );
+          return;
+        }
       }
+    }
+
+    // 3. 权限校验（既支持个人私聊 Chat ID，也支持群组会话中的个人 From ID）
+    const isAuthorized = this.isAdmin(chatId) || this.isAdmin(fromId);
+    if (!isAuthorized) {
+      console.warn(`🔒 [Telegram] 拦截未授权指令 - ChatID: ${strChatId}, FromID: ${strFromId}, 指令: "${text}"`);
+      await this.sendMessage(chatId, 
+        `🔒 <b>中控台权限未授权</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `您的 Telegram ID: <code>${strChatId}</code>` + (strFromId !== strChatId ? ` (个人 ID: <code>${strFromId}</code>)` : '') + `\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `💡 <b>如何快速获得调度权限：</b>\n\n` +
+        `<b>方式一（推荐·手机直接绑定）</b>：\n` +
+        `直接向本机器人发送中控台管理密码完成一键绑定：\n` +
+        `<code>/bind &lt;中控台管理密码&gt;</code>\n\n` +
+        `<b>方式二（Web 控制台添加）</b>：\n` +
+        `登录中控台网页，在顶栏点击【✈️ Telegram 设置】，将上方 ID 填入「管理员 Chat ID」列表保存。`
+      );
       return;
     }
 
-    // 3. 指令路由
+    // 4. 指令路由
     const cmd = text.split(' ')[0].toLowerCase();
 
     if (cmd === '/start' || cmd === '/help') {
@@ -300,11 +359,20 @@ class TelegramBotManager {
   // Inline 按钮点击交互 (Callback Query)
   async handleCallbackQuery(query) {
     const chatId = query.message?.chat?.id;
+    const fromId = query.from?.id;
     const data = query.data;
     const queryId = query.id;
 
-    if (!this.isAdmin(chatId)) {
-      await this.answerCallbackQuery(queryId, { text: '⛔ 权限不足，无法操作', show_alert: true });
+    console.log(`[Telegram] 按钮点击 - ChatID: ${chatId}, FromID: ${fromId}, 用户: @${query.from?.username || '无'}, Action: "${data}"`);
+
+    // 既校验 message.chat.id，也校验点击按钮的操作者 from.id（支持群组与私聊）
+    const isAuthorized = this.isAdmin(chatId) || this.isAdmin(fromId);
+
+    if (!isAuthorized) {
+      await this.answerCallbackQuery(queryId, { 
+        text: `⛔ 权限不足：您的 Telegram ID (${fromId || chatId}) 未获授权。\n请向机器人发送: /bind <密码> 绑定`, 
+        show_alert: true 
+      });
       return;
     }
 

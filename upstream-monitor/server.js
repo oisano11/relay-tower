@@ -4435,7 +4435,8 @@ telegram.init({
     syncRealSub2APIAccounts();
     broadcastSSE('CHANNELS_UPDATED', state);
     return { success: true };
-  }
+  },
+  verifyPassword: (pwd) => auth.verifyPassword(pwd)
 });
 
 server.listen(PORT, '0.0.0.0', () => {
