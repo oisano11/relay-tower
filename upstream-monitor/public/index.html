@@ -682,11 +682,14 @@
           </p>
 
           <!-- 1. 新建分组栏 -->
-          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 7px; padding: 0.65rem 0.85rem; margin: 0.5rem 0 0.8rem 0;">
-            <div style="font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.35rem; display: flex; align-items: center; gap: 0.35rem;">
-              <span>➕ 新建业务销售分组</span>
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 7px; padding: 0.75rem 0.85rem; margin: 0.5rem 0 0.8rem 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.45rem;">
+              <div style="font-size: 0.82rem; font-weight: 600; color: #334155; display: flex; align-items: center; gap: 0.35rem;">
+                <span>➕ 新建业务销售分组</span>
+              </div>
+              <span style="font-size: 0.72rem; color: #64748b;">支持直接绑定通道，系统自动以最便宜健康通道为主调</span>
             </div>
-            <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <div style="display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.55rem;">
               <input type="text" id="inputNewGroupName" placeholder="分组名称 (如: DeepSeek 0.4 / Claude极速 1.1)" class="form-input" style="flex: 2; font-size: 0.82rem;" />
               <div style="display: flex; align-items: center; gap: 0.25rem; flex: 1.2;">
                 <span style="font-size: 0.78rem; color: #64748b;">对外倍率:</span>
@@ -694,8 +697,23 @@
                 <span style="font-size: 0.78rem; color: #64748b;">x</span>
               </div>
               <button id="btnCreateNewGroup" class="btn btn-primary" style="font-size: 0.8rem; padding: 0.35rem 0.8rem; white-space: nowrap;">
-                ➕ 确认创建
+                ➕ 确认创建分组
               </button>
+            </div>
+            <!-- 通道直接绑定勾选区 -->
+            <div style="border-top: 1px dashed #cbd5e1; padding-top: 0.45rem; margin-top: 0.2rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
+                <span style="font-size: 0.75rem; font-weight: 600; color: #475569;">
+                  📦 放入该分组的初始通道 (可多选，选中的通道将直接归入该销售分组)：
+                </span>
+                <div style="display: flex; gap: 0.35rem;">
+                  <button type="button" id="btnSelectAllNewGroupChs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选</button>
+                  <button type="button" id="btnClearAllNewGroupChs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">清空</button>
+                </div>
+              </div>
+              <div id="newGroupChannelsContainer" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 0.4rem; max-height: 140px; overflow-y: auto; background: #ffffff; padding: 0.45rem; border-radius: 6px; border: 1px solid #e2e8f0;">
+                <!-- 由 app.js 动态渲染可用通道列表 -->
+              </div>
             </div>
           </div>
 
