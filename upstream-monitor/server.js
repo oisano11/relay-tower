@@ -1016,7 +1016,7 @@ function selectPrimaryGroup(groupsDetail) {
 // 获取 Sub2API 系统的所有分组与销售倍率
 function fetchAllSub2APIGroups() {
   try {
-    const sql = `SELECT json_agg(g) FROM (SELECT id, name, rate_multiplier::float as sale_rate FROM groups WHERE deleted_at IS NULL AND is_exclusive = false ORDER BY id ASC) g;`;
+    const sql = `SELECT json_agg(g) FROM (SELECT id, name, rate_multiplier::float as sale_rate FROM groups WHERE deleted_at IS NULL ORDER BY id ASC) g;`;
     const output = execPsql(sql, true).trim();
     if (!output || !output.startsWith('[')) return [];
     return JSON.parse(output);
@@ -1026,7 +1026,7 @@ function fetchAllSub2APIGroups() {
   }
 }
 
-// 从 Sub2API 远端数据库拉取 10 个真实上游及完整销售分组关联
+// 从 Sub2API 远端数据库拉取真实上游及完整销售分组关联
 function syncRealSub2APIAccounts() {
   try {
     const sql = `
@@ -1052,13 +1052,13 @@ SELECT json_agg(t) FROM (
     COALESCE(
       (SELECT json_agg(json_build_object('id', g.id, 'name', g.name, 'sale_rate', g.rate_multiplier::float))
        FROM account_groups ag JOIN groups g ON ag.group_id = g.id 
-       WHERE ag.account_id = accounts.id AND g.deleted_at IS NULL AND g.is_exclusive = false),
+       WHERE ag.account_id = accounts.id AND g.deleted_at IS NULL),
       '[]'::json
     ) as groups_detail,
     COALESCE(
       (SELECT json_agg(g.name) 
        FROM account_groups ag JOIN groups g ON ag.group_id = g.id 
-       WHERE ag.account_id = accounts.id AND g.deleted_at IS NULL AND g.is_exclusive = false),
+       WHERE ag.account_id = accounts.id AND g.deleted_at IS NULL),
       '[]'::json
     ) as groups
   FROM accounts 
@@ -1069,11 +1069,8 @@ SELECT json_agg(t) FROM (
     const output = execPsql(sql, true).trim();
     if (!output || !output.startsWith('[')) return null;
     const allAccountsRaw = JSON.parse(output);
-    // 过滤掉纯私人专属账号（没有绑定任何对外商业分组的账号），保障私人专属组与专属渠道不参与公开统计与自动编排
-    const realAccounts = allAccountsRaw.filter(acc => {
-      const gDetail = acc.groups_detail || [];
-      return gDetail.length > 0;
-    });
+    // 保留所有未删除的真实上游账号（包含暂未分配分组的独立通道，便于在控制台统一查看与指派分组）
+    const realAccounts = allAccountsRaw;
     const allGroups = fetchAllSub2APIGroups();
     state.allGroups = allGroups;
 
@@ -1838,7 +1835,7 @@ function fetchGroupsWithAccountDetails() {
             '[]'::json
           ) as accounts
         FROM groups g
-        WHERE g.deleted_at IS NULL AND g.is_exclusive = false
+        WHERE g.deleted_at IS NULL
         ORDER BY g.id ASC
       ) t;
     `;
