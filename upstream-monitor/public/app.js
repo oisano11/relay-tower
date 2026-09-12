@@ -2746,6 +2746,12 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnClearAllNewGroupChs')?.addEventListener('click', () => {
     document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = false);
   });
+  document.getElementById('btnRefreshAllGroupsList')?.addEventListener('click', async () => {
+    try {
+      renderNewGroupChannelSelector();
+    } catch (e) {}
+    await loadAllGroupsDetails();
+  });
 
   // 点击背景关闭分组弹窗
   document.getElementById('channelGroupsModal')?.addEventListener('click', (e) => {
@@ -2854,18 +2860,23 @@ let cachedGroupsDetailsData = [];
 
 async function openAllGroupsModal() {
   document.getElementById('allGroupsModal').classList.add('open');
-  renderNewGroupChannelSelector();
+  try {
+    renderNewGroupChannelSelector();
+  } catch (e) {
+    console.error('renderNewGroupChannelSelector error:', e);
+  }
   await loadAllGroupsDetails();
 }
 
 function renderNewGroupChannelSelector() {
   const container = document.getElementById('newGroupChannelsContainer');
   if (!container) return;
-  if (!currentChannels || currentChannels.length === 0) {
+  const list = (typeof channelsData !== 'undefined' && Array.isArray(channelsData)) ? channelsData : [];
+  if (!list || list.length === 0) {
     container.innerHTML = `<span style="color: #94a3b8; font-size: 0.75rem; grid-column: 1/-1;">暂无通道数据</span>`;
     return;
   }
-  container.innerHTML = currentChannels.map(c => {
+  container.innerHTML = list.map(c => {
     const cost = formatRate(c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier);
     const bal = c.balance !== null && c.balance !== undefined ? `$${Number(c.balance).toFixed(2)}` : '未同步';
     const isOut = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
@@ -2986,6 +2997,9 @@ async function createNewGroup() {
     if (nameInput) nameInput.value = '';
     document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = false);
     await loadChannels();
+    try {
+      renderNewGroupChannelSelector();
+    } catch (e) {}
     await loadAllGroupsDetails();
   } catch (e) {
     showToast(e.message, 'error');
@@ -3032,6 +3046,9 @@ async function handleDeleteGroup(groupId, groupName) {
 
     showToast(data.message || `分组 [${groupName}] 已删除！`, 'success');
     await loadChannels();
+    try {
+      renderNewGroupChannelSelector();
+    } catch (e) {}
     await loadAllGroupsDetails();
   } catch (e) {
     showToast(e.message, 'error');

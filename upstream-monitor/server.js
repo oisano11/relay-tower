@@ -3334,21 +3334,21 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate 
         executeRemoteSQL(`UPDATE accounts SET schedulable = false, priority = LEAST(priority, 10) WHERE id = ${currentActive.id};`);
         invalidateSub2APIScheduler([currentActive.id]);
         writeJSON(CHANNELS_FILE, state);
-      }
 
-      console.warn(`[自动切线引擎] 业务分组【${targetGroup.name}】原通道 [${currentActive ? currentActive.name : '无'}] 欠费/不可用，且组内无可用备用通道，已触发全组熔断！`);
-      
-      const fuseAlert = {
-        id: 'alt_fuse_' + targetGroup.id + '_' + Date.now(),
-        channelId: String(targetGroup.id),
-        channelName: targetGroup.name,
-        type: 'group_fused',
-        timestamp: new Date().toISOString(),
-        note: `【业务组断流熔断】业务销售分组 [${targetGroup.name}] 所有通道均已欠费或不可用，且无健康备用通道，已熔断关停！请立即充值或添加新渠道！`
-      };
-      alerts.unshift(fuseAlert);
-      writeJSON(ALERTS_FILE, alerts);
-      broadcastSSE('CHANNELS_UPDATED', state);
+        console.warn(`[自动切线引擎] 业务分组【${targetGroup.name}】原通道 [${currentActive ? currentActive.name : '无'}] 欠费/不可用，且组内无可用备用通道，已触发全组熔断！`);
+        
+        const fuseAlert = {
+          id: 'alt_fuse_' + targetGroup.id + '_' + Date.now(),
+          channelId: String(targetGroup.id),
+          channelName: targetGroup.name,
+          type: 'group_fused',
+          timestamp: new Date().toISOString(),
+          note: `【业务组断流熔断】业务销售分组 [${targetGroup.name}] 所有通道均已欠费或不可用，且无健康备用通道，已熔断关停！请立即充值或添加新渠道！`
+        };
+        alerts.unshift(fuseAlert);
+        writeJSON(ALERTS_FILE, alerts);
+        broadcastSSE('CHANNELS_UPDATED', state);
+      }
       continue;
     }
 
@@ -4044,7 +4044,10 @@ const server = http.createServer(async (req, res) => {
 
   // 获取所有分组及各分组挂载的渠道详情
   if (pathname === '/api/groups/details' && req.method === 'GET') {
-    const details = getGroupsWithAccountDetailsMemory();
+    let details = getGroupsWithAccountDetailsMemory();
+    if (!details || details.length === 0) {
+      details = fetchGroupsWithAccountDetails();
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(details));
     return;
