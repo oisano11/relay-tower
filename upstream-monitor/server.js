@@ -162,7 +162,8 @@ let autoSwitchConfig = readJSON(AUTO_SWITCH_CONFIG_FILE, {
   consecutiveFailuresThreshold: 5, // 连续硬故障阈值
   strategy: 'cost_first', // 'cost_first' | 'speed_first'
   cooldownMinutes: 10,
-  autoRecoverLowestCost: false,
+  autoRecoverLowestCost: true,
+  originalGroupSaleRates: {},
   lastSwitchTime: null,
   lastSwitchReason: null
 });
@@ -2881,6 +2882,136 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate 
     const isProviderFailing = isHighFailRate || isHardDown;
 
     if (!isProviderFailing && !isChannelOffline && !isOutOfBalance) {
+      // 🌟【核心闭环：低成本优质主线充值/健康恢复，自动回切并降回原售价 (Auto-Failback)】
+      const autoRecover = autoSwitchConfig.autoRecoverLowestCost !== false;
+      const currentGroupId = currentActive.primaryGroupId;
+      const currentCost = currentActive.costMultiplier !== undefined ? currentActive.costMultiplier : currentActive.multiplier;
+
+      if (autoRecover && currentGroupId) {
+        const groupCandidates = state.channels.filter(c => {
+          if (String(c.id) === String(currentActive.id)) return false;
+          const sameGroup = (c.groupsDetail && c.groupsDetail.some(g => g.id === currentGroupId)) ||
+                            (c.primaryGroupId && c.primaryGroupId === currentGroupId);
+          return sameGroup;
+        });
+
+        // 查找同组内比当前通道更便宜、且已充值恢复健康的低价渠道
+        const cheaperHealthyRecovered = groupCandidates.filter(c => {
+          if (c.status === 'offline') return false;
+          // 余额健康充裕 (有余额且 >= $1.0，或状态为 ok 且不为空)
+          const candOutOfBalance = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
+          if (candOutOfBalance) return false;
+          const hasAdequateBalance = (c.balanceStatus === 'ok') || (c.balance !== null && c.balance !== undefined && Number(c.balance) >= 1.0);
+          if (!hasAdequateBalance) return false;
+
+          const cost = c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier;
+          // 成本至少便宜 0.005x 以上 (有切实降本意义)
+          if (cost >= currentCost - 0.005) return false;
+
+          // 健康度检查：无连续硬报错，失败率低于阈值
+          const s = getChannelStabilitySummary(c.id, stabilityMap);
+          const sCalls = s.totalCalls || 0;
+          const sErr = s.totalErr || 0;
+          const sFailRate = sCalls > 0 ? (sErr / sCalls) * 100 : 0;
+          if (s.faultOwner === 'provider' && (sErr >= consecutiveFailuresThreshold || (sCalls >= minSampleSize && sFailRate >= failRateThreshold))) {
+            return false;
+          }
+          return true;
+        });
+
+        if (cheaperHealthyRecovered.length > 0) {
+          // 按进货成本升序排序，选最便宜的优质通道
+          cheaperHealthyRecovered.sort((a, b) => {
+            const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
+            const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
+            return costA - costB;
+          });
+          const bestRecoverCandidate = cheaperHealthyRecovered[0];
+          const bestRecoverCost = bestRecoverCandidate.costMultiplier !== undefined ? bestRecoverCandidate.costMultiplier : bestRecoverCandidate.multiplier;
+
+          // 防频繁横跳抖动保护 (非强制评估下检查冷静期)
+          let inRecoverCooldown = false;
+          if (!forceEvaluate && autoSwitchConfig.lastSwitchTime) {
+            const lastSwitch = new Date(autoSwitchConfig.lastSwitchTime).getTime();
+            if (now - lastSwitch < cooldownMs) {
+              inRecoverCooldown = true;
+            }
+          }
+
+          if (inRecoverCooldown) {
+            stableDetails.push(`[${currentActive.name}]: 运行稳定。已发现更优低价恢复渠道 [${bestRecoverCandidate.name}] (进价: ${bestRecoverCost}x < 当前 ${currentCost}x)，处于防颠簸冷静期中，暂缓回切。`);
+            continue;
+          }
+
+          // 自动回退售价处理
+          let priceRestored = false;
+          let restoredGroupInfo = null;
+          const targetGroup = (currentActive.groupsDetail || []).find(g => g.id === currentGroupId) || (state.allGroups || []).find(g => g.id === currentGroupId);
+
+          if (targetGroup && targetGroup.id) {
+            const savedOriginalRate = autoSwitchConfig.originalGroupSaleRates?.[targetGroup.id];
+            const currentSaleRate = Number((targetGroup.sale_rate || currentActive.saleMultiplier || 1.0).toFixed(4));
+
+            let targetRestoredRate = null;
+            if (savedOriginalRate && savedOriginalRate >= bestRecoverCost) {
+              // 完美匹配记忆的原始常态售价
+              targetRestoredRate = Number(Number(savedOriginalRate).toFixed(4));
+            } else if (currentSaleRate > bestRecoverCost * 1.25) {
+              // 若之前没有存过或存的值过低，按低成本加成 20% 自动回调，把暴利/避险溢价还给客户
+              targetRestoredRate = Number((bestRecoverCost * 1.20).toFixed(4));
+            }
+
+            if (targetRestoredRate && targetRestoredRate < currentSaleRate) {
+              const spread = Number((targetRestoredRate - bestRecoverCost).toFixed(4));
+              const marginPercent = Number(((spread / targetRestoredRate) * 100).toFixed(1));
+
+              console.log(`🟢 [自动恢复原价] 低价优质主线 [${bestRecoverCandidate.name}] 充值恢复 (进价: ${bestRecoverCost}x)；业务分组 [${targetGroup.name}] 售价自动从 ${currentSaleRate}x 回调至 ${targetRestoredRate}x (毛利率 +${marginPercent}%)`);
+              updateRemoteGroupSaleRate(targetGroup.id, targetRestoredRate);
+              syncRealSub2APIAccounts();
+
+              if (autoSwitchConfig.originalGroupSaleRates && autoSwitchConfig.originalGroupSaleRates[targetGroup.id]) {
+                delete autoSwitchConfig.originalGroupSaleRates[targetGroup.id];
+                writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
+              }
+
+              priceRestored = true;
+              restoredGroupInfo = {
+                groupId: targetGroup.id,
+                groupName: targetGroup.name,
+                oldSaleRate: currentSaleRate,
+                restoredSaleRate: targetRestoredRate,
+                newMarginPercent: marginPercent,
+                spread
+              };
+            }
+          }
+
+          const recoverReason = priceRestored && restoredGroupInfo
+            ? `【低价主线充值恢复+恢复原价】原优质主调 [${bestRecoverCandidate.name}] 余额已恢复充裕 (进价: ${bestRecoverCost}x < 当前 ${currentCost}x)，已自动回切为主调，并将【${restoredGroupInfo.groupName}】对外售价从 ${restoredGroupInfo.oldSaleRate}x 回调至 ${restoredGroupInfo.restoredSaleRate}x (新毛利率: +${restoredGroupInfo.newMarginPercent}%)！`
+            : `【低价主线充值恢复】原优质主调 [${bestRecoverCandidate.name}] 余额已恢复充裕 (进价: ${bestRecoverCost}x < 当前 ${currentCost}x)，自动回切为主调降本增效！`;
+
+          const switchRes = executeAutoSwitch(currentActive, bestRecoverCandidate, recoverReason, {
+            triggerType: 'auto_recover_lowest_cost',
+            oldCost: currentCost,
+            newCost: bestRecoverCost,
+            oldTtft: activeStab.avgTtftMs,
+            newTtft: bestRecoverCandidate.latency || null,
+            priceRestored,
+            ...(restoredGroupInfo || {})
+          });
+
+          return {
+            executed: true,
+            trigger: 'auto_recover_lowest_cost',
+            from: currentActive.name,
+            to: bestRecoverCandidate.name,
+            reason: recoverReason,
+            priceRestored,
+            details: [recoverReason]
+          };
+        }
+      }
+
       stableDetails.push(`[${currentActive.name}]: 运行稳定 (余额充足, 失败率 ${failRate}% < ${failRateThreshold}%, 样本数 ${totalCalls}/${minSampleSize})`);
       continue;
     }
@@ -2978,6 +3109,13 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate 
         const oldSaleRate = Number((targetGroup.sale_rate || currentActive.saleMultiplier || 1.0).toFixed(4));
         const spread = Number((newSaleRate - bestCandidateCost).toFixed(4));
         const marginPercent = Number(((spread / newSaleRate) * 100).toFixed(1));
+
+        // 🌟 记忆原始基准售价，以便低价通道充值恢复后精准自动降回原价
+        if (!autoSwitchConfig.originalGroupSaleRates) autoSwitchConfig.originalGroupSaleRates = {};
+        if (!autoSwitchConfig.originalGroupSaleRates[targetGroup.id]) {
+          autoSwitchConfig.originalGroupSaleRates[targetGroup.id] = oldSaleRate;
+          writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
+        }
 
         console.log(`⚡ [自动改售价] 备选渠道 [${bestCandidate.name}] 成本 (${bestCandidateCost}x) 高于分组 [${targetGroup.name}] 售价 (${oldSaleRate}x)；自动将售价调整为 ${newSaleRate}x (保毛利 +${marginPercent}%)`);
         updateRemoteGroupSaleRate(targetGroup.id, newSaleRate);
