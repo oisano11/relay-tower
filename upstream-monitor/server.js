@@ -1927,6 +1927,76 @@ function getChannelStabilitySummary(channelId, channelMap) {
   };
 }
 
+// ====== 🚀 网关实时流量、并发与用户负载追踪器 ======
+const gatewayTrafficTracker = {
+  // channelId -> { inflight: 0, calls15m: [], calls24h: 0, clients15m: Map<clientKey, timestamp> }
+  channels: new Map(),
+
+  recordRequestStart(channelId, clientKey = 'anonymous') {
+    const cid = String(channelId);
+    let record = this.channels.get(cid);
+    if (!record) {
+      record = { inflight: 0, calls15m: [], calls24h: 0, clients15m: new Map() };
+      this.channels.set(cid, record);
+    }
+    record.inflight = Math.max(0, (record.inflight || 0) + 1);
+    const now = Date.now();
+    record.calls15m.push(now);
+    record.calls24h = (record.calls24h || 0) + 1;
+    record.clients15m.set(clientKey, now);
+
+    return () => {
+      record.inflight = Math.max(0, (record.inflight || 0) - 1);
+    };
+  },
+
+  cleanup() {
+    const now = Date.now();
+    const threshold15m = now - 15 * 60 * 1000;
+    for (const record of this.channels.values()) {
+      record.calls15m = record.calls15m.filter(t => t >= threshold15m);
+      for (const [key, ts] of record.clients15m.entries()) {
+        if (ts < threshold15m) {
+          record.clients15m.delete(key);
+        }
+      }
+    }
+  },
+
+  getChannelStats(channelId) {
+    this.cleanup();
+    const record = this.channels.get(String(channelId));
+    if (!record) {
+      return { inflight: 0, activeUsers15m: 0, calls15m: 0, calls24h: 0 };
+    }
+    return {
+      inflight: record.inflight || 0,
+      activeUsers15m: record.clients15m.size,
+      calls15m: record.calls15m.length,
+      calls24h: record.calls24h || 0
+    };
+  },
+
+  getGlobalStats() {
+    this.cleanup();
+    let totalInflight = 0;
+    let totalCalls24h = 0;
+    const globalClients15m = new Set();
+    for (const record of this.channels.values()) {
+      totalInflight += record.inflight || 0;
+      totalCalls24h += record.calls24h || 0;
+      for (const key of record.clients15m.keys()) {
+        globalClients15m.add(key);
+      }
+    }
+    return {
+      totalInflight,
+      totalCalls24h,
+      totalOnline15m: globalClients15m.size
+    };
+  }
+};
+
 // ====== 👥 渠道实时使用用户与今日活跃用户指标统计 ======
 
 let cachedUserActivity = null;
@@ -2000,28 +2070,35 @@ let lastGlobalUserStatsFetch = 0;
 
 function fetchGlobalUserStats(forceRefresh = false) {
   const now = Date.now();
-  if (!forceRefresh && cachedGlobalUserStats && (now - lastGlobalUserStatsFetch < 20000)) {
-    return cachedGlobalUserStats;
-  }
-  try {
-    const sql = `
+  let dbStats = cachedGlobalUserStats;
+  if (forceRefresh || !cachedGlobalUserStats || (now - lastGlobalUserStatsFetch >= 20000)) {
+    try {
+      const sql = `
 SELECT json_build_object(
   'totalOnline15m', COUNT(DISTINCT user_id) FILTER (WHERE created_at >= NOW() - INTERVAL '15 minutes'),
   'totalUsers24h', COUNT(DISTINCT user_id) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours'),
   'totalCalls24h', COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')
 ) FROM usage_logs WHERE created_at >= NOW() - INTERVAL '24 hours';
-    `;
-    const output = execPsql(sql, true).trim();
-    if (output && output.startsWith('{')) {
-      cachedGlobalUserStats = JSON.parse(output);
-      lastGlobalUserStatsFetch = now;
-      return cachedGlobalUserStats;
+      `;
+      const output = execPsql(sql, true).trim();
+      if (output && output.startsWith('{')) {
+        cachedGlobalUserStats = JSON.parse(output);
+        lastGlobalUserStatsFetch = now;
+        dbStats = cachedGlobalUserStats;
+      }
+    } catch (err) {
+      console.error('Error fetching global user stats:', err.message);
     }
-    return cachedGlobalUserStats || { totalOnline15m: 0, totalUsers24h: 0, totalCalls24h: 0 };
-  } catch (err) {
-    console.error('Error fetching global user stats:', err.message);
-    return cachedGlobalUserStats || { totalOnline15m: 0, totalUsers24h: 0, totalCalls24h: 0 };
   }
+
+  const memGlobal = gatewayTrafficTracker.getGlobalStats();
+  const base = dbStats || { totalOnline15m: 0, totalUsers24h: 0, totalCalls24h: 0 };
+  return {
+    totalOnline15m: Math.max(Number(base.totalOnline15m || 0), memGlobal.totalOnline15m || 0),
+    totalUsers24h: Math.max(Number(base.totalUsers24h || 0), memGlobal.totalOnline15m || 0),
+    totalCalls24h: Number(base.totalCalls24h || 0) + (memGlobal.totalCalls24h || 0),
+    totalInflight: memGlobal.totalInflight || 0
+  };
 }
 
 // ====== 💳 全站用户充值金额、消费消耗与财务大盘数据引擎 ======
@@ -2377,7 +2454,8 @@ function getEnrichedChannels(forceStabilityRefresh = false) {
     }
     copy.stability = getChannelStabilitySummary(c.id, stabilityMap);
     copy.modelsStability = stabilityMap[String(c.id)] || [];
-    copy.userActivity = userActivityMap[String(c.id)] || {
+
+    const dbAct = userActivityMap[String(c.id)] || {
       activeUsers15m: 0,
       activeUsers1h: 0,
       activeUsers24h: 0,
@@ -2386,6 +2464,19 @@ function getEnrichedChannels(forceStabilityRefresh = false) {
       calls24h: 0,
       lastUsedAt: null,
       recentUsers: []
+    };
+    const memAct = gatewayTrafficTracker.getChannelStats(c.id);
+
+    copy.userActivity = {
+      activeUsers15m: Math.max(Number(dbAct.activeUsers15m || 0), memAct.activeUsers15m || 0),
+      activeUsers1h: Math.max(Number(dbAct.activeUsers1h || 0), memAct.activeUsers15m || 0),
+      activeUsers24h: Math.max(Number(dbAct.activeUsers24h || 0), memAct.activeUsers15m || 0),
+      calls15m: Number(dbAct.calls15m || 0) + (memAct.calls15m || 0),
+      calls1h: Number(dbAct.calls1h || 0) + (memAct.calls15m || 0),
+      calls24h: Number(dbAct.calls24h || 0) + (memAct.calls24h || 0),
+      inflight: memAct.inflight || 0,
+      lastUsedAt: dbAct.lastUsedAt || (memAct.calls15m > 0 ? new Date().toISOString().replace('T', ' ').slice(0, 19) : null),
+      recentUsers: dbAct.recentUsers || []
     };
     return copy;
   });
@@ -3126,6 +3217,18 @@ const server = http.createServer(async (req, res) => {
         }
         const fullBody = Buffer.concat(bodyBuffer);
 
+        const clientKey = gatewayAuth.clientIp || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'anonymous';
+        const endTracker = gatewayTrafficTracker.recordRequestStart(activeChannel.id, clientKey);
+        let trackerEnded = false;
+        const safeEndTracker = () => {
+          if (!trackerEnded) {
+            trackerEnded = true;
+            endTracker();
+          }
+        };
+        res.on('finish', safeEndTracker);
+        res.on('close', safeEndTracker);
+
         const upstreamHeaders = { ...req.headers };
         delete upstreamHeaders['host'];
         upstreamHeaders['authorization'] = `Bearer ${activeChannel.apiKey}`;
@@ -3139,6 +3242,7 @@ const server = http.createServer(async (req, res) => {
         });
 
         upReq.on('error', (err) => {
+          safeEndTracker();
           console.error(`[Gateway Proxy Error] 调度上游通道 [${activeChannel.name}] 出现异常:`, err.message);
           res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({
@@ -4419,7 +4523,11 @@ if (initialAccounts) {
 
 // 初始化 Telegram 机器人与移动调度引擎
 telegram.init({
-  getState: () => state,
+  getState: () => ({
+    ...state,
+    channels: getEnrichedChannels(false),
+    globalUserStats: fetchGlobalUserStats(false)
+  }),
   getAutoSwitchConfig: () => autoSwitchConfig,
   activateChannel: async (targetId, operator = 'Telegram Bot') => {
     return activateChannel(targetId, operator);
