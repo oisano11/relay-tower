@@ -569,45 +569,93 @@ async function syncSingleUpstreamPanel(params = {}) {
   let models = params.models || [];
 
   try {
-    // 若提供账号密码，自动登录获取 session 与 JWT access_token 以及 user 概览
+    // 若提供账号密码，智能自适应登录 (同时支持 Sub2API 与 New-API)
     if (username && password) {
-      const loginRes = await fetch(`${backendUrl}/api/user/login`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0'
-        },
-        body: JSON.stringify({ username, password }),
-        signal: AbortSignal.timeout(8000)
-      });
-      const loginData = await loginRes.json();
-      if (!loginData.success) {
-        throw new Error(loginData.message || '上游后台登录失败，请核对账号密码');
+      let loginOk = false;
+      let lastLoginErr = '';
+
+      // 方式 1: 尝试 Sub2API 登录协议 (/api/v1/auth/login)
+      try {
+        const sub2Res = await fetch(`${backendUrl}/api/v1/auth/login`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0'
+          },
+          body: JSON.stringify({ email: username, password }),
+          signal: AbortSignal.timeout(8000)
+        });
+        const sub2Data = await sub2Res.json();
+        if (sub2Data.code === 0 && sub2Data.data && sub2Data.data.access_token) {
+          token = sub2Data.data.access_token;
+          loginOk = true;
+          if (sub2Data.data.user) {
+            const u = sub2Data.data.user;
+            const rawBal = u.balance !== undefined ? u.balance : 0;
+            userInfo = {
+              id: u.id,
+              username: u.email || u.username || username,
+              role: u.role,
+              quota: Math.round(Number(rawBal) * 500000),
+              balanceUSD: Number(Number(rawBal).toFixed(2)),
+              usedQuota: 0
+            };
+          }
+        } else if (sub2Data.message) {
+          lastLoginErr = sub2Data.message;
+        }
+      } catch (e) {}
+
+      // 方式 2: 尝试 New-API / One-API 登录协议 (/api/user/login)
+      if (!loginOk) {
+        try {
+          const loginRes = await fetch(`${backendUrl}/api/user/login`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'Mozilla/5.0'
+            },
+            body: JSON.stringify({ username, password }),
+            signal: AbortSignal.timeout(8000)
+          });
+          const loginData = await loginRes.json();
+          if (loginData.success) {
+            if (loginData.data && loginData.data.access_token) {
+              token = loginData.data.access_token;
+            }
+            if (loginData.data && loginData.data.user) {
+              const u = loginData.data.user;
+              const quota = u.quota || 0;
+              const balanceUSD = Number((quota / 500000).toFixed(2));
+              userInfo = {
+                id: u.id,
+                username: u.username || username,
+                role: u.role,
+                quota,
+                balanceUSD,
+                usedQuota: u.used_quota || 0
+              };
+            }
+            const setCookies = loginRes.headers.getSetCookie ? loginRes.headers.getSetCookie() : [loginRes.headers.get('set-cookie')];
+            if (setCookies && setCookies.length > 0 && setCookies[0]) {
+              cookie = setCookies.map(c => (c || '').split(';')[0]).join('; ');
+            }
+            loginOk = true;
+          } else if (loginData.message) {
+            lastLoginErr = loginData.message;
+          }
+        } catch (e) {}
       }
 
-      // 提取 JWT access_token (New API 核心鉴权凭证)
-      if (loginData.data && loginData.data.access_token) {
-        token = loginData.data.access_token;
-      }
-
-      // 从登录响应中直接提取配额与余额 (New API 500,000 额度 = $1.00 USD)
-      if (loginData.data && loginData.data.user) {
-        const u = loginData.data.user;
-        const quota = u.quota || 0;
-        const balanceUSD = Number((quota / 500000).toFixed(2));
-        userInfo = {
-          id: u.id,
-          username: u.username || username,
-          role: u.role,
-          quota,
-          balanceUSD,
-          usedQuota: u.used_quota || 0
-        };
-      }
-
-      const setCookies = loginRes.headers.getSetCookie ? loginRes.headers.getSetCookie() : [loginRes.headers.get('set-cookie')];
-      if (setCookies && setCookies.length > 0 && setCookies[0]) {
-        cookie = setCookies.map(c => (c || '').split(';')[0]).join('; ');
+      if (!loginOk && !token) {
+        if (params.userInfo && params.userInfo.balanceUSD !== undefined) {
+          console.warn(`[UpstreamPanel] [${name}] 登录受限 (${lastLoginErr})，沿用现有有效用户与额度信息: $${params.userInfo.balanceUSD}`);
+          userInfo = params.userInfo;
+          token = params.userToken || '';
+          cookie = params.cookie || '';
+        } else {
+          throw new Error(lastLoginErr || '上游后台登录失败，请核对账号密码');
+        }
       }
     }
 
@@ -616,8 +664,30 @@ async function syncSingleUpstreamPanel(params = {}) {
     if (token) reqHeaders['Authorization'] = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
     if (cookie) reqHeaders['Cookie'] = cookie;
 
-    // 请求 /api/user/self 获取最新的详细个人中心信息
-    if (token || cookie) {
+    // 尝试 1: Sub2API /api/v1/auth/me 获取个人信息与余额
+    if (token && !userInfo) {
+      try {
+        const meRes = await fetch(`${backendUrl}/api/v1/auth/me`, {
+          headers: reqHeaders,
+          signal: AbortSignal.timeout(6000)
+        });
+        const meData = await meRes.json();
+        if (meData.code === 0 && meData.data) {
+          const rawBal = meData.data.balance !== undefined ? meData.data.balance : 0;
+          userInfo = {
+            id: meData.data.id || meData.data.user_id,
+            username: meData.data.email || meData.data.username || username,
+            role: meData.data.role,
+            quota: Math.round(Number(rawBal) * 500000),
+            balanceUSD: Number(Number(rawBal).toFixed(2)),
+            usedQuota: 0
+          };
+        }
+      } catch (e) {}
+    }
+
+    // 尝试 2: New-API /api/user/self 获取最新的详细个人中心信息
+    if ((token || cookie) && !userInfo) {
       try {
         const userRes = await fetch(`${backendUrl}/api/user/self`, {
           headers: reqHeaders,
@@ -636,16 +706,42 @@ async function syncSingleUpstreamPanel(params = {}) {
             usedQuota: userData.data.used_quota || 0
           };
         }
-      } catch (e) {
-        console.error(`上游后台 [${name}] /api/user/self 请求异常:`, e.message);
-      }
+      } catch (e) {}
+    }
+
+    // 尝试 3: /v1/usage 协议 (适用于 Token/API Key 模式，如 子桐)
+    if ((token || cookie) && !userInfo) {
+      try {
+        const usageRes = await fetch(`${backendUrl}/v1/usage`, {
+          headers: reqHeaders,
+          signal: AbortSignal.timeout(6000)
+        });
+        if (usageRes.ok) {
+          const usageData = await usageRes.json();
+          const bal = usageData.balance !== undefined ? usageData.balance : (usageData.remaining !== undefined ? usageData.remaining : null);
+          if (bal !== null && !isNaN(Number(bal))) {
+            userInfo = {
+              id: 'api_key_user',
+              username: username || 'API Key User',
+              role: 'user',
+              quota: Math.round(Number(bal) * 500000),
+              balanceUSD: Number(Number(bal).toFixed(2)),
+              usedQuota: 0
+            };
+          }
+        }
+      } catch (e) {}
     }
 
     if (!userInfo) {
-      throw new Error(`未能从上游后台 [${name}] 获取到账户余额，请检查账号密码或授权状态`);
+      if (params.userInfo && params.userInfo.balanceUSD !== undefined) {
+        userInfo = params.userInfo;
+      } else {
+        throw new Error(`未能从上游后台 [${name}] 获取到账户余额，请检查账号密码或授权状态`);
+      }
     }
 
-    // 请求 /api/user/models 获取支持模型列表
+    // 请求模型列表：优先 New-API /api/user/models，若无则尝试 Sub2API /v1/models
     try {
       const modelRes = await fetch(`${backendUrl}/api/user/models`, {
         headers: reqHeaders,
@@ -656,6 +752,47 @@ async function syncSingleUpstreamPanel(params = {}) {
         models = modelData.data;
       }
     } catch (e) {}
+
+    // 如果未获取到模型，尝试 Sub2API /api/v1/keys -> /v1/models
+    if (!models || models.length === 0) {
+      try {
+        let keyForModels = token;
+        try {
+          const kRes = await fetch(`${backendUrl}/api/v1/keys`, { headers: reqHeaders, signal: AbortSignal.timeout(4000) });
+          const kData = await kRes.json();
+          if (kData.code === 0 && kData.data && kData.data.items && kData.data.items[0]) {
+            keyForModels = kData.data.items[0].key;
+          }
+        } catch (e) {}
+
+        const mHeaders = { 'Authorization': keyForModels.startsWith('Bearer ') ? keyForModels : `Bearer ${keyForModels}` };
+        const v1Res = await fetch(`${backendUrl}/v1/models`, {
+          headers: mHeaders,
+          signal: AbortSignal.timeout(5000)
+        });
+        const v1Data = await v1Res.json();
+        const list = Array.isArray(v1Data.data) ? v1Data.data : (Array.isArray(v1Data) ? v1Data : []);
+        if (list.length > 0) {
+          models = list.map(m => typeof m === 'string' ? m : (m.id || m.name)).filter(Boolean);
+        }
+      } catch (e) {}
+    }
+
+    // 若依然为空，从已关联该域名的 channels.json 中继承 knownModels 作为保底
+    if (!models || models.length === 0) {
+      const related = state.channels.filter(c => c.baseUrl && backendUrl && c.baseUrl.includes(backendUrl.replace(/^https?:\/\//, '')));
+      const set = new Set();
+      related.forEach(c => {
+        (c.knownModels || c.configuredModels || []).forEach(m => set.add(m));
+      });
+      if (set.size > 0) {
+        models = Array.from(set);
+      }
+    }
+
+    if ((!models || models.length === 0) && params.models && params.models.length > 0) {
+      models = params.models;
+    }
 
     const resultPanel = {
       id,
@@ -683,6 +820,27 @@ async function syncSingleUpstreamPanel(params = {}) {
     }
     writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
     syncUpstreamPanelConfigCompat();
+
+    // 同步更新关联通道渠道数据中的余额信息
+    let channelsUpdated = false;
+    state.channels.forEach(c => {
+      const isMatch = (c.upstreamPanelId && c.upstreamPanelId === id) ||
+                      (c.panelSync === true && id === 'panel_jinlong') ||
+                      (c.baseUrl && backendUrl && c.baseUrl.includes(backendUrl.replace(/^https?:\/\//, '')));
+      if (isMatch) {
+        c.balance = userInfo.balanceUSD;
+        c.balanceUnit = 'USD';
+        c.balanceStatus = userInfo.balanceUSD < 5 ? (userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok';
+        c.balanceUpdated = resultPanel.lastSyncTime;
+        channelsUpdated = true;
+      }
+    });
+
+    if (channelsUpdated) {
+      writeJSON(CHANNELS_FILE, state);
+      broadcastSSE('CHANNELS_UPDATED', state);
+    }
+
     return resultPanel;
   } catch (err) {
     const existingIdx = upstreamPanels.findIndex(p => p.id === id);
@@ -709,28 +867,6 @@ async function syncSingleUpstreamPanel(params = {}) {
     syncUpstreamPanelConfigCompat();
     throw err;
   }
-
-  // 更新关联通道渠道数据中的余额信息
-  let channelsUpdated = false;
-  state.channels.forEach(c => {
-    const isMatch = (c.upstreamPanelId && c.upstreamPanelId === id) ||
-                    (c.panelSync === true && id === 'panel_jinlong') ||
-                    (c.baseUrl && backendUrl && c.baseUrl.includes(backendUrl.replace(/^https?:\/\//, '')));
-    if (isMatch) {
-      c.balance = userInfo.balanceUSD;
-      c.balanceUnit = 'USD';
-      c.balanceStatus = userInfo.balanceUSD < 5 ? (userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok';
-      c.balanceUpdated = resultPanel.lastSyncTime;
-      channelsUpdated = true;
-    }
-  });
-
-  if (channelsUpdated) {
-    writeJSON(CHANNELS_FILE, state);
-    broadcastSSE('CHANNELS_UPDATED', state);
-  }
-
-  return resultPanel;
 }
 
 const syncUpstreamPanel = syncSingleUpstreamPanel;
