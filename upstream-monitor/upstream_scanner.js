@@ -534,6 +534,23 @@ class UpstreamScanner {
           });
         }
       } catch (e) {}
+
+      // (c) 纳入已同步缓存的上游模型 (支持 Sub2API 与多平台聚合)
+      if (Array.isArray(panel.models) && panel.models.length > 0) {
+        panel.models.forEach(m => {
+          const mName = typeof m === 'string' ? m : (m.id || m.name);
+          if (mName) {
+            offerings.push({
+              type: 'model',
+              modelName: mName,
+              provider: panelName,
+              panelId: panel.id,
+              baseUrl: panelUrl,
+              multiplier: 1.0
+            });
+          }
+        });
+      }
     }
 
     // 2. 从各个已知上游通道探索 /v1/models
