@@ -79,6 +79,25 @@ class TelegramBotManager {
       if (me && me.is_bot) {
         this.botInfo = me;
         console.log(`✅ [Telegram] 机器人认证成功: [${me.first_name}] (@${me.username})`);
+
+        // 注册 Telegram 客户端原生命令菜单
+        try {
+          await this.apiRequest('setMyCommands', {
+            commands: [
+              { command: 'status', description: '📊 实时大盘、毛利与系统并发' },
+              { command: 'load', description: '👥 各线路实时负载与在线使用用户' },
+              { command: 'switch', description: '🔀 弹出可用渠道列表，一键换线' },
+              { command: 'auto', description: '⚡ 自动故障切线与成本熔断保护' },
+              { command: 'rates', description: '💰 查看所有渠道进货倍率天梯榜' },
+              { command: 'check', description: '🔍 立即触发全网探活与测速巡检' },
+              { command: 'help', description: '❓ 查看命令菜单与帮助说明' }
+            ]
+          });
+          console.log('✅ [Telegram] 客户端原生快捷指令菜单已自动同步更新');
+        } catch (e) {
+          console.warn('[Telegram] 注册 setMyCommands 忽略异常:', e.message);
+        }
+
         this.isPolling = true;
         this.runPollingLoop();
       } else {
@@ -333,6 +352,8 @@ class TelegramBotManager {
       await this.sendHelp(chatId);
     } else if (cmd === '/status' || text === '状态' || text === '大盘') {
       await this.sendStatus(chatId);
+    } else if (cmd === '/load' || text === '负载' || text === '并发' || text === '用户') {
+      await this.sendLoadStatus(chatId);
     } else if (cmd === '/switch' || text === '换线' || text === '切换') {
       await this.sendSwitchMenu(chatId);
     } else if (cmd === '/auto' || text === '自动切线') {
@@ -348,7 +369,8 @@ class TelegramBotManager {
         {
           reply_markup: {
             inline_keyboard: [
-              [{ text: '📊 查看大盘', callback_data: 'cmd:status' }, { text: '🔀 换线菜单', callback_data: 'cmd:switch' }]
+              [{ text: '📊 查看大盘', callback_data: 'cmd:status' }, { text: '👥 线路负载', callback_data: 'cmd:load' }],
+              [{ text: '🔀 换线菜单', callback_data: 'cmd:switch' }]
             ]
           }
         }
@@ -381,9 +403,15 @@ class TelegramBotManager {
     if (data === 'cmd:status') {
       await this.answerCallbackQuery(queryId);
       await this.sendStatus(chatId, query.message.message_id);
+    } else if (data === 'cmd:load') {
+      await this.answerCallbackQuery(queryId);
+      await this.sendLoadStatus(chatId, query.message.message_id);
     } else if (data === 'cmd:switch') {
       await this.answerCallbackQuery(queryId);
       await this.sendSwitchMenu(chatId, query.message.message_id);
+    } else if (data === 'cmd:rates') {
+      await this.answerCallbackQuery(queryId);
+      await this.sendRatesList(chatId, query.message.message_id);
     } else if (data === 'cmd:auto') {
       await this.answerCallbackQuery(queryId);
       await this.sendAutoSwitchMenu(chatId, query.message.message_id);
@@ -409,15 +437,20 @@ class TelegramBotManager {
     const state = this.context.getState();
     const active = state.channels.find(c => String(c.id) === String(state.activeChannelId)) || state.channels[0] || {};
     const autoConfig = this.context.getAutoSwitchConfig();
+    const act = active.userActivity || {};
+    const u15m = act.activeUsers15m || 0;
+    const inflight = act.inflight || 0;
 
     const text = 
       `🤖 <b>天枢 · 中转站智能调度中枢</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🌟 <b>当前主力出海:</b> <b>${active.name || '--'}</b> (<code>${active.multiplier || '--'}x</code>)\n` +
+      `👥 <b>主力在线负载:</b> <b>${u15m}</b> 人在线 · <b>${inflight}</b> 个在途并发\n` +
       `⚡ <b>自动切线保护:</b> <b>${autoConfig.enabled ? '🟢 运行中' : '🔴 已暂停'}</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `📋 <b>快捷交互命令：</b>\n` +
-      `• /status - 查看实时大盘、倍率与毛利数据\n` +
+      `• /status - 📊 查看实时大盘、倍率与毛利数据\n` +
+      `• /load   - 👥 查看每条线路实时负载与当前使用用户数\n` +
       `• /switch - 🔀 弹出所有可用上游渠道，手机点选换线\n` +
       `• /auto   - ⚡ 开启/关闭自动故障切线与成本保护\n` +
       `• /rates  - 💰 查看所有渠道倍率天梯榜\n` +
@@ -429,8 +462,9 @@ class TelegramBotManager {
     await this.sendMessage(chatId, text, {
       reply_markup: {
         inline_keyboard: [
-          [{ text: '📊 查看大盘', callback_data: 'cmd:status' }, { text: '🔀 一键换线', callback_data: 'cmd:switch' }],
-          [{ text: '⚡ 自动切线', callback_data: 'cmd:auto' }, { text: '🔍 全量巡检', callback_data: 'cmd:check' }]
+          [{ text: '📊 查看大盘', callback_data: 'cmd:status' }, { text: '👥 线路负载', callback_data: 'cmd:load' }],
+          [{ text: '🔀 一键换线', callback_data: 'cmd:switch' }, { text: '⚡ 自动切线', callback_data: 'cmd:auto' }],
+          [{ text: '💰 倍率天梯', callback_data: 'cmd:rates' }, { text: '🔍 全量巡检', callback_data: 'cmd:check' }]
         ]
       }
     });
@@ -441,28 +475,150 @@ class TelegramBotManager {
     const state = this.context.getState();
     const active = state.channels.find(c => String(c.id) === String(state.activeChannelId)) || state.channels[0] || {};
     const autoConfig = this.context.getAutoSwitchConfig();
+    const globalStats = state.globalUserStats || { totalOnline15m: 0, totalUsers24h: 0, totalCalls24h: 0, totalInflight: 0 };
 
     const schedulableCount = state.channels.filter(c => c.schedulable).length;
     const lossCount = state.channels.filter(c => c.isLoss).length;
+
+    const actUser = active.userActivity || {};
+    const activeUsers15m = actUser.activeUsers15m || 0;
+    const activeUsers24h = actUser.activeUsers24h || 0;
+    const activeInflight = actUser.inflight || 0;
+    const activeCalls15m = actUser.calls15m || 0;
+    const activeCalls24h = actUser.calls24h || 0;
+
+    const totalOnline = globalStats.totalOnline15m || 0;
+    const totalUsers24h = globalStats.totalUsers24h || 0;
+    const totalCalls24h = globalStats.totalCalls24h || 0;
+    const totalInflight = globalStats.totalInflight || 0;
 
     const text = 
       `📊 <b>【中转站大盘实时运行状态】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🌟 <b>主力出海通道:</b> <b>${active.name || '--'}</b> (ID: <code>${active.id || '--'}</code>)\n` +
-      `💸 <b>进货成本倍率:</b> <code>${active.multiplier !== undefined ? active.multiplier.toFixed(4) : '--'}x</code>\n` +
-      `📈 <b>销售核算倍率:</b> <code>${active.saleMultiplier !== undefined ? active.saleMultiplier.toFixed(4) : '--'}x</code>\n` +
+      `💸 <b>进货成本倍率:</b> <code>${active.multiplier !== undefined ? Number(active.multiplier).toFixed(4) : '--'}x</code>\n` +
+      `📈 <b>销售核算倍率:</b> <code>${active.saleMultiplier !== undefined ? Number(active.saleMultiplier).toFixed(4) : '--'}x</code>\n` +
       `💰 <b>当前毛利率:</b> <b>+${active.marginPercent !== undefined ? active.marginPercent : '--'}%</b>\n` +
       `📶 <b>节点响应状态:</b> ${active.status === 'offline' ? '🔴 离线' : '🟢 正常'}${active.latency ? ` (${active.latency}ms)` : ''}\n` +
       `⚡ <b>自动切线保护:</b> ${autoConfig.enabled ? '🟢 统一基准运行中' : '🔴 已暂停'} (<code>成本第一·不足80%切副调</code>)\n` +
-      `👥 <b>渠道调度池:</b> 共接入 ${state.channels.length} 家 (${schedulableCount} 家已开启调度 / ${lossCount} 家倒贴)\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `👥 <b>【主力线路实时负载】</b>\n` +
+      `• 正在使用用户: <b>${activeUsers15m}</b> 人在线 (今日累计: <b>${activeUsers24h}</b> 人)\n` +
+      `• 实时在途并发: <b>${activeInflight}</b> 个请求处理中\n` +
+      `• 近15分钟吞吐: <b>${activeCalls15m}</b> 次请求 (今日累计: <b>${activeCalls24h}</b> 次)\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🌐 <b>【全站大盘使用统计】</b>\n` +
+      `• 全站总在线用户: <b>${totalOnline}</b> 人 (今日服务: <b>${totalUsers24h}</b> 人)\n` +
+      `• 全站总在途并发: <b>${totalInflight}</b> 个请求\n` +
+      `• 全站今日总调用: <b>${Number(totalCalls24h).toLocaleString()}</b> 次\n` +
+      `• 渠道调度池: 共接入 ${state.channels.length} 家 (${schedulableCount} 家在池 / ${lossCount} 家倒贴)\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🕒 <i>更新时间: ${new Date().toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' })}</i>`;
 
     const reply_markup = {
       inline_keyboard: [
-        [{ text: '🔀 一键切换主用线路', callback_data: 'cmd:switch' }],
+        [{ text: '👥 各线路实时负载明细', callback_data: 'cmd:load' }, { text: '🔀 一键切换主用线路', callback_data: 'cmd:switch' }],
         [{ text: '⚡ 自动切线设置', callback_data: 'cmd:auto' }, { text: '🔄 刷新状态', callback_data: 'cmd:status' }],
-        [{ text: '🔍 立即全量测速', callback_data: 'cmd:check' }]
+        [{ text: '💰 倍率天梯榜', callback_data: 'cmd:rates' }, { text: '🔍 立即全量测速', callback_data: 'cmd:check' }]
+      ]
+    };
+
+    if (editMessageId) {
+      await this.editMessageText(chatId, editMessageId, text, { reply_markup });
+    } else {
+      await this.sendMessage(chatId, text, { reply_markup });
+    }
+  }
+
+  // 发送全线路实时负载与当前使用用户明细
+  async sendLoadStatus(chatId, editMessageId = null) {
+    const state = this.context.getState();
+    const activeId = String(state.activeChannelId);
+    const globalStats = state.globalUserStats || { totalOnline15m: 0, totalUsers24h: 0, totalCalls24h: 0, totalInflight: 0 };
+
+    const totalOnline = globalStats.totalOnline15m || 0;
+    const totalInflight = globalStats.totalInflight || 0;
+    const totalCallsToday = globalStats.totalCalls24h || 0;
+
+    // 排序：主力排最前，其余按在线用户数、并发和15m请求数倒序
+    const sorted = [...state.channels].sort((a, b) => {
+      const isActA = String(a.id) === activeId;
+      const isActB = String(b.id) === activeId;
+      if (isActA && !isActB) return -1;
+      if (!isActA && isActB) return 1;
+
+      const uA = a.userActivity?.activeUsers15m || 0;
+      const uB = b.userActivity?.activeUsers15m || 0;
+      if (uB !== uA) return uB - uA;
+
+      const ifA = a.userActivity?.inflight || 0;
+      const ifB = b.userActivity?.inflight || 0;
+      if (ifB !== ifA) return ifB - ifA;
+
+      const cA = a.userActivity?.calls15m || 0;
+      const cB = b.userActivity?.calls15m || 0;
+      return cB - cA;
+    });
+
+    const activeList = [];
+    const idleList = [];
+
+    sorted.forEach((c) => {
+      const isCurrent = String(c.id) === activeId;
+      const p = Number(c.priority);
+      const roleTag = isCurrent ? '🌟主力' : (p >= 100 ? '🟢主调' : (p <= 1 ? '🟡保底' : '🔵副调'));
+      const act = c.userActivity || {};
+      const u15m = act.activeUsers15m || 0;
+      const u24h = act.activeUsers24h || 0;
+      const inflight = act.inflight || 0;
+      const c15m = act.calls15m || 0;
+      const c24h = act.calls24h || 0;
+      const statusIcon = c.status === 'offline' ? '🔴 离线' : (c.schedulable ? '🟢 正常' : '⚪ 未开启');
+      const latencyStr = c.latency ? `${c.latency}ms` : '--';
+
+      if (isCurrent || u15m > 0 || inflight > 0 || c15m > 0) {
+        const trafficBadge = inflight > 3 ? '🔥 高负荷' : (u15m > 0 || inflight > 0 ? '⚡ 活跃' : '💤 待命');
+        let block = 
+          `<b>[${roleTag}] ${c.name}</b> (${trafficBadge})\n` +
+          `   • 👥 <b>当前使用用户:</b> <b>${u15m}</b> 人正在使用 (今日累计: ${u24h} 人)\n` +
+          `   • ⚡ <b>实时在途并发:</b> <b>${inflight}</b> 个请求\n` +
+          `   • 📊 <b>吞吐调用负荷:</b> 15m内 <b>${c15m}</b> 次 | 今日 <b>${c24h}</b> 次\n` +
+          `   • ⏱️ <b>响应状态:</b> ${statusIcon} · ${latencyStr} · 进货 <code>${Number(c.multiplier).toFixed(4)}x</code>\n`;
+        if (act.recentUsers && act.recentUsers.length > 0) {
+          const topUsers = act.recentUsers.slice(0, 3).map(u => `${u.name}(${u.calls}次)`).join(', ');
+          block += `   • 👤 <i>主要使用者: ${topUsers}</i>\n`;
+        }
+        activeList.push(block);
+      } else {
+        idleList.push(`• [${roleTag}] <b>${c.name}</b>: 0人 · 0并发 · 进货 <code>${Number(c.multiplier).toFixed(4)}x</code> · ${latencyStr}`);
+      }
+    });
+
+    let linesText = '';
+    if (activeList.length > 0) {
+      linesText += `🔥 <b>正在使用/主要线路 (${activeList.length} 条)：</b>\n\n` + activeList.join('\n');
+    }
+    if (idleList.length > 0) {
+      linesText += `\n💤 <b>待命空闲线路 (${idleList.length} 条)：</b>\n` + idleList.slice(0, 8).join('\n') + '\n';
+      if (idleList.length > 8) {
+        linesText += `<i>...及另外 ${idleList.length - 8} 条空闲线路</i>\n`;
+      }
+    }
+
+    const text = 
+      `👥 <b>【各线路实时负载与当前使用用户明细】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🌐 <b>全站总活跃:</b> <b>${totalOnline}</b> 人在线 | ⚡ <b>总并发:</b> <b>${totalInflight}</b> 个请求\n` +
+      `📈 <b>全站今日调用:</b> <b>${Number(totalCallsToday).toLocaleString()}</b> 次请求\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      linesText +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 <i>点击「一键换线」可根据各线路负载调度出海流量</i>`;
+
+    const reply_markup = {
+      inline_keyboard: [
+        [{ text: '🔄 刷新实时负载', callback_data: 'cmd:load' }, { text: '🔀 一键切换主用线路', callback_data: 'cmd:switch' }],
+        [{ text: '📊 返回大盘状态', callback_data: 'cmd:status' }, { text: '💰 倍率天梯榜', callback_data: 'cmd:rates' }]
       ]
     };
 
@@ -478,6 +634,9 @@ class TelegramBotManager {
     const state = this.context.getState();
     const activeId = String(state.activeChannelId);
     const active = state.channels.find(c => String(c.id) === activeId) || state.channels[0] || {};
+    const act = active.userActivity || {};
+    const activeUsers15m = act.activeUsers15m || 0;
+    const activeInflight = act.inflight || 0;
 
     const keyboard = [];
     let row = [];
@@ -485,8 +644,10 @@ class TelegramBotManager {
     state.channels.forEach((c) => {
       const isCurrent = String(c.id) === activeId;
       const p = Number(c.priority);
-      const roleTag = p >= 100 ? '🟢主' : (p <= 1 ? '🟡保' : '🔵副');
-      const label = `${isCurrent ? '🌟' : roleTag} ${c.name.slice(0, 9)} (${c.multiplier}x)`;
+      const roleTag = isCurrent ? '🌟' : (p >= 100 ? '🟢' : (p <= 1 ? '🟡' : '🔵'));
+      const uCount = c.userActivity?.activeUsers15m || 0;
+      const uTag = uCount > 0 ? `·${uCount}人` : '';
+      const label = `${roleTag} ${c.name.slice(0, 7)} (${Number(c.multiplier).toFixed(2)}x${uTag})`;
       row.push({
         text: label,
         callback_data: `switch:${c.id}`
@@ -499,15 +660,19 @@ class TelegramBotManager {
     if (row.length > 0) keyboard.push(row);
 
     keyboard.push([
-      { text: '🔄 刷新列表', callback_data: 'cmd:switch' },
-      { text: '◀️ 返回大盘', callback_data: 'cmd:status' }
+      { text: '👥 实时负载明细', callback_data: 'cmd:load' },
+      { text: '🔄 刷新列表', callback_data: 'cmd:switch' }
+    ]);
+    keyboard.push([
+      { text: '◀️ 返回大盘状态', callback_data: 'cmd:status' }
     ]);
 
     const text = 
       `🔀 <b>【一键切换主力出海通道】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🌟 <b>当前主力:</b> <b>${active.name || '--'}</b> (进货: <code>${active.multiplier || '--'}x</code>)\n` +
-      `👇 <b>请直接在手机上点击下方按钮切换：</b>`;
+      `👥 <b>当前负载:</b> <b>${activeUsers15m}</b> 人正在使用 | <b>${activeInflight}</b> 个并发在途\n` +
+      `👇 <b>按钮已标注 [当前使用人数]，点击即可无缝切换：</b>`;
 
     if (editMessageId) {
       await this.editMessageText(chatId, editMessageId, text, { reply_markup: { inline_keyboard: keyboard } });
@@ -529,19 +694,25 @@ class TelegramBotManager {
     const res = await this.context.activateChannel(channelId, 'Telegram 移动端');
 
     if (res && res.success) {
+      const act = target.userActivity || {};
+      const u15m = act.activeUsers15m || 0;
+      const inflight = act.inflight || 0;
+
       const text = 
         `✅ <b>主力出海通道切换成功！</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `🌟 <b>新主力通道:</b> <b>${target.name}</b> (ID: <code>${target.id}</code>)\n` +
-        `💸 <b>进货倍率:</b> <code>${target.multiplier.toFixed(4)}x</code>\n` +
-        `📈 <b>销售倍率:</b> <code>${target.saleMultiplier ? target.saleMultiplier.toFixed(4) : '--'}x</code>\n` +
+        `💸 <b>进货倍率:</b> <code>${Number(target.multiplier).toFixed(4)}x</code>\n` +
+        `📈 <b>销售倍率:</b> <code>${target.saleMultiplier ? Number(target.saleMultiplier).toFixed(4) : '--'}x</code>\n` +
+        `👥 <b>当前负载:</b> <b>${u15m}</b> 人使用中 · <b>${inflight}</b> 个在途并发\n` +
         `⚡ <b>Sub2API 调度与 Redis 路由已毫秒级同步生效！</b>\n` +
         `━━━━━━━━━━━━━━━━━━`;
 
       await this.editMessageText(chatId, messageId, text, {
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🔀 换其它线路', callback_data: 'cmd:switch' }, { text: '📊 返回大盘', callback_data: 'cmd:status' }]
+            [{ text: '👥 线路负载明细', callback_data: 'cmd:load' }, { text: '🔀 换其它线路', callback_data: 'cmd:switch' }],
+            [{ text: '📊 返回大盘', callback_data: 'cmd:status' }]
           ]
         }
       });
@@ -585,14 +756,20 @@ class TelegramBotManager {
   }
 
   // 发送倍率天梯榜
-  async sendRatesList(chatId) {
+  async sendRatesList(chatId, editMessageId = null) {
     const state = this.context.getState();
     const sorted = [...state.channels].sort((a, b) => a.multiplier - b.multiplier);
 
     let listText = '';
     sorted.forEach((c, idx) => {
       const isCurrent = String(c.id) === String(state.activeChannelId);
-      listText += `${idx + 1}. [<code>${c.multiplier.toFixed(4)}x</code>] <b>${c.name}</b> ${isCurrent ? '🌟 (当前主用)' : ''}${c.schedulable ? '' : ' (🚫已禁)'}\n`;
+      const u = c.userActivity?.activeUsers15m || 0;
+      const inflight = c.userActivity?.inflight || 0;
+      const calls15m = c.userActivity?.calls15m || 0;
+      const loadTag = (u > 0 || inflight > 0) 
+        ? ` (👥 ${u}人 · ⚡${inflight}并发)` 
+        : (calls15m > 0 ? ` (📊 15m:${calls15m}次)` : '');
+      listText += `${idx + 1}. [<code>${Number(c.multiplier).toFixed(4)}x</code>] <b>${c.name}</b>${loadTag} ${isCurrent ? '🌟 (当前主用)' : ''}${c.schedulable ? '' : ' (🚫已禁)'}\n`;
     });
 
     const text = 
@@ -600,15 +777,20 @@ class TelegramBotManager {
       `━━━━━━━━━━━━━━━━━━\n` +
       listText +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `💡 点击下方换线按钮可直接选择任意线路：`;
+      `💡 <i>已附带各线路当前在线使用人数与并发负荷</i>`;
 
-    await this.sendMessage(chatId, text, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '🔀 立即换线', callback_data: 'cmd:switch' }, { text: '📊 查看大盘', callback_data: 'cmd:status' }]
-        ]
-      }
-    });
+    const reply_markup = {
+      inline_keyboard: [
+        [{ text: '👥 线路实时负载', callback_data: 'cmd:load' }, { text: '🔀 立即换线', callback_data: 'cmd:switch' }],
+        [{ text: '📊 查看大盘', callback_data: 'cmd:status' }]
+      ]
+    };
+
+    if (editMessageId) {
+      await this.editMessageText(chatId, editMessageId, text, { reply_markup });
+    } else {
+      await this.sendMessage(chatId, text, { reply_markup });
+    }
   }
 
   // 触发全量巡检
@@ -686,19 +868,25 @@ class TelegramBotManager {
     if (!this.config.enabled || !this.config.notifyOnAutoSwitch) return;
     if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
 
+    const toAct = toChannel?.userActivity || {};
+    const toUsers = toAct.activeUsers15m || 0;
+    const toInflight = toAct.inflight || 0;
+
     const message = 
       `⚡ <b>【智能自动熔断切线触发】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🔄 <b>切线动作:</b> [${logEntry.fromName}] ➔ <b>[${logEntry.toName}]</b>\n` +
       `🎯 <b>触发原因:</b> ${logEntry.reason}\n` +
       `💸 <b>进货倍率:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
+      `👥 <b>新通道当前负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
       `${logEntry.oldTtft ? `⏱️ <b>延迟对比:</b> <code>${logEntry.oldTtft}ms</code> ➔ <code>${logEntry.newTtft || '--'}ms</code>\n` : ''}` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `✅ <i>Sub2API 调度网关已即时切换至新通道！</i>`;
 
     const reply_markup = {
       inline_keyboard: [
-        [{ text: '🔀 人工选其它线', callback_data: 'cmd:switch' }, { text: '📊 查看大盘', callback_data: 'cmd:status' }]
+        [{ text: '👥 线路实时负载', callback_data: 'cmd:load' }, { text: '🔀 人工选其它线', callback_data: 'cmd:switch' }],
+        [{ text: '📊 查看大盘', callback_data: 'cmd:status' }]
       ]
     };
 
@@ -713,18 +901,23 @@ class TelegramBotManager {
     // 如果操作者就是 Telegram Bot，自身已有交互回复，无需重复刷屏广播
     if (operator && operator.includes('Telegram')) return;
 
+    const act = channel.userActivity || {};
+    const u15m = act.activeUsers15m || 0;
+    const inflight = act.inflight || 0;
+
     const message = 
       `🔀 <b>【主力出海线路切换通知】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🌟 <b>新主力通道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
       `💸 <b>进货倍率:</b> <code>${channel.multiplier}x</code>\n` +
+      `👥 <b>当前负载:</b> <b>${u15m}</b> 人在线 · <b>${inflight}</b> 个并发\n` +
       `👤 <b>操作来源:</b> ${operator}\n` +
       `━━━━━━━━━━━━━━━━━━`;
 
     await this.broadcastToAdmins(message, {
       reply_markup: {
         inline_keyboard: [
-          [{ text: '📊 查看大盘', callback_data: 'cmd:status' }]
+          [{ text: '👥 查看实时负载', callback_data: 'cmd:load' }, { text: '📊 查看大盘', callback_data: 'cmd:status' }]
         ]
       }
     });
