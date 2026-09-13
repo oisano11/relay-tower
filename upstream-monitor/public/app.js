@@ -70,7 +70,7 @@ let profitSummary = {};
 let allGroups = [];
 
 // 分类状态
-let currentDimension = 'vendor'; // 'vendor' | 'provider' | 'group'
+let currentDimension = 'group'; // 默认进入按业务分组维度
 let currentFilterPill = 'all';
 
 // 目标修改倍率的渠道与分组 ID
@@ -198,24 +198,32 @@ async function loadAlerts() {
 
 // 渲染顶部统计面板 (进货、售价、毛利率与倒贴亏损排查)
 function renderOverviewMetrics() {
-  if (!channelsData.length) return;
+  if (!channelsData || !channelsData.length) return;
 
   const activeChannel = channelsData.find(c => String(c.id) === String(activeChannelId)) || channelsData[0];
   
   if (activeChannel) {
-    document.getElementById('metricActiveName').textContent = activeChannel.name;
-    document.getElementById('metricActiveMultiplier').textContent = `${activeChannel.costMultiplier ? formatRate(activeChannel.costMultiplier) : formatRate(activeChannel.multiplier)}x 进`;
+    const elName = document.getElementById('metricActiveName');
+    if (elName) elName.textContent = activeChannel.name;
+    const elMult = document.getElementById('metricActiveMultiplier');
+    if (elMult) elMult.textContent = `${activeChannel.costMultiplier ? formatRate(activeChannel.costMultiplier) : formatRate(activeChannel.multiplier)}x 进`;
     
     const saleVal = activeChannel.saleMultiplier !== undefined ? activeChannel.saleMultiplier : 1.0;
-    document.getElementById('metricActiveSale').textContent = `${formatRate(saleVal)}x (${activeChannel.primaryGroupName || '默认'})`;
+    const elSale = document.getElementById('metricActiveSale');
+    if (elSale) elSale.textContent = `${formatRate(saleVal)}x (${activeChannel.primaryGroupName || '默认'})`;
     
     const margin = activeChannel.marginPercent !== undefined ? activeChannel.marginPercent : 0;
     const sign = margin >= 0 ? '+' : '';
-    document.getElementById('metricActiveMargin').textContent = `${sign}${margin}%`;
-    document.getElementById('metricActiveMargin').style.color = activeChannel.isLoss ? 'var(--color-red)' : 'var(--color-green)';
+    const elMargin = document.getElementById('metricActiveMargin');
+    if (elMargin) {
+      elMargin.textContent = `${sign}${margin}%`;
+      elMargin.style.color = activeChannel.isLoss ? 'var(--color-red)' : 'var(--color-green)';
+    }
     
-    document.getElementById('metricActiveUrl').textContent = activeChannel.baseUrl || 'https://api.openai.com/v1';
-    document.getElementById('headerMultiplierBadge').textContent = `${formatRate(activeChannel.multiplier)}x`;
+    const elUrl = document.getElementById('metricActiveUrl');
+    if (elUrl) elUrl.textContent = activeChannel.baseUrl || 'https://api.openai.com/v1';
+    const elBadge = document.getElementById('headerMultiplierBadge');
+    if (elBadge) elBadge.textContent = `${formatRate(activeChannel.multiplier)}x`;
   }
 
   // 1. 综合预估毛利率
@@ -230,21 +238,27 @@ function renderOverviewMetrics() {
   }
 
   const sign = avgMargin >= 0 ? '+' : '';
-  document.getElementById('metricAvgMargin').textContent = `${sign}${avgMargin}%`;
+  const elAvgMargin = document.getElementById('metricAvgMargin');
+  if (elAvgMargin) elAvgMargin.textContent = `${sign}${avgMargin}%`;
   const badgeEl = document.getElementById('metricMarginStatusBadge');
-  if (avgMargin > 35) {
-    if (badgeEl) { badgeEl.textContent = '利润丰厚'; badgeEl.className = 'badge-accent'; }
-  } else if (avgMargin >= 0) {
-    if (badgeEl) { badgeEl.textContent = '利润健康'; badgeEl.className = 'badge-neutral'; }
-  } else {
-    if (badgeEl) { badgeEl.textContent = '🚨 倒贴亏损'; badgeEl.className = 'trend-tag delta-up'; }
+  if (badgeEl) {
+    if (avgMargin > 35) {
+      badgeEl.textContent = '利润丰厚'; badgeEl.className = 'badge-accent';
+    } else if (avgMargin >= 0) {
+      badgeEl.textContent = '利润健康'; badgeEl.className = 'badge-neutral';
+    } else {
+      badgeEl.textContent = '🚨 倒贴亏损'; badgeEl.className = 'trend-tag delta-up';
+    }
   }
 
-  if (enabledChannels.length > 0) {
-    const avgSpread = (enabledChannels.reduce((sum, c) => sum + (c.profitSpread || 0), 0) / enabledChannels.length).toFixed(4);
-    document.getElementById('metricMarginSpreadText').textContent = `开启通道平均利差: ${avgSpread >= 0 ? '+' : ''}${avgSpread}x`;
-  } else {
-    document.getElementById('metricMarginSpreadText').textContent = `当前调度池无开启通道`;
+  const elMarginSpread = document.getElementById('metricMarginSpreadText');
+  if (elMarginSpread) {
+    if (enabledChannels.length > 0) {
+      const avgSpread = (enabledChannels.reduce((sum, c) => sum + (c.profitSpread || 0), 0) / enabledChannels.length).toFixed(4);
+      elMarginSpread.textContent = `开启通道平均利差: ${avgSpread >= 0 ? '+' : ''}${avgSpread}x`;
+    } else {
+      elMarginSpread.textContent = `当前调度池无开启通道`;
+    }
   }
 
   // 2. 倒贴亏损排查
@@ -252,6 +266,10 @@ function renderOverviewMetrics() {
   const activeLoss = profitSummary.activeLossCount !== undefined ? profitSummary.activeLossCount : channelsData.filter(c => c.schedulable && c.isLoss).length;
   const cardLoss = document.getElementById('cardLossWarning');
   const jumpHint = document.getElementById('metricLossJumpHint');
+  const elLossCount = document.getElementById('metricLossCount');
+  const elLossBadge = document.getElementById('metricLossBadge');
+  const elLossDesc = document.getElementById('metricLossDesc');
+  const elLossFooter = document.getElementById('metricLossFooterText');
 
   if (activeLoss > 0) {
     if (cardLoss) {
@@ -262,14 +280,20 @@ function renderOverviewMetrics() {
       jumpHint.style.display = 'inline-block';
       jumpHint.textContent = '定位 ↗';
     }
-    document.getElementById('metricLossCount').textContent = `🚨 ${activeLoss} 条调度中倒贴!`;
-    document.getElementById('metricLossCount').style.color = 'var(--color-red)';
-    document.getElementById('metricLossBadge').textContent = '高危扣费中';
-    document.getElementById('metricLossBadge').className = 'trend-tag delta-up';
-    document.getElementById('metricLossDesc').textContent = '进货价高于客户扣费售价！每调用一次亏损一次！';
+    if (elLossCount) {
+      elLossCount.textContent = `🚨 ${activeLoss} 条调度中倒贴!`;
+      elLossCount.style.color = 'var(--color-red)';
+    }
+    if (elLossBadge) {
+      elLossBadge.textContent = '高危扣费中';
+      elLossBadge.className = 'trend-tag delta-up';
+    }
+    if (elLossDesc) elLossDesc.textContent = '进货价高于客户扣费售价！每调用一次亏损一次！';
     const activeLossNames = channelsData.filter(c => c.schedulable && c.isLoss).map(c => c.name).join(', ');
-    document.getElementById('metricLossFooterText').textContent = `倒贴中: ${activeLossNames} (建议停用或提价)`;
-    document.getElementById('metricLossFooterText').style.color = '#f87171';
+    if (elLossFooter) {
+      elLossFooter.textContent = `倒贴中: ${activeLossNames} (建议停用或提价)`;
+      elLossFooter.style.color = '#f87171';
+    }
   } else if (totalLoss > 0) {
     if (cardLoss) {
       cardLoss.classList.remove('card-loss-danger');
@@ -279,39 +303,115 @@ function renderOverviewMetrics() {
       jumpHint.style.display = 'inline-block';
       jumpHint.textContent = '定位 ↗';
     }
-    document.getElementById('metricLossCount').textContent = `${totalLoss} 条潜在倒贴`;
-    document.getElementById('metricLossCount').style.color = '#fbbf24';
-    document.getElementById('metricLossBadge').textContent = '已隔离停用';
-    document.getElementById('metricLossBadge').className = 'badge-neutral';
-    document.getElementById('metricLossDesc').textContent = '倒贴通道均处于暂停调度状态，线上未产生实际亏损。';
+    if (elLossCount) {
+      elLossCount.textContent = `${totalLoss} 条潜在倒贴`;
+      elLossCount.style.color = '#fbbf24';
+    }
+    if (elLossBadge) {
+      elLossBadge.textContent = '已隔离停用';
+      elLossBadge.className = 'badge-neutral';
+    }
+    if (elLossDesc) elLossDesc.textContent = '倒贴通道均处于暂停调度状态，线上未产生实际亏损。';
     const lossNames = channelsData.filter(c => c.isLoss).map(c => c.name).join(', ');
-    document.getElementById('metricLossFooterText').textContent = `隐患通道: ${lossNames} (停用中)`;
-    document.getElementById('metricLossFooterText').style.color = '#a1a1aa';
+    if (elLossFooter) {
+      elLossFooter.textContent = `隐患通道: ${lossNames} (停用中)`;
+      elLossFooter.style.color = '#a1a1aa';
+    }
   } else {
     if (cardLoss) {
       cardLoss.classList.remove('card-loss-danger');
       cardLoss.title = '所有上游进价均低于销售价，定价结构健康。点击可检查渠道列表';
     }
     if (jumpHint) jumpHint.style.display = 'none';
-    document.getElementById('metricLossCount').textContent = `0 条倒贴`;
-    document.getElementById('metricLossCount').style.color = 'var(--color-green)';
-    document.getElementById('metricLossBadge').textContent = '成本安全';
-    document.getElementById('metricLossBadge').className = 'badge-status-glow';
-    document.getElementById('metricLossDesc').textContent = '所有上游进价均低于销售价，定价结构健康。';
-    document.getElementById('metricLossFooterText').textContent = '全部通道均处于盈利空间';
-    document.getElementById('metricLossFooterText').style.color = '#71717a';
+    if (elLossCount) {
+      elLossCount.textContent = `0 条倒贴`;
+      elLossCount.style.color = 'var(--color-green)';
+    }
+    if (elLossBadge) {
+      elLossBadge.textContent = '成本安全';
+      elLossBadge.className = 'badge-status-glow';
+    }
+    if (elLossDesc) elLossDesc.textContent = '所有上游进价均低于销售价，定价结构健康。';
+    if (elLossFooter) {
+      elLossFooter.textContent = '全部通道均处于盈利空间';
+      elLossFooter.style.color = '#71717a';
+    }
   }
 
   // 3. 调度通道池与全场最低进货
   const sortedByRate = [...channelsData].sort((a, b) => a.multiplier - b.multiplier);
   currentLowestChannel = sortedByRate[0];
-  if (currentLowestChannel) {
-    document.getElementById('metricLowestMultiplier').textContent = `最低 ${formatRate(currentLowestChannel.multiplier)}x`;
+  const elLowest = document.getElementById('metricLowestMultiplier');
+  if (elLowest && currentLowestChannel) {
+    elLowest.textContent = `最低 ${formatRate(currentLowestChannel.multiplier)}x`;
   }
   const enabledCount = channelsData.filter(c => c.schedulable).length;
-  document.getElementById('metricEnabledCount').textContent = `${enabledCount} / ${channelsData.length} 开`;
-  document.getElementById('metricChannelCount').textContent = `共接入 ${channelsData.length} 家中转站真实上游`;
-  document.getElementById('metricLastProbeTime').textContent = `上次同步: ${formatTime(activeChannel ? activeChannel.lastCheckTime : null)}`;
+  const elEnabledCount = document.getElementById('metricEnabledCount');
+  if (elEnabledCount) elEnabledCount.textContent = `${enabledCount} / ${channelsData.length} 开`;
+  const elChannelCount = document.getElementById('metricChannelCount');
+  if (elChannelCount) elChannelCount.textContent = `共接入 ${channelsData.length} 家中转站真实上游`;
+  const elLastProbe = document.getElementById('metricLastProbeTime');
+  if (elLastProbe) elLastProbe.textContent = `上次同步: ${formatTime(activeChannel ? activeChannel.lastCheckTime : null)}`;
+
+  // 4. 更新全局轻量化运营态势中枢 (Ops Ribbon)
+  const barActiveChannels = document.getElementById('barActiveChannels');
+  if (barActiveChannels) {
+    barActiveChannels.textContent = `${enabledCount} / ${channelsData.length}`;
+  }
+
+  const barLossCount = document.getElementById('barLossCount');
+  if (barLossCount) {
+    if (activeLoss > 0) {
+      barLossCount.textContent = `🚨 ${activeLoss} 条倒贴`;
+      barLossCount.className = 'ops-pill-val mono danger';
+    } else if (totalLoss > 0) {
+      barLossCount.textContent = `${totalLoss} 条潜在`;
+      barLossCount.className = 'ops-pill-val mono warning';
+    } else {
+      barLossCount.textContent = '0 条';
+      barLossCount.className = 'ops-pill-val mono safe';
+    }
+  }
+
+  const barUpstreamBalance = document.getElementById('barUpstreamBalance');
+  if (barUpstreamBalance) {
+    let totalUSD = 0;
+    channelsData.forEach(c => {
+      const b = Number(c.balance);
+      if (!isNaN(b) && b > 0) totalUSD += b;
+    });
+    const totalCNY = (totalUSD * 7.2).toFixed(2);
+    barUpstreamBalance.textContent = `$${totalUSD.toFixed(1)} (¥${totalCNY})`;
+  }
+
+  const barActiveUsers = document.getElementById('barActiveUsers');
+  if (barActiveUsers) {
+    let totalOnline = 0;
+    channelsData.forEach(c => {
+      if (c.userActivity && c.userActivity.activeUsers15m) {
+        totalOnline += Number(c.userActivity.activeUsers15m) || 0;
+      }
+    });
+    barActiveUsers.textContent = `${totalOnline} 人在线`;
+  }
+
+  const barGlobalHealth = document.getElementById('barGlobalHealth');
+  if (barGlobalHealth) {
+    let totalCalls = 0;
+    let totalErr = 0;
+    channelsData.forEach(c => {
+      if (c.stability) {
+        totalCalls += Number(c.stability.totalCalls) || 0;
+        totalErr += Number(c.stability.totalErr) || 0;
+      }
+    });
+    if (totalCalls > 0) {
+      const rate = ((1 - (totalErr / totalCalls)) * 100).toFixed(1);
+      barGlobalHealth.textContent = `${rate}%`;
+    } else {
+      barGlobalHealth.textContent = '100%';
+    }
+  }
 }
 
 // 顶部切换下拉
@@ -386,7 +486,57 @@ function getVendorTheme(vendor) {
   };
 }
 
-// 【核心功能 2】按模型厂商、上游供应商、业务分组、活跃渠道分类切换
+// ====== 【业务分组准入与容量规则核心算法】 ======
+// 获取业务分组对应的模型分类 (如 Codex组 归属 OpenAI / GPT, CCMAX 归属 Claude)
+function getGroupCategory(groupName, channels = channelsData) {
+  if (!groupName) return '通用';
+  const n = groupName.toLowerCase();
+  if (n.includes('codex') || n.includes('gpt') || n.includes('openai')) return 'OpenAI / GPT';
+  if (n.includes('claude') || n.includes('ccmax') || n.includes('kiro') || n.includes('cursor')) return 'Claude';
+  if (n.includes('grok') || n.includes('xai')) return 'Grok';
+  if (n.includes('deepseek') || n.includes('kimi') || n.includes('国模') || n.includes('qwen') || n.includes('glm')) return '国模专区';
+  if (n.includes('gemini')) return 'Gemini';
+
+  // 兜底：从该分组已绑定的通道中寻找最常见的厂商
+  if (channels && channels.length) {
+    const groupChs = channels.filter(c => c.groups && c.groups.includes(groupName));
+    if (groupChs.length > 0) {
+      const vCounts = {};
+      groupChs.forEach(c => {
+        const v = c.vendor || '通用';
+        vCounts[v] = (vCounts[v] || 0) + 1;
+      });
+      const sorted = Object.entries(vCounts).sort((a, b) => b[1] - a[1]);
+      if (sorted.length > 0) return sorted[0][0];
+    }
+  }
+  return 'OpenAI / GPT';
+}
+
+// 获取全站所有可容纳到指定业务分组的合规通道 (模型分类匹配 且 进货成本严格低于分组对外售价)
+function getEligibleChannelsForGroup(group, channels = channelsData) {
+  if (!group) return [];
+  const gName = group.name;
+  const targetCategory = getGroupCategory(gName, channels);
+  const saleRate = group.sale_rate !== undefined ? Number(group.sale_rate) : 999;
+
+  return channels.filter(c => {
+    const cost = c.costMultiplier !== undefined ? Number(c.costMultiplier) : Number(c.multiplier || 0);
+    // 1. 分类规则：严格匹配该分组分类 (如 Codex 组只能容纳 GPT 通道)
+    const catMatch = c.vendor === targetCategory || 
+      (targetCategory === 'OpenAI / GPT' && (c.vendor || '').includes('GPT')) ||
+      (targetCategory === 'Claude' && ((c.vendor || '').includes('Claude') || (c.vendor || '').includes('Anthropic'))) ||
+      (targetCategory === '国模专区' && ((c.vendor || '').includes('国模') || (c.vendor || '').includes('DeepSeek') || (c.vendor || '').includes('Kimi')));
+    if (!catMatch) return false;
+
+    // 2. 价格规则：严格低于分组对外售价 (进货成本 < 分组售价，以不赔钱为第一主线)
+    if (cost >= saleRate) return false;
+
+    return true;
+  });
+}
+
+// 【核心功能 2】按业务分组 (默认第一项)、模型厂商、上游供应商、活跃渠道分类切换
 function renderFilterPills() {
   const container = document.getElementById('filterPillsContainer');
   if (!container) return;
@@ -414,7 +564,7 @@ function renderFilterPills() {
       if (isOnline) onlineCount++;
       if (isSchedulable) schedulableCount++;
       if (p >= 100) mainCount++;
-      else if (p >= 10) subCount++;
+      else if (p >= 20) subCount++;
 
       if (!hasTraffic && isSchedulable) idleCount++;
       if (!isSchedulable) disabledCount++;
@@ -445,8 +595,51 @@ function renderFilterPills() {
     return;
   }
 
+  // 业务分组维度：固定平台业务分组体系
+  if (currentDimension === 'group') {
+    const groupCounts = {};
+    channelsData.forEach(c => {
+      (c.groups || ['未分配分组']).forEach(g => {
+        groupCounts[g] = (groupCounts[g] || 0) + 1;
+      });
+    });
+
+    const pills = [
+      { key: 'all', label: `全部分组 (${allGroups.length || 0})` }
+    ];
+
+    // 复制固定业务分组列表，按销售倍率阶梯从低到高排列
+    const sortedGroups = [...(allGroups || [])].sort((a, b) => {
+      const rateA = a.sale_rate !== undefined ? a.sale_rate : 999;
+      const rateB = b.sale_rate !== undefined ? b.sale_rate : 999;
+      return rateA - rateB;
+    });
+
+    sortedGroups.forEach(g => {
+      const cCount = groupCounts[g.name] || 0;
+      pills.push({
+        key: g.name,
+        label: `${g.name} (${cCount})`,
+        rate: g.sale_rate
+      });
+    });
+
+    if (groupCounts['未分配分组']) {
+      pills.push({ key: '未分配分组', label: `未分配分组 (${groupCounts['未分配分组']})` });
+    }
+
+    container.innerHTML = pills.map(p => {
+      return `
+        <button class="filter-pill ${currentFilterPill === p.key ? 'active' : ''}" onclick="selectFilterPill('${p.key}')">
+          ${p.label}
+        </button>
+      `;
+    }).join('');
+    return;
+  }
+
+  // 厂商或供应商维度
   const counts = { all: channelsData.length };
-  
   channelsData.forEach(c => {
     if (currentDimension === 'vendor') {
       const k = c.vendor || '其他厂商';
@@ -454,10 +647,6 @@ function renderFilterPills() {
     } else if (currentDimension === 'provider') {
       const k = c.provider || '三方渠道';
       counts[k] = (counts[k] || 0) + 1;
-    } else if (currentDimension === 'group') {
-      (c.groups || ['未分配']).forEach(g => {
-        counts[g] = (counts[g] || 0) + 1;
-      });
     }
   });
 
@@ -465,19 +654,8 @@ function renderFilterPills() {
     { key: 'all', label: `全部 (${counts.all || 0})` }
   ];
 
-  const groupOrKeys = Object.keys(counts).filter(k => k !== 'all');
-  if (currentDimension === 'group') {
-    // 业务分组排序：按销售倍率阶梯由低到高规范排列
-    groupOrKeys.sort((a, b) => {
-      const gA = allGroups.find(g => g.name === a);
-      const gB = allGroups.find(g => g.name === b);
-      const rateA = gA && gA.sale_rate !== undefined ? gA.sale_rate : 999;
-      const rateB = gB && gB.sale_rate !== undefined ? gB.sale_rate : 999;
-      return rateA - rateB;
-    });
-  }
-
-  groupOrKeys.forEach(k => {
+  const keys = Object.keys(counts).filter(k => k !== 'all');
+  keys.forEach(k => {
     pills.push({ key: k, label: `${k} (${counts[k]})` });
   });
 
@@ -662,6 +840,14 @@ function renderChannels() {
     }
   }
 
+  // 业务分组专属横幅渲染控制
+  if (currentDimension === 'group' && currentFilterPill !== 'all') {
+    renderGroupControlBanner(currentFilterPill);
+  } else {
+    const b = document.getElementById('groupControlBanner');
+    if (b) { b.style.display = 'none'; b.innerHTML = ''; }
+  }
+
   renderStripsView(enabledList, standbyList);
 }
 
@@ -769,84 +955,94 @@ function renderStripsView(enabledChannels, standbyChannels) {
       userBadgeHtml = `<span class="user-active-badge none" title="${escapeHtml(userTooltip)}">⚪ 0人使用</span>`;
     }
 
-    // 找出当前业务分类（业务分组）下包含的所有渠道清单
-    const groupChannels = channelsData
-      .filter(c => c.groups && c.groups.includes(effectiveGroupName))
-      .map(c => c.name);
-    const groupChannelsStr = groupChannels.length > 0 ? groupChannels.join('、') : ch.name;
+    const activeBadgeHtml = isActive
+      ? `<span class="channel-status-badge active">🌟 主调</span>`
+      : (role === 'sub' 
+          ? `<span class="channel-status-badge sub" style="background: #eff6ff; color: #1e40af; border-color: #bfdbfe;">🔵 副调</span>`
+          : (role === 'alt'
+              ? `<span class="channel-status-badge alt" style="background: #fefce8; color: #854d0e; border-color: #fef08a;">🟡 备选</span>`
+              : `<span class="channel-status-badge standby">⚪ 备用</span>`));
+
+    const statusPillHtml = ch.status === 'online'
+      ? `<span class="status-indicator online" title="在线可用"><span class="pulse-dot"></span></span>`
+      : `<span class="status-indicator offline" title="连接异常/离线"></span>`;
+
+    const singleActiveMode = autoSwitchConfig.singleActiveExclusive !== false;
+
+    // 格式化上游账户余额展示
+    let balanceHtml = '';
+    const balVal = ch.balance;
+    const balUnit = ch.balanceUnit || 'USD';
+    const balUnitSymbol = balUnit === 'CNY' ? '¥' : '$';
+    const balStatus = ch.balanceStatus || 'unknown';
+
+    if (balVal === null || balVal === undefined) {
+      balanceHtml = `<span class="strip-bal-badge bal-unknown" title="尚未抓取余额或无需余额">--</span>`;
+    } else if (balStatus === 'empty' || Number(balVal) <= 0.001) {
+      balanceHtml = `
+        <div class="strip-bal-wrap" title="⚠️ 余额已耗尽 ($0.00)！将触发自动换通道保护">
+          <span class="strip-bal-badge bal-empty">${balUnitSymbol}0.00</span>
+          <span class="strip-bal-tag tag-empty">已欠费</span>
+        </div>
+      `;
+    } else if (balStatus === 'low' || Number(balVal) < 5.0) {
+      balanceHtml = `
+        <div class="strip-bal-wrap" title="余额不足 $5.00，请及时充值">
+          <span class="strip-bal-badge bal-low">${balUnitSymbol}${Number(balVal).toFixed(2)}</span>
+          <span class="strip-bal-tag tag-low">告急</span>
+        </div>
+      `;
+    } else {
+      balanceHtml = `
+        <div class="strip-bal-wrap" title="账户余额充裕 (${balUnitSymbol}${Number(balVal).toFixed(2)})">
+          <span class="strip-bal-badge bal-ok">${balUnitSymbol}${Number(balVal).toFixed(2)}</span>
+        </div>
+      `;
+    }
 
     return `
-      <div class="channel-strip ${vTheme.cssClass} ${isActive ? 'is-active' : ''} ${effectiveIsLoss && isSchedulable ? 'is-danger-loss' : ''}" data-id="${ch.id}">
-        <!-- 1. 状态点 -->
+      <div class="channel-strip ${isActive ? 'is-active' : ''} ${!isSchedulable ? 'is-disabled' : ''} ${effectiveIsLoss ? 'is-loss' : ''}" data-channel-id="${ch.id}">
+        <!-- 1. 状态指示器与主副标签 -->
         <div class="strip-col-status">
-          <span class="strip-status-dot ${isSchedulable ? 'active' : ''}" title="${isSchedulable ? '已开启调度分流' : '已暂停'}"></span>
+          ${statusPillHtml}
+          ${activeBadgeHtml}
         </div>
 
-        <!-- 2. 名称、厂商、线路与分组 -->
-        <div class="strip-col-name">
+        <!-- 2. 上游名称、厂商与兼跨标签 -->
+        <div class="strip-col-info">
           <div class="strip-name-row">
-            <span class="strip-group-lead-badge" title="当前分类: ${escapeHtml(effectiveGroupName)} · 包含渠道 (${groupChannels.length}条): ${escapeHtml(groupChannelsStr)}">
-              📁 ${escapeHtml(effectiveGroupName)} <span class="group-channels-bracket">(${escapeHtml(groupChannelsStr)})</span>
-            </span>
-            <span class="strip-name" title="${ch.name}">${ch.name}</span>
-            <span class="strip-vendor-badge ${vTheme.cssClass}">${vTheme.label}</span>
-            ${(() => {
-              if (role === 'main') {
-                return `<span class="badge-role-pill role-main" title="调度定性: 主调 (优先级 100 · 生产主力)">⚡ 主调</span>`;
-              } else if (role === 'sub') {
-                return `<span class="badge-role-pill role-sub" title="调度定性: 副调 (优先级 10 · 备选分流)">⚖️ 副调</span>`;
-              } else if (role === 'fallback') {
-                return `<span class="badge-role-pill role-fallback" title="调度定性: 保底 (优先级 1 · 故障兜底)">🛡️ 保底</span>`;
-              }
-              return '';
-            })()}
+            <strong class="strip-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</strong>
+            <span class="vendor-tag ${vTheme.pillClass}">${vTheme.shortLabel}</span>
+            <span class="strip-provider-tag" title="上游供应商 / 平台">${escapeHtml(ch.provider || '三方')}</span>
             ${userBadgeHtml}
           </div>
-          <div style="display: flex; align-items: center; gap: 0.35rem; margin-top: 0.22rem;">
-            <button class="strip-lines-btn" onclick="openLinesModal('${ch.id}')" title="查看备用线路并测速切换">
-              🌐 线路 (${(ch.backupLines || []).length}) ▾
-            </button>
-            <span class="strip-current-line-label" title="${ch.baseUrl}">${formatLineHost(ch.baseUrl)}</span>
-          </div>
-          <div class="strip-groups" style="margin-top: 0.22rem; display: flex; align-items: center; flex-wrap: wrap; gap: 0.25rem;">
+          <div class="strip-meta-row">
+            <span class="strip-id mono">#${ch.id}</span>
+            <span class="strip-url" title="${escapeHtml(ch.baseUrl || '')}">${escapeHtml(ch.baseUrl || '无URL')}</span>
             ${secondaryGroupsHtml}
-            <button class="btn-micro-group-edit" onclick="openChannelGroupsModal('${ch.id}')" title="免登后台：在线勾选/调整此上游所属的业务分组">
-              ⚙️ 调分组
-            </button>
           </div>
         </div>
 
-        <!-- 3. 开关 -->
-        <div style="display: flex; align-items: center; justify-content: center;">
-          <button class="toggle-switch-btn ${isSchedulable ? 'is-on' : 'is-off'}" onclick="toggleChannelSchedulable('${ch.id}', ${!isSchedulable})" title="点击开启或关闭此上游调度">
-            <span>${isSchedulable ? '●' : '○'}</span>
-            <span>${isSchedulable ? '已开启' : '已停用'}</span>
-          </button>
+        <!-- 3. 调度开关 (单主独占模式下物理锁定非主调，提示需切换主调) -->
+        <div class="strip-col-toggle">
+          <label class="switch-control" title="${singleActiveMode && !isActive ? '当前开启【业务组单主独占】：同组严禁多开。如需开启此通道，请右侧点击「主调」设为唯一主力！' : (isSchedulable ? '点击停用调度' : '点击开启调度')}">
+            <input type="checkbox" ${isSchedulable ? 'checked' : ''} onchange="toggleChannelSchedulable('${ch.id}', this.checked)" />
+            <span class="slider"></span>
+          </label>
         </div>
 
-        <!-- 4. 账户钱包余额 -->
+        <!-- 4. 上游账户余额 -->
         <div class="strip-col-balance">
-          ${(() => {
-            if (ch.balance !== null && ch.balance !== undefined) {
-              const balNum = Number(ch.balance);
-              const balClass = ch.balanceStatus === 'empty' ? 'badge-bal-empty' : (ch.balanceStatus === 'low' ? 'badge-bal-low' : 'badge-bal-ok');
-              const title = `最后更新: ${formatTime(ch.balanceUpdated)}`;
-              return `<span class="balance-badge ${balClass}" title="${title}">💰 $${balNum.toFixed(2)}</span>`;
-            }
-            if (ch.panelSync) {
-              return `<button class="balance-badge badge-bal-btn" onclick="openJinlongModal()" title="接入上游后台获取余额与倍率">🔑 接入查额</button>`;
-            }
-            return `<span class="balance-badge badge-bal-muted" title="免额度或无钱包接口">免额度</span>`;
-          })()}
+          ${balanceHtml}
         </div>
 
-        <!-- 5. 进货倍率 (Cost) -->
+        <!-- 5. 进货采购成本 (Cost) -->
         <div class="strip-col-cost">
           <div class="strip-price-main">
-            <span class="strip-cost-val">${ch.costMultiplier !== undefined ? formatRate(ch.costMultiplier) : formatRate(ch.multiplier)}x</span>
+            <span class="strip-cost-val">${formatRate(costMult)}x</span>
             ${trendHtml}
           </div>
-          <button class="btn-micro-edit cost" onclick="openRateEditModal('${ch.id}')" title="免登后台直接修改进货成本">✎ 改进价</button>
+          <button class="btn-micro-edit cost" onclick="openRateEditModal('${ch.id}')" title="免登后台直接修改上游进货倍率">✎ 改进价</button>
         </div>
 
         <!-- 6. 销售分组对外售价 (Sale) -->
@@ -926,28 +1122,109 @@ function renderStripsView(enabledChannels, standbyChannels) {
           <span class="latency-time">${formatTime(ch.lastCheckTime)}</span>
         </div>
 
-        <!-- 9. 快捷操作区 -->
+        <!-- 10. 快捷操作区 (支持四层角色定性与移出分组) -->
         <div class="strip-col-actions">
-          <div class="role-segmented-control" data-channel-id="${ch.id}" title="为该通道定性：主调(100) / 副调(10) / 保底(1)">
+          <div class="role-segmented-control" data-channel-id="${ch.id}" title="为该通道指定调度角色：主调(100) / 副调(20) / 备选(10) / 备用(1)">
             <button class="role-seg-btn role-main ${role === 'main' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'main')" 
-                    title="定性为主调 (优先级 100 · 生产主力，优先承接流量)">主调</button>
+                    title="定性为主调 (优先级 100 · 生产主力，独占承接流量)">主调</button>
             <button class="role-seg-btn role-sub ${role === 'sub' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'sub')" 
-                    title="定性为副调 (优先级 10 · 备选分流，主线故障时自动承接)">副调</button>
-            <button class="role-seg-btn role-fallback ${role === 'fallback' ? 'active' : ''}" 
-                    onclick="setChannelRole('${ch.id}', 'fallback')" 
-                    title="定性为保底 (优先级 1 · 灾备托底，主副均不可用时底线兜底)">保底</button>
+                    title="定性为副调 (优先级 20 · 第1顺位冷备)">副调</button>
+            <button class="role-seg-btn role-alt ${role === 'alt' ? 'active' : ''}" 
+                    onclick="setChannelRole('${ch.id}', 'alt')" 
+                    title="定性为备选 (优先级 10 · 第2顺位冷备)">备选</button>
+            <button class="role-seg-btn role-standby ${role === 'standby' ? 'active' : ''}" 
+                    onclick="setChannelRole('${ch.id}', 'standby')" 
+                    title="定性为备用 (优先级 1 · 兜底待命池)">备用</button>
           </div>
           <button class="btn-strip-icon" title="测速并拉取最新状态" onclick="probeSingleChannel('${ch.id}')">
             ⟳
           </button>
-          <button class="btn-strip-icon" title="模拟改价测试弹窗" onclick="simulateChannelChange('${ch.id}')">
-            ⚡
-          </button>
+          ${(currentDimension === 'group' && currentFilterPill !== 'all' && effectiveGroupId) ? `
+            <button class="btn-strip-icon btn-strip-remove" title="从业务分组【${escapeHtml(effectiveGroupName)}】中移除解绑" onclick="removeChannelFromGroup('${ch.id}', '${effectiveGroupId}', '${escapeHtml(effectiveGroupName)}')">
+              ✕
+            </button>
+          ` : `
+            <button class="btn-strip-icon" title="模拟改价测试弹窗" onclick="simulateChannelChange('${ch.id}')">
+              ⚡
+            </button>
+          `}
         </div>
       </div>
     `;
+  }
+
+  // 🌟【业务分组专属四层架构视图】：在选定具体业务分组时，清晰按主调、副调、备选、备用四层分块排列！
+  if (currentDimension === 'group' && currentFilterPill !== 'all') {
+    const allGroupChannels = [...enabledChannels, ...standbyChannels];
+    const mains = allGroupChannels.filter(c => getChannelRole(c) === 'main');
+    const subs = allGroupChannels.filter(c => getChannelRole(c) === 'sub');
+    const alts = allGroupChannels.filter(c => getChannelRole(c) === 'alt');
+    const standbys = allGroupChannels.filter(c => getChannelRole(c) === 'standby');
+
+    const sortByCost = (a, b) => ((a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier) - (b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier));
+    mains.sort(sortByCost);
+    subs.sort(sortByCost);
+    alts.sort(sortByCost);
+    standbys.sort(sortByCost);
+
+    let html = '';
+
+    // 1. 🌟 主调
+    html += `
+      <div class="channel-section-header group-tier-header tier-main">
+        <span class="section-badge active-badge" style="background: #166534; color: #fff; font-weight: 700;">🌟 当前主调 (${mains.length} 条) · 正在调度 · 独占承接</span>
+        <span class="section-desc">当前线上生产流量正在分流承接的通道 · 全组严格单主独占力保 Prompt Cache 缓存命中率</span>
+      </div>
+    `;
+    if (mains.length > 0) {
+      html += mains.map(renderSingleStrip).join('');
+    } else {
+      html += `<div class="group-empty-tier-notice">⚠️ 暂无生效主调！请在下方通道中点击「主调」按钮或点击上方「⚡ 编排通道」立即指定！</div>`;
+    }
+
+    // 2. 🔵 副调
+    html += `
+      <div class="channel-section-header group-tier-header tier-sub" style="margin-top: 1.15rem;">
+        <span class="section-badge" style="background: #1e40af; color: #fff; font-weight: 700;">🔵 第 1 顺位副调 (${subs.length} 条) · 冷备待命</span>
+        <span class="section-desc">当主调发生连续硬故障、失败率超标或余额耗尽时，第一顺位优先自动切线替补</span>
+      </div>
+    `;
+    if (subs.length > 0) {
+      html += subs.map(renderSingleStrip).join('');
+    } else {
+      html += `<div class="group-empty-tier-notice muted">○ 暂无指定副调（主调故障时将依次切至备选或备用通道）</div>`;
+    }
+
+    // 3. 🟡 备选
+    html += `
+      <div class="channel-section-header group-tier-header tier-alt" style="margin-top: 1.15rem;">
+        <span class="section-badge" style="background: #b45309; color: #fff; font-weight: 700;">🟡 第 2 顺位备选 (${alts.length} 条) · 冷备待命</span>
+        <span class="section-desc">当主调与副调均不可用时的第二顺位替补渠道 · 冷备停调确保业务永不宕机</span>
+      </div>
+    `;
+    if (alts.length > 0) {
+      html += alts.map(renderSingleStrip).join('');
+    } else {
+      html += `<div class="group-empty-tier-notice muted">○ 暂无指定备选渠道</div>`;
+    }
+
+    // 4. ⚪ 备用待命池
+    html += `
+      <div class="channel-section-header group-tier-header tier-standby" style="margin-top: 1.15rem;">
+        <span class="section-badge standby-badge" style="font-weight: 700;">⚪ 备用待命池 (${standbys.length} 条) · 进货成本由低到高排列</span>
+        <span class="section-desc">未被选为主调/副调/备选的组内合规渠道全部归入此池 · 严格按进货价格升序兜底</span>
+      </div>
+    `;
+    if (standbys.length > 0) {
+      html += standbys.map(renderSingleStrip).join('');
+    } else {
+      html += `<div class="group-empty-tier-notice muted">○ 暂无备用通道</div>`;
+    }
+
+    container.innerHTML = html;
+    return;
   }
 
   let html = '';
@@ -1443,16 +1720,17 @@ function initCalculatorToggle() {
   });
 }
 
-// 获取渠道当前的调度定性 (main: 主调 | sub: 副调 | fallback: 保底)
+// 获取渠道当前的调度定性 (main: 🌟 主调 | sub: 🔵 副调 | alt: 🟡 备选 | standby: ⚪ 备用)
 function getChannelRole(ch) {
-  if (!ch) return 'sub';
+  if (!ch) return 'standby';
   const p = Number(ch.priority);
   if (p >= 100 || ch.isActive || String(ch.id) === String(activeChannelId)) return 'main';
-  if (p <= 1) return 'fallback';
-  return 'sub';
+  if (p >= 20) return 'sub';
+  if (p >= 10) return 'alt';
+  return 'standby';
 }
 
-// 调整渠道调度定性 (主调 / 副调 / 保底)
+// 调整渠道调度定性 (主调 main / 副调 sub / 备选 alt / 备用 standby)
 async function setChannelRole(channelId, role) {
   const target = channelsData.find(c => String(c.id) === String(channelId));
   if (!target) return;
@@ -1461,10 +1739,12 @@ async function setChannelRole(channelId, role) {
 
   const roleMeta = {
     main: { label: '主调', priority: 100 },
-    sub: { label: '副调', priority: 10 },
-    fallback: { label: '保底', priority: 1 }
+    sub: { label: '副调', priority: 20 },
+    alt: { label: '备选', priority: 10 },
+    standby: { label: '备用', priority: 1 },
+    fallback: { label: '备用', priority: 1 }
   };
-  const targetMeta = roleMeta[role] || { label: role, priority: 10 };
+  const targetMeta = roleMeta[role] || { label: role, priority: 1 };
 
   try {
     showToast(`正在将 [${target.name}] 定性为【${targetMeta.label}】...`, 'warning');
@@ -1476,19 +1756,25 @@ async function setChannelRole(channelId, role) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '定性设置失败');
 
-    // 本地即时响应状态与优先级
+    // 本地即时响应状态与优先级 (单主独占模式下除主调外皆冷备停调)
     if (role === 'main') {
       activeChannelId = String(channelId);
       target.isActive = true;
       target.priority = 100;
+      target.schedulable = true;
     } else if (role === 'sub') {
       target.isActive = false;
+      target.priority = 20;
+      target.schedulable = false;
+    } else if (role === 'alt') {
+      target.isActive = false;
       target.priority = 10;
-    } else if (role === 'fallback') {
+      target.schedulable = false;
+    } else if (role === 'standby' || role === 'fallback') {
       target.isActive = false;
       target.priority = 1;
+      target.schedulable = false;
     }
-    target.schedulable = true;
 
     if (data.activeChannelId) {
       activeChannelId = String(data.activeChannelId);
@@ -1904,6 +2190,24 @@ function setupSSE() {
       autoSwitchConfig = JSON.parse(event.data);
       updateAutoSwitchHeaderBadge();
     } catch (e) {}
+  });
+
+  evtSource.addEventListener('MANUAL_MAIN_FAILOVER_PROPOSAL', (event) => {
+    try {
+      const proposal = JSON.parse(event.data);
+      showManualFailoverProposalModal(proposal);
+    } catch (e) {
+      console.error('处理人工主调切线请示异常:', e);
+    }
+  });
+
+  evtSource.addEventListener('MANUAL_MAIN_FAILOVER_RESOLVED', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      handleManualFailoverResolved(payload);
+    } catch (e) {
+      console.error('处理人工主调决策生效异常:', e);
+    }
   });
 
   evtSource.addEventListener('UPSTREAM_SCAN_REPORT', (event) => {
@@ -2496,7 +2800,15 @@ async function refreshAllBalances() {
   }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+function markModeAsCustom() {
+  // 标记模式为自定义
+}
+
+function applyModePreset(mode) {
+  // 模式预设联动
+}
+
+function initApp() {
   loadChannels();
   loadAlerts();
   setupSSE();
@@ -2506,6 +2818,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // 上游供应商后台管理池弹窗控制
   document.getElementById('btnOpenJinlongModal')?.addEventListener('click', openJinlongModal);
   document.getElementById('btnCloseJinlongModal')?.addEventListener('click', closeJinlongModal);
+  document.getElementById('btnCloseJinlongModalHeader')?.addEventListener('click', closeJinlongModal);
   document.getElementById('btnOpenAddUpstreamForm')?.addEventListener('click', openAddUpstreamForm);
   document.getElementById('btnCancelUpstreamForm')?.addEventListener('click', cancelUpstreamForm);
   document.getElementById('btnUpstreamTabCreds')?.addEventListener('click', () => switchUpstreamTab('creds'));
@@ -2515,6 +2828,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 线路管理弹窗控制
   document.getElementById('btnCloseLinesModal')?.addEventListener('click', closeLinesModal);
+  document.getElementById('btnCloseLinesModalHeader')?.addEventListener('click', closeLinesModal);
   document.getElementById('btnModalPingAllLines')?.addEventListener('click', pingAllModalLines);
   document.getElementById('btnModalAddNewLine')?.addEventListener('click', addNewBackupLine);
 
@@ -2612,6 +2926,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // 加载 Telegram 机器人状态
   loadTelegramStatus();
 
+  // 人工指定主调切线请示弹窗交互
+  document.getElementById('btnCloseFailoverModal')?.addEventListener('click', closeManualFailoverModal);
+  document.getElementById('btnRejectFailover')?.addEventListener('click', () => resolveFailoverProposal('reject'));
+  document.getElementById('btnApproveFailover')?.addEventListener('click', () => resolveFailoverProposal('approve'));
+
+  // 页面初次加载时检查是否有未处理的人工主调切线请示
+  checkPendingFailovers();
+
   // 页面加载后自动探测上游后台状态
   checkJinlongStatus();
   startCountdown();
@@ -2674,10 +2996,16 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnCancelRateEdit')?.addEventListener('click', () => {
     document.getElementById('rateEditModal').classList.remove('open');
   });
+  document.getElementById('btnCloseRateEditModal')?.addEventListener('click', () => {
+    document.getElementById('rateEditModal').classList.remove('open');
+  });
 
   // 销售倍率弹窗确认与取消
   document.getElementById('btnConfirmSaleRateEdit')?.addEventListener('click', submitSaleRateEdit);
   document.getElementById('btnCancelSaleRateEdit')?.addEventListener('click', () => {
+    document.getElementById('saleRateEditModal').classList.remove('open');
+  });
+  document.getElementById('btnCloseSaleRateEditModal')?.addEventListener('click', () => {
     document.getElementById('saleRateEditModal').classList.remove('open');
   });
 
@@ -2704,10 +3032,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modalBtnDismiss')?.addEventListener('click', () => {
     document.getElementById('alertModal').classList.remove('open');
   });
-  document.getElementById('alertModal')?.addEventListener('click', (e) => {
-    if (e.target.id === 'alertModal') {
-      document.getElementById('alertModal').classList.remove('open');
-    }
+  document.getElementById('btnCloseAlertModal')?.addEventListener('click', () => {
+    document.getElementById('alertModal').classList.remove('open');
   });
 
   // 报错与告警信息盒抽屉
@@ -2735,13 +3061,20 @@ document.addEventListener('DOMContentLoaded', () => {
   // 单渠道调分组保存与取消
   document.getElementById('btnSaveChannelGroups')?.addEventListener('click', saveChannelGroups);
   document.getElementById('btnCloseChannelGroupsModal')?.addEventListener('click', closeChannelGroupsModal);
+  document.getElementById('btnCloseChannelGroupsModalHeader')?.addEventListener('click', closeChannelGroupsModal);
 
   // 全站业务分组中枢打开、关闭、刷新、新建
   document.getElementById('btnOpenAllGroupsModal')?.addEventListener('click', openAllGroupsModal);
   document.getElementById('btnCloseAllGroupsModal')?.addEventListener('click', closeAllGroupsModal);
+  document.getElementById('btnCloseAllGroupsModalHeader')?.addEventListener('click', closeAllGroupsModal);
   document.getElementById('btnCreateNewGroup')?.addEventListener('click', createNewGroup);
   document.getElementById('btnSelectAllNewGroupChs')?.addEventListener('click', () => {
-    document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = true);
+    document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => {
+      const label = cb.closest('label');
+      if (!label || label.style.display !== 'none') {
+        cb.checked = true;
+      }
+    });
     updateNewGroupSelectedCount();
   });
   document.getElementById('btnClearAllNewGroupChs')?.addEventListener('click', () => {
@@ -2755,12 +3088,23 @@ document.addEventListener('DOMContentLoaded', () => {
     await loadAllGroupsDetails();
   });
 
-  // 点击背景关闭分组弹窗
-  document.getElementById('channelGroupsModal')?.addEventListener('click', (e) => {
-    if (e.target.id === 'channelGroupsModal') closeChannelGroupsModal();
+  // ====== 业务分组四层编排与自动切线弹窗监听 ======
+  document.getElementById('btnCloseGroupOrchestrateModalHeader')?.addEventListener('click', closeGroupOrchestrateModal);
+  document.getElementById('btnCancelGroupOrchestrateModal')?.addEventListener('click', closeGroupOrchestrateModal);
+  document.getElementById('btnCloseGroupAutoSwitchModalHeader')?.addEventListener('click', closeGroupAutoSwitchModal);
+  document.getElementById('btnCancelGroupAutoSwitchModal')?.addEventListener('click', closeGroupAutoSwitchModal);
+
+  // ====== 全局弹窗交互增强：点击背景遮罩层 & 按 ESC 键关闭当前弹窗 ======
+  document.addEventListener('click', (e) => {
+    if (e.target && e.target.classList && (e.target.classList.contains('modal-backdrop') || e.target.classList.contains('drawer-backdrop'))) {
+      closeActiveModal(e.target);
+    }
   });
-  document.getElementById('allGroupsModal')?.addEventListener('click', (e) => {
-    if (e.target.id === 'allGroupsModal') closeAllGroupsModal();
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' || e.key === 'Esc') {
+      closeActiveModal();
+    }
   });
 
   // URL Hash 快捷打开弹窗与定位
@@ -2780,7 +3124,243 @@ document.addEventListener('DOMContentLoaded', () => {
   };
   window.addEventListener('hashchange', handleHash);
   setTimeout(handleHash, 150);
-});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
+}
+
+// ====== 全局弹窗安全关闭调度器 ======
+function closeActiveModal(targetBackdrop = null) {
+  if (targetBackdrop && targetBackdrop.id) {
+    const id = targetBackdrop.id;
+    if (id === 'assignAccountsModalBackdrop') {
+      targetBackdrop.remove();
+      return;
+    }
+    if (id === 'quickRechargeModal') {
+      if (typeof closeQuickRechargeModal === 'function') closeQuickRechargeModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'quickConcurrencyModal') {
+      if (typeof closeQuickConcurrencyModal === 'function') closeQuickConcurrencyModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'upstreamScanReportModal') {
+      if (typeof closeUpstreamScanModal === 'function') closeUpstreamScanModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'userFinancesModal') {
+      if (typeof closeUserFinancesModal === 'function') closeUserFinancesModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'manualFailoverModal') {
+      if (typeof closeManualFailoverModal === 'function') closeManualFailoverModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'groupOrchestrateModal') {
+      if (typeof closeGroupOrchestrateModal === 'function') closeGroupOrchestrateModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'groupAutoSwitchModal') {
+      if (typeof closeGroupAutoSwitchModal === 'function') closeGroupAutoSwitchModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'channelGroupsModal') {
+      if (typeof closeChannelGroupsModal === 'function') closeChannelGroupsModal();
+      else targetBackdrop.classList.remove('open');
+      return;
+    }
+    if (id === 'allGroupsModal') {
+      if (typeof closeAllGroupsModal === 'function') closeAllGroupsModal();
+      else targetBackdrop.classList.remove('open');
+      return;
+    }
+    if (id === 'jinlongModal') {
+      if (typeof closeJinlongModal === 'function') closeJinlongModal();
+      else targetBackdrop.classList.remove('open');
+      return;
+    }
+    if (id === 'backupLinesModal') {
+      if (typeof closeLinesModal === 'function') closeLinesModal();
+      else targetBackdrop.classList.remove('open');
+      return;
+    }
+    if (id === 'modelStabilityModal') {
+      if (typeof closeModelStabilityModal === 'function') closeModelStabilityModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'autoSwitchModal') {
+      if (typeof closeAutoSwitchModal === 'function') closeAutoSwitchModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'telegramModal') {
+      if (typeof closeTelegramModal === 'function') closeTelegramModal();
+      else targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'securityModal') {
+      targetBackdrop.style.display = 'none';
+      return;
+    }
+    if (id === 'rateEditModal' || id === 'saleRateEditModal' || id === 'alertModal' || id === 'alertsDrawer') {
+      targetBackdrop.classList.remove('open');
+      return;
+    }
+    targetBackdrop.classList.remove('open');
+    if (targetBackdrop.style.display && targetBackdrop.style.display !== 'none') {
+      targetBackdrop.style.display = 'none';
+    }
+    return;
+  }
+
+  // 若无特定目标（如按下 ESC 键），按层级优先顺序关闭顶层可见弹窗
+  const assignModal = document.getElementById('assignAccountsModalBackdrop');
+  if (assignModal) {
+    assignModal.remove();
+    return;
+  }
+
+  const failoverModal = document.getElementById('manualFailoverModal');
+  if (failoverModal && failoverModal.style.display === 'flex') {
+    if (typeof closeManualFailoverModal === 'function') closeManualFailoverModal();
+    else failoverModal.style.display = 'none';
+    return;
+  }
+
+  const rechargeModal = document.getElementById('quickRechargeModal');
+  if (rechargeModal && rechargeModal.style.display === 'flex') {
+    if (typeof closeQuickRechargeModal === 'function') closeQuickRechargeModal();
+    else rechargeModal.style.display = 'none';
+    return;
+  }
+
+  const concModal = document.getElementById('quickConcurrencyModal');
+  if (concModal && concModal.style.display === 'flex') {
+    if (typeof closeQuickConcurrencyModal === 'function') closeQuickConcurrencyModal();
+    else concModal.style.display = 'none';
+    return;
+  }
+
+  const scanModal = document.getElementById('upstreamScanReportModal');
+  if (scanModal && scanModal.style.display === 'flex') {
+    if (typeof closeUpstreamScanModal === 'function') closeUpstreamScanModal();
+    else scanModal.style.display = 'none';
+    return;
+  }
+
+  const finModal = document.getElementById('userFinancesModal');
+  if (finModal && finModal.style.display === 'flex') {
+    if (typeof closeUserFinancesModal === 'function') closeUserFinancesModal();
+    else finModal.style.display = 'none';
+    return;
+  }
+
+  const grpOrchModal = document.getElementById('groupOrchestrateModal');
+  if (grpOrchModal && grpOrchModal.style.display === 'flex') {
+    if (typeof closeGroupOrchestrateModal === 'function') closeGroupOrchestrateModal();
+    else grpOrchModal.style.display = 'none';
+    return;
+  }
+
+  const grpAutoModal = document.getElementById('groupAutoSwitchModal');
+  if (grpAutoModal && grpAutoModal.style.display === 'flex') {
+    if (typeof closeGroupAutoSwitchModal === 'function') closeGroupAutoSwitchModal();
+    else grpAutoModal.style.display = 'none';
+    return;
+  }
+
+  const chGrpModal = document.getElementById('channelGroupsModal');
+  if (chGrpModal && chGrpModal.classList.contains('open')) {
+    if (typeof closeChannelGroupsModal === 'function') closeChannelGroupsModal();
+    else chGrpModal.classList.remove('open');
+    return;
+  }
+
+  const allGrpModal = document.getElementById('allGroupsModal');
+  if (allGrpModal && allGrpModal.classList.contains('open')) {
+    if (typeof closeAllGroupsModal === 'function') closeAllGroupsModal();
+    else allGrpModal.classList.remove('open');
+    return;
+  }
+
+  const jinlongModal = document.getElementById('jinlongModal');
+  if (jinlongModal && jinlongModal.classList.contains('open')) {
+    if (typeof closeJinlongModal === 'function') closeJinlongModal();
+    else jinlongModal.classList.remove('open');
+    return;
+  }
+
+  const linesModal = document.getElementById('backupLinesModal');
+  if (linesModal && linesModal.classList.contains('open')) {
+    if (typeof closeLinesModal === 'function') closeLinesModal();
+    else linesModal.classList.remove('open');
+    return;
+  }
+
+  const stabModal = document.getElementById('modelStabilityModal');
+  if (stabModal && stabModal.style.display === 'flex') {
+    if (typeof closeModelStabilityModal === 'function') closeModelStabilityModal();
+    else stabModal.style.display = 'none';
+    return;
+  }
+
+  const autoModal = document.getElementById('autoSwitchModal');
+  if (autoModal && autoModal.style.display === 'flex') {
+    if (typeof closeAutoSwitchModal === 'function') closeAutoSwitchModal();
+    else autoModal.style.display = 'none';
+    return;
+  }
+
+  const tgModal = document.getElementById('telegramModal');
+  if (tgModal && tgModal.style.display === 'flex') {
+    if (typeof closeTelegramModal === 'function') closeTelegramModal();
+    else tgModal.style.display = 'none';
+    return;
+  }
+
+  const secModal = document.getElementById('securityModal');
+  if (secModal && secModal.style.display === 'flex') {
+    secModal.style.display = 'none';
+    return;
+  }
+
+  const rateModal = document.getElementById('rateEditModal');
+  if (rateModal && rateModal.classList.contains('open')) {
+    rateModal.classList.remove('open');
+    return;
+  }
+
+  const saleModal = document.getElementById('saleRateEditModal');
+  if (saleModal && saleModal.classList.contains('open')) {
+    saleModal.classList.remove('open');
+    return;
+  }
+
+  const alertModal = document.getElementById('alertModal');
+  if (alertModal && alertModal.classList.contains('open')) {
+    alertModal.classList.remove('open');
+    return;
+  }
+
+  const drawer = document.getElementById('alertsDrawer');
+  if (drawer && drawer.classList.contains('open')) {
+    drawer.classList.remove('open');
+    return;
+  }
+}
+window.closeActiveModal = closeActiveModal;
 
 // ====== 【单渠道调整所属业务分组】 ======
 let activeChannelGroupsModalId = null;
@@ -2870,8 +3450,168 @@ async function openAllGroupsModal() {
   await loadAllGroupsDetails();
 }
 
+let currentChannelSelectorFilter = 'all';
+
+function switchGroupConsoleTab(mode) {
+  const tabExisting = document.getElementById('tabModeExistingGroup');
+  const tabNew = document.getElementById('tabModeNewGroup');
+  const panelExisting = document.getElementById('panelAssignToExistingGroup');
+  const panelNew = document.getElementById('panelCreateNewGroupForm');
+  const btnExisting = document.getElementById('btnAssignToExistingGroup');
+  const btnNew = document.getElementById('btnCreateNewGroup');
+  const helpText = document.getElementById('groupConsoleHelpText');
+
+  if (mode === 'existing') {
+    if (tabExisting) {
+      tabExisting.style.background = '#ffffff';
+      tabExisting.style.color = '#0f172a';
+      tabExisting.style.fontWeight = '700';
+      tabExisting.style.boxShadow = '0 1px 2px rgba(0,0,0,0.05)';
+    }
+    if (tabNew) {
+      tabNew.style.background = 'transparent';
+      tabNew.style.color = '#64748b';
+      tabNew.style.fontWeight = '600';
+      tabNew.style.boxShadow = 'none';
+    }
+    if (panelExisting) panelExisting.style.display = 'flex';
+    if (panelNew) panelNew.style.display = 'none';
+    if (btnExisting) btnExisting.style.display = 'inline-flex';
+    if (btnNew) btnNew.style.display = 'none';
+    if (helpText) helpText.textContent = '勾选下方通道后直接追加至已有分组，原组内通道不受影响';
+  } else {
+    if (tabNew) {
+      tabNew.style.background = '#ffffff';
+      tabNew.style.color = '#0f172a';
+      tabNew.style.fontWeight = '700';
+      tabNew.style.boxShadow = '0 1px 2px rgba(0,0,0,0.05)';
+    }
+    if (tabExisting) {
+      tabExisting.style.background = 'transparent';
+      tabExisting.style.color = '#64748b';
+      tabExisting.style.fontWeight = '600';
+      tabExisting.style.boxShadow = 'none';
+    }
+    if (panelExisting) panelExisting.style.display = 'none';
+    if (panelNew) panelNew.style.display = 'flex';
+    if (btnExisting) btnExisting.style.display = 'none';
+    if (btnNew) btnNew.style.display = 'inline-flex';
+    if (helpText) helpText.textContent = '支持直接勾选初始通道，系统自动以最便宜健康通道为主调';
+  }
+}
+
+function filterChannelSelector(filterStatus) {
+  currentChannelSelectorFilter = filterStatus;
+  const btnAll = document.getElementById('btnFilterChAll');
+  const btnUnassigned = document.getElementById('btnFilterChUnassigned');
+  const btnAssigned = document.getElementById('btnFilterChAssigned');
+
+  [btnAll, btnUnassigned, btnAssigned].forEach(b => {
+    if (b) {
+      b.style.background = 'transparent';
+      b.style.fontWeight = '600';
+    }
+  });
+
+  if (filterStatus === 'all' && btnAll) {
+    btnAll.style.background = '#ffffff';
+    btnAll.style.fontWeight = '700';
+  } else if (filterStatus === 'unassigned' && btnUnassigned) {
+    btnUnassigned.style.background = '#ffffff';
+    btnUnassigned.style.fontWeight = '700';
+  } else if (filterStatus === 'assigned' && btnAssigned) {
+    btnAssigned.style.background = '#ffffff';
+    btnAssigned.style.fontWeight = '700';
+  }
+
+  renderNewGroupChannelSelector();
+}
+
+function populateTargetGroupSelect(groupsList) {
+  const select = document.getElementById('selectTargetExistingGroup');
+  if (!select) return;
+  const list = groupsList || cachedGroupsDetailsData || [];
+  if (!list || list.length === 0) {
+    select.innerHTML = `<option value="">暂无可用业务分组，请先在右侧创建</option>`;
+    return;
+  }
+
+  const prevValue = select.value;
+  select.innerHTML = `
+    <option value="">-- 请选择要归入的目标已有业务销售分组 --</option>
+    ${list.map(g => {
+      const count = (g.accounts || []).length;
+      return `<option value="${g.id}">【#${g.id} · ${escapeHtml(g.name)}】 (售价: ${formatRate(g.sale_rate || 1)}x · 现有 ${count} 条通道承接)</option>`;
+    }).join('')}
+  `;
+
+  if (prevValue && list.some(g => String(g.id) === String(prevValue))) {
+    select.value = prevValue;
+  }
+}
+
+async function addSelectedChannelsToExistingGroup() {
+  const select = document.getElementById('selectTargetExistingGroup');
+  const groupId = select?.value;
+  if (!groupId) {
+    showToast('请先选择要归入的目标已有业务分组！', 'error');
+    if (select) select.focus();
+    return;
+  }
+
+  const selectedChs = Array.from(document.querySelectorAll('input[name="newGroupChannel"]:checked'))
+    .map(cb => parseInt(cb.value, 10))
+    .filter(id => !isNaN(id));
+
+  if (selectedChs.length === 0) {
+    showToast('请在下方勾选需要归入该分组的上游通道！', 'error');
+    return;
+  }
+
+  const targetGroup = (cachedGroupsDetailsData || []).find(g => String(g.id) === String(groupId));
+  const groupName = targetGroup ? targetGroup.name : `#${groupId}`;
+
+  try {
+    const res = await fetch(`/api/groups/${groupId}/add-accounts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountIds: selectedChs })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '分配通道失败');
+
+    showToast(data.message || `已成功将 ${selectedChs.length} 个通道加入分组 [${groupName}]！`, 'success');
+    document.querySelectorAll('input[name="newGroupChannel"]').forEach(cb => cb.checked = false);
+    updateNewGroupSelectedCount();
+
+    await loadChannels();
+    try {
+      renderNewGroupChannelSelector();
+    } catch (e) {}
+    await loadAllGroupsDetails();
+  } catch (e) {
+    showToast(e.message, 'error');
+  }
+}
+
 function updateNewGroupSelectedCount() {
-  const count = document.querySelectorAll('input[name="newGroupChannel"]:checked').length;
+  const cbs = document.querySelectorAll('input[name="newGroupChannel"]');
+  let count = 0;
+  cbs.forEach(cb => {
+    const label = cb.closest('label');
+    if (cb.checked) {
+      count++;
+      if (label) {
+        label.style.background = '#eff6ff';
+        label.style.borderColor = '#93c5fd';
+      }
+    } else {
+      if (label) {
+        label.style.background = '#f8fafc';
+        label.style.borderColor = '#e2e8f0';
+      }
+    }
+  });
   const el = document.getElementById('newGroupSelectedCount');
   if (el) el.textContent = count;
 }
@@ -2885,7 +3625,27 @@ function renderNewGroupChannelSelector() {
     updateNewGroupSelectedCount();
     return;
   }
-  container.innerHTML = list.map(c => {
+
+  // 记录当前已勾选状态
+  const currentlyChecked = new Set(
+    Array.from(document.querySelectorAll('input[name="newGroupChannel"]:checked')).map(cb => String(cb.value))
+  );
+
+  // 根据当前过滤器筛选通道
+  const filteredList = list.filter(c => {
+    const hasGroup = (c.groupsDetail && c.groupsDetail.length > 0) || (c.groups && c.groups.length > 0 && !c.groups.includes('未分配分组'));
+    if (currentChannelSelectorFilter === 'unassigned') return !hasGroup;
+    if (currentChannelSelectorFilter === 'assigned') return hasGroup;
+    return true;
+  });
+
+  if (filteredList.length === 0) {
+    container.innerHTML = `<span style="color: #94a3b8; font-size: 0.75rem; grid-column: 1/-1; text-align: center; padding: 0.6rem;">当前筛选条件下暂无通道</span>`;
+    updateNewGroupSelectedCount();
+    return;
+  }
+
+  container.innerHTML = filteredList.map(c => {
     const cost = formatRate(c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier);
     const bal = c.balance !== null && c.balance !== undefined ? `$${Number(c.balance).toFixed(2)}` : '未同步';
     const isOut = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
@@ -2894,11 +3654,12 @@ function renderNewGroupChannelSelector() {
     const hasGroup = (c.groupsDetail && c.groupsDetail.length > 0) || (c.groups && c.groups.length > 0 && !c.groups.includes('未分配分组'));
     const groupBadge = hasGroup 
       ? `<span style="font-size: 0.62rem; color: #475569; background: #e2e8f0; padding: 0 4px; border-radius: 3px;">已有组</span>`
-      : `<span style="font-size: 0.62rem; color: #d97706; background: #fef3c7; padding: 0 4px; border-radius: 3px;">待分配</span>`;
+      : `<span style="font-size: 0.62rem; color: #d97706; background: #fef3c7; padding: 0 4px; border-radius: 3px; font-weight: bold;">待分配</span>`;
+    const isChecked = currentlyChecked.has(String(c.id));
 
     return `
-      <label style="display: flex; align-items: center; gap: 0.35rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 0.3rem 0.45rem; cursor: pointer; font-size: 0.74rem; user-select: none;">
-        <input type="checkbox" name="newGroupChannel" value="${c.id}" onchange="updateNewGroupSelectedCount()" style="cursor: pointer;" />
+      <label style="display: flex; align-items: center; gap: 0.35rem; background: ${isChecked ? '#eff6ff' : '#f8fafc'}; border: 1px solid ${isChecked ? '#93c5fd' : '#e2e8f0'}; border-radius: 4px; padding: 0.3rem 0.45rem; cursor: pointer; font-size: 0.74rem; user-select: none;">
+        <input type="checkbox" name="newGroupChannel" value="${c.id}" ${isChecked ? 'checked' : ''} onchange="updateNewGroupSelectedCount()" style="cursor: pointer;" />
         <div style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
           <div style="display: flex; justify-content: space-between; align-items: center;">
             <strong style="color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${c.name}</strong>
@@ -2929,6 +3690,7 @@ async function loadAllGroupsDetails() {
     if (!res.ok) throw new Error('拉取分组数据失败');
     const groupsWithDetails = await res.json();
     cachedGroupsDetailsData = groupsWithDetails || [];
+    populateTargetGroupSelect(cachedGroupsDetailsData);
     renderAllGroupsCards(groupsWithDetails);
   } catch (e) {
     container.innerHTML = `<div style="text-align: center; padding: 1.5rem; color: #ef4444; font-size: 0.8rem;">拉取失败: ${e.message}</div>`;
@@ -3107,7 +3869,10 @@ function openAssignAccountsModal(groupId, groupName) {
     <div id="assignAccountsModalBackdrop" class="modal-backdrop open" style="z-index: 1050;">
       <div class="modal-dialog" style="max-width: 520px;">
         <div class="dialog-content">
-          <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a; margin-bottom: 0.2rem;">为分组 [${groupName}] 分配上游渠道</div>
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.2rem;">
+            <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a;">为分组 [${groupName}] 分配上游渠道</div>
+            <button type="button" onclick="document.getElementById('assignAccountsModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
           <p style="font-size: 0.75rem; color: #64748b; margin-bottom: 0.5rem;">勾选所有归属于此业务销售分组的上游渠道（共 ${list.length} 个通道可选）：</p>
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; gap: 0.4rem;">
             <input type="text" id="filterAssignAccsInput" placeholder="🔍 快速搜索渠道名称..." class="form-input" style="font-size: 0.76rem; padding: 0.2rem 0.5rem; flex: 1;" />
@@ -3173,6 +3938,658 @@ function openAssignAccountsModal(groupId, groupName) {
       showToast(e.message, 'error');
     }
   });
+}
+
+// ==========================================
+// 业务销售分组专属控制台、四层编排与自动切线策略
+// ==========================================
+
+let currentOrchestratingGroupId = null;
+let currentAutoSwitchGroupId = null;
+
+// 渲染业务分组专属控制横幅
+function renderGroupControlBanner(groupName) {
+  const banner = document.getElementById('groupControlBanner');
+  if (!banner) return;
+
+  if (!groupName || groupName === 'all' || groupName === '未分配分组') {
+    banner.style.display = 'none';
+    banner.innerHTML = '';
+    return;
+  }
+
+  const group = (allGroups || []).find(g => g.name === groupName);
+  if (!group) {
+    banner.style.display = 'none';
+    banner.innerHTML = '';
+    return;
+  }
+
+  const category = getGroupCategory(group.name, channelsData);
+  const saleRate = group.sale_rate !== undefined ? Number(group.sale_rate) : 1.0;
+  const eligible = getEligibleChannelsForGroup(group, channelsData);
+
+  const currentAssigned = channelsData.filter(c => {
+    if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(group.id))) return true;
+    if (String(c.primaryGroupId) === String(group.id)) return true;
+    if (c.groups && c.groups.includes(group.name)) return true;
+    return false;
+  });
+
+  const mainCh = currentAssigned.find(c => getChannelRole(c) === 'main');
+  const subCh = currentAssigned.find(c => getChannelRole(c) === 'sub');
+  const altCh = currentAssigned.find(c => getChannelRole(c) === 'alt');
+  const standbyChs = currentAssigned.filter(c => getChannelRole(c) === 'standby');
+
+  const unassignedEligible = eligible.filter(c => !currentAssigned.some(a => String(a.id) === String(c.id)));
+
+  banner.style.display = 'block';
+  banner.innerHTML = `
+    <div class="group-control-card">
+      <div class="gcc-header">
+        <div class="gcc-left">
+          <div class="gcc-title-row">
+            <span class="gcc-badge-cat">${escapeHtml(category)} 分类</span>
+            <h2 class="gcc-title">${escapeHtml(group.name)}</h2>
+            <span class="gcc-rate-badge">对外售价: <strong class="mono">${formatRate(saleRate)}x</strong></span>
+            <button class="btn-micro-edit sale" onclick="openSaleRateEditModal('${group.id}', '${escapeHtml(group.name)}', ${saleRate})" title="直接修改分组对外售价">✎ 改售价</button>
+          </div>
+          <div class="gcc-meta-row">
+            <span class="gcc-rule-tag">准入规则: <strong>${escapeHtml(category)} 分类</strong> 且 进货成本 <strong>&lt; ${formatRate(saleRate)}x</strong></span>
+            <span class="gcc-cap-tag">容量: 全站合规 <strong>${eligible.length}</strong> 条 · 组内已纳管 <strong>${currentAssigned.length}</strong> 条${unassignedEligible.length > 0 ? ` (尚有 <strong style="color: #059669;">${unassignedEligible.length}</strong> 条待纳管)` : ''}</span>
+          </div>
+        </div>
+        <div class="gcc-actions">
+          <button class="btn btn-primary btn-gcc-orchestrate" onclick="openGroupOrchestrateModal('${group.id}')" title="指定主调、副调、备选，其余通道一键归为备用">
+            <span>⚡</span> 编排通道与角色 (调分组)
+          </button>
+          <button class="btn btn-secondary btn-gcc-autoswitch" onclick="openGroupAutoSwitchModal('${group.id}')" title="设置本组自动故障切线、欠费秒切与熔断容灾策略">
+            <span>⚡</span> 自动换通道策略
+          </button>
+          <button class="btn btn-secondary btn-gcc-autoqualify" onclick="triggerAutoQualifyByCostForGroup('${group.id}')" title="以不赔钱为第一主线：最便宜为主调，次便宜为副调，第三为备选，其余全部备用">
+            <span>⚡</span> 一键按成本定性
+          </button>
+          ${unassignedEligible.length > 0 ? `
+            <button class="btn btn-secondary btn-gcc-include-all" onclick="quickIncludeAllEligibleChannels('${group.id}')" title="将全站所有符合该组分类且成本低于售价的 ${unassignedEligible.length} 条通道一键全部纳入本组备用池">
+              + 纳入全组合规渠道 (${unassignedEligible.length})
+            </button>
+          ` : ''}
+        </div>
+      </div>
+      <div class="gcc-status-bar">
+        <div class="gcc-stat-item">
+          <span class="gcc-stat-label">🌟 主调:</span>
+          <span class="gcc-stat-val ${mainCh ? 'is-valid' : 'is-empty'}">${mainCh ? escapeHtml(mainCh.name) + ' (' + formatRate(mainCh.costMultiplier !== undefined ? mainCh.costMultiplier : mainCh.multiplier) + 'x)' : '未指定 (请点编排)'}</span>
+        </div>
+        <div class="gcc-stat-item">
+          <span class="gcc-stat-label">🔵 第 1 副调:</span>
+          <span class="gcc-stat-val">${subCh ? escapeHtml(subCh.name) + ' (' + formatRate(subCh.costMultiplier !== undefined ? subCh.costMultiplier : subCh.multiplier) + 'x)' : '无'}</span>
+        </div>
+        <div class="gcc-stat-item">
+          <span class="gcc-stat-label">🟡 第 2 备选:</span>
+          <span class="gcc-stat-val">${altCh ? escapeHtml(altCh.name) + ' (' + formatRate(altCh.costMultiplier !== undefined ? altCh.costMultiplier : altCh.multiplier) + 'x)' : '无'}</span>
+        </div>
+        <div class="gcc-stat-item">
+          <span class="gcc-stat-label">⚪ 备用待命池:</span>
+          <span class="gcc-stat-val">${standbyChs.length} 条通道 (按进价升序兜底)</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// 打开业务分组通道编排弹窗
+function openGroupOrchestrateModal(groupId) {
+  const group = (allGroups || []).find(g => String(g.id) === String(groupId));
+  if (!group) {
+    showToast('未找到该业务分组信息', 'error');
+    return;
+  }
+  currentOrchestratingGroupId = String(groupId);
+
+  const category = getGroupCategory(group.name, channelsData);
+  const saleRate = group.sale_rate !== undefined ? Number(group.sale_rate) : 1.0;
+
+  document.getElementById('orchestrateGroupName').textContent = `编排【${group.name}】通道与四层角色`;
+  document.getElementById('orchestrateGroupCategoryBadge').textContent = `${category} 分类`;
+  document.getElementById('orchestrateSaleRateInput').value = formatRate(saleRate);
+  document.getElementById('orchestrateRuleText').textContent = `${category} 分类 且 进货成本 < ${formatRate(saleRate)}x`;
+
+  const eligible = getEligibleChannelsForGroup(group, channelsData);
+  const currentAssigned = channelsData.filter(c => {
+    if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(groupId))) return true;
+    if (String(c.primaryGroupId) === String(groupId)) return true;
+    if (c.groups && c.groups.includes(group.name)) return true;
+    return false;
+  });
+
+  document.getElementById('orchestrateCapacityText').innerHTML = `
+    📊 全站合规可容纳通道：<strong>${eligible.length}</strong> 条 · 当前已纳管：<strong>${currentAssigned.length}</strong> 条
+  `;
+
+  renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned);
+
+  const modal = document.getElementById('groupOrchestrateModal');
+  if (modal) modal.style.display = 'flex';
+}
+
+function closeGroupOrchestrateModal() {
+  const modal = document.getElementById('groupOrchestrateModal');
+  if (modal) modal.style.display = 'none';
+  currentOrchestratingGroupId = null;
+}
+
+// 渲染编排弹窗内的下拉框与通道勾选列表
+function renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned) {
+  const poolMap = new Map();
+  [...eligible, ...currentAssigned].forEach(c => {
+    if (!poolMap.has(String(c.id))) {
+      poolMap.set(String(c.id), c);
+    }
+  });
+
+  const channelPool = Array.from(poolMap.values()).sort((a, b) => {
+    const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
+    const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
+    return costA - costB;
+  });
+
+  const currentMain = currentAssigned.find(c => getChannelRole(c) === 'main');
+  const currentSub = currentAssigned.find(c => getChannelRole(c) === 'sub');
+  const currentAlt = currentAssigned.find(c => getChannelRole(c) === 'alt');
+
+  const mainId = currentMain ? String(currentMain.id) : (channelPool[0] ? String(channelPool[0].id) : '');
+  const subId = currentSub ? String(currentSub.id) : '';
+  const altId = currentAlt ? String(currentAlt.id) : '';
+
+  const mainSelect = document.getElementById('selectOrchestrateMain');
+  const subSelect = document.getElementById('selectOrchestrateSub');
+  const altSelect = document.getElementById('selectOrchestrateAlt');
+
+  function renderSelectOptions(selectedVal, isRequired = false) {
+    let opts = isRequired ? `<option value="">-- 请选择主调通道 (必填) --</option>` : `<option value="">-- 暂不指定 (可选) --</option>`;
+    channelPool.forEach(c => {
+      const cost = formatRate(c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier);
+      opts += `<option value="${c.id}" ${String(c.id) === String(selectedVal) ? 'selected' : ''}>#${c.id} ${escapeHtml(c.name)} (成本: ${cost}x · 优先级: ${c.priority})</option>`;
+    });
+    return opts;
+  }
+
+  if (mainSelect) mainSelect.innerHTML = renderSelectOptions(mainId, true);
+  if (subSelect) subSelect.innerHTML = renderSelectOptions(subId, false);
+  if (altSelect) altSelect.innerHTML = renderSelectOptions(altId, false);
+
+  const listContainer = document.getElementById('orchestrateChannelsCheckboxList');
+  if (listContainer) {
+    const assignedIds = new Set(currentAssigned.map(c => String(c.id)));
+    const saleRate = group.sale_rate !== undefined ? Number(group.sale_rate) : 1.0;
+
+    listContainer.innerHTML = channelPool.map(c => {
+      const isChecked = assignedIds.has(String(c.id)) || String(c.id) === String(mainId) || String(c.id) === String(subId) || String(c.id) === String(altId);
+      const cost = c.costMultiplier !== undefined ? Number(c.costMultiplier) : Number(c.multiplier || 0);
+      const isOver = cost >= saleRate;
+      const vTheme = getVendorTheme(c.vendor);
+
+      return `
+        <label class="orchestrate-chk-item ${isOver ? 'over-price' : ''}" id="orchItem_${c.id}">
+          <input type="checkbox" class="orch-ch-checkbox" value="${c.id}" ${isChecked ? 'checked' : ''} onchange="updateOrchestrateStandbySummary()" />
+          <div class="orch-ch-info">
+            <span class="orch-ch-name" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>
+            <span class="strip-id mono">#${c.id}</span>
+            <span class="vendor-tag ${vTheme.pillClass}">${vTheme.shortLabel}</span>
+            <span class="mono orch-cost-val" style="color: ${isOver ? '#dc2626' : '#059669'}; font-weight: 700;">进价: ${formatRate(cost)}x</span>
+            ${isOver ? '<span class="orch-loss-tag">⚠️ 倒贴售价</span>' : ''}
+          </div>
+          <span class="orch-role-tag" id="orchRoleTag_${c.id}"></span>
+        </label>
+      `;
+    }).join('');
+  }
+
+  const handleSelectChange = () => {
+    updateOrchestrateRoleTags();
+    updateOrchestrateStandbySummary();
+  };
+
+  if (mainSelect) mainSelect.onchange = handleSelectChange;
+  if (subSelect) subSelect.onchange = handleSelectChange;
+  if (altSelect) altSelect.onchange = handleSelectChange;
+
+  updateOrchestrateRoleTags();
+  updateOrchestrateStandbySummary();
+}
+
+// 刷新编排弹窗内各条目的角色标签与锁定状态
+function updateOrchestrateRoleTags() {
+  const mainId = document.getElementById('selectOrchestrateMain')?.value || '';
+  const subId = document.getElementById('selectOrchestrateSub')?.value || '';
+  const altId = document.getElementById('selectOrchestrateAlt')?.value || '';
+
+  const checkboxes = document.querySelectorAll('.orch-ch-checkbox');
+  checkboxes.forEach(cb => {
+    const id = cb.value;
+    const tag = document.getElementById(`orchRoleTag_${id}`);
+    if (!tag) return;
+
+    if (id === mainId) {
+      tag.innerHTML = `<span class="role-badge-main">🌟 主调</span>`;
+      cb.checked = true;
+      cb.disabled = true;
+    } else if (id === subId) {
+      tag.innerHTML = `<span class="role-badge-sub">🔵 副调</span>`;
+      cb.checked = true;
+      cb.disabled = true;
+    } else if (id === altId) {
+      tag.innerHTML = `<span class="role-badge-alt">🟡 备选</span>`;
+      cb.checked = true;
+      cb.disabled = true;
+    } else {
+      cb.disabled = false;
+      if (cb.checked) {
+        tag.innerHTML = `<span class="role-badge-standby">⚪ 备用</span>`;
+      } else {
+        tag.innerHTML = `<span style="font-size: 0.68rem; color: #94a3b8;">未纳管</span>`;
+      }
+    }
+  });
+}
+
+// 刷新备用通道汇总提示
+function updateOrchestrateStandbySummary() {
+  updateOrchestrateRoleTags();
+  const mainId = document.getElementById('selectOrchestrateMain')?.value || '';
+  const subId = document.getElementById('selectOrchestrateSub')?.value || '';
+  const altId = document.getElementById('selectOrchestrateAlt')?.value || '';
+
+  const checkboxes = document.querySelectorAll('.orch-ch-checkbox:checked');
+  const checkedIds = Array.from(checkboxes).map(c => c.value);
+  const standbyIds = checkedIds.filter(id => id !== mainId && id !== subId && id !== altId);
+
+  const summaryEl = document.getElementById('orchestrateStandbySummary');
+  if (summaryEl) {
+    summaryEl.textContent = `组内其余 ${standbyIds.length} 条已勾选通道将自动作为备用通道，按进货成本由低到高在待命池中排列兜底。`;
+  }
+}
+
+// 弹窗内一键按成本最优定性
+function autoQualifyOrchestrateModalByCost() {
+  const checkboxes = document.querySelectorAll('.orch-ch-checkbox');
+  const items = Array.from(checkboxes).map(cb => {
+    const id = cb.value;
+    const ch = channelsData.find(c => String(c.id) === String(id));
+    const cost = ch ? (ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier) : 999;
+    return { id, cost, isLoss: ch ? Boolean(ch.isLoss) : false };
+  }).filter(item => !item.isLoss);
+
+  items.sort((a, b) => a.cost - b.cost);
+
+  if (items.length === 0) {
+    showToast('暂无合规健康的候选通道', 'warning');
+    return;
+  }
+
+  const mainSelect = document.getElementById('selectOrchestrateMain');
+  const subSelect = document.getElementById('selectOrchestrateSub');
+  const altSelect = document.getElementById('selectOrchestrateAlt');
+
+  if (mainSelect && items[0]) mainSelect.value = items[0].id;
+  if (subSelect && items[1]) subSelect.value = items[1].id;
+  if (altSelect && items[2]) altSelect.value = items[2].id;
+
+  checkboxes.forEach(cb => {
+    const isProfitable = items.some(it => it.id === cb.value);
+    cb.checked = isProfitable;
+  });
+
+  updateOrchestrateRoleTags();
+  updateOrchestrateStandbySummary();
+  showToast('已一键按进货成本最优指派：最低价主调、次低价副调、第三备选，其余全数备用！', 'success');
+}
+
+// 弹窗内全选 / 清空通道勾选
+function orchestrateSelectAllChannels(select) {
+  const mainId = document.getElementById('selectOrchestrateMain')?.value || '';
+  const subId = document.getElementById('selectOrchestrateSub')?.value || '';
+  const altId = document.getElementById('selectOrchestrateAlt')?.value || '';
+
+  const checkboxes = document.querySelectorAll('.orch-ch-checkbox');
+  checkboxes.forEach(cb => {
+    if (cb.value === mainId || cb.value === subId || cb.value === altId) return;
+    cb.checked = Boolean(select);
+  });
+  updateOrchestrateStandbySummary();
+}
+
+// 提交业务分组通道编排
+async function submitGroupOrchestration() {
+  if (!currentOrchestratingGroupId) return;
+
+  const mainId = document.getElementById('selectOrchestrateMain')?.value || null;
+  const subId = document.getElementById('selectOrchestrateSub')?.value || null;
+  const altId = document.getElementById('selectOrchestrateAlt')?.value || null;
+  const saleRate = parseFloat(document.getElementById('orchestrateSaleRateInput')?.value);
+
+  if (!mainId) {
+    showToast('请至少指定一个主调通道！', 'warning');
+    return;
+  }
+
+  if (mainId === subId || mainId === altId || (subId && subId === altId)) {
+    showToast('主调、副调、备选不能选择同一通道！', 'warning');
+    return;
+  }
+
+  const checkboxes = document.querySelectorAll('.orch-ch-checkbox:checked');
+  const checkedIds = Array.from(checkboxes).map(cb => cb.value);
+  const standbyIds = checkedIds.filter(id => id !== mainId && id !== subId && id !== altId);
+
+  const saveBtn = document.getElementById('btnSaveGroupOrchestrateModal');
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = '正在保存编排...';
+  }
+
+  try {
+    const res = await fetch(`/api/groups/${currentOrchestratingGroupId}/orchestrate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mainId,
+        subId,
+        altId,
+        standbyIds,
+        saleRate: (!isNaN(saleRate) && saleRate > 0) ? saleRate : null
+      })
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(result.message || '分组通道编排与角色配置已成功生效！', 'success');
+      closeGroupOrchestrateModal();
+      await loadChannels();
+      renderFilterPills();
+      if (currentDimension === 'group' && currentFilterPill !== 'all') {
+        renderGroupControlBanner(currentFilterPill);
+      }
+    } else {
+      showToast(result.error || '保存编排失败', 'error');
+    }
+  } catch (err) {
+    showToast(`保存异常: ${err.message}`, 'error');
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = '💾 确认保存并应用编排';
+    }
+  }
+}
+
+// 打开业务分组专属自动切线策略弹窗
+async function openGroupAutoSwitchModal(groupId) {
+  const group = (allGroups || []).find(g => String(g.id) === String(groupId));
+  if (!group) {
+    showToast('未找到该业务分组信息', 'error');
+    return;
+  }
+  currentAutoSwitchGroupId = String(groupId);
+
+  document.getElementById('groupAutoSwitchNameBadge').textContent = group.name;
+
+  try {
+    const res = await fetch(`/api/groups/${groupId}/auto-switch`);
+    const data = await res.json();
+    const policy = data.policy || {};
+
+    const isEnabled = policy.enabled !== false;
+    const btnSwitch = document.getElementById('btnToggleGroupAutoSwitch');
+    const txtSwitch = document.getElementById('textGroupAutoSwitchState');
+    if (btnSwitch && txtSwitch) {
+      btnSwitch.className = `toggle-switch-btn ${isEnabled ? 'is-on' : 'is-off'}`;
+      txtSwitch.textContent = isEnabled ? '已开启' : '已停用';
+    }
+
+    const selectFailRate = document.getElementById('selectGroupFailRate');
+    if (selectFailRate) selectFailRate.value = String(policy.failRateThreshold || 50);
+
+    const selectConsec = document.getElementById('selectGroupConsecutiveFailures');
+    if (selectConsec) selectConsec.value = String(policy.consecutiveFailuresThreshold || 5);
+
+    const selectCooldown = document.getElementById('selectGroupCooldown');
+    if (selectCooldown) selectCooldown.value = String(policy.cooldownMinutes || 10);
+
+    const isLowRate = Boolean(policy.isLowRateGroup);
+    const lowRateNotice = document.getElementById('groupLowRateNotice');
+    if (lowRateNotice) {
+      lowRateNotice.style.display = isLowRate ? 'block' : 'none';
+    }
+
+    const selectMinSample = document.getElementById('selectGroupMinSampleSize');
+    if (selectMinSample) selectMinSample.value = String(policy.minSampleSize || (isLowRate ? 10 : 5));
+
+    const isAutoRecover = policy.autoRecover !== false;
+    const btnRecover = document.getElementById('btnToggleGroupAutoRecover');
+    const txtRecover = document.getElementById('textGroupAutoRecoverState');
+    if (btnRecover && txtRecover) {
+      btnRecover.className = `toggle-switch-btn ${isAutoRecover ? 'is-on' : 'is-off'}`;
+      txtRecover.textContent = isAutoRecover ? '已开启' : '已停用';
+    }
+
+    const modal = document.getElementById('groupAutoSwitchModal');
+    if (modal) modal.style.display = 'flex';
+  } catch (err) {
+    showToast(`读取自动切线策略失败: ${err.message}`, 'error');
+  }
+}
+
+function applyLowRatePreset() {
+  const selectFailRate = document.getElementById('selectGroupFailRate');
+  if (selectFailRate) selectFailRate.value = '60';
+
+  const selectMinSample = document.getElementById('selectGroupMinSampleSize');
+  if (selectMinSample) selectMinSample.value = '10';
+
+  const selectConsec = document.getElementById('selectGroupConsecutiveFailures');
+  if (selectConsec) selectConsec.value = '10';
+
+  const selectCooldown = document.getElementById('selectGroupCooldown');
+  if (selectCooldown) selectCooldown.value = '20';
+
+  showToast('⚡ 已一键填入低倍率专区防抖推荐配置（失败率60%·样本量10次·连续硬报错10次·冷静期20分），点击下方【保存本组切线策略】即可生效！', 'info');
+}
+
+function closeGroupAutoSwitchModal() {
+  const modal = document.getElementById('groupAutoSwitchModal');
+  if (modal) modal.style.display = 'none';
+  currentAutoSwitchGroupId = null;
+}
+
+function toggleGroupAutoSwitchState() {
+  const btn = document.getElementById('btnToggleGroupAutoSwitch');
+  const txt = document.getElementById('textGroupAutoSwitchState');
+  if (!btn || !txt) return;
+  const isOn = btn.classList.contains('is-on');
+  btn.className = `toggle-switch-btn ${!isOn ? 'is-on' : 'is-off'}`;
+  txt.textContent = !isOn ? '已开启' : '已停用';
+}
+
+function toggleGroupAutoRecoverState() {
+  const btn = document.getElementById('btnToggleGroupAutoRecover');
+  const txt = document.getElementById('textGroupAutoRecoverState');
+  if (!btn || !txt) return;
+  const isOn = btn.classList.contains('is-on');
+  btn.className = `toggle-switch-btn ${!isOn ? 'is-on' : 'is-off'}`;
+  txt.textContent = !isOn ? '已开启' : '已停用';
+}
+
+// 提交保存本组自动切线策略
+async function submitGroupAutoSwitchPolicy() {
+  if (!currentAutoSwitchGroupId) return;
+
+  const enabled = document.getElementById('btnToggleGroupAutoSwitch')?.classList.contains('is-on');
+  const failRateThreshold = Number(document.getElementById('selectGroupFailRate')?.value || 50);
+  const minSampleSize = Number(document.getElementById('selectGroupMinSampleSize')?.value || 5);
+  const consecutiveFailuresThreshold = Number(document.getElementById('selectGroupConsecutiveFailures')?.value || 5);
+  const cooldownMinutes = Number(document.getElementById('selectGroupCooldown')?.value || 10);
+  const autoRecover = document.getElementById('btnToggleGroupAutoRecover')?.classList.contains('is-on');
+
+  const btnSave = document.getElementById('btnSaveGroupAutoSwitchModal');
+  if (btnSave) {
+    btnSave.disabled = true;
+    btnSave.textContent = '正在保存...';
+  }
+
+  try {
+    const res = await fetch(`/api/groups/${currentAutoSwitchGroupId}/auto-switch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled,
+        failRateThreshold,
+        minSampleSize,
+        consecutiveFailuresThreshold,
+        cooldownMinutes,
+        autoRecover
+      })
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(result.message || '本组自动换通道策略已成功保存！', 'success');
+      closeGroupAutoSwitchModal();
+    } else {
+      showToast(result.error || '保存策略失败', 'error');
+    }
+  } catch (err) {
+    showToast(`保存异常: ${err.message}`, 'error');
+  } finally {
+    if (btnSave) {
+      btnSave.disabled = false;
+      btnSave.textContent = '💾 保存本组切线策略';
+    }
+  }
+}
+
+// 一键按进货成本定性指定分组 (最低价主调、次低价副调、第三备选、其余备用)
+async function triggerAutoQualifyByCostForGroup(groupId) {
+  const group = (allGroups || []).find(g => String(g.id) === String(groupId));
+  const groupName = group ? group.name : '该分组';
+
+  if (!confirm(`确定按成本最优自动定性【${groupName}】？\n\n以不赔钱为第一主线：进货成本最低者设为主调(100)，次便宜者设为副调(20)，第三为备选(10)，其余组内合规通道设为备用待命池(1)！`)) {
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/channels/auto-qualify-by-cost', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groupId: parseInt(groupId, 10) })
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(result.message || `已按成本最优自动定性分组！`, 'success');
+      await loadChannels();
+      renderFilterPills();
+      if (currentDimension === 'group' && currentFilterPill !== 'all') {
+        renderGroupControlBanner(currentFilterPill);
+      }
+    } else {
+      showToast(result.error || '定性失败', 'error');
+    }
+  } catch (err) {
+    showToast(`定性异常: ${err.message}`, 'error');
+  }
+}
+
+// 一键将全站所有符合分类且低于售价的合规通道纳入本组
+async function quickIncludeAllEligibleChannels(groupId) {
+  const group = (allGroups || []).find(g => String(g.id) === String(groupId));
+  if (!group) return;
+
+  const eligible = getEligibleChannelsForGroup(group, channelsData);
+  if (eligible.length === 0) {
+    showToast('全站暂无符合条件的合规通道（需分类一致且进价严格低于售价）', 'warning');
+    return;
+  }
+
+  const currentAssigned = channelsData.filter(c => {
+    if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(groupId))) return true;
+    if (String(c.primaryGroupId) === String(groupId)) return true;
+    if (c.groups && c.groups.includes(group.name)) return true;
+    return false;
+  });
+
+  const mainCh = currentAssigned.find(c => getChannelRole(c) === 'main');
+  const subCh = currentAssigned.find(c => getChannelRole(c) === 'sub');
+  const altCh = currentAssigned.find(c => getChannelRole(c) === 'alt');
+
+  const mainId = mainCh ? String(mainCh.id) : (eligible[0] ? String(eligible[0].id) : null);
+  const subId = subCh ? String(subCh.id) : (eligible[1] && String(eligible[1].id) !== mainId ? String(eligible[1].id) : null);
+  const altId = altCh ? String(altCh.id) : (eligible[2] && String(eligible[2].id) !== mainId && String(eligible[2].id) !== subId ? String(eligible[2].id) : null);
+
+  const allAssignedSet = new Set([...currentAssigned.map(c => String(c.id)), ...eligible.map(c => String(c.id))]);
+  const standbyIds = Array.from(allAssignedSet).filter(id => id !== mainId && id !== subId && id !== altId);
+
+  if (!confirm(`确定将全站 ${eligible.length} 条合规通道一键纳入业务分组【${group.name}】？\n\n主调、副调、备选将保持不变，新增合规通道将全部作为备用待命池。`)) {
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/groups/${groupId}/orchestrate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mainId,
+        subId,
+        altId,
+        standbyIds
+      })
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(`已成功将全组合规渠道纳入【${group.name}】！`, 'success');
+      await loadChannels();
+      renderFilterPills();
+      if (currentDimension === 'group' && currentFilterPill !== 'all') {
+        renderGroupControlBanner(currentFilterPill);
+      }
+    } else {
+      showToast(result.error || '纳入失败', 'error');
+    }
+  } catch (err) {
+    showToast(`操作异常: ${err.message}`, 'error');
+  }
+}
+
+// 从当前业务分组中解绑移除单个通道
+async function removeChannelFromGroup(channelId, groupId, groupName) {
+  if (!confirm(`确定将该渠道从业务分组【${groupName}】中移除解绑？`)) return;
+
+  try {
+    const ch = channelsData.find(c => String(c.id) === String(channelId));
+    let remainingGroupIds = [];
+    if (ch && ch.groupsDetail && ch.groupsDetail.length > 0) {
+      remainingGroupIds = ch.groupsDetail.map(g => parseInt(g.id, 10)).filter(gid => String(gid) !== String(groupId) && !isNaN(gid));
+    } else {
+      remainingGroupIds = [];
+    }
+
+    const res = await fetch(`/api/channels/${channelId}/groups`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groupIds: remainingGroupIds })
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(`已从【${groupName}】中成功移除该渠道！`, 'success');
+      await loadChannels();
+      renderFilterPills();
+      if (currentDimension === 'group' && currentFilterPill !== 'all') {
+        renderGroupControlBanner(currentFilterPill);
+      }
+    } else {
+      showToast(result.error || '移除失败', 'error');
+    }
+  } catch (err) {
+    showToast(`操作异常: ${err.message}`, 'error');
+  }
 }
 
 // ====== 🛡️ 系统安全中心与会话管理 ======
@@ -4234,7 +5651,7 @@ async function saveAutoSwitchConfig() {
   const cooldownMinutes = Number(document.getElementById('selectCooldownMinutes')?.value) || 10;
   const minSampleSize = Number(document.getElementById('selectMinSampleSize')?.value) || 5;
   const consecutiveFailuresThreshold = Number(document.getElementById('selectConsecutiveFailures')?.value) || 5;
-  const manualLockPolicy = document.getElementById('selectManualLockPolicy')?.value || 'failover_allowed';
+  const manualLockPolicy = document.getElementById('selectManualLockPolicy')?.value || 'confirm_required';
 
   const saveBtn = document.getElementById('btnSaveAutoSwitchConfig');
   if (saveBtn) {
@@ -4391,6 +5808,140 @@ async function loadAutoSwitchLogs() {
     }).join('');
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: #ef4444; padding: 0.75rem;">加载记录失败: ${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+// ====== 🛡️ 人工指定主调切线确认请示 (铁律：人工设定的主调绝不擅自动，故障必须确认后才变) ======
+let currentFailoverProposal = null;
+const pendingFailoverProposalsQueue = [];
+
+function showManualFailoverProposalModal(proposal) {
+  if (!proposal) return;
+  // 若当前已有弹窗在展示不同提案，加入队列排队
+  if (currentFailoverProposal && currentFailoverProposal.id !== proposal.id) {
+    if (!pendingFailoverProposalsQueue.find(p => p.id === proposal.id)) {
+      pendingFailoverProposalsQueue.push(proposal);
+    }
+    return;
+  }
+  currentFailoverProposal = proposal;
+
+  const modal = document.getElementById('manualFailoverModal');
+  if (!modal) return;
+
+  const groupNameEl = document.getElementById('failoverModalGroupName');
+  if (groupNameEl) groupNameEl.textContent = proposal.groupName || `分组 ID: ${proposal.groupId}`;
+
+  const timeEl = document.getElementById('failoverModalTime');
+  if (timeEl) {
+    try {
+      timeEl.textContent = proposal.suggestedAt ? new Date(proposal.suggestedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '刚刚';
+    } catch (e) {
+      timeEl.textContent = '刚刚';
+    }
+  }
+
+  const fromNameEl = document.getElementById('failoverModalFromName');
+  if (fromNameEl) fromNameEl.textContent = proposal.fromChannel?.name || '未知通道';
+
+  const fromCostEl = document.getElementById('failoverModalFromCost');
+  if (fromCostEl) {
+    const cost = proposal.fromChannel?.cost;
+    fromCostEl.textContent = typeof cost === 'number' ? `${cost.toFixed(2)}x` : (cost ? `${cost}x` : '--');
+  }
+
+  const faultReasonEl = document.getElementById('failoverModalFaultReason');
+  if (faultReasonEl) {
+    let reasonText = proposal.reason || '通道异常';
+    if (proposal.fromChannel?.balance !== undefined && Number(proposal.fromChannel.balance) <= 0) {
+      reasonText += ' (当前余额 $0.00)';
+    }
+    faultReasonEl.textContent = `故障原因：${reasonText}`;
+  }
+
+  const toNameEl = document.getElementById('failoverModalToName');
+  if (toNameEl) toNameEl.textContent = proposal.toChannel?.name || '未知备选';
+
+  const toCostEl = document.getElementById('failoverModalToCost');
+  if (toCostEl) {
+    const cost = proposal.toChannel?.cost;
+    toCostEl.textContent = typeof cost === 'number' ? `${cost.toFixed(2)}x` : (cost ? `${cost}x` : '--');
+  }
+
+  modal.style.display = 'flex';
+}
+
+function closeManualFailoverModal() {
+  const modal = document.getElementById('manualFailoverModal');
+  if (modal) modal.style.display = 'none';
+  currentFailoverProposal = null;
+
+  // 队列中有未处理的提案则继续弹出下一项
+  if (pendingFailoverProposalsQueue.length > 0) {
+    const nextProp = pendingFailoverProposalsQueue.shift();
+    showManualFailoverProposalModal(nextProp);
+  }
+}
+
+async function resolveFailoverProposal(decision = 'approve') {
+  if (!currentFailoverProposal) return;
+  const proposal = currentFailoverProposal;
+  const btnApprove = document.getElementById('btnApproveFailover');
+  const btnReject = document.getElementById('btnRejectFailover');
+  if (btnApprove) btnApprove.disabled = true;
+  if (btnReject) btnReject.disabled = true;
+
+  try {
+    const res = await fetch('/api/auto-switch/resolve-failover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        proposalId: proposal.id,
+        decision,
+        operator: 'Web 控制台管理员'
+      })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(data.message || (decision === 'approve' ? '✅ 切线已批准并生效！' : '已驳回切线，保持人工主调'), decision === 'approve' ? 'success' : 'info');
+      closeManualFailoverModal();
+      loadChannels();
+    } else {
+      showToast(`切线处理失败: ${data.error || '未知错误'}`, 'error');
+    }
+  } catch (err) {
+    showToast(`切线请求失败: ${err.message}`, 'error');
+  } finally {
+    if (btnApprove) btnApprove.disabled = false;
+    if (btnReject) btnReject.disabled = false;
+  }
+}
+
+function handleManualFailoverResolved(payload) {
+  if (!payload) return;
+  if (currentFailoverProposal && (currentFailoverProposal.id === payload.proposalId || String(currentFailoverProposal.groupId) === String(payload.groupId))) {
+    showToast(`切线请示已由 [${payload.operator || '管理员'}] ${payload.decision === 'approve' ? '批准切线' : '驳回切线'}`, 'info');
+    closeManualFailoverModal();
+    loadChannels();
+  }
+}
+
+async function checkPendingFailovers() {
+  try {
+    const res = await fetch('/api/auto-switch/pending-failovers');
+    const data = await res.json();
+    if (data.success && Array.isArray(data.proposals) && data.proposals.length > 0) {
+      data.proposals.forEach(p => {
+        if (!pendingFailoverProposalsQueue.find(item => item.id === p.id)) {
+          pendingFailoverProposalsQueue.push(p);
+        }
+      });
+      if (!currentFailoverProposal && pendingFailoverProposalsQueue.length > 0) {
+        showManualFailoverProposalModal(pendingFailoverProposalsQueue.shift());
+      }
+    }
+  } catch (e) {
+    console.error('检查待确认切线请示异常:', e);
   }
 }
 
@@ -4635,7 +6186,7 @@ function updateQuickFinanceBar(summary) {
   if (!summary) return;
   const barRecharge = document.getElementById('barTotalRecharge');
   const barSpent = document.getElementById('barTotalSpent');
-  const barProfit = document.getElementById('barTotalProfit');
+  const barProfit = document.getElementById('barGrossProfit') || document.getElementById('barTotalProfit');
   const barProfitMargin = document.getElementById('barProfitMargin');
   const barBalance = document.getElementById('barBalancePool');
   const barYesterday = document.getElementById('barYesterdaySpent');
@@ -5435,6 +6986,11 @@ function initUserFinancesEvents() {
     btnQuickAdd.addEventListener('click', () => openQuickRechargeModal());
   }
 
+  const btnCloseRechargeHeader = document.getElementById('btnCloseQuickRechargeModalHeader');
+  if (btnCloseRechargeHeader) {
+    btnCloseRechargeHeader.addEventListener('click', closeQuickRechargeModal);
+  }
+
   const btnCancelRecharge = document.getElementById('btnCancelQuickRecharge');
   if (btnCancelRecharge) {
     btnCancelRecharge.addEventListener('click', closeQuickRechargeModal);
@@ -5446,6 +7002,11 @@ function initUserFinancesEvents() {
   }
 
   // 9. 快捷调并发弹窗事件
+  const btnCloseConcurrencyHeader = document.getElementById('btnCloseQuickConcurrencyModalHeader');
+  if (btnCloseConcurrencyHeader) {
+    btnCloseConcurrencyHeader.addEventListener('click', closeQuickConcurrencyModal);
+  }
+
   const btnCancelConcurrency = document.getElementById('btnCancelQuickConcurrency');
   if (btnCancelConcurrency) {
     btnCancelConcurrency.addEventListener('click', closeQuickConcurrencyModal);
@@ -5545,64 +7106,147 @@ function renderUpstreamScanModal(data) {
   if (elSynced) elSynced.textContent = (report.autoSyncedChannels || []).length;
   if (elPending) elPending.textContent = pending.length;
 
-  // 2. 待审批任务区域
+  // 2. 待审批任务区域 (按通道与供应商 API 聚合展示)
   const pendingContainer = document.getElementById('scanPendingList');
   const countText = document.getElementById('scanPendingCountText');
-  if (countText) countText.textContent = pending.length;
 
   if (pendingContainer) {
     if (pending.length === 0) {
+      if (countText) countText.textContent = '0';
       pendingContainer.innerHTML = `<div style="font-size: 0.8rem; color: #92400e; padding: 0.6rem 0; text-align: center;">🎉 当前无待审请示，上游各通道与模型运行正常！</div>`;
     } else {
-      pendingContainer.innerHTML = pending.map(item => {
-        if (item.type === 'same_price_channel') {
-          return `
-            <div style="background: #ffffff; border: 1px solid #fde68a; border-radius: 6px; padding: 0.75rem; display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
-              <div style="flex: 1; min-width: 260px;">
-                <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.25rem;">
-                  <span style="background: #fef3c7; color: #b45309; font-size: 0.72rem; padding: 1px 6px; border-radius: 4px; font-weight: 700;">同价新通道待审</span>
-                  <strong style="color: #0f172a; font-size: 0.88rem;">${escapeHtml(item.name || '新通道')}</strong>
-                  <span style="font-size: 0.74rem; color: #64748b;">(${escapeHtml(item.vendor || '通用')})</span>
-                </div>
-                <div style="font-size: 0.76rem; color: #475569; line-height: 1.4;">
-                  进价: <code class="mono" style="color: #d97706; font-weight: 700;">${item.costMultiplier}x</code> · 建议售价: <code class="mono" style="color: #059669; font-weight: 700;">${item.suggestedSaleMultiplier}x</code> (+20%)
-                </div>
+      // 聚合分类：同价通道直接展示，新模型按【通道名称 + 上游API】聚合
+      const samePriceItems = pending.filter(item => item.type === 'same_price_channel');
+      const newModelItems = pending.filter(item => item.type === 'enable_new_model');
+
+      const channelGroups = {};
+      newModelItems.forEach(item => {
+        const info = resolvePendingChannelInfo(item);
+        const key = `${info.channelName}__${info.apiUrl}`;
+        if (!channelGroups[key]) {
+          channelGroups[key] = {
+            vendor: info.vendor,
+            channelName: info.channelName,
+            apiUrl: info.apiUrl,
+            multiplier: info.multiplier,
+            models: [],
+            actionIds: []
+          };
+        }
+        channelGroups[key].models.push(item.modelName);
+        channelGroups[key].actionIds.push(item.id);
+      });
+
+      const totalGroups = samePriceItems.length + Object.keys(channelGroups).length;
+      if (countText) {
+        countText.innerHTML = `${totalGroups} 条通道待定 <span style="font-size: 0.72rem; color: #b45309; font-weight: normal;">(共 ${pending.length} 项)</span>`;
+      }
+
+      let html = '';
+
+      // (1) 渲染同价通道审批
+      samePriceItems.forEach(item => {
+        html += `
+          <div style="background: #ffffff; border: 1px solid #fde68a; border-radius: 8px; padding: 0.85rem; display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+            <div style="flex: 1; min-width: 260px;">
+              <div style="display: flex; align-items: center; gap: 0.45rem; margin-bottom: 0.3rem; flex-wrap: wrap;">
+                <span style="background: #fef3c7; color: #b45309; font-size: 0.72rem; padding: 2px 7px; border-radius: 4px; font-weight: 700;">同价新通道待审</span>
+                <strong style="color: #0f172a; font-size: 0.95rem;">${escapeHtml(item.name || '新通道')}</strong>
+                <span style="font-size: 0.74rem; color: #64748b; background: #f8fafc; border: 1px solid #e2e8f0; padding: 1px 6px; border-radius: 4px;">🏢 ${escapeHtml(item.vendor || '通用供应商')}</span>
               </div>
-              <div style="display: flex; gap: 0.4rem;">
-                <button type="button" class="btn btn-primary" onclick="resolvePendingAction('${item.id}', 'approve')" style="font-size: 0.76rem; padding: 0.35rem 0.75rem; background: #059669; border-color: #059669;">
-                  ✅ 确认同步建号建组
-                </button>
-                <button type="button" class="btn btn-secondary" onclick="resolvePendingAction('${item.id}', 'reject')" style="font-size: 0.76rem; padding: 0.35rem 0.65rem;">
-                  ❌ 忽略
-                </button>
+              <div style="font-size: 0.76rem; color: #475569; line-height: 1.5; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+                <span>🌐 <b>API:</b> <code class="mono" style="color: #0284c7; font-size: 0.73rem;">${escapeHtml(item.baseUrl || '--')}</code></span>
+                <span style="color: #cbd5e1;">|</span>
+                <span>进价: <code class="mono" style="color: #d97706; font-weight: 700;">${item.costMultiplier}x</code></span>
+                <span style="color: #cbd5e1;">|</span>
+                <span>建议售价: <code class="mono" style="color: #059669; font-weight: 700;">${item.suggestedSaleMultiplier}x</code> (+20%)</span>
               </div>
             </div>
-          `;
-        } else if (item.type === 'enable_new_model') {
-          return `
-            <div style="background: #ffffff; border: 1px solid #ddd6fe; border-radius: 6px; padding: 0.75rem; display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
-              <div style="flex: 1; min-width: 260px;">
-                <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.25rem;">
-                  <span style="background: #ede9fe; color: #6d28d9; font-size: 0.72rem; padding: 1px 6px; border-radius: 4px; font-weight: 700;">全新模型待开启</span>
-                  <strong style="color: #0f172a; font-size: 0.88rem; font-family: monospace;">${escapeHtml(item.modelName)}</strong>
+            <div style="display: flex; gap: 0.4rem;">
+              <button type="button" class="btn btn-primary" onclick="resolvePendingAction('${item.id}', 'approve')" style="font-size: 0.78rem; padding: 0.4rem 0.85rem; background: #059669; border-color: #059669;">
+                ✅ 确认同步建号建组
+              </button>
+              <button type="button" class="btn btn-secondary" onclick="resolvePendingAction('${item.id}', 'reject')" style="font-size: 0.78rem; padding: 0.4rem 0.65rem;">
+                ❌ 忽略
+              </button>
+            </div>
+          </div>
+        `;
+      });
+
+      // (2) 渲染按通道聚合的新上线模型审批卡片
+      Object.entries(channelGroups).forEach(([key, group], idx) => {
+        const safeKey = `grp_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+        const initialModels = group.models.slice(0, 8);
+        const extraModels = group.models.slice(8);
+        const actionIdsJson = JSON.stringify(group.actionIds).replace(/"/g, '&quot;');
+        const safeChName = escapeHtml(group.channelName).replace(/'/g, "\\'");
+
+        html += `
+          <div style="background: #ffffff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 0.9rem; display: flex; flex-direction: column; gap: 0.65rem; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+            <!-- 卡片头部：通道名称、供应商、API、倍率与操作按钮 -->
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; flex-wrap: wrap;">
+              <div style="display: flex; flex-direction: column; gap: 0.3rem;">
+                <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                  <span style="background: #ede9fe; color: #6d28d9; font-size: 0.72rem; padding: 2px 7px; border-radius: 4px; font-weight: 700; display: inline-flex; align-items: center; gap: 3px;">
+                    ⚡ 通道新模型待开启
+                  </span>
+                  <strong style="color: #0f172a; font-size: 1rem; font-weight: 700; letter-spacing: -0.01em;">
+                    ${escapeHtml(group.channelName)}
+                  </strong>
+                  <span style="background: #f1f5f9; color: #475569; font-size: 0.74rem; padding: 2px 7px; border-radius: 4px; font-weight: 600; border: 1px solid #e2e8f0;">
+                    🏢 供应商: ${escapeHtml(group.vendor)}
+                  </span>
                 </div>
-                <div style="font-size: 0.76rem; color: #475569;">
-                  已同步模型元数据及通道映射，默认处于未开启保护状态。
+                <!-- 属性标注栏：API 地址与倍率 -->
+                <div style="display: flex; align-items: center; gap: 0.85rem; font-size: 0.76rem; color: #475569; flex-wrap: wrap;">
+                  <span>🌐 <b>上游 API:</b> <code class="mono" style="color: #0284c7; background: #f0f9ff; padding: 1px 5px; border-radius: 3px; font-size: 0.73rem;">${escapeHtml(group.apiUrl || '未指定地址')}</code></span>
+                  <span style="color: #cbd5e1;">|</span>
+                  <span>💰 <b>通道倍率:</b> <code class="mono" style="color: #d97706; font-weight: 700; font-size: 0.82rem;">${group.multiplier}x</code></span>
+                  <span style="color: #cbd5e1;">|</span>
+                  <span>🆕 <b>新上模型:</b> <b style="color: #4f46e5; font-size: 0.82rem;">${group.models.length}</b> 项</span>
                 </div>
               </div>
-              <div style="display: flex; gap: 0.4rem;">
-                <button type="button" class="btn btn-primary" onclick="resolvePendingAction('${item.id}', 'approve')" style="font-size: 0.76rem; padding: 0.35rem 0.75rem; background: #4f46e5; border-color: #4f46e5;">
-                  🚀 立即开启对外服务
+
+              <!-- 操作按钮 (一键开启此通道对外服务) -->
+              <div style="display: flex; gap: 0.45rem; align-items: center;">
+                <button type="button" class="btn btn-primary" onclick="resolvePendingActionsBatch(${actionIdsJson}, 'approve', '${safeChName}')" style="font-size: 0.78rem; padding: 0.42rem 0.9rem; background: #4f46e5; border-color: #4f46e5; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; box-shadow: 0 1px 2px rgba(79, 70, 229, 0.2);">
+                  🚀 立即开启对外服务 (${group.models.length}个新模型)
                 </button>
-                <button type="button" class="btn btn-secondary" onclick="resolvePendingAction('${item.id}', 'reject')" style="font-size: 0.76rem; padding: 0.35rem 0.65rem;">
+                <button type="button" class="btn btn-secondary" onclick="resolvePendingActionsBatch(${actionIdsJson}, 'reject', '${safeChName}')" style="font-size: 0.78rem; padding: 0.42rem 0.65rem;">
                   ⏸️ 暂缓
                 </button>
               </div>
             </div>
-          `;
-        }
-        return '';
-      }).join('');
+
+            <!-- 新上的什么 (新模型标签列表) -->
+            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div style="font-size: 0.73rem; color: #64748b; font-weight: 600; margin-bottom: 0.35rem; display: flex; justify-content: space-between; align-items: center;">
+                <span>📋 本通道检测到的新模型 (${group.models.length}):</span>
+                ${extraModels.length > 0 ? `<span id="toggleBtn_${safeKey}" style="font-size: 0.72rem; color: #4f46e5; cursor: pointer; font-weight: 600;" onclick="toggleModelPills('${safeKey}')">展开其余 ${extraModels.length} 个模型 ▾</span>` : ''}
+              </div>
+              <div style="display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center;">
+                ${initialModels.map(m => `
+                  <span class="mono" style="background: #ffffff; border: 1px solid #cbd5e1; color: #1e293b; padding: 2px 7px; border-radius: 4px; font-size: 0.73rem; font-weight: 500;">
+                    ${escapeHtml(m)}
+                  </span>
+                `).join('')}
+                ${extraModels.length > 0 ? `
+                  <div id="extraPills_${safeKey}" style="display: none; flex-wrap: wrap; gap: 0.35rem;">
+                    ${extraModels.map(m => `
+                      <span class="mono" style="background: #ffffff; border: 1px solid #cbd5e1; color: #1e293b; padding: 2px 7px; border-radius: 4px; font-size: 0.73rem; font-weight: 500;">
+                        ${escapeHtml(m)}
+                      </span>
+                    `).join('')}
+                  </div>
+                ` : ''}
+              </div>
+            </div>
+          </div>
+        `;
+      });
+
+      pendingContainer.innerHTML = html;
     }
   }
 
@@ -5673,6 +7317,92 @@ function renderUpstreamScanModal(data) {
   }
   if (elNextRun) {
     elNextRun.textContent = `下次巡检: ${config.nextScanTime ? formatTime(config.nextScanTime) : '3 小时周期'}`;
+  }
+}
+
+// 解析待审批项对应的通道名称、供应商、API与倍率
+function resolvePendingChannelInfo(item) {
+  const url = (item.upstreamUrl || '').replace(/\/+$/, '');
+  const channels = channelsData || [];
+  const panels = (typeof upstreamPanelsList !== 'undefined' ? upstreamPanelsList : []) || [];
+
+  let matched = null;
+  if (item.channelId) {
+    matched = channels.find(c => String(c.id) === String(item.channelId));
+  }
+  if (!matched && item.channelName && item.channelName !== '默认通道' && item.channelName !== 'Upstream') {
+    matched = channels.find(c => c.name === item.channelName);
+  }
+  if (!matched && url) {
+    matched = channels.find(c => {
+      const cUrl = (c.baseUrl || '').replace(/\/+$/, '');
+      return cUrl === url && item.suggestedMultiplier && Math.abs(c.multiplier - item.suggestedMultiplier) < 0.01;
+    });
+    if (!matched) {
+      matched = channels.find(c => (c.baseUrl || '').replace(/\/+$/, '') === url);
+    }
+  }
+
+  const panel = panels.find(p => (p.backendUrl || '').replace(/\/+$/, '') === url);
+
+  const vendor = (matched && matched.provider && matched.provider !== '三方渠道')
+    ? matched.provider
+    : (panel ? panel.name : (matched ? (matched.vendor || matched.provider) : (item.provider && item.provider !== 'Upstream' && item.provider !== '国模专区' && item.provider !== 'Claude' ? item.provider : '上游供应商')));
+
+  const channelName = (item.channelName && item.channelName !== '默认通道' && item.channelName !== 'Upstream')
+    ? item.channelName
+    : (matched ? matched.name : (panel ? panel.name : (item.name || '默认通道')));
+
+  const multiplier = item.costMultiplier !== undefined 
+    ? item.costMultiplier 
+    : (item.suggestedMultiplier !== undefined 
+        ? item.suggestedMultiplier 
+        : (matched ? (matched.costMultiplier || matched.multiplier) : 1.0));
+
+  const apiUrl = item.upstreamUrl || (matched ? matched.baseUrl : (panel ? panel.backendUrl : ''));
+
+  return {
+    vendor,
+    channelName,
+    apiUrl,
+    multiplier,
+    matchedChannel: matched,
+    matchedPanel: panel
+  };
+}
+
+window.toggleModelPills = function(key) {
+  const container = document.getElementById('extraPills_' + key);
+  const btn = document.getElementById('toggleBtn_' + key);
+  if (!container) return;
+  if (container.style.display === 'none') {
+    container.style.display = 'contents';
+    if (btn) btn.innerHTML = '收起模型 ▴';
+  } else {
+    container.style.display = 'none';
+    if (btn) btn.innerHTML = '展开其余模型 ▾';
+  }
+};
+
+async function resolvePendingActionsBatch(actionIds, decision, channelName = '') {
+  if (!Array.isArray(actionIds) || actionIds.length === 0) return;
+  try {
+    const actionText = decision === 'approve' ? '开启对外服务' : '暂缓';
+    const res = await fetch('/api/upstream/scanner/resolve-action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actionIds, decision })
+    });
+    const result = await res.json();
+    if (result.success) {
+      showToast(result.message || `已成功${actionText}通道 [${channelName}] 的新模型！`, 'success');
+      fetchUpstreamScannerStatus().then(renderUpstreamScanModal);
+      loadChannels();
+    } else {
+      showToast(result.message || '操作失败', 'error');
+    }
+  } catch (err) {
+    showToast(`操作异常: ${err.message}`, 'error');
   }
 }
 
@@ -5771,6 +7501,28 @@ window.openUpstreamScanModal = openUpstreamScanModal;
 window.closeUpstreamScanModal = closeUpstreamScanModal;
 window.resolvePendingAction = resolvePendingAction;
 window.triggerManualUpstreamScan = triggerManualUpstreamScan;
+window.switchGroupConsoleTab = switchGroupConsoleTab;
+window.filterChannelSelector = filterChannelSelector;
+window.addSelectedChannelsToExistingGroup = addSelectedChannelsToExistingGroup;
+window.createNewGroup = createNewGroup;
+window.renderGroupControlBanner = renderGroupControlBanner;
+window.openGroupOrchestrateModal = openGroupOrchestrateModal;
+window.closeGroupOrchestrateModal = closeGroupOrchestrateModal;
+window.autoQualifyOrchestrateModalByCost = autoQualifyOrchestrateModalByCost;
+window.orchestrateSelectAllChannels = orchestrateSelectAllChannels;
+window.submitGroupOrchestration = submitGroupOrchestration;
+window.openGroupAutoSwitchModal = openGroupAutoSwitchModal;
+window.closeGroupAutoSwitchModal = closeGroupAutoSwitchModal;
+window.toggleGroupAutoSwitchState = toggleGroupAutoSwitchState;
+window.toggleGroupAutoRecoverState = toggleGroupAutoRecoverState;
+window.submitGroupAutoSwitchPolicy = submitGroupAutoSwitchPolicy;
+window.triggerAutoQualifyByCostForGroup = triggerAutoQualifyByCostForGroup;
+window.quickIncludeAllEligibleChannels = quickIncludeAllEligibleChannels;
+window.removeChannelFromGroup = removeChannelFromGroup;
+window.applyLowRatePreset = applyLowRatePreset;
+window.showManualFailoverProposalModal = showManualFailoverProposalModal;
+window.closeManualFailoverModal = closeManualFailoverModal;
+window.resolveFailoverProposal = resolveFailoverProposal;
 
 // 页面加载完成后自动初始化财务看板与上游巡检中枢事件
 if (document.readyState === 'loading') {

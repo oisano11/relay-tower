@@ -49,9 +49,6 @@
         <button id="btnRefreshBalances" class="btn btn-glass" title="一键抓取并刷新所有上游钱包余额">
           <span>💰</span> 刷新余额
         </button>
-        <button id="btnOpenAllGroupsModal" class="btn btn-glass" title="直接在中控管理所有业务销售分组与对外倍率">
-          <span>📁</span> 业务分组
-        </button>
         <button id="btnOpenJinlongModal" class="btn btn-glass" title="配置上游 New API 后台账号获取余额与倍率">
           <span>🔑</span> 上游后台 <span id="jinlongStatusPill" class="jinlong-status-mini">待配置</span>
         </button>
@@ -84,7 +81,7 @@
 
     <!-- 主体内容 -->
     <main class="main-container">
-      <!-- 1. 全局轻量化运营态势中枢 (一体化精简排版，替代原有笨重 4 大卡片，大幅上提渠道监控) -->
+      <!-- 1. 全局轻量化运营态势中枢 (一体化精简排版，大幅上提渠道监控) -->
       <section class="ops-ribbon-section">
         <div class="ops-ribbon-bar">
           
@@ -98,171 +95,141 @@
               </div>
             </div>
 
-            <div class="ops-pill-item pill-spent" title="客户实际累计总消费（不含测试号）">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">📉</span></span>
+            <div class="ops-pill-item pill-profit" title="扣除上游采购成本后的客户累计净毛利">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">📈</span></span>
               <div class="ops-pill-text">
-                <span class="ops-pill-label">客户消费</span>
-                <strong id="barTotalSpent" class="ops-pill-val mono">¥--</strong>
+                <span class="ops-pill-label">客户净利</span>
+                <strong id="barGrossProfit" class="ops-pill-val mono">¥--</strong>
               </div>
             </div>
 
-            <div class="ops-pill-item pill-profit highlight-profit-pill" title="客户消费减去上游采购真实净毛利与利润率">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💎</span></span>
+            <div class="ops-pill-item pill-ratio" title="整体销售利润率与利差">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">⚖️</span></span>
               <div class="ops-pill-text">
-                <div class="ops-pill-label-row">
-                  <span class="ops-pill-label">净赚毛利</span>
-                  <span id="barProfitMargin" class="ops-pill-margin-badge mono">--%</span>
-                </div>
-                <strong id="barTotalProfit" class="ops-pill-val mono">+¥--</strong>
+                <span class="ops-pill-label">综合利率</span>
+                <strong id="barProfitMargin" class="ops-pill-val mono">--%</strong>
               </div>
-            </div>
-
-            <div class="ops-pill-item pill-balance" title="所有客户预存扣除消费后的资金池结存">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💰</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">资金池结存</span>
-                <strong id="barBalancePool" class="ops-pill-val mono">¥--</strong>
-              </div>
-            </div>
-
-            <div class="ops-pill-item pill-yesterday hide-on-compact" title="客户昨日24小时实际消费金额">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">📅</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">昨日消/透</span>
-                <strong id="barYesterdaySpent" class="ops-pill-val mono">¥--</strong>
-                <span id="barYesterdayProfit" style="display: none;"></span>
-              </div>
-            </div>
-
-            <div class="ops-pill-action">
-              <span class="ops-action-tag">
-                <span>财务对账</span>
-                <span class="action-arrow">↗</span>
-              </span>
             </div>
           </div>
 
           <div class="ops-ribbon-divider"></div>
 
-          <!-- 右侧：上游通道与风控指标 (轻量状态胶囊) -->
-          <div class="ops-ribbon-group group-system">
-            <div class="ops-status-badge badge-channels" title="当前开启调度的上游通道数 / 总接入通道数">
-              <span class="ops-badge-dot pulse-green"></span>
-              <span class="ops-badge-label">通道:</span>
-              <strong id="metricEnabledCount" class="mono">-- / 18 开</strong>
+          <!-- 中间：上游池水位与实时安全 (监控核心) -->
+          <div class="ops-ribbon-group group-pool">
+            <div class="ops-pill-item" id="quickOpenPoolBtn" style="cursor: pointer;" title="上游总备付金余额折算（含USD/CNY）">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💰</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">上游余池</span>
+                <strong id="barUpstreamBalance" class="ops-pill-val mono">¥--</strong>
+              </div>
             </div>
 
-            <div class="ops-status-badge badge-risk" id="cardLossWarning" title="点击直接定位跳转至倒贴渠道进行调整" onclick="jumpToProblemChannel()">
-              <span class="ops-badge-icon">🛡️</span>
-              <strong id="metricLossCount">0 倒贴</strong>
-              <span id="metricLossBadge" style="display: none;">安全</span>
-              <span class="badge-jump-hint" id="metricLossJumpHint" style="display: none;">定位 ↗</span>
+            <div class="ops-pill-item" title="正在开启调度的生产通道与总上游数">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">⚡</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">调度通道</span>
+                <strong id="barActiveChannels" class="ops-pill-val mono">-- / --</strong>
+              </div>
             </div>
 
-            <div class="ops-status-badge badge-margin hide-on-compact" title="当前开启渠道综合加权预估毛利率">
-              <span class="ops-badge-icon">📈</span>
-              <span class="ops-badge-label">综合预估:</span>
-              <strong id="metricAvgMargin" class="mono">--%</strong>
-              <span id="metricMarginStatusBadge" style="display: none;">健康</span>
-            </div>
-
-            <div class="ops-status-badge badge-lowest hide-on-compact" title="全场最低进货价渠道">
-              <span class="ops-badge-icon">⚡</span>
-              <span class="ops-badge-label">最低:</span>
-              <strong id="metricLowestMultiplier" class="mono">--x</strong>
+            <div class="ops-pill-item" id="riskLossPillItem" style="cursor: pointer;" title="进货成本高于销售价的倒贴亏损通道（点击可快速筛选定位）">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">🚨</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">倒贴预警</span>
+                <strong id="barLossCount" class="ops-pill-val mono safe">0 条</strong>
+              </div>
             </div>
           </div>
 
-        </div>
+          <div class="ops-ribbon-divider"></div>
 
-        <!-- 隐藏保留的旧指标占位元素，确保任何旧代码和逻辑 100% 兼容无报错 -->
-        <div style="display: none;" aria-hidden="true">
-          <span id="metricActiveName"></span>
-          <span id="metricActiveMultiplier"></span>
-          <span id="metricActiveSale"></span>
-          <span id="metricActiveMargin"></span>
-          <span id="metricActiveUrl"></span>
-          <span id="metricMarginDesc"></span>
-          <span id="metricMarginSpreadText"></span>
-          <span id="metricLossDesc"></span>
-          <span id="metricLossFooterText"></span>
-          <span id="metricChannelCount"></span>
-          <span id="metricLastProbeTime"></span>
-          <span id="barPayingUsers"></span>
+          <!-- 右侧：全局并发与在线 (健康态势) -->
+          <div class="ops-ribbon-group group-traffic">
+            <div class="ops-pill-item" id="quickConcurrencyItem" style="cursor: pointer;" title="全站 15 分钟内发起请求的活跃终端客户与当前承载并发">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">👥</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">活跃并发</span>
+                <strong id="barActiveUsers" class="ops-pill-val mono">-- 人在线</strong>
+              </div>
+            </div>
+
+            <div class="ops-pill-item" title="全站 24h 调用成功率与首字稳定性">
+              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">🛡️</span></span>
+              <div class="ops-pill-text">
+                <span class="ops-pill-label">全站成功率</span>
+                <strong id="barGlobalHealth" class="ops-pill-val mono">--%</strong>
+              </div>
+            </div>
+          </div>
+
+          <!-- 最右侧快捷功能触发按钮 -->
+          <div class="ops-ribbon-actions">
+            <button id="btnQuickShowLossChannels" class="btn-micro-pill" title="一键筛选正在倒贴亏损的通道" style="display: none;">
+              <span>🚨</span> 查看倒贴
+            </button>
+            <button id="btnToggleProfitCalc" class="btn-micro-pill" title="展开/收起业务利润实时测算面板">
+              <span>🧮</span> 测算器
+            </button>
+          </div>
+
         </div>
       </section>
 
-      <!-- 2. 流水与盈利实时测算器 (轻量化折叠设计，默认收起不占地) -->
-      <section class="calculator-section">
-        <div class="calc-card" id="calcCard">
-          <div class="calc-header" id="calcToggleHeader" style="cursor: pointer;" title="点击展开/收起流水盈利核算器">
-            <div class="calc-title-row">
-              <span class="calc-icon">💰</span>
-              <span class="calc-title">流水盈利核算器</span>
-              <span class="calc-tag">进销倍率与毛利实时测算</span>
-              <!-- 收起状态下的精简概要 -->
-              <span id="calcCompactSummary" class="calc-compact-summary">
-                测算: ¥<span id="compactRevenue">1,000</span> 流水 -> 预计毛利 <strong id="compactProfit" style="color: #059669;">+¥242.43</strong> (<span id="compactMargin" style="color: #059669;">+24.2%</span>)
-              </span>
+      <!-- 2. 精致极简利润测算器 (默认收起，点击右上角「测算器」平滑展开) -->
+      <section id="collapsibleCalculatorSection" class="collapsible-calculator-section" style="display: none;">
+        <div class="calculator-drawer-card">
+          <div class="calc-top-row">
+            <div class="calc-title-badge">
+              <span>🧮</span>
+              <strong>流水盈利实时测算器</strong>
+              <span class="calc-hint-tag">按对外售价与上游实际进货成本智能反推毛利</span>
             </div>
-            <div class="calc-header-right">
-              <div class="calc-quick-presets" id="calcQuickPresets" style="display: none;">
-                <span style="font-size: 0.72rem; color: #71717a;">快捷流水:</span>
-                <button class="btn-preset" data-val="500">¥500</button>
-                <button class="btn-preset active" data-val="1000">¥1000</button>
-                <button class="btn-preset" data-val="5000">¥5000</button>
-                <button class="btn-preset" data-val="10000">¥10000</button>
-              </div>
-              <button id="btnToggleCalc" class="btn-toggle-calc" type="button" title="展开/收起核算器">
-                <span id="toggleCalcIcon">▼</span>
-                <span id="toggleCalcText">展开测算</span>
-              </button>
-            </div>
+            <button id="btnCloseCalcDrawer" class="btn-calc-close" title="收起测算器">✕</button>
           </div>
 
-          <div class="calc-body" id="calcBody" style="display: none;">
-            <div class="calc-inputs-row">
-              <div class="calc-input-group">
-                <label>客户充值 / 消费流水 (元):</label>
-                <div class="input-addon-wrap">
-                  <span class="addon">¥</span>
-                  <input type="number" id="calcRevenueInput" value="1000" min="1" step="100" class="calc-input" />
-                </div>
+          <div class="calc-body-grid">
+            <!-- 预估充值流水输入 -->
+            <div class="calc-field-group">
+              <label>预估客户充值 / 调用流水 (元):</label>
+              <div class="calc-input-wrap">
+                <span class="currency-prefix">¥</span>
+                <input type="number" id="calcRevenueInput" value="1000" min="1" step="100" class="calc-input" />
               </div>
-
-              <div class="calc-input-group" style="flex: 1.4;">
-                <label>核算渠道 / 业务分组:</label>
-                <select id="calcChannelSelect" class="calc-select">
-                  <option value="avg">【综合调度池】开启渠道平均 (加权估算)</option>
-                  <!-- 由 app.js 填充各渠道与分组 -->
-                </select>
+              <div class="calc-presets">
+                <button class="btn-preset" data-val="100">¥100</button>
+                <button class="btn-preset" data-val="500">¥500</button>
+                <button class="btn-preset active" data-val="1000">¥1,000</button>
+                <button class="btn-preset" data-val="5000">¥5,000</button>
+                <button class="btn-preset" data-val="10000">¥10,000</button>
               </div>
             </div>
 
-            <!-- 测算结果栏 -->
-            <div class="calc-results-grid">
-              <div class="calc-result-item">
-                <span class="res-label">销售入账 (用户支付)</span>
-                <span id="calcResRevenue" class="res-val val-revenue">¥ 1,000.00</span>
-                <span class="res-sub">下游客户实收金额</span>
+            <!-- 选择核算渠道 -->
+            <div class="calc-field-group">
+              <label>核算渠道 / 业务分组:</label>
+              <div class="calc-select-wrap">
+                <select id="calcChannelSelect" class="calc-select">
+                  <!-- 由 app.js 动态填充 -->
+                </select>
               </div>
-
-              <div class="calc-result-item">
-                <span class="res-label">上游采购成本 (支出)</span>
-                <span id="calcResCost" class="res-val val-cost">¥ 500.00</span>
-                <span id="calcResCostPercent" class="res-sub">成本占比 50.0%</span>
+              <div class="calc-channel-meta" id="calcChannelMeta">
+                进货: <span id="calcMetaCost">--x</span> · 对外: <span id="calcMetaSale">--x</span> · 毛利率: <span id="calcMetaMargin">--%</span>
               </div>
+            </div>
 
-              <div class="calc-result-item highlight">
-                <span class="res-label">中转站净利润 (毛利)</span>
-                <span id="calcResProfit" class="res-val val-profit">+¥ 500.00</span>
-                <span id="calcResMargin" class="res-sub">毛利率 +50.0%</span>
+            <!-- 测算结论看板 -->
+            <div class="calc-result-strip">
+              <div class="calc-res-item">
+                <span class="calc-res-lbl">需付上游成本</span>
+                <strong id="calcCostAmount" class="calc-res-val cost">¥--</strong>
               </div>
-
-              <div class="calc-result-item">
-                <span class="res-label">倍率利差公式</span>
-                <span id="calcResSpreadFormula" class="res-val val-formula">0.1200x - 0.0600x</span>
-                <span id="calcResSpreadDiff" class="res-sub">利差 +0.0600x</span>
+              <div class="calc-res-item">
+                <span class="calc-res-lbl">预期净赚毛利</span>
+                <strong id="calcProfitAmount" class="calc-res-val profit">¥--</strong>
+              </div>
+              <div class="calc-res-item">
+                <span class="calc-res-lbl">单笔毛利率</span>
+                <strong id="calcMarginRate" class="calc-res-val rate">--%</strong>
               </div>
             </div>
           </div>
@@ -285,13 +252,13 @@
 
         <!-- 【分类切换控制面板】 -->
         <div class="filter-section">
-          <!-- 维度一：分类维度切换 -->
+          <!-- 维度一：分类维度切换 (按业务分组前置为第一项) -->
           <div class="filter-dimension-row">
             <span class="dimension-label">分类维度:</span>
             <div class="dimension-tabs">
-              <button class="dim-tab active" data-dim="vendor">按模型厂商</button>
+              <button class="dim-tab active" data-dim="group">按业务分组</button>
+              <button class="dim-tab" data-dim="vendor">按模型厂商</button>
               <button class="dim-tab" data-dim="provider">按上游供应商</button>
-              <button class="dim-tab" data-dim="group">按业务分组</button>
               <button class="dim-tab" data-dim="active">活跃渠道</button>
             </div>
           </div>
@@ -313,6 +280,9 @@
 
         <!-- 正在调度异常预警横幅 -->
         <div id="activeStabilityWarningBanner" class="active-stability-warning-banner" style="display: none;"></div>
+
+        <!-- 业务分组专属管控中枢与调配面板 (在选定具体分组时动态呈现) -->
+        <div id="groupControlBanner" class="group-control-banner" style="display: none;"></div>
 
         <!-- 【条状表格安全横向滚动容器】 -->
         <div class="strips-table-wrapper">
@@ -343,8 +313,11 @@
       <div class="modal-dialog" style="max-width: 400px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #eff6ff; color: #1e40af; border-color: #bfdbfe;">中控直改倍率</span>
-            <span style="font-size: 0.72rem; color: #64748b;">免登 Sub2API 后台</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #eff6ff; color: #1e40af; border-color: #bfdbfe;">中控直改倍率</span>
+              <span style="font-size: 0.72rem; color: #64748b;">免登 Sub2API 后台</span>
+            </div>
+            <button id="btnCloseRateEditModal" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <h3 id="rateEditChannelName" style="color: #0f172a; font-size: 1.1rem; margin-top: 2px;">修改上游倍率</h3>
           <p style="font-size: 0.78rem; color: #64748b;">修改后将直接同步至线上生产数据库，立即对扣费生效。</p>
@@ -378,8 +351,11 @@
       <div class="modal-dialog" style="max-width: 420px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #ecfdf5; color: #047857; border-color: #a7f3d0;">中控直改销售倍率</span>
-            <span style="font-size: 0.72rem; color: #64748b;">免登 Sub2API 后台</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #ecfdf5; color: #047857; border-color: #a7f3d0;">中控直改销售倍率</span>
+              <span style="font-size: 0.72rem; color: #64748b;">免登 Sub2API 后台</span>
+            </div>
+            <button id="btnCloseSaleRateEditModal" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <h3 id="saleRateEditGroupName" style="color: #0f172a; font-size: 1.1rem; margin-top: 2px;">修改分组对外售价</h3>
           <p style="font-size: 0.78rem; color: #64748b;">调整该业务分组对外卖给客户的扣费倍率，修改后立即对下游客户调用生效。</p>
@@ -413,8 +389,11 @@
       <div class="modal-dialog alert-dialog">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" id="modalAlertBadge">上游改价提醒</span>
-            <span class="alert-time" id="modalAlertTime">刚刚</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" id="modalAlertBadge">上游改价提醒</span>
+              <span class="alert-time" id="modalAlertTime">刚刚</span>
+            </div>
+            <button id="btnCloseAlertModal" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <h2 id="modalAlertTitle" class="alert-title">注意：上游渠道调整了进货倍率！</h2>
           <p id="modalAlertReason" class="alert-reason-text">系统在自动检测中抓取到了最新进货价格。</p>
@@ -455,6 +434,66 @@
       </div>
     </div>
 
+    <!-- 弹窗：人工主调异常切线确认弹窗 (铁律：人工指定的主调必须确认后才变) -->
+    <div id="manualFailoverModal" class="modal-backdrop">
+      <div class="modal-dialog alert-dialog danger" style="max-width: 520px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #fee2e2; color: #b91c1c; border-color: #fca5a5;">⚠️ 人工主调请示</span>
+              <span class="alert-time" id="failoverModalTime">刚刚</span>
+            </div>
+            <button id="btnCloseFailoverModal" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+          <h2 class="alert-title" style="color: #991b1b; font-size: 1.15rem; margin-top: 0.4rem;">
+            人工指定主调出现异常，请示是否切换！
+          </h2>
+          <p class="alert-reason-text" style="font-size: 0.82rem; margin-bottom: 0.75rem;">
+            根据安全铁律：<b>管理员手动指定的主调绝不擅自动</b>。检测到该主调发生严重故障，系统已生成替补切线提案，请你决策：
+          </p>
+
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.65rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; border-bottom: 1px dashed #cbd5e1; padding-bottom: 0.4rem;">
+              <span style="color: #64748b;">业务分组：</span>
+              <span id="failoverModalGroupName" style="font-weight: 700; color: #0f172a;">--</span>
+            </div>
+
+            <!-- 当前故障主调 -->
+            <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 0.6rem 0.75rem;">
+              <div style="font-size: 0.72rem; font-weight: 700; color: #991b1b; margin-bottom: 0.2rem;">👑 当前人工主调 (发生故障)</div>
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span id="failoverModalFromName" style="font-weight: 700; color: #b91c1c; font-size: 0.92rem;">--</span>
+                <span id="failoverModalFromCost" class="mono" style="font-size: 0.8rem; color: #7f1d1d;">0.00x</span>
+              </div>
+              <div id="failoverModalFaultReason" style="font-size: 0.75rem; color: #dc2626; margin-top: 0.25rem; font-weight: 600;">
+                故障原因：--
+              </div>
+            </div>
+
+            <div style="text-align: center; color: #94a3b8; font-size: 0.9rem; margin: -0.2rem 0;">⬇️ 建议调换至组内最优备选</div>
+
+            <!-- 建议接替通道 -->
+            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.6rem 0.75rem;">
+              <div style="font-size: 0.72rem; font-weight: 700; color: #166534; margin-bottom: 0.2rem;">🌟 推荐接替备选 (健康且成本最优)</div>
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span id="failoverModalToName" style="font-weight: 700; color: #15803d; font-size: 0.92rem;">--</span>
+                <span id="failoverModalToCost" class="mono" style="font-size: 0.8rem; color: #14532d;">0.00x</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1.15rem; display: flex; gap: 0.6rem; justify-content: flex-end;">
+            <button id="btnRejectFailover" class="btn btn-secondary" style="font-size: 0.82rem; padding: 0.5rem 1rem;">
+              ❌ 暂不切换 (保持人工主调)
+            </button>
+            <button id="btnApproveFailover" class="btn btn-success" style="font-size: 0.82rem; padding: 0.5rem 1.25rem; font-weight: 700;">
+              ✅ 批准并立即切换
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 抽屉：报错与告警信息盒 -->
     <div id="alertsDrawer" class="drawer-backdrop">
       <div class="drawer-panel">
@@ -482,8 +521,11 @@
       <div class="modal-dialog" style="max-width: 600px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;">备选线路与多节点调度</span>
-            <span style="font-size: 0.72rem; color: #64748b;">支持一键热切 & 自动同步线上数据库</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;">备选线路与多节点调度</span>
+              <span style="font-size: 0.72rem; color: #64748b;">支持一键热切 & 自动同步线上数据库</span>
+            </div>
+            <button id="btnCloseLinesModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <div style="display: flex; justify-content: space-between; align-items: baseline;">
             <h3 id="linesModalChannelName" style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">渠道线路管理</h3>
@@ -526,8 +568,11 @@
       <div class="modal-dialog" style="max-width: 680px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #f0fdf4; color: #15803d; border-color: #bbf7d0;">多上游供应商管理池</span>
-            <span style="font-size: 0.72rem; color: #64748b;">支持同时接入金龙 / 子桐 / LIKE / LAO 等多家平台</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #f0fdf4; color: #15803d; border-color: #bbf7d0;">多上游供应商管理池</span>
+              <span style="font-size: 0.72rem; color: #64748b;">支持同时接入金龙 / 子桐 / LIKE / LAO 等多家平台</span>
+            </div>
+            <button id="btnCloseJinlongModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <div style="display: flex; justify-content: space-between; align-items: baseline;">
             <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">上游供应商后台管理中心</h3>
@@ -636,8 +681,11 @@
       <div class="modal-dialog" style="max-width: 560px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #eef2ff; color: #4338ca; border-color: #c7d2fe;">渠道业务分组指派</span>
-            <span style="font-size: 0.72rem; color: #64748b;">支持多选勾选 · 自动更新生产数据库</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #eef2ff; color: #4338ca; border-color: #c7d2fe;">渠道业务分组指派</span>
+              <span style="font-size: 0.72rem; color: #64748b;">支持多选勾选 · 自动更新生产数据库</span>
+            </div>
+            <button id="btnCloseChannelGroupsModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <div style="display: flex; justify-content: space-between; align-items: baseline;">
             <h3 id="channelGroupsModalTitle" style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">调整所属分组</h3>
@@ -665,85 +713,118 @@
 
     <!-- 弹窗：全站业务分组管理中枢 (增/改/分配) -->
     <div id="allGroupsModal" class="modal-backdrop">
-      <div class="modal-dialog" style="max-width: 780px;">
-        <div class="dialog-content">
-          <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #fdf2f8; color: #be185d; border-color: #fbcfe8;">业务分组控制中枢</span>
-            <span style="font-size: 0.72rem; color: #64748b;">免登录 Sub2API 后台直接维护分组与对外倍率</span>
+      <div class="modal-dialog" style="max-width: 780px; max-height: calc(100vh - 2.5rem); display: flex; flex-direction: column;">
+        <div class="dialog-content" style="display: flex; flex-direction: column; height: 100%; overflow: hidden;">
+          <div class="alert-tag-row" style="flex-shrink: 0;">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #fdf2f8; color: #be185d; border-color: #fbcfe8;">业务分组控制中枢</span>
+              <span style="font-size: 0.72rem; color: #64748b;">免登录 Sub2API 后台直接维护分组与对外倍率</span>
+            </div>
+            <button id="btnCloseAllGroupsModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
-          <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;">
             <h3 style="color: #0f172a; font-size: 1.18rem; margin-top: 2px;">业务分组与销售倍率管理</h3>
             <button id="btnRefreshAllGroupsList" class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.22rem 0.6rem;">
               ⟳ 刷新分组数据
             </button>
           </div>
-          <p style="font-size: 0.78rem; color: #64748b; margin-top: -2px;">
+          <p style="font-size: 0.78rem; color: #64748b; margin-top: -2px; flex-shrink: 0;">
             在下方直接新建分组、在线修改销售倍率，或指派所属上游渠道。所有变更将即时直写生产数据库。
           </p>
 
-          <!-- 1. 新建分组栏 -->
-          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.75rem 0.85rem; margin: 0.5rem 0 0.9rem 0;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.45rem;">
-              <div style="font-size: 0.82rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 0.4rem;">
-                <span>➕ 新建业务销售分组</span>
-                <span style="font-size: 0.68rem; font-weight: normal; color: #475569; background: #e2e8f0; padding: 1px 6px; border-radius: 3px;">如需修改已有分组请在下方卡片操作</span>
+          <div style="flex: 1; overflow-y: auto; min-height: 0; padding-right: 0.25rem;">
+            <!-- 1. 分组与通道调配操作台 -->
+            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.75rem 0.85rem; margin: 0.5rem 0 0.9rem 0;">
+              <!-- 模式切换标签栏 -->
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.55rem; flex-wrap: wrap; gap: 0.4rem;">
+                <div style="display: flex; gap: 0.35rem; align-items: center; background: #e2e8f0; padding: 2px; border-radius: 6px;">
+                  <button type="button" id="tabModeExistingGroup" onclick="switchGroupConsoleTab('existing')" class="btn" style="font-size: 0.76rem; padding: 0.25rem 0.65rem; border-radius: 4px; font-weight: 700; background: #ffffff; color: #0f172a; box-shadow: 0 1px 2px rgba(0,0,0,0.05); border: none;">
+                    📥 归入已有业务分组
+                  </button>
+                  <button type="button" id="tabModeNewGroup" onclick="switchGroupConsoleTab('create_new')" class="btn" style="font-size: 0.76rem; padding: 0.25rem 0.65rem; border-radius: 4px; font-weight: 600; background: transparent; color: #64748b; border: none;">
+                    ➕ 创建全新业务销售分组
+                  </button>
+                </div>
+                <span id="groupConsoleHelpText" style="font-size: 0.72rem; color: #64748b;">勾选下方通道后直接追加至已有分组，原组内通道不受影响</span>
               </div>
-              <span style="font-size: 0.72rem; color: #64748b;">支持直接勾选初始通道，系统自动以最便宜健康通道为主调</span>
-            </div>
 
-            <!-- 分组名称与倍率 -->
-            <div style="display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.55rem;">
-              <div style="flex: 2; display: flex; align-items: center; gap: 0.35rem;">
-                <span style="font-size: 0.76rem; color: #475569; white-space: nowrap; font-weight: 600;">分组名称:</span>
-                <input type="text" id="inputNewGroupName" placeholder="例如: DeepSeek 0.4 / Codex 专区" class="form-input" style="flex: 1; font-size: 0.82rem;" />
+              <!-- Panel A: 归入已有分组 -->
+              <div id="panelAssignToExistingGroup" style="display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.55rem; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 0.45rem 0.65rem;">
+                <span style="font-size: 0.76rem; color: #334155; white-space: nowrap; font-weight: 600;">目标已有业务分组:</span>
+                <select id="selectTargetExistingGroup" class="form-input" style="flex: 1; font-size: 0.82rem; height: 32px; background: #ffffff;">
+                  <option value="">正在加载已有分组列表...</option>
+                </select>
               </div>
-              <div style="flex: 1.2; display: flex; align-items: center; gap: 0.35rem;">
-                <span style="font-size: 0.76rem; color: #475569; white-space: nowrap; font-weight: 600;">对外倍率:</span>
-                <input type="number" id="inputNewGroupRate" step="0.0001" min="0.0001" max="100" placeholder="1.0000" value="1.0000" class="form-input mono" style="width: 88px; font-size: 0.85rem; text-align: center;" />
-                <span style="font-size: 0.78rem; color: #64748b;">x</span>
-              </div>
-            </div>
 
-            <!-- 通道直接绑定勾选区 -->
-            <div style="border-top: 1px dashed #cbd5e1; padding-top: 0.45rem; margin-top: 0.2rem;">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
-                <span style="font-size: 0.75rem; font-weight: 600; color: #334155;">
-                  📦 勾选归入此新分组的初始上游渠道 (选中的渠道将直属该组)：
-                </span>
-                <div style="display: flex; gap: 0.35rem;">
-                  <button type="button" id="btnSelectAllNewGroupChs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选</button>
-                  <button type="button" id="btnClearAllNewGroupChs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">清空</button>
+              <!-- Panel B: 创建全新分组 (默认隐藏) -->
+              <div id="panelCreateNewGroupForm" style="display: none; gap: 0.6rem; align-items: center; margin-bottom: 0.55rem;">
+                <div style="flex: 2; display: flex; align-items: center; gap: 0.35rem;">
+                  <span style="font-size: 0.76rem; color: #475569; white-space: nowrap; font-weight: 600;">分组名称:</span>
+                  <input type="text" id="inputNewGroupName" placeholder="例如: DeepSeek 0.4 / Codex 专区" class="form-input" style="flex: 1; font-size: 0.82rem;" />
+                </div>
+                <div style="flex: 1.2; display: flex; align-items: center; gap: 0.35rem;">
+                  <span style="font-size: 0.76rem; color: #475569; white-space: nowrap; font-weight: 600;">对外倍率:</span>
+                  <input type="number" id="inputNewGroupRate" step="0.0001" min="0.0001" max="100" placeholder="1.0000" value="1.0000" class="form-input mono" style="width: 88px; font-size: 0.85rem; text-align: center;" />
+                  <span style="font-size: 0.78rem; color: #64748b;">x</span>
                 </div>
               </div>
-              <div id="newGroupChannelsContainer" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 0.4rem; max-height: 140px; overflow-y: auto; background: #ffffff; padding: 0.45rem; border-radius: 6px; border: 1px solid #e2e8f0;">
-                <!-- 由 app.js 动态渲染可用通道列表 -->
+
+              <!-- 通道直接绑定勾选区 -->
+              <div style="border-top: 1px dashed #cbd5e1; padding-top: 0.45rem; margin-top: 0.2rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem; flex-wrap: wrap; gap: 0.35rem;">
+                  <div style="display: flex; align-items: center; gap: 0.4rem;">
+                    <span style="font-size: 0.75rem; font-weight: 600; color: #334155;">
+                      📦 勾选归入的通道 (选中的渠道将直属该组)：
+                    </span>
+                    <!-- 快捷状态过滤 -->
+                    <div style="display: inline-flex; gap: 0.2rem; background: #e2e8f0; padding: 1px; border-radius: 4px;">
+                      <button type="button" id="btnFilterChAll" onclick="filterChannelSelector('all')" class="btn" style="font-size: 0.68rem; padding: 1px 6px; height: 20px; border-radius: 3px; background: #ffffff; color: #1e293b; border: none; font-weight: 700;">全部</button>
+                      <button type="button" id="btnFilterChUnassigned" onclick="filterChannelSelector('unassigned')" class="btn" style="font-size: 0.68rem; padding: 1px 6px; height: 20px; border-radius: 3px; background: transparent; color: #b45309; border: none; font-weight: 600;">待分配</button>
+                      <button type="button" id="btnFilterChAssigned" onclick="filterChannelSelector('assigned')" class="btn" style="font-size: 0.68rem; padding: 1px 6px; height: 20px; border-radius: 3px; background: transparent; color: #475569; border: none; font-weight: 600;">已有组</button>
+                    </div>
+                  </div>
+                  <div style="display: flex; gap: 0.35rem;">
+                    <button type="button" id="btnSelectAllNewGroupChs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选</button>
+                    <button type="button" id="btnClearAllNewGroupChs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">清空</button>
+                  </div>
+                </div>
+                <div id="newGroupChannelsContainer" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 0.4rem; max-height: 140px; overflow-y: auto; background: #ffffff; padding: 0.45rem; border-radius: 6px; border: 1px solid #e2e8f0;">
+                  <!-- 由 app.js 动态渲染可用通道列表 -->
+                </div>
+              </div>
+
+              <!-- 创建动作提交栏 (位于勾选区下方，流程自然顺畅) -->
+              <div style="margin-top: 0.55rem; padding-top: 0.45rem; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.4rem;">
+                <span style="font-size: 0.74rem; color: #64748b;">
+                  已选择 <strong id="newGroupSelectedCount" style="color: #2563eb;">0</strong> 个通道
+                </span>
+                <div style="display: flex; gap: 0.4rem;">
+                  <!-- 归入已有分组按钮 -->
+                  <button type="button" id="btnAssignToExistingGroup" class="btn btn-primary" onclick="addSelectedChannelsToExistingGroup()" style="font-size: 0.82rem; padding: 0.35rem 1rem; font-weight: 600; background: #059669; border-color: #059669; box-shadow: 0 1px 2px rgba(5,150,105,0.2);">
+                    📥 确认将所选通道加入目标已有分组
+                  </button>
+                  <!-- 创建新分组按钮 (创建模式下显示) -->
+                  <button type="button" id="btnCreateNewGroup" class="btn btn-primary" onclick="createNewGroup()" style="display: none; font-size: 0.82rem; padding: 0.35rem 1rem; font-weight: 600; box-shadow: 0 1px 2px rgba(37,99,235,0.2);">
+                    ➕ 确认创建新分组并绑定所选通道
+                  </button>
+                </div>
               </div>
             </div>
 
-            <!-- 创建动作提交栏 (位于勾选区下方，流程自然顺畅) -->
-            <div style="margin-top: 0.55rem; padding-top: 0.45rem; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
-              <span style="font-size: 0.74rem; color: #64748b;">
-                已选择 <strong id="newGroupSelectedCount" style="color: #2563eb;">0</strong> 个初始通道
-              </span>
-              <button id="btnCreateNewGroup" class="btn btn-primary" style="font-size: 0.82rem; padding: 0.35rem 1rem; font-weight: 600; box-shadow: 0 1px 2px rgba(37,99,235,0.2);">
-                ➕ 确认创建新分组并绑定所选通道
-              </button>
+            <!-- 2. 分组全景卡片列表 -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin: 0.6rem 0 0.35rem 0;">
+              <div style="font-size: 0.84rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 0.35rem;">
+                <span>📋 现有业务销售分组列表</span>
+                <span id="allGroupsCountBadge" class="mono-badge" style="font-size: 0.7rem;">--</span>
+              </div>
+              <span style="font-size: 0.72rem; color: #64748b;">💡 如需为已有分组增删、调配上游通道，请点击卡片右下方的「👥 分配上游」</span>
+            </div>
+            <div id="allGroupsCardsContainer" style="display: flex; flex-direction: column; gap: 0.55rem; padding-right: 0.2rem;">
+              <!-- 由 app.js 动态渲染各分组卡片 -->
             </div>
           </div>
 
-          <!-- 2. 分组全景卡片列表 -->
-          <div style="display: flex; justify-content: space-between; align-items: center; margin: 0.6rem 0 0.35rem 0;">
-            <div style="font-size: 0.84rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 0.35rem;">
-              <span>📋 现有业务销售分组列表</span>
-              <span id="allGroupsCountBadge" class="mono-badge" style="font-size: 0.7rem;">--</span>
-            </div>
-            <span style="font-size: 0.72rem; color: #64748b;">💡 如需为已有分组增删、调配上游通道，请点击卡片右下方的「👥 分配上游」</span>
-          </div>
-          <div id="allGroupsCardsContainer" style="display: flex; flex-direction: column; gap: 0.55rem; max-height: 380px; overflow-y: auto; padding-right: 0.2rem;">
-            <!-- 由 app.js 动态渲染各分组卡片 -->
-          </div>
-
-          <div class="dialog-actions" style="margin-top: 1rem;">
+          <div class="dialog-actions" style="margin-top: 0.75rem; flex-shrink: 0; padding-top: 0.6rem; border-top: 1px solid #e2e8f0;">
             <button id="btnCloseAllGroupsModal" class="btn btn-secondary" style="width: 100%; justify-content: center;">
               关闭窗口
             </button>
@@ -898,11 +979,12 @@
               <div class="as-config-row">
                 <div class="as-config-info">
                   <span class="as-config-label">👑 人工主调锁定策略</span>
-                  <span class="as-config-desc">控制人工手动指定主调后的行为：可选择【容灾接管】（日常锁定防乱变，确诊严重宕机才切）、【绝对锁死】（永不换）、或【自由轮换】</span>
+                  <span class="as-config-desc">控制人工手动指定主调后的行为：【需确认接管】（安全铁律：绝不擅自动，确诊故障时弹窗请示）、【绝对锁死】（永不换）、或【直接容灾】</span>
                 </div>
-                <select id="selectManualLockPolicy" class="form-input mono" style="width: 215px; font-weight: 700;">
-                  <option value="failover_allowed" selected>🛡️ 容灾接管 (推荐·宕机可切)</option>
+                <select id="selectManualLockPolicy" class="form-input mono" style="width: 235px; font-weight: 700;">
+                  <option value="confirm_required" selected>🛡️ 需确认接管 (推荐·绝不擅自动)</option>
                   <option value="strict_lock">🔒 绝对锁死 (人工锁死·永不换)</option>
+                  <option value="failover_allowed">⚡ 直接容灾 (无需确认·自动切备用)</option>
                   <option value="disabled">🔄 自由轮换 (不锁定·算法自治)</option>
                 </select>
               </div>
@@ -1309,10 +1391,10 @@
 
     <!-- 8. 用户充值金额与消费金额统计看板模态框 -->
     <div id="userFinancesModal" class="modal-backdrop" style="display: none;">
-      <div class="modal-dialog" style="max-width: 1120px;">
-        <div class="dialog-content" style="padding: 1.25rem 1.5rem;">
+      <div class="modal-dialog" style="max-width: 1120px; max-height: calc(100vh - 2.5rem); display: flex; flex-direction: column;">
+        <div class="dialog-content" style="padding: 1.25rem 1.5rem; display: flex; flex-direction: column; height: 100%; overflow: hidden;">
           <!-- 头部信息 -->
-          <div class="modal-header-clean">
+          <div class="modal-header-clean" style="flex-shrink: 0;">
             <div style="display: flex; align-items: center; gap: 0.6rem;">
               <div class="modal-icon-badge" style="background: #ecfdf5; border: 1px solid #a7f3d0; font-size: 1.25rem; width: 38px; height: 38px; display: flex; align-items: center; justify-content: center; border-radius: 9px;">
                 💳
@@ -1332,14 +1414,14 @@
               <button id="btnRefreshUserFinances" class="btn btn-secondary" style="font-size: 0.76rem; padding: 0.3rem 0.75rem;">
                 ⟳ 刷新财务数据
               </button>
-              <button id="btnCloseUserFinancesModal" class="btn btn-secondary" style="font-size: 0.85rem; padding: 0.25rem 0.55rem;">
+              <button id="btnCloseUserFinancesModal" class="modal-close-btn" title="关闭窗口">
                 ✕
               </button>
             </div>
           </div>
 
           <!-- Tab 选项卡导航 -->
-          <div class="fin-tabs-bar">
+          <div class="fin-tabs-bar" style="flex-shrink: 0;">
             <button class="fin-tab-btn active" data-fintab="overview">
               <span>📊</span> 核心收支大盘与每日走势
             </button>
@@ -1351,12 +1433,14 @@
             </button>
           </div>
 
-          <!-- Tab 1 内容：核心收支大盘与每日走势 -->
-          <div id="finTabOverview" class="fin-tab-content active">
-            <!-- 6 大核心指标卡 (含净毛利润与毛利率) -->
-            <div class="fin-kpi-grid">
-              <!-- 卡片 1: 客户累计充值 -->
-              <div class="fin-kpi-card kpi-recharge">
+          <!-- 滚动内容区 -->
+          <div class="fin-tabs-scroll-body" style="flex: 1; overflow-y: auto; min-height: 0; padding-right: 0.25rem;">
+            <!-- Tab 1 内容：核心收支大盘与每日走势 -->
+            <div id="finTabOverview" class="fin-tab-content active">
+              <!-- 6 大核心指标卡 (含净毛利润与毛利率) -->
+              <div class="fin-kpi-grid">
+                <!-- 卡片 1: 客户累计充值 -->
+                <div class="fin-kpi-card kpi-recharge">
                 <div class="kpi-header">
                   <span class="kpi-title">客户累计总充值</span>
                   <span class="kpi-tag success">资金流入</span>
@@ -1596,10 +1680,11 @@
                 </tbody>
               </table>
             </div>
+            </div>
           </div>
 
           <!-- 弹窗底部操作 -->
-          <div class="dialog-actions" style="margin-top: 1.25rem; display: flex; justify-content: space-between; align-items: center;">
+          <div class="dialog-actions" style="flex-shrink: 0; margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
             <span style="font-size: 0.75rem; color: #64748b;">
               💡 统计看板数据每 15 秒自动更新，所有扣费基于 usage_logs 真实执行记录与 PostgreSQL 强一致事务。
             </span>
@@ -1616,8 +1701,11 @@
       <div class="modal-dialog" style="max-width: 440px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #ecfdf5; color: #047857; border-color: #a7f3d0;">用户余额快捷加款</span>
-            <span style="font-size: 0.72rem; color: #64748b;">直写 Sub2API 数据库并入库流水</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #ecfdf5; color: #047857; border-color: #a7f3d0;">用户余额快捷加款</span>
+              <span style="font-size: 0.72rem; color: #64748b;">直写 Sub2API 数据库并入库流水</span>
+            </div>
+            <button id="btnCloseQuickRechargeModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">给用户充值 / 补发余额</h3>
           <p style="font-size: 0.78rem; color: #64748b;">充值金额将立即增加至用户的可用余额，并生成一条充值对账记录。</p>
@@ -1661,8 +1749,11 @@
       <div class="modal-dialog" style="max-width: 440px;">
         <div class="dialog-content">
           <div class="alert-tag-row">
-            <span class="alert-type-badge" style="background: #eff6ff; color: #0284c7; border-color: #bae6fd;">客户并发限制管理</span>
-            <span style="font-size: 0.72rem; color: #64748b;">即时生效并记录审计流水</span>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #eff6ff; color: #0284c7; border-color: #bae6fd;">客户并发限制管理</span>
+              <span style="font-size: 0.72rem; color: #64748b;">即时生效并记录审计流水</span>
+            </div>
+            <button id="btnCloseQuickConcurrencyModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
           <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">⚡ 调整客户最大并发限制</h3>
           <p style="font-size: 0.78rem; color: #64748b;">限制该客户同时发起的最大并发请求数 (路数)，默认普通用户为 10 路。</p>
@@ -1822,6 +1913,252 @@
             </div>
           </div>
 
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：业务分组通道编排与角色指定 (主调/副调/备选/备用) -->
+    <div id="groupOrchestrateModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 680px; max-height: calc(100vh - 2.5rem); display: flex; flex-direction: column;">
+        <div class="dialog-content" style="display: flex; flex-direction: column; height: 100%; overflow: hidden;">
+          <div class="alert-tag-row" style="flex-shrink: 0;">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #eef2ff; color: #4338ca; border-color: #c7d2fe;">业务分组通道编排</span>
+              <span id="orchestrateGroupCategoryBadge" class="mono-badge" style="background: #f1f5f9; color: #334155;">--</span>
+            </div>
+            <button id="btnCloseGroupOrchestrateModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; margin-top: 2px;">
+            <h3 id="orchestrateGroupName" style="color: #0f172a; font-size: 1.18rem; margin: 0;">编排分组通道与角色</h3>
+            <button type="button" class="btn btn-secondary" onclick="autoQualifyOrchestrateModalByCost()" style="font-size: 0.75rem; padding: 0.25rem 0.65rem; color: #047857; background: #ecfdf5; border-color: #a7f3d0; font-weight: 700;" title="以进货成本最低为主调，次便宜为副调，第三为备选，其余全部归入备用通道">
+              ⚡ 一键按成本最优定性
+            </button>
+          </div>
+
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.65rem 0.85rem; margin-top: 0.5rem; flex-shrink: 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; font-size: 0.78rem;">
+              <div>
+                <span style="color: #64748b;">准入规则：</span>
+                <strong id="orchestrateRuleText" style="color: #1e293b;">进货成本 &lt; 售价 且 分类一致</strong>
+              </div>
+              <div style="display: flex; align-items: center; gap: 0.35rem;">
+                <span style="color: #64748b; font-weight: 600;">分组对外售价:</span>
+                <input type="number" id="orchestrateSaleRateInput" step="0.0001" min="0.0001" max="100" class="form-input mono" style="width: 86px; font-size: 0.82rem; height: 26px; padding: 0 4px; text-align: center; font-weight: 700;" />
+                <span style="color: #64748b;">x</span>
+              </div>
+            </div>
+            <div id="orchestrateCapacityText" style="font-size: 0.72rem; color: #059669; margin-top: 0.35rem; font-weight: 600;">
+              可容纳通道统计加载中...
+            </div>
+          </div>
+
+          <div style="flex: 1; overflow-y: auto; min-height: 0; padding-right: 0.25rem; margin-top: 0.65rem; display: flex; flex-direction: column; gap: 0.75rem;">
+            <!-- 四层角色指派区域 -->
+            <div style="display: flex; flex-direction: column; gap: 0.55rem; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 0.75rem;">
+              <div style="font-size: 0.8rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 0.35rem;">
+                <span>🎯 四层调度流转角色指定（单主独占·严格逐级冷备）</span>
+              </div>
+
+              <!-- 1. 🌟 主调 -->
+              <div style="display: flex; align-items: center; gap: 0.6rem; background: #f0fdf4; border: 1px solid #86efac; border-radius: 6px; padding: 0.45rem 0.65rem;">
+                <div style="min-width: 100px; display: flex; align-items: center; gap: 0.3rem;">
+                  <span style="font-size: 0.95rem;">🌟</span>
+                  <strong style="color: #166534; font-size: 0.78rem;">当前主调:</strong>
+                </div>
+                <select id="selectOrchestrateMain" class="form-input" style="flex: 1; font-size: 0.8rem; height: 30px; font-weight: 700; background: #ffffff;">
+                  <option value="">-- 请选择主调通道 --</option>
+                </select>
+                <span style="font-size: 0.7rem; color: #15803d; white-space: nowrap;">开启调度 · 独占分流</span>
+              </div>
+
+              <!-- 2. 🔵 副调 -->
+              <div style="display: flex; align-items: center; gap: 0.6rem; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.45rem 0.65rem;">
+                <div style="min-width: 100px; display: flex; align-items: center; gap: 0.3rem;">
+                  <span style="font-size: 0.95rem;">🔵</span>
+                  <strong style="color: #1e40af; font-size: 0.78rem;">第1顺位副调:</strong>
+                </div>
+                <select id="selectOrchestrateSub" class="form-input" style="flex: 1; font-size: 0.8rem; height: 30px; font-weight: 600; background: #ffffff;">
+                  <option value="">-- 请选择副调通道 (可选) --</option>
+                </select>
+                <span style="font-size: 0.7rem; color: #1d4ed8; white-space: nowrap;">冷备停调 · 首选替补</span>
+              </div>
+
+              <!-- 3. 🟡 备选 -->
+              <div style="display: flex; align-items: center; gap: 0.6rem; background: #fefce8; border: 1px solid #fde047; border-radius: 6px; padding: 0.45rem 0.65rem;">
+                <div style="min-width: 100px; display: flex; align-items: center; gap: 0.3rem;">
+                  <span style="font-size: 0.95rem;">🟡</span>
+                  <strong style="color: #854d0e; font-size: 0.78rem;">第2顺位备选:</strong>
+                </div>
+                <select id="selectOrchestrateAlt" class="form-input" style="flex: 1; font-size: 0.8rem; height: 30px; font-weight: 600; background: #ffffff;">
+                  <option value="">-- 请选择备选通道 (可选) --</option>
+                </select>
+                <span style="font-size: 0.7rem; color: #a16207; white-space: nowrap;">冷备停调 · 次席替补</span>
+              </div>
+
+              <!-- 4. ⚪ 其余全部为备用通道提示 -->
+              <div style="display: flex; align-items: flex-start; gap: 0.5rem; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 0.45rem 0.65rem; font-size: 0.73rem; color: #475569;">
+                <span style="font-size: 0.9rem; line-height: 1;">⚪</span>
+                <div>
+                  <strong>备用待命池 (其余组内通道)：</strong>
+                  <span id="orchestrateStandbySummary">除上方选定通道外，下方勾选的其余合规通道将全部自动作为该组的备用通道，按进货成本由低到高排列兜底。</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 通道勾选纳管列表 (全站合规通道一览) -->
+            <div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
+                <span style="font-size: 0.76rem; font-weight: 700; color: #334155;">
+                  📦 组内归属通道管理 (仅展示符合分类且成本低于售价的合规通道):
+                </span>
+                <div style="display: flex; gap: 0.35rem;">
+                  <button type="button" class="btn btn-secondary" onclick="orchestrateSelectAllChannels(true)" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选合规</button>
+                  <button type="button" class="btn btn-secondary" onclick="orchestrateSelectAllChannels(false)" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">清空非指定</button>
+                </div>
+              </div>
+              <div id="orchestrateChannelsCheckboxList" style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 180px; overflow-y: auto; background: #ffffff; padding: 0.45rem; border-radius: 6px; border: 1px solid #e2e8f0;">
+                <!-- 由 app.js 动态渲染通道列表 -->
+              </div>
+            </div>
+          </div>
+
+          <!-- 弹窗底部操作按钮 -->
+          <div class="dialog-actions" style="margin-top: 0.75rem; flex-shrink: 0; padding-top: 0.6rem; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
+            <button type="button" id="btnCancelGroupOrchestrateModal" class="btn btn-secondary" style="font-size: 0.8rem;">
+              取消
+            </button>
+            <button type="button" id="btnSaveGroupOrchestrateModal" class="btn btn-primary" onclick="submitGroupOrchestration()" style="font-size: 0.82rem; padding: 0.4rem 1.25rem; font-weight: 700; background: #059669; border-color: #059669; box-shadow: 0 1px 3px rgba(5,150,105,0.25);">
+              💾 确认保存并应用编排
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗：业务分组专属自动换通道策略设置 -->
+    <div id="groupAutoSwitchModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog" style="max-width: 580px;">
+        <div class="dialog-content">
+          <div class="alert-tag-row">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="alert-type-badge" style="background: #fef3c7; color: #b45309; border-color: #fde68a;">分组自动换通道策略</span>
+              <span id="groupAutoSwitchNameBadge" class="mono-badge" style="background: #fffbeb; color: #92400e; font-weight: 700;">--</span>
+            </div>
+            <button id="btnCloseGroupAutoSwitchModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+
+          <h3 style="color: #0f172a; font-size: 1.18rem; margin: 4px 0 2px 0;">⚡ 自动换通道与熔断容灾配置</h3>
+          <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem 0.75rem; font-size: 0.75rem; color: #1e40af; line-height: 1.45; margin-top: 0.4rem;">
+            <strong>📌 组内四层流转规则：</strong><br/>
+            🌟 <strong>主调故障 / 余额断流</strong> ➜ 自动接替为 🔵 <strong>副调</strong> ➜ 若副调不可用 ➜ 自动接替为 🟡 <strong>备选</strong> ➜ 依次动用 ⚪ <strong>备用待命池</strong> (严格按进货成本由低到高兜底)
+          </div>
+
+          <div style="margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.6rem;">
+            <!-- 低倍率/特惠专属防抖预设快捷栏 -->
+            <div id="groupLowRateNotice" style="display: none; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+                <div>
+                  <div style="font-size: 0.78rem; font-weight: 700; color: #b45309;">💡 系统识别：本组属于低倍率/特惠业务组</div>
+                  <div style="font-size: 0.71rem; color: #92400e;">低倍率渠道常有偶发轻微波动，推荐应用宽松阈值杜绝频繁误切与来回横跳</div>
+                </div>
+                <button type="button" class="btn btn-secondary" onclick="applyLowRatePreset()" style="font-size: 0.74rem; padding: 0.35rem 0.65rem; background: #fef3c7; border-color: #f59e0b; color: #92400e; font-weight: 700; white-space: nowrap;">
+                  ⚡ 一键套用低倍率防抖配置
+                </button>
+              </div>
+            </div>
+
+            <!-- 1. 本组自动切线开关 -->
+            <div class="as-config-row" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div class="as-config-info">
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">本组自动换通道总开关</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">开启后后端将对该业务分组的主调进行健康巡检，异常时自动流转切线</span>
+              </div>
+              <button id="btnToggleGroupAutoSwitch" class="toggle-switch-btn is-on" onclick="toggleGroupAutoSwitchState()">
+                <span>●</span> <span id="textGroupAutoSwitchState">已开启</span>
+              </button>
+            </div>
+
+            <!-- 2. 失败率门槛 -->
+            <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div class="as-config-info">
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">📊 故障切线失败率门槛</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">主调错误率超过此比例切至副调 (保 Prompt Cache 缓存)</span>
+              </div>
+              <select id="selectGroupFailRate" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
+                <option value="70">70% (低倍率专区·超高容忍)</option>
+                <option value="60">60% (低倍率防抖·推荐)</option>
+                <option value="50" selected>50% (失败过半才切·标准)</option>
+                <option value="40">40% (轻度严格)</option>
+                <option value="30">30% (高敏响应)</option>
+                <option value="20">20% (成功率&lt;80%切线)</option>
+              </select>
+            </div>
+
+            <!-- 3. 统计最小有效样本量 -->
+            <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div class="as-config-info">
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">🔢 最小统计有效样本量</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">累计调用达到该样本数才核算失败率，杜绝 1~2 次偶发报错误切</span>
+              </div>
+              <select id="selectGroupMinSampleSize" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
+                <option value="5">5 次 (基准)</option>
+                <option value="10" selected>10 次 (低倍率推荐·防抖)</option>
+                <option value="15">15 次 (高稳健样本)</option>
+                <option value="20">20 次 (超高防抖样本)</option>
+              </select>
+            </div>
+
+            <!-- 4. 连续硬故障次数 -->
+            <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div class="as-config-info">
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">💥 连续硬故障确诊门槛</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">连续爆出 502/503/429/401 达到此次数确诊宕机，秒切副调</span>
+              </div>
+              <select id="selectGroupConsecutiveFailures" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
+                <option value="3">连续 3 次 (敏捷切线)</option>
+                <option value="5">连续 5 次 (常规确诊)</option>
+                <option value="8">连续 8 次 (高容忍度)</option>
+                <option value="10" selected>连续 10 次 (低倍率推荐)</option>
+                <option value="15">连续 15 次 (超高耐受)</option>
+              </select>
+            </div>
+
+            <!-- 5. 冷静期 -->
+            <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div class="as-config-info">
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">🧊 防颠簸冷静期时长</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">切换后锁定该时间，防止频繁在主副间来回横跳</span>
+              </div>
+              <select id="selectGroupCooldown" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
+                <option value="5">5 分钟</option>
+                <option value="10">10 分钟 (常规推荐)</option>
+                <option value="15">15 分钟</option>
+                <option value="20" selected>20 分钟 (低倍率推荐·高防抖)</option>
+                <option value="30">30 分钟 (超高防颠簸)</option>
+              </select>
+            </div>
+
+            <!-- 6. 自动恢复低成本主调 -->
+            <div class="as-config-row" style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div class="as-config-info">
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700; color: #166534;">📉 低成本优质通道充值恢复后自动回切</span>
+                <span class="as-config-desc" style="font-size: 0.72rem; color: #15803d;">原低价主调重新充值且健康后，自动回切并降回原对外售价 (人工主调受保护绝不回切)</span>
+              </div>
+              <button id="btnToggleGroupAutoRecover" class="toggle-switch-btn is-on" onclick="toggleGroupAutoRecoverState()">
+                <span>●</span> <span id="textGroupAutoRecoverState">已开启</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="dialog-actions" style="margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
+            <button type="button" id="btnCancelGroupAutoSwitchModal" class="btn btn-secondary" style="font-size: 0.8rem;">
+              取消
+            </button>
+            <button type="button" id="btnSaveGroupAutoSwitchModal" class="btn btn-primary" onclick="submitGroupAutoSwitchPolicy()" style="font-size: 0.82rem; padding: 0.4rem 1.25rem; font-weight: 700; background: #2563eb; border-color: #2563eb;">
+              💾 保存本组切线策略
+            </button>
+          </div>
         </div>
       </div>
     </div>

@@ -14,5 +14,7 @@
   "autoRecoverLowestCost": true,
   "originalGroupSaleRates": {},
   "lastSwitchTime": null,
-  "lastSwitchReason": null
+  "lastSwitchReason": null,
+  "exemptKeywords": ["通用", "自用", "私人", "private"],
+  "exemptGroupIds": []
 }
