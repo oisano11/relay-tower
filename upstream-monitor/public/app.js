@@ -77,12 +77,56 @@ let currentFilterPill = 'all';
 let targetRateEditChannelId = null;
 let targetSaleEditGroupId = null;
 
+// 错误信息友好化过滤转换 (将底层 Go context 错误转为直观中文，消除 "context 失败" 报错困惑)
+function formatErrorMessage(msg) {
+  if (!msg) return '未知错误';
+  let str = String(msg);
+  if (str.includes('context deadline exceeded')) {
+    str = str.replace(/context deadline exceeded/gi, '上游响应超时 (超出等待时限)');
+  }
+  if (str.includes('context canceled') || str.includes('context cancelled')) {
+    str = str.replace(/context cancel+ed/gi, '请求已中断 (Context Canceled)');
+  }
+  if (str.includes('exceeds the context window')) {
+    str = str.replace(/Your input exceeds the context window of this model.*?(\.|$)/gi, '输入内容超出该模型最大上下文窗口，请缩减提示词重试。');
+  }
+  return str;
+}
+
+// 全局音频上下文 (单例并在用户交互后自动唤醒，杜绝 AudioContext was not allowed to start 浏览器拦截与报错)
+let globalAudioCtx = null;
+function getAudioContext() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+    if (!globalAudioCtx) {
+      globalAudioCtx = new AudioContextClass();
+    }
+    if (globalAudioCtx.state === 'suspended') {
+      globalAudioCtx.resume().catch(() => {});
+    }
+    return globalAudioCtx;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 监听首次用户交互，解锁 AudioContext
+if (typeof window !== 'undefined') {
+  ['click', 'keydown', 'touchstart'].forEach(evt => {
+    window.addEventListener(evt, () => {
+      if (globalAudioCtx && globalAudioCtx.state === 'suspended') {
+        globalAudioCtx.resume().catch(() => {});
+      }
+    }, { once: true, passive: true });
+  });
+}
+
 // 使用 Web Audio API 合成报警提示音
 function playAlertTone(isDanger = true) {
   try {
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContext) return;
-    const ctx = new AudioContext();
+    const ctx = getAudioContext();
+    if (!ctx || ctx.state === 'suspended') return;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
@@ -99,7 +143,7 @@ function playAlertTone(isDanger = true) {
     osc.start();
     osc.stop(ctx.currentTime + 0.45);
   } catch (e) {
-    console.warn('播放警报音受限:', e);
+    // 静默忽略音频受限，不污染控制台
   }
 }
 
@@ -108,10 +152,11 @@ function showToast(message, type = 'success') {
   const container = document.getElementById('toastContainer');
   if (!container) return;
 
+  const displayMessage = (type === 'error' || type === 'warning') ? formatErrorMessage(message) : message;
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
   const icon = type === 'success' ? '✅' : type === 'warning' ? '⚠️' : '❌';
-  toast.innerHTML = `<span>${icon}</span><span>${message}</span>`;
+  toast.innerHTML = `<span>${icon}</span><span>${displayMessage}</span>`;
   container.appendChild(toast);
 
   setTimeout(() => {
@@ -679,8 +724,22 @@ function selectFilterPill(key) {
   renderChannels();
 }
 
+let lastRenderedChannelsFingerprint = null;
+
+function getChannelsRenderFingerprint(channels, activeId) {
+  if (!channels || !Array.isArray(channels)) return '';
+  const search = (document.getElementById('channelSearchInput')?.value || '').trim().toLowerCase();
+  return (channels || []).map(c => [
+    c.id, c.name, c.schedulable ? 1 : 0, c.priority, c.multiplier, c.costMultiplier, c.saleMultiplier,
+    c.status, c.balance, c.isLoss ? 1 : 0, c.primaryGroupId,
+    (c.groupsDetail || []).map(g => `${g.id}:${g.sale_rate}:${g.is_loss ? 1 : 0}`).join(','),
+    (c.userActivity ? c.userActivity.activeUsers15m : 0)
+  ].join(':')).join(';') + `|act:${activeId}|dim:${currentDimension}|pill:${currentFilterPill}|s:${search}`;
+}
+
 // 筛选并渲染渠道
 function renderChannels() {
+  lastRenderedChannelsFingerprint = getChannelsRenderFingerprint(channelsData, activeChannelId);
   const search = (document.getElementById('channelSearchInput')?.value || '').trim().toLowerCase();
   
   const filtered = channelsData.filter(c => {
@@ -2154,8 +2213,13 @@ function setupSSE() {
 
       activeChannelId = payload.activeChannelId;
       renderOverviewMetrics();
-      renderChannels();
       updateHeaderSwitcher();
+
+      // 指纹差异比对：若渠道列表核心数据与显示要素未变动，跳过 DOM 推倒重建，从根源杜绝画面高频抖动
+      const newFp = getChannelsRenderFingerprint(channelsData, activeChannelId);
+      if (newFp !== lastRenderedChannelsFingerprint) {
+        renderChannels();
+      }
 
       // 若当前正打开着某渠道的「📊 模型」弹窗，自动同步刷新弹窗内容，避免画面断层
       const modal = document.getElementById('modelStabilityModal');
