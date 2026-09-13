@@ -593,19 +593,23 @@ class UpstreamScanner {
         if (res.ok) {
           const data = await res.json();
           const list = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : []);
+          const seenCore = new Set();
           list.forEach(m => {
             const mName = typeof m === 'string' ? m : (m.id || m.name);
-            if (mName) {
-              offerings.push({
-                type: 'model',
-                modelName: mName,
-                channelId: ch.id,
-                channelName: ch.name,
-                provider: chProvider,
-                baseUrl: cleanUrl,
-                multiplier: chMultiplier
-              });
-            }
+            if (!mName || mName.includes('*')) return; // 过滤通配符
+            const core = this.getCoreModelName(mName);
+            if (seenCore.has(core)) return; // 避免同一模型因 xai/、x-ai/ 等前缀重复汇报
+            seenCore.add(core);
+
+            offerings.push({
+              type: 'model',
+              modelName: mName,
+              channelId: ch.id,
+              channelName: ch.name,
+              provider: chProvider,
+              baseUrl: cleanUrl,
+              multiplier: chMultiplier
+            });
           });
         }
       } catch (e) {}
@@ -614,17 +618,44 @@ class UpstreamScanner {
     return offerings;
   }
 
-  // 检查模型是否已在本地配置
+  // 提取核心模型名，剥离厂商别名前缀（如 xai/、x-ai/、grok/ 等）
+  getCoreModelName(name) {
+    if (!name || typeof name !== 'string') return '';
+    let s = name.trim().toLowerCase();
+    const prefixes = ['xai/', 'x-ai/', 'grok/', 'openai/', 'anthropic/', 'google/', 'meta/'];
+    for (const p of prefixes) {
+      if (s.startsWith(p)) {
+        s = s.slice(p.length);
+        break;
+      }
+    }
+    return s;
+  }
+
+  // 检查模型是否已在本地配置（支持别名前缀归一化识别与通配符过滤）
   checkModelExistsLocally(modelName, channels, upstreamCache) {
+    if (!modelName || modelName.includes('*')) return true; // 自动忽略通配符占位符
     const clean = modelName.trim().toLowerCase();
+    const core = this.getCoreModelName(clean);
+
     for (const ch of channels) {
-      if (ch.configuredModels && ch.configuredModels.some(m => m.toLowerCase() === clean)) return true;
-      if (ch.knownModels && ch.knownModels.some(m => m.toLowerCase() === clean)) return true;
-      if (ch.modelMapping && Object.keys(ch.modelMapping).some(m => m.toLowerCase() === clean)) return true;
+      const matchAny = (list) => (list || []).some(m => {
+        const ml = m.toLowerCase();
+        return ml === clean || this.getCoreModelName(ml) === core;
+      });
+      if (matchAny(ch.configuredModels)) return true;
+      if (matchAny(ch.knownModels)) return true;
+      if (ch.modelMapping && Object.keys(ch.modelMapping).some(m => {
+        const ml = m.toLowerCase();
+        return ml === clean || this.getCoreModelName(ml) === core;
+      })) return true;
     }
     for (const cid of Object.keys(upstreamCache)) {
       const list = upstreamCache[cid] || [];
-      if (list.some(m => m.toLowerCase() === clean)) return true;
+      if (list.some(m => {
+        const ml = m.toLowerCase();
+        return ml === clean || this.getCoreModelName(ml) === core;
+      })) return true;
     }
     return false;
   }

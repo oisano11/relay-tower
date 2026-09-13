@@ -256,6 +256,17 @@ body {
   font-weight: 600;
   color: var(--text-secondary);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+#pollerCountdown {
+  display: inline-block;
+  min-width: 50px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .header-actions .btn {
@@ -2152,17 +2163,13 @@ body {
 
 .bell-pulse {
   display: inline-block;
-  animation: bellShake 1.6s infinite ease-in-out;
+  animation: bellPulse 2.5s infinite ease-in-out;
   color: #f59e0b;
 }
 
-@keyframes bellShake {
-  0%, 100% { transform: rotate(0deg); }
-  10% { transform: rotate(14deg); }
-  20% { transform: rotate(-14deg); }
-  30% { transform: rotate(10deg); }
-  40% { transform: rotate(-10deg); }
-  50% { transform: rotate(0deg); }
+@keyframes bellPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.12); opacity: 0.85; }
 }
 
 /* Toast 提示浮条 */

@@ -3122,12 +3122,18 @@ async function probeChannelModel(channel, modelName) {
   } catch (err) {
     clearTimeout(timer);
     const elapsed = Date.now() - t0;
-    const isTimeout = err.name === 'AbortError' || elapsed >= 7900;
+    const isTimeout = err.name === 'AbortError' || elapsed >= 7900 || (err.message && err.message.includes('context deadline exceeded'));
+    let errMsg = err.message || '网络连接失败';
+    if (isTimeout) {
+      errMsg = '首字响应超时 (>8秒)';
+    } else if (errMsg.includes('context canceled')) {
+      errMsg = '探测请求已中断 (Context Canceled)';
+    }
     return {
       success: false,
       statusCode: isTimeout ? 524 : 0,
       ttftMs: null,
-      error: isTimeout ? '首字响应超时 (>8秒)' : (err.message || '网络连接失败')
+      error: errMsg
     };
   }
 }
@@ -3837,7 +3843,8 @@ let lastSub2APISignature = '';
 
 function getSub2APISignature() {
   try {
-    const sql = `SELECT COALESCE(MAX(updated_at)::text, '') || ':' || COUNT(*)::text || '|' || (SELECT COALESCE(MAX(updated_at)::text, '') || ':' || COUNT(*)::text FROM groups WHERE deleted_at IS NULL) || '|' || (SELECT COALESCE(MAX(created_at)::text, '') || ':' || COUNT(*)::text || ':' || COALESCE(SUM(account_id + group_id)::text, '0') FROM account_groups) FROM accounts WHERE deleted_at IS NULL;`;
+    // 采用核心配置特征指纹哈希（排除 last_used_at/updated_at 等非配置项变动，杜绝后台调用产生 SSE 广播风暴引起的前端反复重绘与页面抖动）
+    const sql = `SELECT MD5(COALESCE((SELECT string_agg(id || ':' || status || ':' || schedulable::text || ':' || priority || ':' || rate_multiplier || ':' || MD5(COALESCE(credentials::text, '')), ',' ORDER BY id) FROM accounts WHERE deleted_at IS NULL), '') || '|' || COALESCE((SELECT string_agg(id || ':' || name || ':' || rate_multiplier, ',' ORDER BY id) FROM groups WHERE deleted_at IS NULL), '') || '|' || COALESCE((SELECT string_agg(account_id || '-' || group_id, ',' ORDER BY account_id, group_id) FROM account_groups), ''));`;
     return execPsql(sql, true).trim();
   } catch (e) {
     return '';
