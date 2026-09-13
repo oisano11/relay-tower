@@ -178,8 +178,13 @@ class UpstreamScanner {
           this.executeChannelDeactivation(channel.id);
 
           // 检查该通道所属的每一个业务分组
-          const affectedGroups = channel.groupsDetail || [];
           for (const g of affectedGroups) {
+            // 🔒 豁免保护：通用/自用等私有例外分组，系统绝不自动熔断关停分组！
+            if (this.context.isExemptGroup && this.context.isExemptGroup(g)) {
+              console.log(`ℹ️ [UpstreamScanner] 业务分组 [${g.name}] (ID: ${g.id}) 为例外自用分组，跳过自动熔断关停保护`);
+              continue;
+            }
+
             const fallbackCount = this.countGroupActiveFallbacks(g.id, channel.id);
             if (fallbackCount <= 0) {
               // 孤岛空组：无其他备用 API，必须将其关停！
@@ -231,7 +236,10 @@ class UpstreamScanner {
               title: `发现上游全新模型: ${modelName}`,
               modelName,
               provider: offering.provider || 'Upstream',
+              channelId: offering.channelId || '',
+              channelName: offering.channelName || offering.provider || '默认通道',
               upstreamUrl: offering.baseUrl || '',
+              costMultiplier: offering.multiplier || 1.0,
               suggestedMultiplier: offering.multiplier || 1.0,
               status: 'pending',
               createdAt: new Date().toISOString(),
@@ -491,6 +499,15 @@ class UpstreamScanner {
         headers['Cookie'] = panel.cookie;
       }
 
+      // 尝试匹配本地关联通道以获取具体通道名与准确倍率
+      const matchedCh = channels.find(c => (c.baseUrl || '').replace(/\/+$/, '') === panelUrl);
+      const chName = matchedCh ? matchedCh.name : panelName;
+      const chId = matchedCh ? matchedCh.id : '';
+      const chMultiplier = matchedCh ? (matchedCh.costMultiplier || matchedCh.multiplier || 1.0) : 1.0;
+      const chProvider = (matchedCh && matchedCh.provider && matchedCh.provider !== '三方渠道')
+        ? matchedCh.provider
+        : panelName;
+
       // (a) 拉取模型列表
       try {
         const modelRes = await fetch(`${panelUrl}/api/user/models`, {
@@ -503,10 +520,12 @@ class UpstreamScanner {
             offerings.push({
               type: 'model',
               modelName: typeof m === 'string' ? m : m.id || m.name,
-              provider: panelName,
+              provider: chProvider,
+              channelName: chName,
+              channelId: chId,
               panelId: panel.id,
               baseUrl: panelUrl,
-              multiplier: 1.0
+              multiplier: chMultiplier
             });
           });
         }
@@ -525,10 +544,12 @@ class UpstreamScanner {
               offerings.push({
                 type: 'model',
                 modelName: item.model_name,
-                provider: item.owner_by || panelName,
+                provider: chProvider,
+                channelName: chName,
+                channelId: chId,
                 panelId: panel.id,
                 baseUrl: panelUrl,
-                multiplier: item.model_ratio || 1.0
+                multiplier: item.model_ratio || chMultiplier
               });
             }
           });
@@ -543,10 +564,12 @@ class UpstreamScanner {
             offerings.push({
               type: 'model',
               modelName: mName,
-              provider: panelName,
+              provider: chProvider,
+              channelName: chName,
+              channelId: chId,
               panelId: panel.id,
               baseUrl: panelUrl,
-              multiplier: 1.0
+              multiplier: chMultiplier
             });
           }
         });
@@ -554,9 +577,11 @@ class UpstreamScanner {
     }
 
     // 2. 从各个已知上游通道探索 /v1/models
-    for (const ch of channels.slice(0, 10)) {
+    for (const ch of channels) {
       if (!ch.baseUrl || !ch.apiKey) continue;
       const cleanUrl = ch.baseUrl.replace(/\/+$/, '');
+      const chMultiplier = ch.costMultiplier || ch.multiplier || 1.0;
+      const chProvider = (ch.provider && ch.provider !== '三方渠道') ? ch.provider : (ch.vendor || ch.name);
       try {
         const res = await fetch(`${cleanUrl}/v1/models`, {
           headers: {
@@ -574,9 +599,11 @@ class UpstreamScanner {
               offerings.push({
                 type: 'model',
                 modelName: mName,
-                provider: ch.vendor || ch.name,
+                channelId: ch.id,
+                channelName: ch.name,
+                provider: chProvider,
                 baseUrl: cleanUrl,
-                multiplier: ch.multiplier || 1.0
+                multiplier: chMultiplier
               });
             }
           });
@@ -717,6 +744,49 @@ class UpstreamScanner {
   // 待审批项管理
   getPendingActions() {
     this.pendingActions = readJSON(PENDING_FILE, []);
+    const state = this.context.getState ? this.context.getState() : { channels: [] };
+    const channels = state.channels || [];
+    let panels = [];
+    if (this.context.getUpstreamPanels && typeof this.context.getUpstreamPanels === 'function') {
+      panels = this.context.getUpstreamPanels() || [];
+    }
+
+    let modified = false;
+    this.pendingActions.forEach(a => {
+      if (a.type === 'enable_new_model' && (!a.channelName || a.channelName === '默认通道' || a.channelName === 'Upstream')) {
+        const url = (a.upstreamUrl || '').replace(/\/+$/, '');
+        // 匹配规则：优先同时匹配 baseUrl 与倍率，或匹配 baseUrl
+        let matched = channels.find(c => {
+          const cUrl = (c.baseUrl || '').replace(/\/+$/, '');
+          return cUrl === url && a.suggestedMultiplier && Math.abs(c.multiplier - a.suggestedMultiplier) < 0.01;
+        });
+        if (!matched) {
+          matched = channels.find(c => (c.baseUrl || '').replace(/\/+$/, '') === url);
+        }
+        const panel = panels.find(p => (p.backendUrl || '').replace(/\/+$/, '') === url);
+
+        if (matched) {
+          a.channelName = matched.name;
+          a.channelId = matched.id;
+          if (!a.costMultiplier) a.costMultiplier = matched.costMultiplier || matched.multiplier;
+          if (!a.suggestedMultiplier) a.suggestedMultiplier = matched.multiplier;
+          if (!a.provider || a.provider === 'Upstream' || a.provider === 'Claude' || a.provider === '国模专区') {
+            a.provider = (matched.provider && matched.provider !== '三方渠道') ? matched.provider : (panel ? panel.name : matched.provider);
+          }
+          modified = true;
+        } else if (panel) {
+          a.channelName = panel.name;
+          if (!a.provider || a.provider === 'Upstream') a.provider = panel.name;
+          if (!a.costMultiplier) a.costMultiplier = a.suggestedMultiplier || 1.0;
+          modified = true;
+        }
+      }
+    });
+
+    if (modified) {
+      writeJSON(PENDING_FILE, this.pendingActions);
+    }
+
     return this.pendingActions.filter(a => a.status === 'pending');
   }
 
@@ -735,8 +805,11 @@ class UpstreamScanner {
     writeJSON(PENDING_FILE, this.pendingActions);
   }
 
-  // 处理待审批动作 (同意 / 拒绝)
+  // 处理待审批动作 (同意 / 拒绝) - 支持单个或数组
   async resolveAction(actionId, decision = 'approve', operator = '管理员') {
+    if (Array.isArray(actionId)) {
+      return this.resolveActions(actionId, decision, operator);
+    }
     this.pendingActions = readJSON(PENDING_FILE, []);
     const action = this.pendingActions.find(a => String(a.id) === String(actionId));
     if (!action) {
@@ -794,6 +867,68 @@ class UpstreamScanner {
     });
 
     return { success: true, message: resultMessage, action };
+  }
+
+  // 批量处理待审批动作 (按通道一键审批)
+  async resolveActions(actionIds, decision = 'approve', operator = '管理员') {
+    if (!Array.isArray(actionIds) || actionIds.length === 0) {
+      return { success: false, message: '请提供待审批项 ID 列表' };
+    }
+    this.pendingActions = readJSON(PENDING_FILE, []);
+    const resolvedList = [];
+    const state = this.context.getState();
+    const approvedModels = [];
+
+    for (const actionId of actionIds) {
+      const action = this.pendingActions.find(a => String(a.id) === String(actionId));
+      if (!action || action.status !== 'pending') continue;
+
+      action.status = decision === 'approve' ? 'approved' : 'rejected';
+      action.resolvedAt = new Date().toISOString();
+      action.resolvedBy = operator;
+      resolvedList.push(action);
+
+      if (decision === 'approve') {
+        if (action.type === 'same_price_channel') {
+          const sale = action.suggestedSaleMultiplier || this.calculateSaleMultiplier(action.costMultiplier);
+          await this.autoCreateChannelAndGroup(action, action.costMultiplier, sale);
+        } else if (action.type === 'enable_new_model') {
+          approvedModels.push(action.modelName);
+        }
+      }
+    }
+
+    if (approvedModels.length > 0) {
+      state.channels.forEach(c => {
+        if (c.schedulable && c.status === 'online') {
+          if (!c.modelMapping) c.modelMapping = {};
+          if (!c.configuredModels) c.configuredModels = [];
+          if (!c.knownModels) c.knownModels = [];
+          approvedModels.forEach(m => {
+            c.modelMapping[m] = m;
+            if (!c.configuredModels.includes(m)) c.configuredModels.push(m);
+            if (!c.knownModels.includes(m)) c.knownModels.push(m);
+          });
+        }
+      });
+      this.context.saveState(state);
+    }
+
+    writeJSON(PENDING_FILE, this.pendingActions);
+
+    const msg = decision === 'approve'
+      ? `已成功开启对外服务！共生效 ${resolvedList.length} 项待办（覆盖 ${approvedModels.length} 个新上线模型）。`
+      : `已暂缓 ${resolvedList.length} 项待审批事项。`;
+
+    this.context.broadcastSSE('CHANNELS_UPDATED', state);
+    this.context.broadcastSSE('UPSTREAM_ACTION_RESOLVED', {
+      actionIds,
+      count: resolvedList.length,
+      resultMessage: msg,
+      pendingActions: this.getPendingActions()
+    });
+
+    return { success: true, message: msg, count: resolvedList.length, actions: resolvedList };
   }
 
   getLatestReport() {

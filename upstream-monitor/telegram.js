@@ -439,6 +439,12 @@ class TelegramBotManager {
     } else if (data.startsWith('scan_act:reject:')) {
       const actionId = data.replace('scan_act:reject:', '');
       await this.handleActionResolve(chatId, queryId, actionId, 'reject');
+    } else if (data.startsWith('failover_act:approve:')) {
+      const proposalId = data.replace('failover_act:approve:', '');
+      await this.handleFailoverResolve(chatId, queryId, proposalId, 'approve');
+    } else if (data.startsWith('failover_act:reject:')) {
+      const proposalId = data.replace('failover_act:reject:', '');
+      await this.handleFailoverResolve(chatId, queryId, proposalId, 'reject');
     } else if (data.startsWith('switch:')) {
       const channelId = data.replace('switch:', '');
       await this.handleDoSwitch(chatId, queryId, channelId, query.message.message_id);
@@ -745,7 +751,7 @@ class TelegramBotManager {
   // 发送自动切线设置菜单
   async sendAutoSwitchMenu(chatId, editMessageId = null) {
     const autoConfig = this.context.getAutoSwitchConfig();
-    const policyDesc = autoConfig.manualLockPolicy === 'strict_lock' ? '🔒 绝对锁死' : (autoConfig.manualLockPolicy === 'disabled' ? '🔄 自由轮换' : '🛡️ 容灾接管 (推荐)');
+    const policyDesc = autoConfig.manualLockPolicy === 'strict_lock' ? '🔒 绝对锁死' : (autoConfig.manualLockPolicy === 'disabled' ? '🔄 自由轮换' : (autoConfig.manualLockPolicy === 'failover_allowed' ? '🛡️ 直接容灾' : '🛡️ 需确认接管 (推荐)'));
 
     const text = 
       `⚡ <b>【全站统一自动切线与容灾保护】</b>\n` +
@@ -1058,6 +1064,62 @@ class TelegramBotManager {
     }
   }
 
+  // 审批/解决人工主调异常切线请示
+  async handleFailoverResolve(chatId, queryId, proposalId, decision) {
+    if (typeof this.context.resolveFailoverProposal !== 'function') {
+      await this.answerCallbackQuery(queryId, { text: '⚠️ 切线确认接口未就绪', show_alert: true });
+      return;
+    }
+    try {
+      const res = await this.context.resolveFailoverProposal(proposalId, decision, 'Telegram 管理员');
+      if (res.success) {
+        await this.answerCallbackQuery(queryId, { 
+          text: decision === 'approve' ? '✅ 已确认切线并生效！' : '❌ 已驳回切线，保持当前人工主调', 
+          show_alert: true 
+        });
+        await this.sendMessage(chatId, `🔔 <b>【人工主调切线决策已生效】</b>\n${res.message}`);
+      } else {
+        await this.answerCallbackQuery(queryId, { text: `⚠️ ${res.error || res.message}`, show_alert: true });
+      }
+    } catch (e) {
+      await this.answerCallbackQuery(queryId, { text: `❌ 异常: ${e.message}`, show_alert: true });
+    }
+  }
+
+  // 推送人工主调异常切线请示 (带确认/驳回按钮)
+  async notifyFailoverProposal(proposal) {
+    if (!this.config.enabled) return;
+    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
+
+    const safeGroup = escapeHtml(proposal.groupName || '默认分组');
+    const safeFromName = escapeHtml(proposal.fromChannel?.name || '未知主调');
+    const safeToName = escapeHtml(proposal.toChannel?.name || '未知备选');
+    const safeReason = escapeHtml(proposal.reason || '通道异常');
+
+    const text = 
+      `⚠️ <b>【中转塔台 · 人工主调异常切线请示】</b>\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `📁 <b>业务分组:</b> <b>${safeGroup}</b>\n` +
+      `👑 <b>当前人工主调:</b> <b>[${safeFromName}]</b> (进价: ${proposal.fromChannel?.cost || 0}x)\n` +
+      `🚨 <b>确诊异常:</b> <code>${safeReason}</code>\n` +
+      `🔀 <b>建议切向备选:</b> <b>[${safeToName}]</b> (进价: ${proposal.toChannel?.cost || 0}x)\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `🛡️ <i>安全铁律：人工指定的主调绝不擅自自动切走！请确认是否切换：</i>`;
+
+    const reply_markup = {
+      inline_keyboard: [
+        [
+          { text: `✅ 确认切换至 [${safeToName}]`, callback_data: `failover_act:approve:${proposal.id}` }
+        ],
+        [
+          { text: `❌ 暂不切换 (保持人工主调)`, callback_data: `failover_act:reject:${proposal.id}` }
+        ]
+      ]
+    };
+
+    await this.broadcastToAdmins(text, { reply_markup });
+  }
+
   // 7. 推送上游通道巡检报告与一键审批按钮
   async notifyScanReport(report, pendingActions = []) {
     if (!this.config.enabled) return;
@@ -1065,16 +1127,39 @@ class TelegramBotManager {
 
     const keyboard = [];
 
-    // 为每个待处理项提供一键审批按钮 (最多 4 项避免键盘过长)
+    // 为每个待处理项提供一键审批按钮 (按通道维度聚合，避免散碎模型刷屏)
     if (Array.isArray(pendingActions) && pendingActions.length > 0) {
-      const displayActions = pendingActions.slice(0, 4);
-      displayActions.forEach(act => {
-        const title = act.type === 'same_price_channel' 
-          ? `同意同价: ${act.name} (+20%)` 
-          : `开启模型: ${act.modelName}`;
+      const channelGroups = {};
+      const samePriceList = [];
+
+      pendingActions.forEach(act => {
+        if (act.type === 'same_price_channel') {
+          samePriceList.push(act);
+        } else {
+          const chKey = act.channelName || act.provider || '默认通道';
+          if (!channelGroups[chKey]) {
+            channelGroups[chKey] = [];
+          }
+          channelGroups[chKey].push(act);
+        }
+      });
+
+      // 同价通道审批 (最多 2 个)
+      samePriceList.slice(0, 2).forEach(act => {
         keyboard.push([
-          { text: `✅ ${title}`, callback_data: `scan_act:approve:${act.id}` },
+          { text: `✅ 同步同价: ${act.name} (${act.costMultiplier}x)`, callback_data: `scan_act:approve:${act.id}` },
           { text: `❌ 忽略`, callback_data: `scan_act:reject:${act.id}` }
+        ]);
+      });
+
+      // 通道新模型聚合审批 (最多 3 个通道)
+      Object.entries(channelGroups).slice(0, 3).forEach(([chName, acts]) => {
+        const firstAct = acts[0];
+        const mult = firstAct.costMultiplier || firstAct.suggestedMultiplier || 1.0;
+        const shortName = chName.length > 14 ? chName.slice(0, 12) + '..' : chName;
+        keyboard.push([
+          { text: `🚀 开启 [${shortName}] (${mult}x, ${acts.length}新模)`, callback_data: `scan_act:approve:${firstAct.id}` },
+          { text: `⏸️ 暂缓`, callback_data: `scan_act:reject:${firstAct.id}` }
         ]);
       });
     }
