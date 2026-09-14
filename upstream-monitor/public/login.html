@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>安全登录 - 中转塔台 (Relay Tower)</title>
+  <link rel="icon" type="image/png" href="favicon.png">
   <style>
     :root {
       --bg-gradient: linear-gradient(135deg, #f8fafc 0%, #edf2f7 50%, #e2e8f0 100%);
@@ -59,14 +60,21 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 56px;
-      height: 56px;
-      background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
-      border-radius: 14px;
-      font-size: 26px;
-      color: #fff;
+      width: 60px;
+      height: 60px;
       margin-bottom: 16px;
-      box-shadow: 0 8px 16px rgba(37, 99, 235, 0.2);
+    }
+
+    .brand-badge img {
+      width: 60px;
+      height: 60px;
+      border-radius: 14px;
+      box-shadow: 0 8px 24px rgba(0, 242, 254, 0.25), 0 2px 8px rgba(0, 0, 0, 0.15);
+      transition: transform 0.25s ease;
+    }
+
+    .brand-badge img:hover {
+      transform: scale(1.05);
     }
 
     .brand-header h1 {
@@ -253,7 +261,9 @@
   <div class="login-container">
     <div class="login-card">
       <div class="brand-header">
-        <div class="brand-badge">⚡</div>
+        <div class="brand-badge">
+          <img src="favicon.png" alt="中转塔台 · Relay Tower">
+        </div>
         <h1>中转塔台 · Relay Tower</h1>
         <p>智能调度与利润风控中枢</p>
       </div>

@@ -608,11 +608,11 @@ function renderFilterPills() {
       if (hasTraffic) hasTrafficCount++;
       if (isOnline) onlineCount++;
       if (isSchedulable) schedulableCount++;
-      if (p >= 100) mainCount++;
-      else if (p >= 20) subCount++;
+      if (getChannelRole(c) === 'main') mainCount++;
+      else if (getChannelRole(c) === 'sub') subCount++;
 
       if (!hasTraffic && isSchedulable) idleCount++;
-      if (!isSchedulable) disabledCount++;
+      if (c.autoSwitchDisabled === true) disabledCount++;
     });
 
     const activePills = [];
@@ -730,7 +730,7 @@ function getChannelsRenderFingerprint(channels, activeId) {
   if (!channels || !Array.isArray(channels)) return '';
   const search = (document.getElementById('channelSearchInput')?.value || '').trim().toLowerCase();
   return (channels || []).map(c => [
-    c.id, c.name, c.schedulable ? 1 : 0, c.priority, c.multiplier, c.costMultiplier, c.saleMultiplier,
+    c.id, c.name, c.schedulable ? 1 : 0, c.autoSwitchDisabled, c.priority, c.multiplier, c.costMultiplier, c.saleMultiplier,
     c.status, c.balance, c.isLoss ? 1 : 0, c.primaryGroupId,
     (c.groupsDetail || []).map(g => `${g.id}:${g.sale_rate}:${g.is_loss ? 1 : 0}`).join(','),
     (c.userActivity ? c.userActivity.activeUsers15m : 0)
@@ -757,10 +757,10 @@ function renderChannels() {
         if (currentFilterPill === 'has_traffic' && !hasTraffic) return false;
         if (currentFilterPill === 'online' && !isOnline) return false;
         if (currentFilterPill === 'schedulable' && !c.schedulable) return false;
-        if (currentFilterPill === 'main' && p < 100) return false;
-        if (currentFilterPill === 'sub' && (p < 10 || p >= 100)) return false;
+        if (currentFilterPill === 'main' && getChannelRole(c) !== 'main') return false;
+        if (currentFilterPill === 'sub' && getChannelRole(c) !== 'sub') return false;
         if (currentFilterPill === 'idle' && (hasTraffic || !c.schedulable)) return false;
-        if (currentFilterPill === 'disabled' && c.schedulable) return false;
+        if (currentFilterPill === 'disabled' && c.autoSwitchDisabled !== true) return false;
       }
     }
 
@@ -790,10 +790,7 @@ function renderChannels() {
   }
 
   function getPriorityRank(c) {
-    const p = Number(c.priority);
-    if (p >= 100 || c.isActive || String(c.id) === String(activeChannelId)) return 3; // 主调
-    if (p >= 10) return 2; // 副调
-    return 1; // 保底
+    return { main: 4, sub: 3, alt: 2, standby: 1 }[getChannelRole(c)];
   }
 
   const enabledList = filtered.filter(c => c.schedulable);
@@ -1082,12 +1079,13 @@ function renderStripsView(enabledChannels, standbyChannels) {
           </div>
         </div>
 
-        <!-- 3. 调度开关 (单主独占模式下物理锁定非主调，提示需切换主调) -->
+        <!-- 3. 人工纳入或停用；实际调度由自动策略决定 -->
         <div class="strip-col-toggle">
-          <label class="switch-control" title="${singleActiveMode && !isActive ? '当前开启【业务组单主独占】：同组严禁多开。如需开启此通道，请右侧点击「主调」设为唯一主力！' : (isSchedulable ? '点击停用调度' : '点击开启调度')}">
-            <input type="checkbox" ${isSchedulable ? 'checked' : ''} onchange="toggleChannelSchedulable('${ch.id}', this.checked)" />
+          <label class="switch-control" title="${ch.autoSwitchDisabled === true ? '人工停用：点击重新纳入自动调度候选池' : '已纳入自动调度：点击人工停用，系统将不再自动启用此账号'}">
+            <input type="checkbox" ${ch.autoSwitchDisabled !== true ? 'checked' : ''} onchange="toggleChannelSchedulable('${ch.id}', this.checked)" />
             <span class="slider"></span>
           </label>
+          <span style="font-size: 0.65rem; color: var(--text-muted);">${ch.autoSwitchDisabled === true ? '人工停用' : (isSchedulable ? '使用中' : '自动待命')}</span>
         </div>
 
         <!-- 4. 上游账户余额 -->
@@ -1183,19 +1181,19 @@ function renderStripsView(enabledChannels, standbyChannels) {
 
         <!-- 10. 快捷操作区 (支持四层角色定性与移出分组) -->
         <div class="strip-col-actions">
-          <div class="role-segmented-control" data-channel-id="${ch.id}" title="为该通道指定调度角色：主调(100) / 副调(20) / 备选(10) / 备用(1)">
+          <div class="role-segmented-control" data-channel-id="${ch.id}" title="为该通道指定调度角色：主调(1) / 副调(10) / 备选(20) / 备用(100)。SUB2 数字越小越优先">
             <button class="role-seg-btn role-main ${role === 'main' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'main')" 
-                    title="定性为主调 (优先级 100 · 生产主力，独占承接流量)">主调</button>
+                    title="定性为主调 (优先级 1 · 使用中账号)">主调</button>
             <button class="role-seg-btn role-sub ${role === 'sub' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'sub')" 
-                    title="定性为副调 (优先级 20 · 第1顺位冷备)">副调</button>
+                    title="定性为副调 (优先级 10 · 第一替补)">副调</button>
             <button class="role-seg-btn role-alt ${role === 'alt' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'alt')" 
-                    title="定性为备选 (优先级 10 · 第2顺位冷备)">备选</button>
+                    title="定性为备选 (优先级 20 · 第二替补)">备选</button>
             <button class="role-seg-btn role-standby ${role === 'standby' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'standby')" 
-                    title="定性为备用 (优先级 1 · 兜底待命池)">备用</button>
+                    title="定性为备用 (优先级 100 · 后备池)">备用</button>
           </div>
           <button class="btn-strip-icon" title="测速并拉取最新状态" onclick="probeSingleChannel('${ch.id}')">
             ⟳
@@ -1439,10 +1437,10 @@ function jumpToProblemChannel(targetChannelId = null) {
       if (currentFilterPill === 'has_traffic' && !hasTraffic) isFilteredOut = true;
       if (currentFilterPill === 'online' && !isOnline) isFilteredOut = true;
       if (currentFilterPill === 'schedulable' && !target.schedulable) isFilteredOut = true;
-      if (currentFilterPill === 'main' && p < 100) isFilteredOut = true;
-      if (currentFilterPill === 'sub' && (p < 10 || p >= 100)) isFilteredOut = true;
+      if (currentFilterPill === 'main' && getChannelRole(target) !== 'main') isFilteredOut = true;
+      if (currentFilterPill === 'sub' && getChannelRole(target) !== 'sub') isFilteredOut = true;
       if (currentFilterPill === 'idle' && (hasTraffic || !target.schedulable)) isFilteredOut = true;
-      if (currentFilterPill === 'disabled' && target.schedulable) isFilteredOut = true;
+      if (currentFilterPill === 'disabled' && target.autoSwitchDisabled !== true) isFilteredOut = true;
     }
 
     if (isFilteredOut) {
@@ -1500,7 +1498,7 @@ function jumpToProblemChannel(targetChannelId = null) {
 
 window.jumpToProblemChannel = jumpToProblemChannel;
 
-// 【核心功能 1】同时开多条：切换单个上游调度开关 (开启/停用)
+// 人工管理候选池；恢复参与不等于立刻强制切主。
 async function toggleChannelSchedulable(channelId, newSchedulable) {
   try {
     const target = channelsData.find(c => String(c.id) === String(channelId));
@@ -1512,10 +1510,8 @@ async function toggleChannelSchedulable(channelId, newSchedulable) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '操作失败');
 
-    if (target) target.schedulable = newSchedulable;
-    renderOverviewMetrics();
-    renderChannels();
-    showToast(`[${target ? target.name : channelId}] 已${newSchedulable ? '开启' : '关闭'}调度分流，线上已即刻生效！`, 'success');
+    await loadChannels();
+    showToast(`[${target ? target.name : channelId}] ${newSchedulable ? '已重新纳入自动调度候选池' : '已人工停用，不会自动重新启用'}`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -1542,13 +1538,8 @@ async function batchToggleVisible(schedulable) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '批量操作失败');
 
-    channelsData.forEach(c => {
-      if (ids.includes(String(c.id))) c.schedulable = schedulable;
-    });
-
-    renderOverviewMetrics();
-    renderChannels();
-    showToast(`成功批量将 ${ids.length} 家上游全部${schedulable ? '开启' : '停用'}，线上已同步！`, 'success');
+    await loadChannels();
+    showToast(`${ids.length} 家上游已${schedulable ? '纳入自动调度候选池' : '人工停用'}`, 'success');
   } catch (e) {
     showToast(e.message, 'error');
   }
@@ -1706,22 +1697,43 @@ function calculateProfit() {
   const profit = revenue - cost;
   const costRatio = revenue > 0 ? ((cost / revenue) * 100) : 0;
 
-  // 渲染计算结果
-  document.getElementById('calcResRevenue').textContent = `¥ ${revenue.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  document.getElementById('calcResCost').textContent = `¥ ${cost.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  document.getElementById('calcResCostPercent').textContent = `采购支出占比 ${costRatio.toFixed(1)}%`;
+  // 渲染计算结果 (兼容新版卡片与旧版布局，安全判空防崩溃)
+  const costEl = document.getElementById('calcCostAmount') || document.getElementById('calcResCost');
+  if (costEl) costEl.textContent = `¥ ${cost.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-  const profitEl = document.getElementById('calcResProfit');
+  const profitEl = document.getElementById('calcProfitAmount') || document.getElementById('calcResProfit');
   const sign = profit >= 0 ? '+' : '-';
-  profitEl.textContent = `${sign}¥ ${Math.abs(profit).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  profitEl.style.color = profit >= 0 ? 'var(--color-green)' : 'var(--color-red)';
+  if (profitEl) {
+    profitEl.textContent = `${sign}¥ ${Math.abs(profit).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    profitEl.style.color = profit >= 0 ? 'var(--color-green)' : 'var(--color-red)';
+  }
 
-  const marginEl = document.getElementById('calcResMargin');
-  marginEl.textContent = `毛利率 ${marginPercent >= 0 ? '+' : ''}${marginPercent.toFixed(1)}%`;
-  marginEl.style.color = marginPercent >= 0 ? 'var(--color-green)' : 'var(--color-red)';
+  const marginEl = document.getElementById('calcMarginRate') || document.getElementById('calcResMargin');
+  if (marginEl) {
+    marginEl.textContent = `${marginPercent >= 0 ? '+' : ''}${marginPercent.toFixed(1)}%`;
+    marginEl.style.color = marginPercent >= 0 ? 'var(--color-green)' : 'var(--color-red)';
+  }
 
-  document.getElementById('calcResSpreadFormula').textContent = `${formatRate(saleRate)}x - ${formatRate(costRate)}x`;
-  document.getElementById('calcResSpreadDiff').textContent = `利差 ${spread >= 0 ? '+' : ''}${formatRate(spread)}x`;
+  const metaCostEl = document.getElementById('calcMetaCost');
+  if (metaCostEl) metaCostEl.textContent = `${formatRate(costRate)}x`;
+
+  const metaSaleEl = document.getElementById('calcMetaSale');
+  if (metaSaleEl) metaSaleEl.textContent = `${formatRate(saleRate)}x`;
+
+  const metaMarginEl = document.getElementById('calcMetaMargin');
+  if (metaMarginEl) metaMarginEl.textContent = `${marginPercent >= 0 ? '+' : ''}${marginPercent.toFixed(1)}%`;
+
+  const resRevEl = document.getElementById('calcResRevenue');
+  if (resRevEl) resRevEl.textContent = `¥ ${revenue.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  const resCostPctEl = document.getElementById('calcResCostPercent');
+  if (resCostPctEl) resCostPctEl.textContent = `采购支出占比 ${costRatio.toFixed(1)}%`;
+
+  const spreadFormulaEl = document.getElementById('calcResSpreadFormula');
+  if (spreadFormulaEl) spreadFormulaEl.textContent = `${formatRate(saleRate)}x - ${formatRate(costRate)}x`;
+
+  const spreadDiffEl = document.getElementById('calcResSpreadDiff');
+  if (spreadDiffEl) spreadDiffEl.textContent = `利差 ${spread >= 0 ? '+' : ''}${formatRate(spread)}x`;
 
   // 同步更新收起状态下的精简概要
   const compactRev = document.getElementById('compactRevenue');
@@ -1783,9 +1795,10 @@ function initCalculatorToggle() {
 function getChannelRole(ch) {
   if (!ch) return 'standby';
   const p = Number(ch.priority);
-  if (p >= 100 || ch.isActive || String(ch.id) === String(activeChannelId)) return 'main';
-  if (p >= 20) return 'sub';
-  if (p >= 10) return 'alt';
+  if (ch.schedulable && (ch.isActive || String(ch.id) === String(activeChannelId))) return 'main';
+  if (Number.isFinite(p) && p <= 1) return 'main';
+  if (Number.isFinite(p) && p <= 10) return 'sub';
+  if (Number.isFinite(p) && p <= 20) return 'alt';
   return 'standby';
 }
 
@@ -1797,13 +1810,13 @@ async function setChannelRole(channelId, role) {
   if (currentRole === role) return;
 
   const roleMeta = {
-    main: { label: '主调', priority: 100 },
-    sub: { label: '副调', priority: 20 },
-    alt: { label: '备选', priority: 10 },
-    standby: { label: '备用', priority: 1 },
-    fallback: { label: '备用', priority: 1 }
+    main: { label: '主调', priority: 1 },
+    sub: { label: '副调', priority: 10 },
+    alt: { label: '备选', priority: 20 },
+    standby: { label: '备用', priority: 100 },
+    fallback: { label: '备用', priority: 100 }
   };
-  const targetMeta = roleMeta[role] || { label: role, priority: 1 };
+  const targetMeta = roleMeta[role] || { label: role, priority: 100 };
 
   try {
     showToast(`正在将 [${target.name}] 定性为【${targetMeta.label}】...`, 'warning');
@@ -1819,25 +1832,27 @@ async function setChannelRole(channelId, role) {
     if (role === 'main') {
       activeChannelId = String(channelId);
       target.isActive = true;
-      target.priority = 100;
+      target.priority = 1;
       target.schedulable = true;
     } else if (role === 'sub') {
       target.isActive = false;
-      target.priority = 20;
+      target.priority = 10;
       target.schedulable = false;
     } else if (role === 'alt') {
       target.isActive = false;
-      target.priority = 10;
+      target.priority = 20;
       target.schedulable = false;
     } else if (role === 'standby' || role === 'fallback') {
       target.isActive = false;
-      target.priority = 1;
+      target.priority = 100;
       target.schedulable = false;
     }
 
     if (data.activeChannelId) {
       activeChannelId = String(data.activeChannelId);
     }
+
+    await loadChannels();
 
     renderOverviewMetrics();
     renderChannels();
@@ -1851,37 +1866,6 @@ async function setChannelRole(channelId, role) {
 // 设为主用渠道 (兼容老接口与快捷调用)
 async function activateChannel(channelId) {
   return setChannelRole(channelId, 'main');
-}
-
-// 【核心功能】一键按价格定性：严格按“不赔钱为第一主线，谁便宜谁是主调，次便宜为副调，其余为保底”
-async function triggerAutoQualifyByCost() {
-  const confirmMsg = `⚡ 是否立即执行【一键按价格定性】？\n\n` +
-    `核心原则：\n` +
-    `1. 以不赔钱为第一主线：倒贴亏损通道 (进货 > 销售) 自动降为保底并停用\n` +
-    `2. 谁便宜谁是主调：进货成本最低的健康通道定性为【主调】(优先级 100)\n` +
-    `3. 次便宜者定性为【副调】(优先级 10)\n` +
-    `4. 其余备用保障定性为【保底】(优先级 1，保底尤慎重)\n\n` +
-    `点击“确定”后将自动同步写入 Sub2API 数据库与调度缓存。`;
-
-  if (!confirm(confirmMsg)) return;
-
-  try {
-    showToast('正在按进货成本自动定性所有通道...', 'warning');
-    const res = await fetch('/api/channels/auto-qualify-by-cost', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
-    });
-    const data = await res.json();
-    if (!res.ok || !data.success) {
-      throw new Error(data.error || data.message || '自动定性执行失败');
-    }
-
-    showToast(data.message || `已成功重整 ${data.updatedCount || 0} 条通道定性！`, 'success');
-    await loadChannels();
-  } catch (err) {
-    showToast(err.message, 'error');
-  }
 }
 
 // 单渠道测速
@@ -2254,24 +2238,6 @@ function setupSSE() {
       autoSwitchConfig = JSON.parse(event.data);
       updateAutoSwitchHeaderBadge();
     } catch (e) {}
-  });
-
-  evtSource.addEventListener('MANUAL_MAIN_FAILOVER_PROPOSAL', (event) => {
-    try {
-      const proposal = JSON.parse(event.data);
-      showManualFailoverProposalModal(proposal);
-    } catch (e) {
-      console.error('处理人工主调切线请示异常:', e);
-    }
-  });
-
-  evtSource.addEventListener('MANUAL_MAIN_FAILOVER_RESOLVED', (event) => {
-    try {
-      const payload = JSON.parse(event.data);
-      handleManualFailoverResolved(payload);
-    } catch (e) {
-      console.error('处理人工主调决策生效异常:', e);
-    }
   });
 
   evtSource.addEventListener('UPSTREAM_SCAN_REPORT', (event) => {
@@ -2990,14 +2956,6 @@ function initApp() {
   // 加载 Telegram 机器人状态
   loadTelegramStatus();
 
-  // 人工指定主调切线请示弹窗交互
-  document.getElementById('btnCloseFailoverModal')?.addEventListener('click', closeManualFailoverModal);
-  document.getElementById('btnRejectFailover')?.addEventListener('click', () => resolveFailoverProposal('reject'));
-  document.getElementById('btnApproveFailover')?.addEventListener('click', () => resolveFailoverProposal('approve'));
-
-  // 页面初次加载时检查是否有未处理的人工主调切线请示
-  checkPendingFailovers();
-
   // 页面加载后自动探测上游后台状态
   checkJinlongStatus();
   startCountdown();
@@ -3224,11 +3182,6 @@ function closeActiveModal(targetBackdrop = null) {
       else targetBackdrop.style.display = 'none';
       return;
     }
-    if (id === 'manualFailoverModal') {
-      if (typeof closeManualFailoverModal === 'function') closeManualFailoverModal();
-      else targetBackdrop.style.display = 'none';
-      return;
-    }
     if (id === 'groupOrchestrateModal') {
       if (typeof closeGroupOrchestrateModal === 'function') closeGroupOrchestrateModal();
       else targetBackdrop.style.display = 'none';
@@ -3293,13 +3246,6 @@ function closeActiveModal(targetBackdrop = null) {
   const assignModal = document.getElementById('assignAccountsModalBackdrop');
   if (assignModal) {
     assignModal.remove();
-    return;
-  }
-
-  const failoverModal = document.getElementById('manualFailoverModal');
-  if (failoverModal && failoverModal.style.display === 'flex') {
-    if (typeof closeManualFailoverModal === 'function') closeManualFailoverModal();
-    else failoverModal.style.display = 'none';
     return;
   }
 
@@ -4065,13 +4011,10 @@ function renderGroupControlBanner(groupName) {
         </div>
         <div class="gcc-actions">
           <button class="btn btn-primary btn-gcc-orchestrate" onclick="openGroupOrchestrateModal('${group.id}')" title="指定主调、副调、备选，其余通道一键归为备用">
-            <span>⚡</span> 编排通道与角色 (调分组)
+            <span>⚙</span> 分组账号与手动编排
           </button>
-          <button class="btn btn-secondary btn-gcc-autoswitch" onclick="openGroupAutoSwitchModal('${group.id}')" title="设置本组自动故障切线、欠费秒切与熔断容灾策略">
-            <span>⚡</span> 自动换通道策略
-          </button>
-          <button class="btn btn-secondary btn-gcc-autoqualify" onclick="triggerAutoQualifyByCostForGroup('${group.id}')" title="以不赔钱为第一主线：最便宜为主调，次便宜为副调，第三为备选，其余全部备用">
-            <span>⚡</span> 一键按成本定性
+          <button class="btn btn-secondary btn-gcc-autoswitch" onclick="openGroupAutoSwitchModal('${group.id}')" title="覆盖全局自动切号参数，仅影响本组">
+            <span>⚡</span> 本组策略覆盖
           </button>
           ${unassignedEligible.length > 0 ? `
             <button class="btn btn-secondary btn-gcc-include-all" onclick="quickIncludeAllEligibleChannels('${group.id}')" title="将全站所有符合该组分类且成本低于售价的 ${unassignedEligible.length} 条通道一键全部纳入本组备用池">
@@ -4273,41 +4216,6 @@ function updateOrchestrateStandbySummary() {
   if (summaryEl) {
     summaryEl.textContent = `组内其余 ${standbyIds.length} 条已勾选通道将自动作为备用通道，按进货成本由低到高在待命池中排列兜底。`;
   }
-}
-
-// 弹窗内一键按成本最优定性
-function autoQualifyOrchestrateModalByCost() {
-  const checkboxes = document.querySelectorAll('.orch-ch-checkbox');
-  const items = Array.from(checkboxes).map(cb => {
-    const id = cb.value;
-    const ch = channelsData.find(c => String(c.id) === String(id));
-    const cost = ch ? (ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier) : 999;
-    return { id, cost, isLoss: ch ? Boolean(ch.isLoss) : false };
-  }).filter(item => !item.isLoss);
-
-  items.sort((a, b) => a.cost - b.cost);
-
-  if (items.length === 0) {
-    showToast('暂无合规健康的候选通道', 'warning');
-    return;
-  }
-
-  const mainSelect = document.getElementById('selectOrchestrateMain');
-  const subSelect = document.getElementById('selectOrchestrateSub');
-  const altSelect = document.getElementById('selectOrchestrateAlt');
-
-  if (mainSelect && items[0]) mainSelect.value = items[0].id;
-  if (subSelect && items[1]) subSelect.value = items[1].id;
-  if (altSelect && items[2]) altSelect.value = items[2].id;
-
-  checkboxes.forEach(cb => {
-    const isProfitable = items.some(it => it.id === cb.value);
-    cb.checked = isProfitable;
-  });
-
-  updateOrchestrateRoleTags();
-  updateOrchestrateStandbySummary();
-  showToast('已一键按进货成本最优指派：最低价主调、次低价副调、第三备选，其余全数备用！', 'success');
 }
 
 // 弹窗内全选 / 清空通道勾选
@@ -4528,37 +4436,6 @@ async function submitGroupAutoSwitchPolicy() {
       btnSave.disabled = false;
       btnSave.textContent = '💾 保存本组切线策略';
     }
-  }
-}
-
-// 一键按进货成本定性指定分组 (最低价主调、次低价副调、第三备选、其余备用)
-async function triggerAutoQualifyByCostForGroup(groupId) {
-  const group = (allGroups || []).find(g => String(g.id) === String(groupId));
-  const groupName = group ? group.name : '该分组';
-
-  if (!confirm(`确定按成本最优自动定性【${groupName}】？\n\n以不赔钱为第一主线：进货成本最低者设为主调(100)，次便宜者设为副调(20)，第三为备选(10)，其余组内合规通道设为备用待命池(1)！`)) {
-    return;
-  }
-
-  try {
-    const res = await fetch('/api/channels/auto-qualify-by-cost', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId: parseInt(groupId, 10) })
-    });
-    const result = await res.json();
-    if (result.success) {
-      showToast(result.message || `已按成本最优自动定性分组！`, 'success');
-      await loadChannels();
-      renderFilterPills();
-      if (currentDimension === 'group' && currentFilterPill !== 'all') {
-        renderGroupControlBanner(currentFilterPill);
-      }
-    } else {
-      showToast(result.error || '定性失败', 'error');
-    }
-  } catch (err) {
-    showToast(`定性异常: ${err.message}`, 'error');
   }
 }
 
@@ -5629,34 +5506,7 @@ function syncAutoSwitchForm() {
     btnToggle.innerHTML = isEnabled ? '<span>●</span> <span>已启用</span>' : '<span>○</span> <span>已停用</span>';
   }
 
-  // 1. 单主调严格独占模式开关回显
-  const btnSingleActive = document.getElementById('btnToggleSingleActive');
-  if (btnSingleActive) {
-    const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
-    btnSingleActive.classList.toggle('is-on', isSingleActive);
-    btnSingleActive.classList.toggle('is-off', !isSingleActive);
-    btnSingleActive.innerHTML = isSingleActive ? '<span>●</span> <span>已开启独占</span>' : '<span>○</span> <span>已允许双开</span>';
-  }
-
-  // 2. Prompt Cache 保护锁按钮回显
-  const btnCacheLock = document.getElementById('btnTogglePromptCacheLock');
-  if (btnCacheLock) {
-    const isLocked = autoSwitchConfig.promptCacheLock !== false;
-    btnCacheLock.classList.toggle('is-on', isLocked);
-    btnCacheLock.classList.toggle('is-off', !isLocked);
-    btnCacheLock.innerHTML = isLocked ? '<span>●</span> <span>已锁定保护</span>' : '<span>○</span> <span>未开启</span>';
-  }
-
-  // 3. 20分钟防死循环横跳锁定按钮回显
-  const btnFlapping = document.getElementById('btnToggleAntiFlappingLock');
-  if (btnFlapping) {
-    const isFlappingLocked = autoSwitchConfig.antiFlappingLock !== false;
-    btnFlapping.classList.toggle('is-on', isFlappingLocked);
-    btnFlapping.classList.toggle('is-off', !isFlappingLocked);
-    btnFlapping.innerHTML = isFlappingLocked ? '<span>●</span> <span>已锁定防抖</span>' : '<span>○</span> <span>未开启</span>';
-  }
-
-  // 4. 下拉选项与数值回显
+  // 下拉选项与数值回显
   const selectFailRate = document.getElementById('selectFailRateThreshold');
   if (selectFailRate && autoSwitchConfig.failRateThreshold !== undefined) {
     selectFailRate.value = String(autoSwitchConfig.failRateThreshold);
@@ -5677,10 +5527,6 @@ function syncAutoSwitchForm() {
     selectConsecutive.value = String(autoSwitchConfig.consecutiveFailuresThreshold);
   }
 
-  const selectManualPolicy = document.getElementById('selectManualLockPolicy');
-  if (selectManualPolicy && autoSwitchConfig.manualLockPolicy) {
-    selectManualPolicy.value = autoSwitchConfig.manualLockPolicy;
-  }
 }
 
 function openAutoSwitchModal() {
@@ -5707,15 +5553,10 @@ async function saveAutoSwitchConfig() {
   const btnToggle = document.getElementById('btnToggleAutoSwitch');
   const enabled = btnToggle?.classList.contains('is-on');
   
-  const singleActiveExclusive = document.getElementById('btnToggleSingleActive')?.classList.contains('is-on') ?? true;
-  const promptCacheLock = document.getElementById('btnTogglePromptCacheLock')?.classList.contains('is-on') ?? true;
-  const antiFlappingLock = document.getElementById('btnToggleAntiFlappingLock')?.classList.contains('is-on') ?? true;
-
   const failRateThreshold = Number(document.getElementById('selectFailRateThreshold')?.value) || 50;
   const cooldownMinutes = Number(document.getElementById('selectCooldownMinutes')?.value) || 10;
-  const minSampleSize = Number(document.getElementById('selectMinSampleSize')?.value) || 5;
+  const minSampleSize = Number(document.getElementById('selectMinSampleSize')?.value) || 10;
   const consecutiveFailuresThreshold = Number(document.getElementById('selectConsecutiveFailures')?.value) || 5;
-  const manualLockPolicy = document.getElementById('selectManualLockPolicy')?.value || 'confirm_required';
 
   const saveBtn = document.getElementById('btnSaveAutoSwitchConfig');
   if (saveBtn) {
@@ -5729,17 +5570,13 @@ async function saveAutoSwitchConfig() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         enabled,
-        singleActiveExclusive,
-        manualLockPolicy,
         mode: 'unified_cost_first',
-        promptCacheLock,
-        antiFlappingLock,
         ttftThresholdMs: 30000,
         failRateThreshold,
         minSampleSize,
         consecutiveFailuresThreshold,
         cooldownMinutes,
-        autoRecoverLowestCost: false,
+        autoRecoverLowestCost: true,
         strategy: 'cost_first' // 严格唯一基准：谁便宜谁是主调，按照价格来是第一要素
       })
     });
@@ -5779,7 +5616,7 @@ async function evaluateAutoSwitchNow() {
     if (data.success) {
       const resData = data.result;
       if (resData.executed) {
-        showToast(`⚡ 演练结果: 触发切线 [${resData.fromChannel}] -> [${resData.toChannel}]`, 'warning');
+        showToast(`⚡ 已执行切号 [${resData.fromChannel}] -> [${resData.toChannel}]`, 'warning');
         loadChannels();
         loadAlerts();
       } else {
@@ -5794,7 +5631,7 @@ async function evaluateAutoSwitchNow() {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = '⚡ 立即模拟演练评估';
+      btn.textContent = '⚡ 立即检查并执行切号';
     }
   }
 }
@@ -5828,7 +5665,7 @@ async function loadAutoSwitchLogs() {
         tagText = '充值回切';
       } else if (log.triggerType === 'manual_test') {
         badgeClass = 'as-tag-manual';
-        tagText = '演练切换';
+        tagText = '手动检查';
       }
 
       let priceTagHtml = '';
@@ -5872,140 +5709,6 @@ async function loadAutoSwitchLogs() {
     }).join('');
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: #ef4444; padding: 0.75rem;">加载记录失败: ${escapeHtml(err.message)}</td></tr>`;
-  }
-}
-
-// ====== 🛡️ 人工指定主调切线确认请示 (铁律：人工设定的主调绝不擅自动，故障必须确认后才变) ======
-let currentFailoverProposal = null;
-const pendingFailoverProposalsQueue = [];
-
-function showManualFailoverProposalModal(proposal) {
-  if (!proposal) return;
-  // 若当前已有弹窗在展示不同提案，加入队列排队
-  if (currentFailoverProposal && currentFailoverProposal.id !== proposal.id) {
-    if (!pendingFailoverProposalsQueue.find(p => p.id === proposal.id)) {
-      pendingFailoverProposalsQueue.push(proposal);
-    }
-    return;
-  }
-  currentFailoverProposal = proposal;
-
-  const modal = document.getElementById('manualFailoverModal');
-  if (!modal) return;
-
-  const groupNameEl = document.getElementById('failoverModalGroupName');
-  if (groupNameEl) groupNameEl.textContent = proposal.groupName || `分组 ID: ${proposal.groupId}`;
-
-  const timeEl = document.getElementById('failoverModalTime');
-  if (timeEl) {
-    try {
-      timeEl.textContent = proposal.suggestedAt ? new Date(proposal.suggestedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '刚刚';
-    } catch (e) {
-      timeEl.textContent = '刚刚';
-    }
-  }
-
-  const fromNameEl = document.getElementById('failoverModalFromName');
-  if (fromNameEl) fromNameEl.textContent = proposal.fromChannel?.name || '未知通道';
-
-  const fromCostEl = document.getElementById('failoverModalFromCost');
-  if (fromCostEl) {
-    const cost = proposal.fromChannel?.cost;
-    fromCostEl.textContent = typeof cost === 'number' ? `${cost.toFixed(2)}x` : (cost ? `${cost}x` : '--');
-  }
-
-  const faultReasonEl = document.getElementById('failoverModalFaultReason');
-  if (faultReasonEl) {
-    let reasonText = proposal.reason || '通道异常';
-    if (proposal.fromChannel?.balance !== undefined && Number(proposal.fromChannel.balance) <= 0) {
-      reasonText += ' (当前余额 $0.00)';
-    }
-    faultReasonEl.textContent = `故障原因：${reasonText}`;
-  }
-
-  const toNameEl = document.getElementById('failoverModalToName');
-  if (toNameEl) toNameEl.textContent = proposal.toChannel?.name || '未知备选';
-
-  const toCostEl = document.getElementById('failoverModalToCost');
-  if (toCostEl) {
-    const cost = proposal.toChannel?.cost;
-    toCostEl.textContent = typeof cost === 'number' ? `${cost.toFixed(2)}x` : (cost ? `${cost}x` : '--');
-  }
-
-  modal.style.display = 'flex';
-}
-
-function closeManualFailoverModal() {
-  const modal = document.getElementById('manualFailoverModal');
-  if (modal) modal.style.display = 'none';
-  currentFailoverProposal = null;
-
-  // 队列中有未处理的提案则继续弹出下一项
-  if (pendingFailoverProposalsQueue.length > 0) {
-    const nextProp = pendingFailoverProposalsQueue.shift();
-    showManualFailoverProposalModal(nextProp);
-  }
-}
-
-async function resolveFailoverProposal(decision = 'approve') {
-  if (!currentFailoverProposal) return;
-  const proposal = currentFailoverProposal;
-  const btnApprove = document.getElementById('btnApproveFailover');
-  const btnReject = document.getElementById('btnRejectFailover');
-  if (btnApprove) btnApprove.disabled = true;
-  if (btnReject) btnReject.disabled = true;
-
-  try {
-    const res = await fetch('/api/auto-switch/resolve-failover', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        proposalId: proposal.id,
-        decision,
-        operator: 'Web 控制台管理员'
-      })
-    });
-    const data = await res.json();
-    if (data.success) {
-      showToast(data.message || (decision === 'approve' ? '✅ 切线已批准并生效！' : '已驳回切线，保持人工主调'), decision === 'approve' ? 'success' : 'info');
-      closeManualFailoverModal();
-      loadChannels();
-    } else {
-      showToast(`切线处理失败: ${data.error || '未知错误'}`, 'error');
-    }
-  } catch (err) {
-    showToast(`切线请求失败: ${err.message}`, 'error');
-  } finally {
-    if (btnApprove) btnApprove.disabled = false;
-    if (btnReject) btnReject.disabled = false;
-  }
-}
-
-function handleManualFailoverResolved(payload) {
-  if (!payload) return;
-  if (currentFailoverProposal && (currentFailoverProposal.id === payload.proposalId || String(currentFailoverProposal.groupId) === String(payload.groupId))) {
-    showToast(`切线请示已由 [${payload.operator || '管理员'}] ${payload.decision === 'approve' ? '批准切线' : '驳回切线'}`, 'info');
-    closeManualFailoverModal();
-    loadChannels();
-  }
-}
-
-async function checkPendingFailovers() {
-  try {
-    const res = await fetch('/api/auto-switch/pending-failovers');
-    const data = await res.json();
-    if (data.success && Array.isArray(data.proposals) && data.proposals.length > 0) {
-      data.proposals.forEach(p => {
-        if (!pendingFailoverProposalsQueue.find(item => item.id === p.id)) {
-          pendingFailoverProposalsQueue.push(p);
-        }
-      });
-      if (!currentFailoverProposal && pendingFailoverProposalsQueue.length > 0) {
-        showManualFailoverProposalModal(pendingFailoverProposalsQueue.shift());
-      }
-    }
-  } catch (e) {
-    console.error('检查待确认切线请示异常:', e);
   }
 }
 
@@ -7103,7 +6806,6 @@ window.openQuickConcurrencyModal = openQuickConcurrencyModal;
 window.closeQuickConcurrencyModal = closeQuickConcurrencyModal;
 window.setPresetConcurrency = setPresetConcurrency;
 window.setChannelRole = setChannelRole;
-window.triggerAutoQualifyByCost = triggerAutoQualifyByCost;
 
 // ====== 🔄 上游通道 3 小时巡检、差分同步与审批中枢控制逻辑 ======
 
@@ -7143,6 +6845,10 @@ async function openUpstreamScanModal() {
   const data = await fetchUpstreamScannerStatus();
   if (data) {
     renderUpstreamScanModal(data);
+    try {
+      const catalogRes = await fetch('/api/upstream/groups');
+      if (catalogRes.ok) renderUpstreamGroupCatalog((await catalogRes.json()).groups || []);
+    } catch (_) {}
   }
 }
 
@@ -7156,6 +6862,7 @@ function renderUpstreamScanModal(data) {
   const config = data.config || {};
   const report = data.latestReport || {};
   const pending = data.pendingActions || [];
+  renderUpstreamGroupCatalog((data.latestReport && data.latestReport.upstreamGroupCatalog) || []);
 
   // 1. 统计卡片
   const elProbed = document.getElementById('metricTotalProbed');
@@ -7384,6 +7091,26 @@ function renderUpstreamScanModal(data) {
   }
 }
 
+function renderUpstreamGroupCatalog(groups) {
+  const el = document.getElementById('upstreamGroupCatalogList');
+  if (!el) return;
+  if (!Array.isArray(groups) || !groups.length) { el.textContent = '暂无抓取记录'; return; }
+  el.innerHTML = groups.map(g => `<div style="display:flex;justify-content:space-between;gap:0.5rem;border-bottom:1px solid #f1f5f9;padding:0.25rem 0;"><span><b>${escapeHtml(g.panelName || g.panelId)}</b> · ${escapeHtml(g.name)} <span class="mono">(${escapeHtml(g.upstreamGroupId)})</span></span><span>${g.costMultiplier ? `${g.costMultiplier}x` : '价格未知'} · ${g.status === 'stale' ? '抓取失败，沿用旧记录' : '可用'}</span></div>`).join('');
+}
+
+async function scanUpstreamGroups() {
+  const button = document.getElementById('btnScanUpstreamGroups');
+  if (button) button.disabled = true;
+  try {
+    const res = await fetch('/api/upstream/groups/scan', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || '抓取失败');
+    renderUpstreamGroupCatalog(data.catalog || []);
+    alert(`已抓取 ${data.catalog?.length || 0} 个上游分组；新增 ${data.newGroups?.length || 0} 个，变化 ${data.changedGroups?.length || 0} 个。`);
+  } catch (error) { alert(`上游分组抓取失败：${error.message}`); }
+  finally { if (button) button.disabled = false; }
+}
+
 // 解析待审批项对应的通道名称、供应商、API与倍率
 function resolvePendingChannelInfo(item) {
   const url = (item.upstreamUrl || '').replace(/\/+$/, '');
@@ -7554,6 +7281,7 @@ function handleUpstreamActionResolvedSSE(payload) {
 function initUpstreamScannerUI() {
   document.getElementById('btnOpenUpstreamScanModal')?.addEventListener('click', openUpstreamScanModal);
   document.getElementById('btnTriggerScanNow')?.addEventListener('click', triggerManualUpstreamScan);
+  document.getElementById('btnScanUpstreamGroups')?.addEventListener('click', scanUpstreamGroups);
   document.getElementById('upstreamScanReportModal')?.addEventListener('click', (e) => {
     if (e.target.id === 'upstreamScanReportModal') closeUpstreamScanModal();
   });
@@ -7565,6 +7293,7 @@ window.openUpstreamScanModal = openUpstreamScanModal;
 window.closeUpstreamScanModal = closeUpstreamScanModal;
 window.resolvePendingAction = resolvePendingAction;
 window.triggerManualUpstreamScan = triggerManualUpstreamScan;
+window.scanUpstreamGroups = scanUpstreamGroups;
 window.switchGroupConsoleTab = switchGroupConsoleTab;
 window.filterChannelSelector = filterChannelSelector;
 window.addSelectedChannelsToExistingGroup = addSelectedChannelsToExistingGroup;
@@ -7572,7 +7301,6 @@ window.createNewGroup = createNewGroup;
 window.renderGroupControlBanner = renderGroupControlBanner;
 window.openGroupOrchestrateModal = openGroupOrchestrateModal;
 window.closeGroupOrchestrateModal = closeGroupOrchestrateModal;
-window.autoQualifyOrchestrateModalByCost = autoQualifyOrchestrateModalByCost;
 window.orchestrateSelectAllChannels = orchestrateSelectAllChannels;
 window.submitGroupOrchestration = submitGroupOrchestration;
 window.openGroupAutoSwitchModal = openGroupAutoSwitchModal;
@@ -7580,13 +7308,9 @@ window.closeGroupAutoSwitchModal = closeGroupAutoSwitchModal;
 window.toggleGroupAutoSwitchState = toggleGroupAutoSwitchState;
 window.toggleGroupAutoRecoverState = toggleGroupAutoRecoverState;
 window.submitGroupAutoSwitchPolicy = submitGroupAutoSwitchPolicy;
-window.triggerAutoQualifyByCostForGroup = triggerAutoQualifyByCostForGroup;
 window.quickIncludeAllEligibleChannels = quickIncludeAllEligibleChannels;
 window.removeChannelFromGroup = removeChannelFromGroup;
 window.applyLowRatePreset = applyLowRatePreset;
-window.showManualFailoverProposalModal = showManualFailoverProposalModal;
-window.closeManualFailoverModal = closeManualFailoverModal;
-window.resolveFailoverProposal = resolveFailoverProposal;
 
 // 页面加载完成后自动初始化财务看板与上游巡检中枢事件
 if (document.readyState === 'loading') {
@@ -7598,4 +7322,3 @@ if (document.readyState === 'loading') {
   initUserFinancesEvents();
   initUpstreamScannerUI();
 }
-

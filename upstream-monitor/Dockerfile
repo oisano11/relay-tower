@@ -4,6 +4,8 @@ FROM node:22-alpine
 RUN apk add --no-cache docker-cli
 
 WORKDIR /app
+COPY *.js package.json ./
+COPY public ./public
 
 # 环境变量设置
 ENV NODE_ENV=production
