@@ -4,7 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const url = require('url');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
+const gateway = require('./gateway');
+const gatewayMetrics = new gateway.GatewayMetrics();
+const { groupIds, assertExclusiveScope, groupCostIsSafe } = require('./routing-policy');
+const { evaluateGroup } = require('./auto-failover-policy');
 const { EventEmitter } = require('events');
 
 const PORT = process.env.PORT || 3300;
@@ -15,6 +19,7 @@ const HISTORY_FILE = path.join(DATA_DIR, 'ratio_history.json');
 const UPSTREAM_PANEL_FILE = path.join(DATA_DIR, 'upstream_panel.json');
 const UPSTREAM_PANELS_FILE = path.join(DATA_DIR, 'upstream_panels.json');
 const UPSTREAM_MODELS_CACHE_FILE = path.join(DATA_DIR, 'upstream_models_cache.json');
+const UPSTREAM_GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
 
 // 兼容读取与多上游管理池加载
 function loadUpstreamPanels() {
@@ -101,31 +106,22 @@ const IS_VPS = process.env.IS_VPS === 'true';
 
 // 通用数据库查询封装 (在 VPS 本地直接运行 docker exec，避免远程 SSH 延迟；本地则通过 SSH)
 function execPsql(sql, isTupleOnly = true) {
-  const flags = isTupleOnly ? '-t -A' : '';
-  const escaped = sql.replace(/"/g, '\\"');
-  if (IS_VPS) {
-    try {
-      const cmd = `docker exec sub2api-postgres psql -U sub2api -d sub2api ${flags} -c "${escaped}"`;
-      return execSync(cmd, { encoding: 'utf-8', timeout: 8000 });
-    } catch (e) {
-      return '';
-    }
-  } else if (SSH_HOST) {
-    try {
-      const keyOpt = SSH_KEY ? `-i "${SSH_KEY}"` : '';
-      const sshCmd = `ssh ${keyOpt} -p ${SSH_PORT} -o BatchMode=yes -o ConnectTimeout=4 ${SSH_USER}@${SSH_HOST} "docker exec sub2api-postgres psql -U sub2api -d sub2api ${flags} -c \\"${escaped}\\""`;
-      return execSync(sshCmd, { encoding: 'utf-8', timeout: 8000 });
-    } catch (e) {
-      return '';
-    }
+  const args = ['exec', '-i', 'sub2api-postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'sub2api', '-d', 'sub2api'];
+  if (isTupleOnly) args.push('-q', '-t', '-A');
+  const options = { encoding: 'utf-8', timeout: 8000, input: sql, stdio: ['pipe', 'pipe', 'pipe'] };
+  if (IS_VPS) return execFileSync('docker', args, options);
+  if (SSH_HOST) {
+    const sshArgs = [...(SSH_KEY ? ['-i', SSH_KEY] : []), '-p', SSH_PORT, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', `${SSH_USER}@${SSH_HOST}`, 'docker ' + args.join(' ')];
+    return execFileSync('ssh', sshArgs, options);
   }
-  return '';
+  throw new Error('未配置 Sub2API 数据库连接');
 }
+
 
 // 通用 Redis 命令执行封装 (直连 sub2api-redis，操作调度与鉴权缓存)
 function execRedis(args) {
   try {
-    const safeInner = `unset REDISCLI_AUTH; redis-cli ${args}`.replace(/'/g, "'\\''");
+    const safeInner = `redis-cli ${args}`.replace(/'/g, "'\\''");
     if (IS_VPS) {
       const cmd = `docker exec sub2api-redis sh -c '${safeInner}'`;
       return execSync(cmd, { encoding: 'utf-8', timeout: 4000 });
@@ -190,6 +186,7 @@ function writeJSON(filePath, data) {
 }
 
 let upstreamModelsCache = readJSON(UPSTREAM_MODELS_CACHE_FILE, {});
+let upstreamGroupCatalog = readJSON(UPSTREAM_GROUP_CATALOG_FILE, []);
 
 let state = readJSON(CHANNELS_FILE, {
   activeChannelId: '169',
@@ -234,6 +231,10 @@ let autoSwitchConfig = readJSON(AUTO_SWITCH_CONFIG_FILE, {
   lastSwitchReason: null
 });
 
+autoSwitchConfig.manualLockPolicy = 'failover_allowed';
+autoSwitchConfig.singleActiveExclusive = true;
+state.failoverRuntime = state.failoverRuntime || {};
+state.pendingFailoverProposals = {};
 let autoSwitchLogs = readJSON(AUTO_SWITCH_LOGS_FILE, []);
 
 // 判定业务分组是否为“例外分组”(通用、自用、私人等由用户全权手动调优的分组，系统绝不自动切线、比价、改价、关停)
@@ -1214,8 +1215,12 @@ SELECT json_agg(t) FROM (
         isLoss,
         groupsDetail: enrichedGroups,
         previousMultiplier: existing ? existing.previousMultiplier || oldMultiplier : oldMultiplier,
+        configuredStatus: acc.status,
+        lastProbeStatus: existing && existing.baseUrl === (acc.base_url || 'https://api.openai.com/v1') && existing.apiKey === (acc.api_key || '') ? existing.lastProbeStatus : null,
+        lastProbeTime: existing ? existing.lastProbeTime : null,
         status: acc.status === 'active' ? 'online' : 'offline',
         schedulable: acc.schedulable,
+        autoSwitchDisabled: existing ? Boolean(existing.autoSwitchDisabled) : false,
         priority: acc.priority,
         groups: acc.groups || [],
         modelMapping: (acc.model_mapping && typeof acc.model_mapping === 'object') ? acc.model_mapping : {},
@@ -1237,7 +1242,7 @@ SELECT json_agg(t) FROM (
           validCustom.forEach(m => { if (!sanitized.includes(m)) sanitized.push(m); });
           return sanitized;
         })(),
-        latency: existing ? existing.latency : Math.floor(Math.random() * 30) + 35,
+        latency: existing ? existing.latency : null,
         supportedModels: (acc.model_mapping && typeof acc.model_mapping === 'object' && Object.keys(acc.model_mapping).length > 0)
           ? Object.keys(acc.model_mapping)
           : (acc.groups || ['通用模型']),
@@ -1276,95 +1281,39 @@ SELECT json_agg(t) FROM (
 
 // 远端执行 SQL
 function executeRemoteSQL(sql) {
-  try {
-    execPsql(sql, false);
-    return true;
-  } catch (e) {
-    console.error('[Sub2API SQL Error]:', e.message);
-    return false;
-  }
+  execPsql(`BEGIN;\n${sql}\nCOMMIT;`, false);
+  return true;
 }
 
-// 设置渠道在 Sub2API 远端数据库的调度定性 (主调: 100, 副调: 10, 保底: 1)
+// 设置渠道在 Sub2API 远端数据库的调度定性（数字越小越优先：主调 1 / 副调 10 / 备选 20 / 备用 100）
 function setRemoteAccountRole(accountId, role) {
-  const cleanId = parseInt(accountId, 10);
-  const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
-  let sql = '';
-  if (role === 'main') {
-    if (isSingleActive) {
-      // 🔒 单主严格独占模式：
-      // 1. 当前主调设为 priority = 100 且 schedulable = true
-      // 2. 同业务分组内的所有其他通道一律设为 schedulable = false, priority = 10 (彻底关停副调调度，杜绝双开分流破坏 Prompt Cache)
-      sql = `
-UPDATE accounts SET schedulable = true, priority = 100 WHERE id = ${cleanId};
-UPDATE accounts SET schedulable = false, priority = 10 
-WHERE id != ${cleanId} 
-  AND (
-    id IN (
-      SELECT ag.account_id FROM account_groups ag
-      JOIN groups g ON ag.group_id = g.id
-      WHERE ag.group_id IN (
-        SELECT ag2.group_id FROM account_groups ag2
-        JOIN groups g2 ON ag2.group_id = g2.id
-        WHERE ag2.account_id = ${cleanId}
-          AND g2.name NOT LIKE '%通用%'
-          AND g2.name NOT LIKE '%自用%'
-          AND g2.name NOT LIKE '%私人%'
-      )
-      AND g.name NOT LIKE '%通用%'
-      AND g.name NOT LIKE '%自用%'
-      AND g.name NOT LIKE '%私人%'
-    )
-    OR NOT EXISTS (SELECT 1 FROM account_groups WHERE account_id = ${cleanId})
-  );
-`;
-    } else {
-      // 兼容多开分流模式：
-      sql = `
-UPDATE accounts SET schedulable = true, priority = 100 WHERE id = ${cleanId};
-UPDATE accounts SET priority = 10 
-WHERE id != ${cleanId} 
-  AND schedulable = true 
-  AND priority = 100 
-  AND (
-    id IN (
-      SELECT ag.account_id FROM account_groups ag
-      JOIN groups g ON ag.group_id = g.id
-      WHERE ag.group_id IN (
-        SELECT ag2.group_id FROM account_groups ag2
-        JOIN groups g2 ON ag2.group_id = g2.id
-        WHERE ag2.account_id = ${cleanId}
-          AND g2.name NOT LIKE '%通用%'
-          AND g2.name NOT LIKE '%自用%'
-          AND g2.name NOT LIKE '%私人%'
-      )
-      AND g.name NOT LIKE '%通用%'
-      AND g.name NOT LIKE '%自用%'
-      AND g.name NOT LIKE '%私人%'
-    )
-    OR NOT EXISTS (SELECT 1 FROM account_groups WHERE account_id = ${cleanId})
-  );
-`;
+  const target = state.channels.find(c => String(c.id) === String(accountId));
+  const id = Number(accountId);
+  if (!target || !Number.isSafeInteger(id) || id <= 0) throw new Error('无效通道 ID');
+  const exclusive = autoSwitchConfig.singleActiveExclusive !== false;
+  const scope = groupIds(target).filter(gid => !isExemptGroup(gid));
+  const peers = state.channels.filter(c => String(c.id) !== String(id) && groupIds(c).some(gid => scope.includes(gid)));
+  const priority = { main: 1, sub: 10, alt: 20, alternative: 20, fallback: 100, standby: 100 }[role];
+  if (!priority) throw new Error('无效调度角色');
+  const enabled = role === 'main' || !exclusive;
+  let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${id} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Account missing'; END IF; END $$;
+UPDATE accounts SET schedulable = ${enabled}, priority = ${priority} WHERE id = ${id};`;
+  const peerIds = peers.map(c => Number(c.id)).filter(Number.isSafeInteger);
+  if (role === 'main' && peerIds.length) {
+    // 独占时仅对完全属于当前范围的同组渠道关闭 schedulable；若渠道还挂载了其他分组，仅调低优先级 (priority = 10)，杜绝跨组误杀
+    const safeToDisable = exclusive ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(Number.isSafeInteger) : [];
+    const sharedPeers = peerIds.filter(pid => !safeToDisable.includes(pid));
+    if (safeToDisable.length) {
+      sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisable.join(',')});`;
     }
-  } else if (role === 'sub') {
-    const sched = isSingleActive ? 'false' : 'true';
-    sql = `UPDATE accounts SET schedulable = ${sched}, priority = 20 WHERE id = ${cleanId};`;
-  } else if (role === 'alt' || role === 'alternative') {
-    const sched = isSingleActive ? 'false' : 'true';
-    sql = `UPDATE accounts SET schedulable = ${sched}, priority = 10 WHERE id = ${cleanId};`;
-  } else if (role === 'fallback' || role === 'standby') {
-    const sched = isSingleActive ? 'false' : 'true';
-    sql = `UPDATE accounts SET schedulable = ${sched}, priority = 1 WHERE id = ${cleanId};`;
-  } else {
-    return false;
+    if (sharedPeers.length) {
+      sql += `UPDATE accounts SET priority = GREATEST(priority, 10) WHERE id IN (${sharedPeers.join(',')});`;
+    }
   }
-
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler(cleanId);
-    lastSub2APISignature = getSub2APISignature();
-  }
-  return ok;
+  executeRemoteSQL(sql);
+  invalidateSub2APIScheduler([id, ...peerIds]);
+  lastSub2APISignature = getSub2APISignature();
+  return true;
 }
 
 // 切换单主用渠道 (兼容老调用)
@@ -1374,138 +1323,7 @@ function setRemoteActiveSub2APIAccount(accountId) {
 
 // 🔒 全局全业务组强制执行“单主严格独占，同组严禁多开”检查与修复 (杜绝任何分组多渠道同时开启分流破坏 Prompt Cache)
 function enforceSingleActiveState() {
-  if (autoSwitchConfig.singleActiveExclusive === false) return;
-
-  // 1. 收集全站所有业务分组 ID
-  const allGroupIds = new Set();
-  (state.allGroups || []).forEach(g => { if (g.id) allGroupIds.add(g.id); });
-  state.channels.forEach(c => {
-    if (c.primaryGroupId) allGroupIds.add(c.primaryGroupId);
-    (c.groupsDetail || []).forEach(g => { if (g.id) allGroupIds.add(g.id); });
-  });
-
-  let changed = false;
-  const disableIds = new Set();
-  const enableIds = new Set();
-
-  for (const groupId of allGroupIds) {
-    if (isExemptGroup(groupId)) {
-      // 🔒 用户私有/通用业务组：豁免单主独占检查，允许用户自选多渠道并存，绝对不强制停用任何渠道
-      continue;
-    }
-
-    // 找出挂在该分组下的所有通道
-    const groupChannels = state.channels.filter(c => {
-      const inDetail = (c.groupsDetail || []).some(g => g.id === groupId);
-      const isPrimary = c.primaryGroupId === groupId;
-      return inDetail || isPrimary;
-    });
-
-    if (groupChannels.length === 0) continue;
-
-    const isOutOfBal = (c) => (c.balanceStatus === 'empty') || 
-      (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
-
-    // 过滤出该分组内真正健康可用、且未欠费的通道候选池
-    const healthyChannels = groupChannels.filter(c => c.status !== 'offline' && !isOutOfBal(c));
-
-    if (healthyChannels.length === 0) {
-      // ⚠️ 极其关键：若该组所有通道均已欠费或离线，全部关停调度，防止用户打向已欠费通道报 400/500
-      groupChannels.forEach(c => {
-        if (c.schedulable || Number(c.priority) > 10 || c.isActive) {
-          c.schedulable = false;
-          c.isActive = false;
-          c.priority = Math.min(10, Number(c.priority) || 10);
-          disableIds.add(c.id);
-          changed = true;
-        }
-      });
-      continue;
-    }
-
-    // 选拔该组的唯一主调 (必须且只能在健康未欠费通道中选拔！)：
-    // 1. 优先人工锁定的在线健康通道 (manualLocked)
-    // 2. 其次已有 priority >= 100 且 schedulable 的健康通道
-    // 3. 其次已有 schedulable = true 的健康通道
-    // 4. 其次已有 priority >= 100 的健康通道
-    // 5. 否则按进货价选最便宜的健康通道 (优先不倒贴的)
-    let chosenMain = healthyChannels.find(c => c.manualLocked);
-    if (!chosenMain) {
-      chosenMain = healthyChannels.find(c => Number(c.priority) >= 100 && c.schedulable);
-    }
-    if (!chosenMain) {
-      chosenMain = healthyChannels.find(c => c.schedulable);
-    }
-    if (!chosenMain) {
-      chosenMain = healthyChannels.find(c => Number(c.priority) >= 100);
-    }
-    if (!chosenMain) {
-      const safe = healthyChannels.filter(c => !c.isLoss);
-      const pool = safe.length > 0 ? safe : healthyChannels;
-      pool.sort((a, b) => {
-        const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
-        const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
-        return costA - costB;
-      });
-      chosenMain = pool[0];
-    }
-
-    if (!chosenMain) continue;
-
-    // 确保主调激活为 priority = 100, schedulable = true
-    if (!chosenMain.schedulable || Number(chosenMain.priority) !== 100 || !chosenMain.isActive) {
-      chosenMain.schedulable = true;
-      chosenMain.priority = 100;
-      chosenMain.isActive = true;
-      enableIds.add(chosenMain.id);
-      changed = true;
-    }
-
-    // 确保同组其余所有通道全部冷备关停，严禁多渠道同时开启！
-    groupChannels.forEach(c => {
-      if (String(c.id) !== String(chosenMain.id)) {
-        if (c.schedulable || Number(c.priority) > 10 || c.isActive) {
-          c.schedulable = false;
-          c.isActive = false;
-          c.priority = Math.min(10, Number(c.priority) || 10);
-          disableIds.add(c.id);
-          changed = true;
-        }
-      }
-    });
-  }
-
-  // 确保在任何一个分组被定为主调的通道，在内存中最终保持 schedulable = true，且从关停列表中剔除
-  enableIds.forEach(id => {
-    disableIds.delete(id);
-    const ch = state.channels.find(c => String(c.id) === String(id));
-    if (ch) {
-      ch.schedulable = true;
-      ch.priority = 100;
-      ch.isActive = true;
-    }
-  });
-
-  // 执行 Sub2API 远程数据库批量原子同步
-  if (disableIds.size > 0 || enableIds.size > 0) {
-    let sql = '';
-    if (disableIds.size > 0) {
-      const cleanDisable = Array.from(disableIds).map(id => parseInt(id, 10)).join(',');
-      sql += `UPDATE accounts SET schedulable = false, priority = LEAST(priority, 10) WHERE id IN (${cleanDisable}); `;
-    }
-    if (enableIds.size > 0) {
-      const cleanEnable = Array.from(enableIds).map(id => parseInt(id, 10)).join(',');
-      sql += `UPDATE accounts SET schedulable = true, priority = 100 WHERE id IN (${cleanEnable}); `;
-    }
-    executeRemoteSQL(sql);
-    const affectedIds = Array.from(new Set([...disableIds, ...enableIds]));
-    invalidateSub2APIScheduler(affectedIds);
-    console.log(`🔒 [全站多组单主独占] 已同步巡检全站 ${allGroupIds.size} 个业务分组：同组严禁多开，关停副调 [${Array.from(disableIds).join(', ')}]，激活主调 [${Array.from(enableIds).join(', ')}]！`);
-  }
-
-  if (changed) {
-    writeJSON(CHANNELS_FILE, state);
-  }
+  return evaluateAutoSwitch('调度配置更新');
 }
 
 // 通用渠道定性设置逻辑 (主调 main / 副调 sub / 保底 fallback)
@@ -1524,10 +1342,10 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
   const normalizedRole = (role === 'alternative') ? 'alt' : ((role === 'fallback') ? 'standby' : role);
 
   const roleMeta = {
-    main: { priority: 100, label: '主调', desc: '最高优先级主用调度 (独占开启)' },
-    sub: { priority: 20, label: '副调', desc: '第1顺位冷备调度' },
-    alt: { priority: 10, label: '备选', desc: '第2顺位冷备调度' },
-    standby: { priority: 1, label: '备用', desc: '兜底待命池调度' }
+    main: { priority: 1, label: '主调', desc: '最高优先级主用调度 (独占开启)' },
+    sub: { priority: 10, label: '副调', desc: '第1顺位冷备调度' },
+    alt: { priority: 20, label: '备选', desc: '第2顺位冷备调度' },
+    standby: { priority: 100, label: '备用', desc: '兜底待命池调度' }
   };
 
   const currentMeta = roleMeta[normalizedRole];
@@ -1536,54 +1354,41 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
   const nonExemptGroupIds = targetGroupIds.filter(gid => !isExemptGroup(gid));
   const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
 
+  // Remote commit is the success boundary. Do not change local roles on failure.
+  const remoteOk = setRemoteAccountRole(targetId, role);
+  targetChannel.autoSwitchDisabled = false;
   if (normalizedRole === 'main') {
+    const previousActiveId = state.activeChannelId;
     state.activeChannelId = String(targetId);
     state.manualLockedChannelId = String(targetId); // 🔒 管理员手动指定主调：锁定该通道，绝不允许后台自动巡检将其擅自降级为副调
     state.channels.forEach(c => {
       if (String(c.id) === String(targetId)) {
-        c.priority = 100;
+        c.priority = 1;
         c.isActive = true;
         c.schedulable = true;
         c.manualLocked = true;
       } else {
-        // 同业务分组内的其他旧主调降为副调(20)，若开启单主独占则彻底关停调度(schedulable=false)
+        // 同业务分组内的其他旧主调降为副调(10)，若开启单主独占则彻底关停调度(schedulable=false)
         // 🔒 核心保护：排除通用/自用等例外分组，绝不株连例外分组的其它渠道
         const sharedGroup = (c.groupsDetail || []).some(g => nonExemptGroupIds.includes(g.id)) || (c.primaryGroupId && nonExemptGroupIds.includes(c.primaryGroupId));
         if (sharedGroup) {
-          c.priority = Math.min(20, Number(c.priority) || 20);
+          c.priority = Math.max(10, Number(c.priority) || 10);
           c.isActive = false;
           c.manualLocked = false;
           if (isSingleActive) {
             c.schedulable = false; // 🔒 关停副调调度，杜绝双开破坏 Prompt Cache
           }
-        } else if (String(c.id) === String(state.activeChannelId)) {
+        } else if (String(c.id) === String(previousActiveId)) {
           c.isActive = false;
         }
       }
     });
 
-    // 同步刷新切线保护时间戳与原因，为手动操作建立冷却与锁定记录
+    // 手工选主只是偏好；确认故障/欠费时仍由自动容灾接管。
     autoSwitchConfig.lastSwitchTime = new Date().toISOString();
-    autoSwitchConfig.lastSwitchReason = `管理员手动指定 [${targetChannel.name}] 为主调 (操作人: ${operator})，已启用主调锁定保护`;
+    autoSwitchConfig.lastSwitchReason = `管理员手动指定 [${targetChannel.name}] 为主调 (操作人: ${operator})`;
     writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
   } else if (normalizedRole === 'sub') {
-    if (String(state.manualLockedChannelId) === String(targetId)) {
-      state.manualLockedChannelId = null;
-    }
-    state.channels.forEach(c => {
-      if (String(c.id) === String(targetId)) {
-        c.priority = 20;
-        c.isActive = false;
-        c.manualLocked = false;
-        c.schedulable = !isSingleActive;
-      }
-    });
-    if (String(state.activeChannelId) === String(targetId)) {
-      const nextMain = state.channels.find(c => c.priority === 100 && c.schedulable) || state.channels.find(c => c.schedulable);
-      state.activeChannelId = nextMain ? String(nextMain.id) : '';
-      if (nextMain) nextMain.isActive = true;
-    }
-  } else if (normalizedRole === 'alt') {
     if (String(state.manualLockedChannelId) === String(targetId)) {
       state.manualLockedChannelId = null;
     }
@@ -1596,27 +1401,45 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
       }
     });
     if (String(state.activeChannelId) === String(targetId)) {
-      const nextMain = state.channels.find(c => c.priority === 100 && c.schedulable) || state.channels.find(c => c.schedulable);
+      const nextMain = state.channels.find(c => c.priority === 1 && c.schedulable) || state.channels.find(c => c.schedulable);
       state.activeChannelId = nextMain ? String(nextMain.id) : '';
       if (nextMain) nextMain.isActive = true;
     }
-  } else if (normalizedRole === 'standby') {
+  } else if (normalizedRole === 'alt') {
+    if (String(state.manualLockedChannelId) === String(targetId)) {
+      state.manualLockedChannelId = null;
+    }
     state.channels.forEach(c => {
       if (String(c.id) === String(targetId)) {
-        c.priority = 1;
+        c.priority = 20;
         c.isActive = false;
+        c.manualLocked = false;
         c.schedulable = !isSingleActive;
       }
     });
     if (String(state.activeChannelId) === String(targetId)) {
-      const nextMain = state.channels.find(c => c.priority === 100 && c.schedulable) || state.channels.find(c => c.schedulable);
+      const nextMain = state.channels.find(c => c.priority === 1 && c.schedulable) || state.channels.find(c => c.schedulable);
+      state.activeChannelId = nextMain ? String(nextMain.id) : '';
+      if (nextMain) nextMain.isActive = true;
+    }
+  } else if (normalizedRole === 'standby') {
+    if (String(state.manualLockedChannelId) === String(targetId)) state.manualLockedChannelId = null;
+    state.channels.forEach(c => {
+      if (String(c.id) === String(targetId)) {
+        c.priority = 100;
+        c.isActive = false;
+        c.manualLocked = false;
+        c.schedulable = !isSingleActive;
+      }
+    });
+    if (String(state.activeChannelId) === String(targetId)) {
+      const nextMain = state.channels.find(c => c.priority === 1 && c.schedulable) || state.channels.find(c => c.schedulable);
       state.activeChannelId = nextMain ? String(nextMain.id) : '';
       if (nextMain) nextMain.isActive = true;
     }
   }
 
   writeJSON(CHANNELS_FILE, state);
-  const remoteOk = setRemoteAccountRole(targetId, role);
 
   const roleAlert = {
     id: 'role_' + Date.now(),
@@ -1672,6 +1495,9 @@ function activateChannel(targetId, operator = 'Web 控制台') {
 
 // 【核心功能】一键按成本自动定性：以不赔钱为第一主线，谁便宜谁是主调，次便宜为副调，其余为保底
 function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制台') {
+  const plannedChannels = state.channels.map(c => ({ ...c }));
+  let plannedActiveId = state.activeChannelId;
+  const skippedGroups = [];
   let groupsToProcess = [];
   if (targetGroupId) {
     const g = (state.allGroups || []).find(gr => String(gr.id) === String(targetGroupId));
@@ -1690,7 +1516,7 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
     }
 
     // 找出挂载在此分组的所有通道
-    const groupChannels = state.channels.filter(c => {
+    const groupChannels = plannedChannels.filter(c => {
       if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(group.id))) return true;
       if (String(c.primaryGroupId) === String(group.id)) return true;
       if (c.groups && c.groups.includes(group.name)) return true;
@@ -1700,16 +1526,19 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
     if (groupChannels.length === 0) return;
 
     // 核心法则：以不赔钱为第一主线！排除倒贴通道 (isLoss) 与离线通道
-    const profitable = groupChannels.filter(c => !c.isLoss && c.status !== 'offline');
-    const lossChannels = groupChannels.filter(c => c.isLoss);
+    const eligible = c => !c.autoSwitchDisabled && groupCostIsSafe(c, group) && c.status !== 'offline' && c.balanceStatus !== 'empty' &&
+      (c.balance == null || Number(c.balance) > 0.001);
+    const profitable = groupChannels.filter(eligible);
+    const lossChannels = groupChannels.filter(c => !eligible(c));
 
-    // 对于倒贴亏损通道：绝不能为主调或副调，强制降级为保底 (priority = 1) 且停用调度
+    // 对于倒贴亏损通道：绝不能为主调或副调，强制降级为保底 (priority = 100) 且停用调度 (跨组共享渠道保留全局调度开关，下调优先级防倒贴)
     lossChannels.forEach(ch => {
-      ch.priority = 1;
+      ch.priority = 100;
       ch.isActive = false;
-      ch.schedulable = false;
-      assignedRoles[ch.id] = { role: 'fallback', priority: 1, name: ch.name, group: group.name, cost: ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier, isLoss: true };
-      updates.push({ accountId: ch.id, priority: 1, schedulable: false });
+      const isShared = groupIds(ch).some(gid => String(gid) !== String(group.id));
+      if (!isShared) ch.schedulable = false;
+      assignedRoles[ch.id] = { role: 'fallback', priority: 100, name: ch.name, group: group.name, cost: ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier, isLoss: true };
+      updates.push({ accountId: ch.id, priority: 100, schedulable: isShared ? (ch.schedulable ?? true) : false });
     });
 
     // 核心法则：按照价格来是第一要素！严格按进货成本由低到高排序
@@ -1723,33 +1552,34 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
 
     profitable.forEach((ch, index) => {
       let role = 'sub';
-      let priority = 20;
+      let priority = 10;
       let schedulable = true;
+      const isShared = groupIds(ch).some(gid => String(gid) !== String(group.id));
       if (index === 0) {
         // 谁最便宜谁是主调！
         role = 'main';
-        priority = 100;
+        priority = 1;
         ch.isActive = true;
         schedulable = true;
-        state.activeChannelId = String(ch.id);
+        plannedActiveId = String(ch.id);
       } else if (index === 1) {
         // 次便宜者为副调 (第1顺位冷备)！
         role = 'sub';
-        priority = 20;
+        priority = 10;
         ch.isActive = false;
-        schedulable = !isSingleActive; // 🔒 Prompt Cache 锁定保护：开启单主独占时副调冷备停调
+        schedulable = isShared || !isSingleActive; // 跨组共享渠道保留调度状态，独立组渠道冷备停调
       } else if (index === 2) {
         // 第三顺位为备选 (第2顺位冷备)！
         role = 'alt';
-        priority = 10;
+        priority = 20;
         ch.isActive = false;
-        schedulable = !isSingleActive;
+        schedulable = isShared || !isSingleActive;
       } else {
         // 其余合规通道全部归入备用待命池 (按价格升序兜底)！
         role = 'standby';
-        priority = 1;
+        priority = 100;
         ch.isActive = false;
-        schedulable = !isSingleActive;
+        schedulable = isShared || !isSingleActive;
       }
 
       ch.priority = priority;
@@ -1761,7 +1591,16 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
 
   if (updates.length > 0) {
     const sqlStatements = updates.map(u => `UPDATE accounts SET schedulable = ${u.schedulable ? 'true' : 'false'}, priority = ${u.priority} WHERE id = ${u.accountId};`).join('\n');
-    executeRemoteSQL(sqlStatements);
+    if (!updates.every(u => Number.isSafeInteger(Number(u.accountId)) && Number(u.accountId) > 0)) {
+      return { success: false, message: '存在无效账号ID，本地状态保持不变', updatedCount: 0, assignedRoles: {} };
+    }
+    try {
+      if (!executeRemoteSQL(sqlStatements)) throw new Error('数据库同步失败');
+    } catch (error) {
+      return { success: false, message: `${error.message}，本地状态保持不变`, updatedCount: 0, assignedRoles: {} };
+    }
+    plannedChannels.forEach((c, index) => Object.assign(state.channels[index], c));
+    state.activeChannelId = plannedActiveId;
     invalidateSub2APIScheduler(updates.map(u => u.accountId));
     lastSub2APISignature = getSub2APISignature();
   }
@@ -1781,7 +1620,7 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
 
   return {
     success: true,
-    message: `已成功按“价格最低=主调、次低=副调、其余=保底”优化重整了 ${updates.length} 条通道！`,
+    message: `已成功按“价格最低=主调、次低=副调、其余=保底”优化重整了 ${updates.length} 条通道！${skippedGroups.length ? ' 跳过共享分组：' + skippedGroups.join('；') : ''}`,
     updatedCount: updates.length,
     assignedRoles
   };
@@ -2245,6 +2084,7 @@ SELECT json_agg(t) FROM (
         totalCalls: row.total_cnt,
         succCount: row.succ_cnt,
         errCount: row.err_cnt,
+        providerErrCount: row.provider_err_cnt,
         successRate: row.success_rate !== null ? Number(row.success_rate) : null,
         avgTtftMs: row.avg_ttft,
         minTtftMs: row.min_ttft,
@@ -2449,6 +2289,7 @@ function getChannelStabilitySummary(channelId, channelMap) {
     totalCalls,
     totalSucc,
     totalErr,
+    providerErrCount: calledModels.reduce((sum, model) => sum + Number(model.providerErrCount || 0), 0),
     faultOwner: problemModel ? problemModel.owner : 'none',
     faultBadge: problemModel ? problemModel.badgeText : '运行极稳',
     tooltipTitle: problemModel ? problemModel.tooltipTitle : '运行极稳',
@@ -2896,11 +2737,11 @@ FROM u_summary u, r_stats r, s_stats s, paying_count pc, daily_trends dt, users_
 function executeUserRecharge(userId, amount, notes = '') {
   try {
     const numAmount = Number(amount);
-    if (isNaN(numAmount) || numAmount <= 0) {
+    if (!Number.isFinite(numAmount) || numAmount <= 0) {
       return { success: false, error: '充值金额必须大于0' };
     }
     const cleanUserId = Number(userId);
-    if (isNaN(cleanUserId) || cleanUserId <= 0) {
+    if (!Number.isSafeInteger(cleanUserId) || cleanUserId <= 0) {
       return { success: false, error: '无效的用户ID' };
     }
     const escapedNotes = String(notes || '').replace(/'/g, "''");
@@ -2909,6 +2750,8 @@ function executeUserRecharge(userId, amount, notes = '') {
     // 执行事务：增加用户余额，并插入一条 redeem_codes 充值记录保持数据链完整对账
     const sql = `
 BEGIN;
+SELECT id FROM users WHERE id = ${cleanUserId} AND deleted_at IS NULL FOR UPDATE;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM users WHERE id = ${cleanUserId} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'User does not exist'; END IF; END $$;
 UPDATE users SET balance = balance + ${numAmount.toFixed(8)}, updated_at = NOW() WHERE id = ${cleanUserId} AND deleted_at IS NULL;
 INSERT INTO redeem_codes (code, type, value, status, used_by, used_at, notes, validity_days, created_at)
 VALUES ('${codeStr}', 'admin_balance', ${numAmount.toFixed(8)}, 'used', ${cleanUserId}, NOW(), '${escapedNotes}', 365, NOW());
@@ -3143,90 +2986,41 @@ async function probeChannelModel(channel, modelName) {
 function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
   const oldId = String(fromChannel.id);
   const targetId = String(toChannel.id);
-  const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
-
-  // 1. 获取目标通道所属业务分组（过滤掉例外分组，避免互斥逻辑波及私有/通用组）
-  const allTargetGroupIds = (toChannel.groupsDetail || []).map(g => g.id).filter(Boolean);
-  if (toChannel.primaryGroupId) allTargetGroupIds.push(toChannel.primaryGroupId);
-
-  // 触发本次切线的特定业务组 (优先采用 meta.groupId)
-  const triggerGroupId = meta.groupId ? Number(meta.groupId) : null;
-  const isTriggerExempt = triggerGroupId && isExemptGroup(triggerGroupId);
-
-  // 2. 调度角色实时交接：新通道升级为主调 (priority 100, schedulable = true)
-  toChannel.priority = 100;
+  const id = Number(targetId);
+  const balanceUnavailable = toChannel.balanceStatus === 'empty' ||
+    (toChannel.balance != null && Number.isFinite(Number(toChannel.balance)) && Number(toChannel.balance) <= 0.001);
+  if (!Number.isSafeInteger(id) || id <= 0 || toChannel.autoSwitchDisabled ||
+      (toChannel.configuredStatus && toChannel.configuredStatus !== 'active') ||
+      toChannel.status !== 'online' || toChannel.lastProbeStatus === 'offline' || balanceUnavailable) {
+    throw new Error('备选通道已不可用，请重新评估');
+  }
+  const scope = meta.groupId ? [Number(meta.groupId)] : groupIds(toChannel).filter(gid => !isExemptGroup(gid));
+  if (meta.groupId && !groupIds(toChannel).includes(Number(meta.groupId))) throw new Error('备选通道已不属于目标分组');
+  const exclusive = autoSwitchConfig.singleActiveExclusive !== false && !scope.some(gid => isExemptGroup(gid));
+  const peers = state.channels.filter(c => String(c.id) !== targetId && groupIds(c).some(gid => scope.includes(gid)));
+  const safeToDisableIds = exclusive ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(Number.isSafeInteger) : [];
+  const sharedPeerIds = peers.filter(c => !safeToDisableIds.includes(Number(c.id))).map(c => Number(c.id)).filter(Number.isSafeInteger);
+  let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${id} AND deleted_at IS NULL AND status = 'active') THEN RAISE EXCEPTION 'Target unavailable'; END IF; END $$;
+UPDATE accounts SET schedulable = true, priority = 1 WHERE id = ${id};`;
+  if (safeToDisableIds.length) sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisableIds.join(',')});`;
+  if (sharedPeerIds.length) sql += `UPDATE accounts SET priority = GREATEST(priority, 10) WHERE id IN (${sharedPeerIds.join(',')});`;
+  // Automatic routing never changes business sale prices.
+  const remoteOk = executeRemoteSQL(sql);
+  toChannel.priority = 1;
   toChannel.isActive = true;
   toChannel.schedulable = true;
-
-  // 3. 🔒 自动换组/切线时：同业务组内严格单主互斥
-  // 核心铁律：仅在触发切线的具体业务组（meta.groupId）内执行单主互斥排他！
-  // 绝对严禁株连目标渠道兼属的其他分组（例如切 Grok heavy 时，绝不能连带关停 GPT通用 组的 GPT/GLM 渠道）！
-  // 且若触发组为通用/自用等例外分组，绝不排他关停同组其他渠道。
-  const disabledInGroupIds = [];
-
-  if (isSingleActive && !isTriggerExempt) {
-    let scopedGroupIds = [];
-    if (triggerGroupId) {
-      scopedGroupIds = [triggerGroupId];
-    } else {
-      // 若未指定 triggerGroupId，仅排他非例外的业务组
-      scopedGroupIds = allTargetGroupIds.filter(gid => !isExemptGroup(gid));
-    }
-
-    if (scopedGroupIds.length > 0) {
-      state.channels.forEach(c => {
-        if (String(c.id) === targetId) return;
-        const inScopedGroup = (c.groupsDetail || []).some(g => scopedGroupIds.includes(g.id)) ||
-                              (c.primaryGroupId && scopedGroupIds.includes(c.primaryGroupId));
-        if (inScopedGroup) {
-          c.priority = Math.min(10, Number(c.priority) || 10);
-          c.isActive = false;
-          c.manualLocked = false;
-          c.schedulable = false; // 严格保证当前业务组内无多余竞争副调
-          disabledInGroupIds.push(c.id);
-        }
-      });
-    }
+  toChannel.manualLocked = Boolean(meta.manualConfirmed);
+  if (String(state.manualLockedChannelId) === oldId) state.manualLockedChannelId = meta.manualConfirmed ? targetId : null;
+  for (const peer of peers) {
+    if (exclusive && !groupIds(peer).some(gid => !scope.includes(gid))) peer.schedulable = false;
+    peer.priority = Math.max(10, Number(peer.priority) || 10);
+    peer.isActive = false;
+    peer.manualLocked = false;
   }
-
-  if (String(state.activeChannelId) === oldId || !state.activeChannelId) {
-    state.activeChannelId = targetId;
-  }
-
+  if (String(state.activeChannelId) === oldId || !state.activeChannelId) state.activeChannelId = targetId;
   writeJSON(CHANNELS_FILE, state);
-
-  // 4. 同步 Sub2API 数据库：原子互斥切换
-  // 核心修复：SQL 子查询必须严格限制在 scopedGroupIds 内部，杜绝全库级跨组扩散！
-  let sql = '';
-  if (isSingleActive && !isTriggerExempt) {
-    let scopedGroupIds = triggerGroupId ? [triggerGroupId] : allTargetGroupIds.filter(gid => !isExemptGroup(gid));
-    if (scopedGroupIds.length > 0) {
-      const groupInClause = scopedGroupIds.join(',');
-      const oldClause = (oldId && oldId !== '0' && oldId !== 'undefined' && !disabledInGroupIds.includes(Number(oldId))) 
-        ? `OR id = ${oldId}` 
-        : '';
-      sql = `UPDATE accounts SET schedulable = true, priority = 100 WHERE id = ${targetId};
-             UPDATE accounts SET schedulable = false, priority = LEAST(priority, 10) 
-             WHERE id != ${targetId} 
-               AND (
-                 id IN (
-                   SELECT account_id FROM account_groups WHERE group_id IN (${groupInClause})
-                 )
-                 ${oldClause}
-               );`;
-    } else {
-      sql = `UPDATE accounts SET schedulable = true, priority = 100 WHERE id = ${targetId};`;
-    }
-  } else {
-    const oldClause = (oldId && oldId !== '0' && oldId !== 'undefined') ? `UPDATE accounts SET priority = 10 WHERE id = ${oldId}; ` : '';
-    sql = `${oldClause}UPDATE accounts SET priority = 100, schedulable = true WHERE id = ${targetId};`;
-  }
-  const remoteOk = executeRemoteSQL(sql);
-  if (remoteOk) {
-    const affected = Array.from(new Set([oldId, targetId, ...disabledInGroupIds]));
-    invalidateSub2APIScheduler(affected);
-    lastSub2APISignature = getSub2APISignature();
-  }
+  invalidateSub2APIScheduler([id, ...peers.map(c => Number(c.id)).filter(Number.isSafeInteger)]);
+  lastSub2APISignature = getSub2APISignature();
 
   // 记录自动切换日志
   const logEntry = {
@@ -3243,7 +3037,7 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
     oldTtft: meta.oldTtft || null,
     newTtft: meta.newTtft || null,
     remoteSynced: remoteOk,
-    priceAdjusted: Boolean(meta.priceAdjusted),
+    priceAdjusted: false,
     groupName: meta.groupName || null,
     groupId: meta.groupId || null,
     oldSaleRate: meta.oldSaleRate || null,
@@ -3255,6 +3049,8 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
   if (autoSwitchLogs.length > 80) autoSwitchLogs = autoSwitchLogs.slice(0, 80);
   writeJSON(AUTO_SWITCH_LOGS_FILE, autoSwitchLogs);
 
+  autoSwitchConfig.groupLastSwitchTimes = autoSwitchConfig.groupLastSwitchTimes || {};
+  if (meta.groupId) autoSwitchConfig.groupLastSwitchTimes[meta.groupId] = logEntry.timestamp;
   autoSwitchConfig.lastSwitchTime = logEntry.timestamp;
   autoSwitchConfig.lastSwitchReason = reason;
   writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
@@ -3274,7 +3070,7 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
   // 实时 SSE 广播
   broadcastSSE('AUTO_SWITCH_EXECUTED', {
     log: logEntry,
-    activeChannelId: targetId,
+    activeChannelId: state.activeChannelId,
     activeChannel: toChannel
   });
   broadcastSSE('CHANNELS_UPDATED', state);
@@ -3317,8 +3113,10 @@ function resolveFailoverProposal(proposalId, decision = 'approve', operator = 'W
   }
 
   if (decision === 'approve') {
-    const fromCh = state.channels.find(c => String(c.id) === String(targetProposal.fromChannel.id)) || targetProposal.fromChannel;
-    const toCh = state.channels.find(c => String(c.id) === String(targetProposal.toChannel.id)) || targetProposal.toChannel;
+    const fromCh = state.channels.find(c => String(c.id) === String(targetProposal.fromChannel.id));
+    const toCh = state.channels.find(c => String(c.id) === String(targetProposal.toChannel.id));
+    if (!fromCh || !toCh || Date.now() - new Date(targetProposal.suggestedAt).getTime() > 15 * 60 * 1000) return { success: false, error: '请示已过期或通道已变化，请重新评估' };
+    if (Number(toCh.costMultiplier ?? toCh.multiplier) !== Number(targetProposal.toChannel.cost)) return { success: false, error: '备选成本已变化，请重新评估' };
 
     const switchReason = `【管理员确认切线】${targetProposal.reason} -> 由 ${operator} 批准切换至 [${toCh.name}]`;
     const res = executeAutoSwitch(fromCh, toCh, switchReason, {
@@ -3368,475 +3166,129 @@ function resolveFailoverProposal(proposalId, decision = 'approve', operator = 'W
   }
 }
 
-function evaluateAutoSwitch(triggerReason = '自动巡检评估', forceEvaluate = false) {
-  if (!autoSwitchConfig.enabled && !forceEvaluate) {
-    return { executed: false, reason: '自动切线功能处于关闭状态' };
+let recentFailoverMetrics = { at: 0, data: {} };
+function fetchRecentFailoverMetrics() {
+  if (Date.now() - recentFailoverMetrics.at < 30000) return recentFailoverMetrics.data;
+  try {
+    const rows = JSON.parse(execPsql(`WITH events AS (
+      SELECT account_id, created_at, false AS failed, first_token_ms AS ttft
+      FROM usage_logs WHERE created_at >= NOW() - INTERVAL '5 minutes'
+      UNION ALL
+      SELECT account_id, created_at, true AS failed, NULL AS ttft
+      FROM ops_error_logs WHERE created_at >= NOW() - INTERVAL '5 minutes'
+        AND (error_owner = 'provider' OR status_code IN (401, 402, 403, 429) OR status_code >= 500)
+    ), ranked AS (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY created_at DESC) AS position FROM events
+    ) SELECT COALESCE(json_agg(t), '[]'::json) FROM (
+      SELECT account_id, COUNT(*) AS calls, COUNT(*) FILTER (WHERE failed) AS errors,
+        AVG(ttft) AS ttft,
+        COALESCE(MIN(position) FILTER (WHERE NOT failed) - 1, COUNT(*)) AS consecutive
+      FROM ranked WHERE account_id IS NOT NULL GROUP BY account_id
+    ) t;`, true).trim() || '[]');
+    recentFailoverMetrics = { at: Date.now(), data: Object.fromEntries(rows.map(row => [String(row.account_id), {
+      totalCalls: Number(row.calls), providerErrCount: Number(row.errors), consecutiveFailures: Number(row.consecutive), avgTtftMs: Number(row.ttft)
+    }])) };
+  } catch (error) {
+    // Do not keep stale production errors alive when the database is unavailable.
+    recentFailoverMetrics = { at: Date.now(), data: {} };
+    console.error('[近期生产故障统计]', error.message);
   }
-
-  const stabilityMap = fetchChannelStabilityMetrics(false);
+  return recentFailoverMetrics.data;
+}
+function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
+  if (!autoSwitchConfig.enabled) return { executed: false, reason: '自动切号已关闭' };
   const now = Date.now();
-
-  const failRateThreshold = autoSwitchConfig.failRateThreshold !== undefined ? autoSwitchConfig.failRateThreshold : 50;
-  const minSampleSize = autoSwitchConfig.minSampleSize !== undefined ? autoSwitchConfig.minSampleSize : 5;
-  const consecutiveFailuresThreshold = autoSwitchConfig.consecutiveFailuresThreshold !== undefined ? autoSwitchConfig.consecutiveFailuresThreshold : 5;
-  const cooldownMs = (autoSwitchConfig.cooldownMinutes || 10) * 60 * 1000;
-
-  // 1. 收集全站所有有效业务销售分组 (以业务组为核心原子单元进行巡检与容灾评估)
-  const allGroups = (state.allGroups && state.allGroups.length) ? state.allGroups : fetchAllSub2APIGroups();
-  if (!allGroups || allGroups.length === 0) {
-    return { executed: false, reason: '未找到任何业务销售分组' };
-  }
-
-  const switchReports = [];
-  const stableDetails = [];
-
-  for (const targetGroup of allGroups) {
-    if (isExemptGroup(targetGroup)) {
-      // 🔒 用户私有/通用业务组绝对例外：系统绝不自动巡检比价、不切线、不改价、不熔断，全权由用户手动调优
-      continue;
-    }
-
-    const groupId = targetGroup.id;
-    const groupKey = String(groupId);
-    const groupPolicy = (autoSwitchConfig.groupPolicies && autoSwitchConfig.groupPolicies[groupKey]) || {};
-    const groupAutoEnabled = groupPolicy.enabled !== undefined ? groupPolicy.enabled : autoSwitchConfig.enabled;
-    if (!groupAutoEnabled && !forceEvaluate) {
-      continue;
-    }
-
-    // 💡 识别是否为低倍率/特惠业务组 (售价 <= 0.20x 或名称包含 福利/特惠/混池)
-    const isLowRateGroup = (targetGroup.sale_rate && Number(targetGroup.sale_rate) <= 0.20) || 
-      (targetGroup.name && (targetGroup.name.includes('福利') || targetGroup.name.includes('特惠') || targetGroup.name.includes('混池')));
-
-    // 💡 低倍率组由于天然存在轻微网络波动，默认应用更宽容防抖的基线阈值 (允许单独自定义覆盖)
-    const defaultFailRate = isLowRateGroup ? 60 : failRateThreshold;
-    const defaultConsecutive = isLowRateGroup ? 8 : consecutiveFailuresThreshold;
-    const defaultCooldownMin = isLowRateGroup ? 20 : (autoSwitchConfig.cooldownMinutes || 10);
-    const defaultSampleSize = isLowRateGroup ? 10 : (autoSwitchConfig.minSampleSize || 5);
-
-    const groupFailRateThreshold = groupPolicy.failRateThreshold !== undefined ? groupPolicy.failRateThreshold : defaultFailRate;
-    const groupConsecutiveFailuresThreshold = groupPolicy.consecutiveFailuresThreshold !== undefined ? groupPolicy.consecutiveFailuresThreshold : defaultConsecutive;
-    const groupCooldownMs = ((groupPolicy.cooldownMinutes !== undefined ? groupPolicy.cooldownMinutes : defaultCooldownMin) || 10) * 60 * 1000;
-    const groupMinSampleSize = groupPolicy.minSampleSize !== undefined ? groupPolicy.minSampleSize : defaultSampleSize;
-
-    // 找出挂在该分组下的所有通道
-    const groupChannels = state.channels.filter(c => {
-      const inDetail = (c.groupsDetail || []).some(g => g.id === groupId);
-      const isPrimary = c.primaryGroupId === groupId;
-      return inDetail || isPrimary;
-    });
-
-    if (groupChannels.length === 0) continue;
-
-    const isOutOfBal = (c) => (c.balanceStatus === 'empty') || 
-      (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
-
-    // 找到该组当前正在承接流量的主调
-    let currentActive = groupChannels.find(c => (Number(c.priority) >= 100 && c.schedulable) && c.status !== 'offline');
-    if (!currentActive) {
-      currentActive = groupChannels.find(c => c.schedulable && c.status !== 'offline');
-    }
-    if (!currentActive) {
-      currentActive = groupChannels.find(c => Number(c.priority) >= 100);
-    }
-    if (!currentActive && groupChannels.length > 0) {
-      currentActive = groupChannels.find(c => c.status !== 'offline') || groupChannels[0];
-    }
-
-    const isChannelOffline = currentActive ? currentActive.status === 'offline' : false;
-    const isOutOfBalance = currentActive ? isOutOfBal(currentActive) : false;
-
-    // 🔒 管理员人工锁定策略检查 (核心铁律：人工指定的主调不可擅自动)
-    // 凡是 priority >= 100 的主调、显式标记 manualLocked、或在锁定列表中的，均绝对视为人工主调！
-    const manualLockPolicy = autoSwitchConfig.manualLockPolicy || 'confirm_required';
-    const isManualLocked = currentActive && (
-      Boolean(currentActive.manualLocked) || 
-      Number(currentActive.priority) >= 100 || 
-      (state.manualLockedChannelId && String(state.manualLockedChannelId) === String(currentActive.id))
-    );
-
-    const activeStab = currentActive ? getChannelStabilitySummary(currentActive.id, stabilityMap) : { totalCalls: 0, totalErr: 0, avgTtftMs: null };
-    const totalCalls = activeStab.totalCalls || 0;
-    const totalErr = activeStab.totalErr || 0;
-    const failRate = totalCalls > 0 ? Number(((totalErr / totalCalls) * 100).toFixed(1)) : 0;
-    const isHighFailRate = currentActive ? ((totalCalls >= groupMinSampleSize) && (failRate >= groupFailRateThreshold)) : false;
-    const isHardDown = currentActive ? (activeStab.faultOwner === 'provider' && totalErr >= groupConsecutiveFailuresThreshold) : false;
-    const isProviderFailing = isHighFailRate || isHardDown;
-    const isTroubled = isChannelOffline || isOutOfBalance || isProviderFailing;
-
-    // 如果当前主调存在，且无故障、未离线、未欠费：
-    if (currentActive && !isTroubled) {
-      // 🔒 核心铁律：管理员人工指定的主调，绝对禁止自动回切其他低价通道！充分尊重人工选型决策！
-      if (isManualLocked) {
-        stableDetails.push(`[${targetGroup.name} / ${currentActive.name}]: 管理员人工指定主调运行健康 (已锁定保护，不参与低价自动回切)。`);
-        continue;
-      }
-
-      // 🌟【核心闭环：同组低成本优质通道充值/健康恢复，自动回切并降回原售价 (Auto-Failback)】
-      const autoRecover = autoSwitchConfig.autoRecoverLowestCost !== false;
-      const currentCost = currentActive.costMultiplier !== undefined ? currentActive.costMultiplier : currentActive.multiplier;
-
-      if (autoRecover) {
-        const groupCandidates = groupChannels.filter(c => String(c.id) !== String(currentActive.id));
-        const cheaperHealthyRecovered = groupCandidates.filter(c => {
-          if (c.status === 'offline') return false;
-          if (isOutOfBal(c)) return false;
-          const hasAdequateBalance = (c.balanceStatus === 'ok') || (c.balance !== null && c.balance !== undefined && Number(c.balance) >= 1.0);
-          if (!hasAdequateBalance) return false;
-
-          const cost = c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier;
-          if (cost >= currentCost - 0.005) return false;
-
-          const s = getChannelStabilitySummary(c.id, stabilityMap);
-          const sCalls = s.totalCalls || 0;
-          const sErr = s.totalErr || 0;
-          const sFailRate = sCalls > 0 ? (sErr / sCalls) * 100 : 0;
-          if (s.faultOwner === 'provider' && (sErr >= groupConsecutiveFailuresThreshold || (sCalls >= groupMinSampleSize && sFailRate >= groupFailRateThreshold))) {
-            return false;
-          }
-          return true;
-        });
-
-        if (cheaperHealthyRecovered.length > 0) {
-          cheaperHealthyRecovered.sort((a, b) => {
-            const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
-            const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
-            return costA - costB;
-          });
-          const bestRecoverCandidate = cheaperHealthyRecovered[0];
-          const bestRecoverCost = bestRecoverCandidate.costMultiplier !== undefined ? bestRecoverCandidate.costMultiplier : bestRecoverCandidate.multiplier;
-
-          let inRecoverCooldown = false;
-          if (!forceEvaluate && autoSwitchConfig.lastSwitchTime) {
-            const lastSwitch = new Date(autoSwitchConfig.lastSwitchTime).getTime();
-            if (now - lastSwitch < groupCooldownMs) {
-              inRecoverCooldown = true;
-            }
-          }
-
-          if (inRecoverCooldown) {
-            stableDetails.push(`[${targetGroup.name} / ${currentActive.name}]: 运行稳定。发现更低价恢复渠道 [${bestRecoverCandidate.name}] (进价: ${bestRecoverCost}x < 当前 ${currentCost}x)，处于防颠簸冷静期中，暂缓回切。`);
-            continue;
-          }
-
-          let priceRestored = false;
-          let restoredGroupInfo = null;
-          const savedOriginalRate = autoSwitchConfig.originalGroupSaleRates?.[targetGroup.id];
-          const currentSaleRate = Number((targetGroup.sale_rate || currentActive.saleMultiplier || 1.0).toFixed(4));
-          if (savedOriginalRate && savedOriginalRate < currentSaleRate) {
-            const targetRestoredRate = Number(savedOriginalRate.toFixed(4));
-            console.log(`📉 [自动恢复原售价] 业务分组 [${targetGroup.name}] 回切到优质低价渠道 [${bestRecoverCandidate.name}]，对外售价从 ${currentSaleRate}x 恢复为原始售价 ${targetRestoredRate}x！`);
-            updateRemoteGroupSaleRate(targetGroup.id, targetRestoredRate);
-            priceRestored = true;
-            restoredGroupInfo = {
-              groupId: targetGroup.id,
-              groupName: targetGroup.name,
-              oldSaleRate: currentSaleRate,
-              restoredSaleRate: targetRestoredRate,
-              newMarginPercent: Number((((targetRestoredRate - bestRecoverCost) / targetRestoredRate) * 100).toFixed(1)),
-              spread: Number((targetRestoredRate - bestRecoverCost).toFixed(4))
-            };
-          }
-
-          const recoverReason = priceRestored && restoredGroupInfo
-            ? `【低价主线充值恢复+恢复原价】原优质主调 [${bestRecoverCandidate.name}] 余额已恢复充裕 (进价: ${bestRecoverCost}x < 当前 ${currentCost}x)，已自动回切为主调，并将【${restoredGroupInfo.groupName}】对外售价从 ${restoredGroupInfo.oldSaleRate}x 回调至 ${restoredGroupInfo.restoredSaleRate}x！`
-            : `【低价主线充值恢复】原优质主调 [${bestRecoverCandidate.name}] 余额已恢复充裕 (进价: ${bestRecoverCost}x < 当前 ${currentCost}x)，自动回切为主调降本增效！`;
-
-          const switchRes = executeAutoSwitch(currentActive, bestRecoverCandidate, recoverReason, {
-            triggerType: 'auto_recover_lowest_cost',
-            oldCost: currentCost,
-            newCost: bestRecoverCost,
-            oldTtft: activeStab.avgTtftMs,
-            newTtft: bestRecoverCandidate.latency || null,
-            priceRestored,
-            groupName: targetGroup.name,
-            groupId: targetGroup.id,
-            ...(restoredGroupInfo || {})
-          });
-
-          switchReports.push(switchRes);
-          continue;
+  const groups = state.allGroups?.length ? state.allGroups : fetchAllSub2APIGroups();
+  const reports = [], details = [];
+  // Isolated tests and degraded startup may not have the DB metric helper loaded.
+  const productionMetrics = typeof fetchRecentFailoverMetrics === 'function' ? fetchRecentFailoverMetrics() : {};
+  const reasonNames = { disabled: '当前账号已停用', balance_empty: '余额不足', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复' };
+  state.failoverRuntime = state.failoverRuntime || {};
+  for (const group of groups || []) {
+    if (isExemptGroup(group)) continue;
+    const key = String(group.id);
+    const policy = autoSwitchConfig.groupPolicies?.[key] || {};
+    if (policy.enabled === false) continue;
+    const channels = state.channels.filter(c => groupIds(c).includes(Number(group.id)));
+    if (!channels.length) continue;
+    try {
+      const metrics = Object.fromEntries(channels.map(c => {
+        const observed = gatewayMetrics.summary(c.id), production = productionMetrics[String(c.id)];
+        return [String(c.id), production?.totalCalls ? production : observed];
+      }));
+      const decision = evaluateGroup({ group, channels, metrics, config: { ...autoSwitchConfig, ...policy }, runtime: state.failoverRuntime[key] || {}, now });
+      state.failoverRuntime[key] = decision.runtime;
+      const current = channels.find(c => String(c.id) === String(decision.currentId));
+      if (decision.action === 'switch') {
+        const target = channels.find(c => String(c.id) === String(decision.targetId));
+        const result = executeAutoSwitch(current || { id: 0, name: '无活动账号' }, target, group.name + '：' + (reasonNames[decision.reason] || decision.reason), { groupId: group.id, groupName: group.name, triggerType: decision.reason });
+        decision.runtime.lastSwitchAt = now;
+        decision.runtime.exhaustedNotified = false;
+        reports.push(result);
+      } else if (decision.action === 'exhausted') {
+        const active = channels.filter(c => c.schedulable);
+        if (active.length) {
+          const ids = active.map(c => Number(c.id));
+          if (!ids.every(id => Number.isSafeInteger(id) && id > 0)) throw new Error('无效账号ID');
+          executeRemoteSQL('UPDATE accounts SET schedulable = false WHERE id IN (' + ids.join(',') + ');');
+          active.forEach(c => { c.schedulable = false; c.isActive = false; });
+          if (active.some(c => String(c.id) === String(state.activeChannelId))) state.activeChannelId = '';
+          invalidateSub2APIScheduler(ids);
+          broadcastSSE('CHANNELS_UPDATED', state);
         }
-      }
-
-      stableDetails.push(`[${targetGroup.name} / ${currentActive.name}]: 运行稳定 (余额充足, 失败率 ${failRate}% < ${groupFailRateThreshold}%, 样本数 ${totalCalls}/${groupMinSampleSize})`);
-      continue;
-    }
-
-    // ⚠️ 此时进入异常切线/请示流程：当前通道不存在、或已欠费、或已离线、或故障率超标
-    const isCriticalDown = isOutOfBalance || isChannelOffline || (isHardDown && (totalErr >= groupConsecutiveFailuresThreshold * 2));
-    if (!forceEvaluate && !isCriticalDown && autoSwitchConfig.lastSwitchTime) {
-      const lastSwitch = new Date(autoSwitchConfig.lastSwitchTime).getTime();
-      if ((now - lastSwitch < groupCooldownMs)) {
-        const remainSec = Math.round((groupCooldownMs - (now - lastSwitch)) / 1000);
-        stableDetails.push(`[${targetGroup.name}]: 处于防频繁切换冷静期中 (剩余 ${remainSec} 秒)`);
-        continue;
-      }
-    }
-
-    // 🔒 严格搜集同一业务销售分组内的备选通道 (严禁跨组漂移破坏业务隔离与计费！)
-    const candidatePool = groupChannels.filter(c => {
-      if (currentActive && String(c.id) === String(currentActive.id)) return false;
-      return true;
-    });
-
-    const healthyCandidates = candidatePool.filter(c => {
-      if (c.status === 'offline') return false;
-      if (isOutOfBal(c)) return false;
-
-      const s = getChannelStabilitySummary(c.id, stabilityMap);
-      const sCalls = s.totalCalls || 0;
-      const sErr = s.totalErr || 0;
-      const sFailRate = sCalls > 0 ? (sErr / sCalls) * 100 : 0;
-      if (s.faultOwner === 'provider' && (sErr >= groupConsecutiveFailuresThreshold || (sCalls >= groupMinSampleSize && sFailRate >= groupFailRateThreshold))) {
-        return false;
-      }
-      return true;
-    });
-
-    if (healthyCandidates.length === 0) {
-      // ⚠️ 极端情况：该分组内无任何健康可用通道！
-      // 必须将原已故障/欠费的通道关闭调度 (schedulable = false)，避免继续被调用报错
-      if (currentActive && currentActive.schedulable) {
-        currentActive.schedulable = false;
-        currentActive.isActive = false;
-        executeRemoteSQL(`UPDATE accounts SET schedulable = false, priority = LEAST(priority, 10) WHERE id = ${currentActive.id};`);
-        invalidateSub2APIScheduler([currentActive.id]);
-        writeJSON(CHANNELS_FILE, state);
-
-        console.warn(`[自动切线引擎] 业务分组【${targetGroup.name}】原通道 [${currentActive ? currentActive.name : '无'}] 欠费/不可用，且组内无可用备用通道，已触发全组熔断！`);
-        
-        const fuseAlert = {
-          id: 'alt_fuse_' + targetGroup.id + '_' + Date.now(),
-          channelId: String(targetGroup.id),
-          channelName: targetGroup.name,
-          type: 'group_fused',
-          timestamp: new Date().toISOString(),
-          note: `【业务组断流熔断】业务销售分组 [${targetGroup.name}] 所有通道均已欠费或不可用，且无健康备用通道，已熔断关停！请立即充值或添加新渠道！`
-        };
-        alerts.unshift(fuseAlert);
-        writeJSON(ALERTS_FILE, alerts);
-        broadcastSSE('CHANNELS_UPDATED', state);
-      }
-      continue;
-    }
-
-    // 【核心法则：以不赔钱为第一主线】
-    const safeCandidates = healthyCandidates.filter(c => !c.isLoss);
-
-    let bestCandidate = null;
-    let priceAdjusted = false;
-    let adjustedGroupInfo = null;
-
-    if (safeCandidates.length > 0) {
-      // 按照四层流转体系选取候选通道：
-      // 顺位 1: 健康副调 (priority >= 20)
-      // 顺位 2: 健康备选 (priority >= 10 且 < 20)
-      // 顺位 3: 备用待命池通道 (priority < 10)
-      const subCandidates = safeCandidates.filter(c => Number(c.priority) >= 20);
-      const altCandidates = safeCandidates.filter(c => Number(c.priority) >= 10 && Number(c.priority) < 20);
-      const standbyCandidates = safeCandidates.filter(c => Number(c.priority) < 10);
-
-      const targetTier = subCandidates.length > 0 
-        ? subCandidates 
-        : (altCandidates.length > 0 ? altCandidates : standbyCandidates);
-
-      // 组内排序：按进货成本由低到高排列择优接替
-      targetTier.sort((a, b) => {
-        const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
-        const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
-        return costA - costB;
-      });
-      bestCandidate = targetTier[0];
-    } else {
-      // 备选通道进货价均高于对外售价 (若直接切换会赔钱)！自动上调对外售价 (+20%)
-      healthyCandidates.sort((a, b) => {
-        const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
-        const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
-        return costA - costB;
-      });
-      bestCandidate = healthyCandidates[0];
-      const bestCandidateCost = bestCandidate.costMultiplier !== undefined ? bestCandidate.costMultiplier : bestCandidate.multiplier;
-
-      const markupRate = 1.20;
-      const newSaleRate = Number((bestCandidateCost * markupRate).toFixed(4));
-      const oldSaleRate = Number((targetGroup.sale_rate || currentActive?.saleMultiplier || 1.0).toFixed(4));
-      const spread = Number((newSaleRate - bestCandidateCost).toFixed(4));
-      const marginPercent = Number(((spread / newSaleRate) * 100).toFixed(1));
-
-      if (!autoSwitchConfig.originalGroupSaleRates) autoSwitchConfig.originalGroupSaleRates = {};
-      if (!autoSwitchConfig.originalGroupSaleRates[targetGroup.id]) {
-        autoSwitchConfig.originalGroupSaleRates[targetGroup.id] = oldSaleRate;
-        writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
-      }
-
-      console.log(`⚡ [自动改售价] 备选渠道 [${bestCandidate.name}] 成本 (${bestCandidateCost}x) 高于分组 [${targetGroup.name}] 售价 (${oldSaleRate}x)；自动将售价调整为 ${newSaleRate}x (保毛利 +${marginPercent}%)`);
-      updateRemoteGroupSaleRate(targetGroup.id, newSaleRate);
-      priceAdjusted = true;
-      adjustedGroupInfo = {
-        groupId: targetGroup.id,
-        groupName: targetGroup.name,
-        oldSaleRate,
-        newSaleRate,
-        newMarginPercent: marginPercent,
-        spread
-      };
-    }
-
-    if (!bestCandidate) continue;
-
-    const bestCandidateCost = bestCandidate.costMultiplier !== undefined ? bestCandidate.costMultiplier : bestCandidate.multiplier;
-    const isUsingFallback = Number(bestCandidate.priority) <= 1;
-
-    let switchDetail = '';
-    const fromChannelName = currentActive ? currentActive.name : '无(断流)';
-    const fromChannelCost = currentActive ? (currentActive.costMultiplier !== undefined ? currentActive.costMultiplier : currentActive.multiplier) : 0;
-
-    if (priceAdjusted && adjustedGroupInfo) {
-      switchDetail = `【${isOutOfBalance ? '余额断流' : '故障换线'}+自动改售价】分组【${adjustedGroupInfo.groupName}】原渠道 [${fromChannelName}] ${isOutOfBalance ? '余额已耗尽 ($0.00)' : '发生故障'}，备选渠道 [${bestCandidate.name}] 进货 (${bestCandidateCost}x) > 原售价 (${adjustedGroupInfo.oldSaleRate}x)；已自动将对外售价上调至 ${adjustedGroupInfo.newSaleRate}x (保毛利 +${adjustedGroupInfo.newMarginPercent}%) 并完成切线！`;
-    } else if (isOutOfBalance) {
-      switchDetail = `【余额断流紧急切线】分组【${targetGroup.name}】原渠道 [${fromChannelName}] 余额已耗尽 ($0.00) -> 紧急调换至同组可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
-    } else if (isUsingFallback) {
-      switchDetail = `⚠️ 极其慎重启用保底：分组【${targetGroup.name}】原通道 [${fromChannelName}] (失败率: ${failRate}%) 与全部副调均不可用 -> 底线紧急启用保底通道 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
-    } else if (isHighFailRate) {
-      switchDetail = `主调失败率超标调换副调：分组【${targetGroup.name}】原主调 [${fromChannelName}] 失败率升至 ${failRate}% (≥${groupFailRateThreshold}%) -> 调换至最便宜可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
-    } else if (isHardDown) {
-      switchDetail = `主调连续硬故障调换副调：分组【${targetGroup.name}】原主调 [${fromChannelName}] 出现连续上游报错 (${totalErr} 次) -> 调换至最便宜可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
-    } else if (isChannelOffline) {
-      switchDetail = `主调离线调换副调：分组【${targetGroup.name}】原主调 [${fromChannelName}] 已离线 -> 调换至最便宜可用备选 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
-    } else {
-      switchDetail = triggerReason || `按成本第一要素调换至最优副调 [${bestCandidate.name}] (进货成本: ${bestCandidateCost}x)`;
-    }
-
-    // 👑 核心安全铁律：人工手动设为主调后，不可擅自自动切走！如果要动，必须弹通知确认！
-    if (currentActive && isManualLocked) {
-      if (manualLockPolicy === 'strict_lock') {
-        stableDetails.push(`[${targetGroup.name} / ${currentActive.name}]: 人工指定主调发生故障，但当前为【绝对锁死】策略，拒绝自动换线。`);
-        continue;
-      }
-
-      if (manualLockPolicy === 'confirm_required') {
-        // 检查是否在管理员驳回切线的静默期内 (15分钟)
-        const lastReject = state.manualFailoverRejections?.[targetGroup.id];
-        if (lastReject && (now - lastReject < 15 * 60 * 1000)) {
-          stableDetails.push(`[${targetGroup.name} / ${currentActive.name}]: 人工主调故障，管理员曾驳回切线，处于 15 分钟静默保护中。`);
-          continue;
-        }
-
-        // 生成待审批切线请示
-        const proposalId = 'prop_' + targetGroup.id + '_' + Date.now();
-        const existingProp = state.pendingFailoverProposals?.[targetGroup.id];
-        const lastPropTime = existingProp ? new Date(existingProp.suggestedAt).getTime() : 0;
-
-        // 5分钟内不重复刷屏推送相同请示
-        if (!existingProp || (now - lastPropTime > 5 * 60 * 1000)) {
-          const proposal = {
-            id: proposalId,
-            groupId: targetGroup.id,
-            groupName: targetGroup.name,
-            fromChannel: {
-              id: String(currentActive.id),
-              name: currentActive.name,
-              cost: fromChannelCost,
-              balance: currentActive.balance,
-              status: currentActive.status,
-              failRate,
-              totalErr,
-              faultOwner: activeStab.faultOwner
-            },
-            toChannel: {
-              id: String(bestCandidate.id),
-              name: bestCandidate.name,
-              cost: bestCandidateCost,
-              latency: bestCandidate.latency,
-              priority: bestCandidate.priority
-            },
-            reason: isOutOfBalance ? '余额已耗尽 ($0.00)' : (isChannelOffline ? '通道已离线' : (isHardDown ? `连续硬故障 ${totalErr} 次` : `失败率达到 ${failRate}%`)),
-            switchDetail,
-            suggestedAt: new Date().toISOString(),
-            meta: {
-              triggerType: isOutOfBalance ? 'balance_empty' : (isHighFailRate ? 'fail_rate_threshold' : 'hard_down'),
-              oldCost: fromChannelCost,
-              newCost: bestCandidateCost,
-              priceAdjusted,
-              groupName: targetGroup.name,
-              groupId: targetGroup.id,
-              ...(adjustedGroupInfo || {})
-            }
-          };
-
-          if (!state.pendingFailoverProposals) state.pendingFailoverProposals = {};
-          state.pendingFailoverProposals[targetGroup.id] = proposal;
-          writeJSON(CHANNELS_FILE, state);
-
-          // 实时广播待审批请示给前端
-          broadcastSSE('MANUAL_MAIN_FAILOVER_PROPOSAL', proposal);
-
-          // 推送 Telegram 确认按钮
-          try {
-            telegram.notifyFailoverProposal(proposal);
-          } catch (err) {
-            console.error('[Telegram] notifyFailoverProposal 异常:', err.message);
-          }
-
-          // 添加告警记录
-          const alert = {
-            id: 'alt_prop_' + Date.now(),
-            channelId: String(currentActive.id),
-            channelName: currentActive.name,
-            type: 'manual_failover_proposal',
-            timestamp: proposal.suggestedAt,
-            note: `【人工主调异常切线请示】业务组【${targetGroup.name}】人工主调 [${currentActive.name}] ${proposal.reason}，建议切至 [${bestCandidate.name}]，等待管理员确认！`
-          };
-          alerts.unshift(alert);
+        if (!decision.runtime.exhaustedNotified) {
+          const note = group.name + ' 暂无可用且不亏损的备用账号，请检查余额并充值；系统会继续探测并自动恢复。';
+          alerts.unshift({ id: 'pool_' + key + '_' + now, type: 'pool_exhausted', groupId: group.id, timestamp: new Date(now).toISOString(), note });
           writeJSON(ALERTS_FILE, alerts);
-
-          console.log(`🔔 [人工主调切线请示] 业务组【${targetGroup.name}】人工主调 [${currentActive.name}] 发生故障，已向控制台与 Telegram 发送确认请示，等待管理员决策。`);
+          broadcastSSE('POOL_EXHAUSTED', { groupId: group.id, note });
+          Promise.resolve(telegram.broadcastToAdmins(note.replace(/[&<>]/g, ''))).catch(error => console.error('[切号通知]', error.message));
+          decision.runtime.exhaustedNotified = true;
         }
-
-        stableDetails.push(`[${targetGroup.name} / ${currentActive.name}]: 人工主调故障 (${isOutOfBalance ? '余额已耗尽' : '服务异常'})，已生成待确认切线请示，等待管理员确认后切线。`);
-        continue; // 铁律：绝不擅自动！不执行 executeAutoSwitch
+        details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason));
+      } else {
+        details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason));
       }
+    } catch (error) {
+      details.push(group.name + '：' + error.message);
+      console.error('[自动切号]', group.id, error.message);
     }
-
-    const switchRes = executeAutoSwitch(currentActive || { id: 0, name: '无活动渠道', multiplier: fromChannelCost }, bestCandidate, switchDetail, {
-      triggerType: isOutOfBalance ? 'balance_empty' : (isUsingFallback ? 'emergency_fallback' : (isHighFailRate ? 'fail_rate_threshold' : 'hard_down')),
-      oldCost: fromChannelCost,
-      newCost: bestCandidateCost,
-      oldTtft: activeStab.avgTtftMs,
-      newTtft: bestCandidate.latency || null,
-      priceAdjusted,
-      groupName: targetGroup.name,
-      groupId: targetGroup.id,
-      ...(adjustedGroupInfo || {})
-    });
-
-    switchReports.push(switchRes);
   }
-
-  if (switchReports.length > 0) {
-    return switchReports[0];
-  }
-
-  return {
-    executed: false,
-    reason: `全站各业务组调度通道稳定运行，未达切线门槛，坚决保持路由力保 Prompt Cache 与毛利。`,
-    details: stableDetails
-  };
+  if (typeof CHANNELS_FILE !== 'undefined') writeJSON(CHANNELS_FILE, state);
+  return { executed: reports.length > 0, reports, details, reason: reports.length ? '已自动切换可用账号' : '已评估，保持当前路由或等待恢复' };
 }
 
 let autoSwitchTimer = null;
+let healthPollRunning = false;
+async function refreshFailoverHealth() {
+  if (healthPollRunning || !autoSwitchConfig.enabled) return;
+  healthPollRunning = true;
+  try {
+    const channels = state.channels.filter(c => !c.autoSwitchDisabled && groupIds(c).some(gid => !isExemptGroup(gid)));
+    for (let offset = 0; offset < channels.length; offset += 8) {
+      await Promise.all(channels.slice(offset, offset + 8).map(async channel => {
+        const endpoint = channel.baseUrl, apiKey = channel.apiKey;
+        const started = Date.now();
+        const alive = await upstreamScanner.probeChannelAlive(channel);
+        const current = state.channels.find(c => String(c.id) === String(channel.id));
+        if (!current || current.baseUrl !== endpoint || current.apiKey !== apiKey) return;
+        current.lastProbeStatus = alive === true ? 'online' : alive === false ? 'offline' : 'unknown';
+        current.lastProbeTime = new Date().toISOString();
+        if (alive === true) {
+          current.status = 'online';
+          current.latency = Date.now() - started;
+        }
+      }));
+    }
+    evaluateAutoSwitch('自动探活评估');
+  } finally {
+    healthPollRunning = false;
+  }
+}
 function startAutoSwitchPoller() {
   if (autoSwitchTimer) clearInterval(autoSwitchTimer);
-  autoSwitchTimer = setInterval(() => {
-    if (autoSwitchConfig.enabled) {
-      try {
-        evaluateAutoSwitch('自动定时巡检评估', false);
-      } catch (e) {
-        console.error('自动切线巡检异常:', e.message);
-      }
-    }
-  }, 60000); // 每 60 秒评估一次
+  const poll = () => refreshFailoverHealth().catch(error => console.error('自动探活异常:', error.message));
+  autoSwitchTimer = setInterval(poll, 60000);
+  poll();
 }
 
 let lastSub2APISignature = '';
@@ -3924,10 +3376,19 @@ const MIME_TYPES = {
   '.ico': 'image/x-icon'
 };
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(err => {
+    console.error('[Request failed]', err.name);
+    if (res.headersSent) { res.destroy(); return; }
+    res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: false, error: err.statusCode ? err.message : '操作未完成，请检查服务端连接与配置' }));
+  });
+});
+
+async function handleRequest(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -3938,14 +3399,25 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  const getBody = () => new Promise((resolve) => {
+  const getBody = () => new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    let tooLarge = false;
+    req.on('error', reject);
+    req.on('aborted', () => reject(new Error('Request aborted')));
+    req.on('data', chunk => {
+      if (tooLarge) return;
+      body += chunk;
+      if (body.length > 1024 * 1024) {
+        tooLarge = true;
+        reject(Object.assign(new Error('请求体过大'), { statusCode: 413 }));
+        body = '';
+      }
+    });
     req.on('end', () => {
       try {
         resolve(body ? JSON.parse(body) : {});
       } catch (err) {
-        resolve({});
+        reject(Object.assign(new Error('无效的 JSON 请求体'), { statusCode: 400 }));
       }
     });
   });
@@ -4178,67 +3650,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const activeChannel = state.channels.find(c => String(c.id) === String(state.activeChannelId)) || state.channels[0];
+    const activeChannel = gateway.selectChannel(state);
     
     if (activeChannel && activeChannel.baseUrl && activeChannel.baseUrl.startsWith('http') && activeChannel.apiKey) {
+      let endTracker = () => {};
       try {
-        const cleanBase = activeChannel.baseUrl.replace(/\/+$/, '');
-        const hasV1InBase = cleanBase.endsWith('/v1');
-        const pathPart = hasV1InBase ? pathname.replace(/^\/v1/, '') : pathname;
-        const upstreamUrl = `${cleanBase}${pathPart}`;
-
-        const bodyBuffer = [];
-        for await (const chunk of req) {
-          bodyBuffer.push(chunk);
-        }
-        const fullBody = Buffer.concat(bodyBuffer);
-
-        const clientKey = gatewayAuth.clientIp || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'anonymous';
-        const endTracker = gatewayTrafficTracker.recordRequestStart(activeChannel.id, clientKey);
-        let trackerEnded = false;
-        const safeEndTracker = () => {
-          if (!trackerEnded) {
-            trackerEnded = true;
-            endTracker();
-          }
-        };
-        res.on('finish', safeEndTracker);
-        res.on('close', safeEndTracker);
-
-        const upstreamHeaders = { ...req.headers };
-        delete upstreamHeaders['host'];
-        upstreamHeaders['authorization'] = `Bearer ${activeChannel.apiKey}`;
-
-        const upReq = (upstreamUrl.startsWith('https:') ? https : http).request(upstreamUrl, {
-          method: req.method,
-          headers: upstreamHeaders
-        }, (upRes) => {
-          res.writeHead(upRes.statusCode, upRes.headers);
-          upRes.pipe(res);
+        const clientKey = gatewayAuth.clientIp || 'anonymous';
+        endTracker = gatewayTrafficTracker.recordRequestStart(activeChannel.id, clientKey);
+        gateway.forward(req, res, activeChannel, {
+          timeoutMs: autoSwitchConfig.ttftThresholdMs || 30000,
+          metrics: gatewayMetrics,
+          onEnd: endTracker
         });
-
-        upReq.on('error', (err) => {
-          safeEndTracker();
-          console.error(`[Gateway Proxy Error] 调度上游通道 [${activeChannel.name}] 出现异常:`, err.message);
-          res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({
-            error: {
-              message: `上游服务通道 [${activeChannel.name}] 响应失败或网络不可达: ${err.message}`,
-              type: 'upstream_gateway_error',
-              code: 502,
-              channel: {
-                id: activeChannel.id,
-                name: activeChannel.name,
-                multiplier: activeChannel.multiplier
-              }
-            }
-          }));
-        });
-
-        upReq.write(fullBody);
-        upReq.end();
         return;
       } catch (e) {
+        endTracker();
         console.error('Proxy error:', e);
         res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
@@ -4586,61 +4012,42 @@ const server = http.createServer(async (req, res) => {
     const standbyIds = Array.isArray(body.standbyIds) ? body.standbyIds.map(String) : [];
     const newSaleRate = (body.saleRate !== undefined && !isNaN(Number(body.saleRate))) ? Number(Number(body.saleRate).toFixed(4)) : null;
 
-    // 1. 如果指定了新销售倍率，更新分组销售倍率
-    if (newSaleRate !== null && newSaleRate > 0) {
-      updateRemoteGroupSaleRate(groupId, newSaleRate);
-      if (state.allGroups) {
-        const g = state.allGroups.find(gr => Number(gr.id) === groupId);
-        if (g) g.sale_rate = newSaleRate;
+    if (!Number.isSafeInteger(groupId) || groupId <= 0) throw Object.assign(new Error('无效分组'), { statusCode: 400 });
+    const assigned = [mainId, subId, altId, ...standbyIds].filter(Boolean);
+    const allAssignedAccountIds = [...new Set(assigned)];
+    if (assigned.length !== allAssignedAccountIds.length || assigned.some(id => !Number.isSafeInteger(Number(id)) || Number(id) <= 0)) {
+      throw Object.assign(new Error('调度角色不能重复，账号 ID 必须有效'), { statusCode: 400 });
+    }
+    for (const id of allAssignedAccountIds) {
+      const channel = state.channels.find(c => String(c.id) === id);
+      if (!channel) throw Object.assign(new Error('通道不存在'), { statusCode: 400 });
+      if (groupIds(channel).some(gid => gid !== groupId)) throw Object.assign(new Error('共享账号无法独立编排，请先为该组配置独立账号'), { statusCode: 409 });
+    }
+    if (newSaleRate !== null && (!Number.isFinite(newSaleRate) || newSaleRate <= 0)) throw Object.assign(new Error('售价必须为正数'), { statusCode: 400 });
+    const sqlStatements = [`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM groups WHERE id = ${groupId} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Group missing'; END IF; END $$;`];
+    if (newSaleRate !== null) sqlStatements.push(`UPDATE groups SET rate_multiplier = ${newSaleRate}, updated_at = NOW() WHERE id = ${groupId};`);
+    sqlStatements.push(`DELETE FROM account_groups WHERE group_id = ${groupId};`);
+    if (allAssignedAccountIds.length) {
+      sqlStatements.push(`INSERT INTO account_groups (account_id, group_id, priority) VALUES ${allAssignedAccountIds.map(id => '(' + Number(id) + ',' + groupId + ',50)').join(',')};`);
+      for (const id of allAssignedAccountIds) {
+        const priority = id === mainId ? 1 : id === subId ? 10 : id === altId ? 20 : 100;
+        sqlStatements.push(`UPDATE accounts SET schedulable = ${id === mainId}, priority = ${priority} WHERE id = ${Number(id)};`);
       }
     }
-
-    // 2. 收集此分组应绑定的所有通道 ID
-    const allAssignedAccountIds = Array.from(new Set([
-      ...(mainId ? [mainId] : []),
-      ...(subId ? [subId] : []),
-      ...(altId ? [altId] : []),
-      ...standbyIds
-    ])).filter(Boolean);
-
-    // 3. 更新数据库中该分组的关联通道列表 (account_groups)
-    if (allAssignedAccountIds.length > 0) {
-      updateGroupAccounts(groupId, allAssignedAccountIds);
-    }
-
-    // 4. 更新数据库各通道的 priority 和 schedulable
-    const sqlStatements = [];
+    executeRemoteSQL(sqlStatements.join('\n'));
     if (mainId) {
-      sqlStatements.push(`UPDATE accounts SET schedulable = true, priority = 100 WHERE id = ${parseInt(mainId, 10)};`);
-      state.activeChannelId = String(mainId);
-      state.manualLockedChannelId = String(mainId);
-      (state.channels || []).forEach(c => {
-        if (String(c.id) === String(mainId)) c.manualLocked = true;
-        else if (allAssignedAccountIds.includes(Number(c.id)) || allAssignedAccountIds.includes(String(c.id))) c.manualLocked = false;
-      });
+      state.activeChannelId = mainId;
+      state.manualLockedChannelId = mainId;
     }
-    if (subId) {
-      sqlStatements.push(`UPDATE accounts SET schedulable = false, priority = 20 WHERE id = ${parseInt(subId, 10)};`);
+    for (const channel of state.channels) {
+      if (!allAssignedAccountIds.includes(String(channel.id))) continue;
+      channel.manualLocked = String(channel.id) === mainId;
+      channel.schedulable = String(channel.id) === mainId;
+      channel.priority = String(channel.id) === mainId ? 1 : String(channel.id) === subId ? 10 : String(channel.id) === altId ? 20 : 100;
     }
-    if (altId) {
-      sqlStatements.push(`UPDATE accounts SET schedulable = false, priority = 10 WHERE id = ${parseInt(altId, 10)};`);
-    }
-    if (standbyIds.length > 0) {
-      const cleanStandby = standbyIds.map(id => parseInt(id, 10)).filter(n => !isNaN(n));
-      if (cleanStandby.length > 0) {
-        sqlStatements.push(`UPDATE accounts SET schedulable = false, priority = 1 WHERE id IN (${cleanStandby.join(',')});`);
-      }
-    }
-
-    if (sqlStatements.length > 0) {
-      executeRemoteSQL(sqlStatements.join('\n'));
-      invalidateSub2APIScheduler(allAssignedAccountIds);
-      lastSub2APISignature = getSub2APISignature();
-    }
-
-    // 5. 更新本地状态与独占性检测
+    writeJSON(CHANNELS_FILE, state);
+    invalidateSub2APIScheduler(allAssignedAccountIds);
     syncRealSub2APIAccounts();
-    enforceSingleActiveState();
     broadcastSSE('CHANNELS_UPDATED', state);
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4729,8 +4136,8 @@ const server = http.createServer(async (req, res) => {
     let role = body.role;
     if (!role && body.priority) {
       const p = Number(body.priority);
-      if (p >= 100) role = 'main';
-      else if (p <= 1) role = 'fallback';
+      if (p <= 1) role = 'main';
+      else if (p >= 100) role = 'fallback';
       else role = 'sub';
     }
     const result = setChannelRole(targetId, role, 'Web 控制台');
@@ -4774,11 +4181,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const newSchedulable = body.schedulable !== undefined ? Boolean(body.schedulable) : !targetChannel.schedulable;
-    targetChannel.schedulable = newSchedulable;
+    const newSchedulable = body.schedulable !== undefined ? Boolean(body.schedulable) : Boolean(targetChannel.autoSwitchDisabled);
+    const remoteOk = newSchedulable ? true : toggleRemoteAccountSchedulable(targetId, false);
+    if (!newSchedulable) targetChannel.schedulable = false;
+    targetChannel.autoSwitchDisabled = !newSchedulable;
     writeJSON(CHANNELS_FILE, state);
+    evaluateAutoSwitch('候选号池调整');
 
-    const remoteOk = toggleRemoteAccountSchedulable(targetId, newSchedulable);
     broadcastSSE('CHANNELS_UPDATED', state);
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4813,13 +4222,14 @@ const server = http.createServer(async (req, res) => {
 
     const oldRate = targetChannel.multiplier;
     const newRate = Number(Number(body.multiplier).toFixed(4));
+    if (!Number.isFinite(newRate) || newRate < 0) throw Object.assign(new Error('倍率必须为非负有限数值'), { statusCode: 400 });
+    const remoteOk = updateRemoteAccountMultiplier(targetId, newRate);
 
     targetChannel.multiplier = newRate;
     targetChannel.previousMultiplier = oldRate;
     targetChannel.lastCheckTime = new Date().toISOString();
     writeJSON(CHANNELS_FILE, state);
 
-    const remoteOk = updateRemoteAccountMultiplier(targetId, newRate);
 
     // 记录到调价记录
     const alert = {
@@ -4864,20 +4274,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     const idList = channelIds.map(id => Number(id)).filter(n => !isNaN(n)).join(',');
-    const sql = `UPDATE accounts SET schedulable = ${schedulable ? 'true' : 'false'} WHERE id IN (${idList});`;
-    executeRemoteSQL(sql);
-    invalidateSub2APIScheduler(channelIds);
-    lastSub2APISignature = getSub2APISignature();
+    if (!schedulable) {
+      executeRemoteSQL(`UPDATE accounts SET schedulable = false WHERE id IN (${idList});`);
+      invalidateSub2APIScheduler(channelIds);
+      lastSub2APISignature = getSub2APISignature();
+    }
 
     state.channels.forEach(c => {
       if (channelIds.includes(String(c.id))) {
-        c.schedulable = Boolean(schedulable);
+        if (!schedulable) c.schedulable = false;
+        c.autoSwitchDisabled = !schedulable;
       }
     });
     writeJSON(CHANNELS_FILE, state);
     broadcastSSE('CHANNELS_UPDATED', state);
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
+    evaluateAutoSwitch('批量候选号池调整');
     res.end(JSON.stringify({ success: true, count: channelIds.length, schedulable }));
     return;
   }
@@ -5581,7 +4994,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/api/auto-switch/config' && req.method === 'POST') {
     const body = await getBody();
     if (body.enabled !== undefined) autoSwitchConfig.enabled = Boolean(body.enabled);
-    if (body.singleActiveExclusive !== undefined) autoSwitchConfig.singleActiveExclusive = Boolean(body.singleActiveExclusive);
+    autoSwitchConfig.singleActiveExclusive = true;
     if (body.promptCacheLock !== undefined) autoSwitchConfig.promptCacheLock = Boolean(body.promptCacheLock);
     if (body.antiFlappingLock !== undefined) autoSwitchConfig.antiFlappingLock = Boolean(body.antiFlappingLock);
     if (body.mode) autoSwitchConfig.mode = body.mode;
@@ -5592,7 +5005,7 @@ const server = http.createServer(async (req, res) => {
     if (body.minSampleSize !== undefined) autoSwitchConfig.minSampleSize = Math.max(1, Number(body.minSampleSize) || 10);
     if (body.consecutiveFailuresThreshold !== undefined) autoSwitchConfig.consecutiveFailuresThreshold = Math.max(1, Number(body.consecutiveFailuresThreshold) || 5);
     if (body.autoRecoverLowestCost !== undefined) autoSwitchConfig.autoRecoverLowestCost = Boolean(body.autoRecoverLowestCost);
-    if (body.manualLockPolicy) autoSwitchConfig.manualLockPolicy = body.manualLockPolicy;
+    autoSwitchConfig.manualLockPolicy = 'failover_allowed';
 
     // 🔒 若开启了单主独占，立即执行一次同步检测与清理，确保同组内无双开副调
     if (autoSwitchConfig.singleActiveExclusive) {
@@ -5622,10 +5035,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 立即触发自动切线决策评估 (用于管理员演练测试)
+  // 立即触发一次自动切号评估（与定时评估使用同一套规则）
   if (pathname === '/api/auto-switch/evaluate-now' && req.method === 'POST') {
     try {
-      const result = evaluateAutoSwitch('管理员手动演练评估', true);
+      const result = evaluateAutoSwitch('管理员手动触发检查');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
@@ -5678,6 +5091,23 @@ const server = http.createServer(async (req, res) => {
     upstreamScanner.runScan('Web 控制台手动触发').then(result => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result));
+    }).catch(err => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    });
+    return;
+  }
+
+  if (pathname === '/api/upstream/groups' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, groups: upstreamGroupCatalog, count: upstreamGroupCatalog.length }));
+    return;
+  }
+
+  if (pathname === '/api/upstream/groups/scan' && req.method === 'POST') {
+    upstreamScanner.discoverUpstreamGroups(state.channels || [], upstreamPanels[0] || {}).then(result => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, ...result }));
     }).catch(err => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: err.message }));
@@ -5877,15 +5307,13 @@ const server = http.createServer(async (req, res) => {
     });
     fs.createReadStream(filePath).pipe(res);
   });
-});
+}
 
 console.log('Connecting to Sub2API backend to load upstream channels...');
 const initialAccounts = syncRealSub2APIAccounts();
 if (initialAccounts) {
   console.log(`✅ 成功同步加载中转站真实上游渠道: ${initialAccounts.length} 个`);
-  if (autoSwitchConfig.singleActiveExclusive !== false) {
-    enforceSingleActiveState();
-  }
+  // Wait for fresh health observations before changing any startup routing.
 }
 
 // 初始化上游通道 3 小时自动扫描巡检引擎
@@ -5897,6 +5325,7 @@ upstreamScanner.init({
   },
   execPsql,
   executeRemoteSQL,
+  evaluateAutoSwitch,
   invalidateSub2APIScheduler,
   broadcastSSE,
   telegram,
@@ -5906,6 +5335,11 @@ upstreamScanner.init({
   setUpstreamModelsCache: (cache) => {
     upstreamModelsCache = cache;
     writeJSON(UPSTREAM_MODELS_CACHE_FILE, upstreamModelsCache);
+  },
+  getUpstreamGroupCatalog: () => upstreamGroupCatalog,
+  setUpstreamGroupCatalog: (catalog) => {
+    upstreamGroupCatalog = Array.isArray(catalog) ? catalog : [];
+    writeJSON(UPSTREAM_GROUP_CATALOG_FILE, upstreamGroupCatalog);
   },
   isExemptGroup: (g) => isExemptGroup(g)
 });

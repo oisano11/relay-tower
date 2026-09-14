@@ -68,7 +68,8 @@ upstream-monitor/scripts/capture_vps_dashboard.js
 # Private Website & Customer Operations Assets (Not part of open-source framework)
 /website/
 /customer-pages/
-/docs/
+/docs/*
+!/docs/repair-plan.md
 /index.html
 /preview.html
 /styles.css

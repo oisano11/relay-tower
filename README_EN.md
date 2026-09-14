@@ -2,9 +2,11 @@
 
 <img src="assets/relay-tower-banner.png" alt="Relay Tower Banner" width="100%" style="border-radius: 12px; margin-bottom: 20px;" />
 
-# 🗼 Relay Tower (中转塔台)
+<img src="assets/relay-tower-logo.png" alt="Relay Tower Logo" width="84" height="84" style="border-radius: 20px; box-shadow: 0 4px 20px rgba(0, 242, 254, 0.35); margin-top: 10px; margin-bottom: 6px;" />
 
-**Full-Stack Enterprise AI Model Relay Router · Intelligent Upstream Rate Multiplier Monitor · Millisecond Zero-Downtime Hot Switching · Prompt Cache Affinity Lock · Telegram Remote Console Bot**
+# Relay Tower (中转塔台)
+
+**AI Model Relay Router · Upstream Rate Monitor · Stable Gateway Endpoint · Prompt Cache Route Affinity · Telegram Remote Console**
 
 [![CI](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml/badge.svg)](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -31,7 +33,7 @@
 
 Developers and operators managing AI model API proxies constantly face critical operational bottlenecks:
 1. **Stealth Upstream Price Hikes**: Providers frequently increase wholesale multipliers silently during peak hours, creating severe margin losses;
-2. **Round-Robin Multi-Channel Routing Destroys Prompt Cache**: Operating multiple standby channels simultaneously causes requests to alternate between different upstream instances. This **drops the Prompt Cache hit rate to zero, doubling token bills and spiking latency**;
+2. **Multi-Channel Routing Can Reduce Prompt Cache Hits**: Splitting context across providers or nodes can reduce cache reuse and increase token costs and latency;
 3. **Unexpected Provider Downtime While Away From Keyboard**: Sudden upstream outages at night cannot be resolved without immediate access to an operations laptop;
 4. **Disruptive Client Reconfiguration**: Traditional proxies require restarting clients or modifying client configs to change providers.
 
@@ -43,11 +45,11 @@ Developers and operators managing AI model API proxies constantly face critical 
 
 | Feature / Capability | Standard Reverse Proxy (Nginx) | Standalone One-API / New-API | **Relay Tower (This Project)** |
 | :--- | :---: | :---: | :---: |
-| **Wholesale Multiplier Probe & Differential Detection** | ❌ No | ❌ Fixed manual rate only | ✅ **Sub-second differential price detection** |
+| **Wholesale Multiplier Probe & Differential Detection** | ❌ No | ❌ Fixed manual rate only | ✅ **Scheduled rate checks, every 5 minutes by default** |
 | **Price Hike Siren & Failover Circuit Breaker** | ❌ No | ❌ No | ✅ **Audio/visual + Telegram alert with 1-click failover** |
-| **Prompt Cache Single-Active Exclusive Lock** | ❌ Round-robin drift | ❌ Dual-active breaks caching | ✅ **Exclusive feature: Standbys set to cold stop, 90%+ cache hit rate** |
+| **Prompt Cache Route Affinity** | Depends on routing | Depends on routing | ✅ **Cold standby reduces cross-channel routing in eligible groups** |
 | **Telegram Two-Way Interactive Remote Switcher** | ❌ No | ❌ One-way notification only | ✅ **Inline Keyboard: Switch active channels in 1 tap from mobile** |
-| **Client Zero-Downtime Hot Switching (`/v1`)** | ❌ Requires config reload | Requires admin panel login | ✅ **Zero downtime: Clients point to unified ingress with zero restarts** |
+| **Stable Gateway Endpoint (`/v1`)** | Depends on configuration | Depends on configuration | ✅ **Switch upstreams for subsequent requests without changing the client endpoint** |
 | **Time-To-First-Token (TTFT) Outage Breaker** | ❌ HTTP 5xx only | ❌ Basic timeout only | ✅ **Tracks stream start latency; auto-switches on stalls** |
 | **Real-time Spread & Profit Margin Auditing** | ❌ No | ❌ Usage logging only | ✅ **Real-time gross margin & loss-route auditing** |
 | **Zero Public IP Needed for Mobile Ops** | ❌ Requires domain & SSL | Requires public panel | ✅ **Telegram Bot uses Long Polling, works behind NATs** |
@@ -62,18 +64,18 @@ Developers and operators managing AI model API proxies constantly face critical 
 - **Dynamic Spread & Margin Calculation**: Evaluates pricing differentials against customer retail groups and highlights unprofitable channels in red.
 
 ### 2. 🚨 Differential Price Spike Alerts
-- **Differential Algorithm**: Captures rate adjustments in sub-seconds (e.g., `0.65x -> 1.10x (+69.2%)`).
+- **Scheduled Differential Detection**: Compares rates on each check (e.g., `0.65x -> 1.10x (+69.2%)`). Rate checks default to every 5 minutes; channel health scans default to every 3 hours. Checks can also be triggered manually. Detection time depends on the interval and upstream response.
 - **Multi-Sensory Warnings**: Centered modal alerts + Web Audio synthesized alarm sirens + full audit logs.
 - **Primary Route Surge Breaker**: Triggers an alert when your currently active route undergoes a price increase, with a **1-click instant switch button** to lower-cost backups.
 
-### 3. 🔒 Single-Active Exclusive Mode & Prompt Cache Lock (Breakthrough)
-- **Eliminates Concurrent Round-Robin**: Only the active primary channel (`priority=100`) remains `schedulable=true`. All other standby channels in the group are forced to cold standby (`schedulable=false, priority=10`).
-- **Maximizes Prompt Cache Hit Rate**: Ensures continuous context requests (Claude Code, Cursor, DeepSeek) consistently hit the exact same upstream instance, **slashing prompt token expenses by up to 70%+ while reducing latency**.
+### 3. 🔒 Single-Active Mode & Prompt Cache Route Affinity
+- **Reduces Cross-Channel Routing**: Eligible groups retain one primary and keep standalone channels in cold standby (`schedulable=false, priority=10`). Shared multi-group channels preserve their global schedulable flag and adjust priority (`priority=10`), preventing cross-group interruption.
+- **Cache Affinity**: Sending subsequent requests to the same upstream channel can improve cache reuse. Providers may still route to different physical instances; hit rates and savings depend on provider policies, request content, and cache expiry. No fixed hit rate or physical instance affinity is guaranteed.
 - **Atomic Mutex Handover**: Manual or automated failover performs an atomic SQL transaction, ensuring zero multi-channel overlap during transitions.
 
-### 4. ⚡ Secure Zero-Downtime Smart Reverse Proxy Gateway
+### 4. ⚡ Unified Reverse Proxy Gateway
 - **Unified Ingress**: Exposes a unified endpoint at `http://localhost:3300/v1`.
-- **Zero Client Interruption**: Any tool pointing to this address switches upstream providers instantly with **zero downtime and zero configuration changes**.
+- **Stable Client Endpoint**: Subsequent requests use the new primary without changing the client endpoint. Existing requests are not migrated, and failed requests may need retries.
 - **🛡️ Gateway API Key Authentication**: Calls to `/v1/*` from external clients require a valid `Authorization: Bearer <Gateway-Key>` or `x-api-key` header to prevent unauthorized credit draining. Local loopback (`127.0.0.1`) requests pass seamlessly. The Gateway Key can be viewed, copied, and reset directly in the Security Modal.
 - **⚡ Standardized HTTP 502/503 Errors**: Fully eliminates misleading mock 200 assistant messages. Returns standard `502 Bad Gateway` on upstream failure and `503 Service Unavailable` when no channel is active, properly triggering client retries.
 - **🔒 Exclusive Prompt Cache Affinity**: Auto-qualification by cost preserves the cold-standby status (`schedulable=false`) of secondary routes to prevent cache breakdown across multiple nodes.
@@ -136,7 +138,7 @@ flowchart TD
     end
 
     Clients -->|API Requests| Proxy
-    Proxy -->|Zero-Downtime Forwarding| Upstreams
+    Proxy -->|Request Forwarding| Upstreams
     Probe -->|Periodic Health & Pricing Checks| Upstreams
     Probe --> Engine
     Engine --> CacheLock
@@ -228,7 +230,7 @@ Navigate to `http://localhost:3300`. An initial admin password will be generated
 
 ## 💻 Client Integration Guide
 
-Point your client tools to `http://localhost:3300/v1` to benefit from **Prompt Cache Affinity** and **Zero-Downtime Hot Switching**.
+Point your client tools to `http://localhost:3300/v1` to use prompt cache route affinity and switch upstreams through a stable endpoint.
 
 > [!TIP]
 > **Gateway Key**: In the examples below, `sk-your-relay-key` represents the Gateway API Key. You can view, copy, or reset it anytime in the **Security Center** modal on the top bar. Requests made locally from `127.0.0.1` pass through without requiring a key by default.
@@ -291,8 +293,8 @@ main();
 4. Paste it into the Web Console **Telegram Settings** dialog or into `TELEGRAM_BOT_TOKEN` in `upstream-monitor/.env`.
 
 ### 2. Zero-Password Admin Binding
-- Start a direct chat with your bot and send `/start`.
-- The first user to message `/start` is **automatically authenticated and bound as the super administrator**.
+- In a private chat, use `/bind <console-admin-password>`, or configure the administrator's individual Telegram ID in the console.
+- `/start` does not grant administrator access. Notification groups receive messages only; membership does not grant permission to operate the bot.
 
 ### 3. Command Reference
 
@@ -336,7 +338,11 @@ main();
 ## ❓ FAQ
 
 ### Q1: Why is "Single-Active Exclusive Mode" important for Prompt Cache?
-> **Answer**: LLM architectures (e.g. Claude 3.7, DeepSeek) tie prompt caching to specific upstream instances. When requests are split between multiple providers, long-context prompts must be repeatedly recalculated, dropping cache hit rates to zero. Single-Active Exclusive Mode forces secondary channels into cold standby (`schedulable=false`), ensuring **consistent 90%+ cache hit rates and reducing token costs by up to 70%**.
+> **Answer**: Single-active routing reduces cross-channel traffic and improves cache affinity. The system fully supports channels belonging to multiple groups by safely keeping global schedulability and lowering group priority instead of turning off the account.
+
+### Current Architecture Limits
+
+Database and Redis synchronization still uses synchronous child processes in some paths. Slow queries or SSH waits may block the gateway event loop. Asynchronous database access and separating background tasks from the gateway remain future architecture work. See the [repair plan](docs/repair-plan.md) for scope and acceptance status. CI includes an isolated container startup check; deployment validation depends on actual execution results.
 
 ### Q2: Does the Telegram Bot need a public IP or open port?
 > **Answer**: **No.** The bot uses Telegram's official `Long Polling` protocol. It initiates outbound HTTPS requests to Telegram servers, functioning flawlessly behind NATs, home routers, and firewalls without open inbound ports.

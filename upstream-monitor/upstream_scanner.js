@@ -15,11 +15,14 @@
 
 const fs = require('fs');
 const path = require('path');
+const { createHash } = require('crypto');
+const { upstreamUrl } = require('./gateway');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'upstream_sync_config.json');
 const PENDING_FILE = path.join(DATA_DIR, 'upstream_pending_actions.json');
 const REPORTS_FILE = path.join(DATA_DIR, 'upstream_scan_reports.json');
+const GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
 
 const DEFAULT_CONFIG = {
   enabled: true,
@@ -61,7 +64,7 @@ function writeJSON(filePath, data) {
 
 class UpstreamScanner {
   constructor() {
-    this.config = readJSON(CONFIG_FILE, DEFAULT_CONFIG);
+    this.config = { ...DEFAULT_CONFIG, ...readJSON(CONFIG_FILE, {}) };
     this.pendingActions = readJSON(PENDING_FILE, []);
     this.reports = readJSON(REPORTS_FILE, []);
     this.timer = null;
@@ -76,7 +79,9 @@ class UpstreamScanner {
       telegram: null,
       getUpstreamPanelConfig: () => ({}),
       getUpstreamModelsCache: () => ({}),
-      setUpstreamModelsCache: () => {}
+      setUpstreamModelsCache: () => {},
+      getUpstreamGroupCatalog: () => readJSON(GROUP_CATALOG_FILE, []),
+      setUpstreamGroupCatalog: catalog => writeJSON(GROUP_CATALOG_FILE, catalog)
     };
   }
 
@@ -151,6 +156,9 @@ class UpstreamScanner {
       autoSyncedChannels: [],   // (a) 价格更优惠自动同步上线 (+20%加价)
       pendingSamePrice: [],     // (b) 价格一样待审批项
       pendingNewModels: [],     // (c) 新模型待确认开启项
+      newUpstreamGroups: [],
+      changedUpstreamGroups: [],
+      groupDiscoveryErrors: [],
       summaryText: ''
     };
 
@@ -164,61 +172,29 @@ class UpstreamScanner {
 
       report.totalProbed = channels.length;
 
-      // 1. 逐个探活通道与接口
+      // Probe every candidate first so fallback decisions do not depend on array order.
+      const probeResults = new Map();
       for (const channel of channels) {
-        const isOnline = await this.probeChannelAlive(channel);
-
-        // 规则 1：停用处理
-        if (!isOnline && channel.schedulable) {
-          console.warn(`⚠️ [UpstreamScanner] 检测到通道关停/不可达: [${channel.name}] (ID: ${channel.id})`);
-          
-          // 下线通道
-          channel.schedulable = false;
-          channel.status = 'offline';
-          this.executeChannelDeactivation(channel.id);
-
-          // 检查该通道所属的每一个业务分组
-          for (const g of affectedGroups) {
-            // 🔒 豁免保护：通用/自用等私有例外分组，系统绝不自动熔断关停分组！
-            if (this.context.isExemptGroup && this.context.isExemptGroup(g)) {
-              console.log(`ℹ️ [UpstreamScanner] 业务分组 [${g.name}] (ID: ${g.id}) 为例外自用分组，跳过自动熔断关停保护`);
-              continue;
-            }
-
-            const fallbackCount = this.countGroupActiveFallbacks(g.id, channel.id);
-            if (fallbackCount <= 0) {
-              // 孤岛空组：无其他备用 API，必须将其关停！
-              console.error(`🚨 [UpstreamScanner] 业务分组 [${g.name}] (ID: ${g.id}) 无任何备选通道，触发自动关停保护！`);
-              this.deactivateGroup(g.id, g.name);
-              report.closedGroups.push({
-                groupId: g.id,
-                groupName: g.name,
-                causedByChannel: channel.name,
-                reason: '组内唯一通道关停且无备选，系统已自动熔断关停该分组，避免下游报错'
-              });
-            } else {
-              report.survivedGroups.push({
-                groupId: g.id,
-                groupName: g.name,
-                deactivatedChannel: channel.name,
-                remainingFallbacks: fallbackCount,
-                reason: `通道关停，但组内仍有 ${fallbackCount} 个健康备选通道，业务平稳运行`
-              });
-            }
-          }
-
-          report.deactivatedChannels.push({
-            id: channel.id,
-            name: channel.name,
-            vendor: channel.vendor || channel.provider,
-            multiplier: channel.multiplier,
-            reason: '上游 API 探针不可达或关停下线'
-          });
-        }
+        const probeStarted = Date.now();
+        const alive = await this.probeChannelAlive(channel);
+        probeResults.set(channel, alive);
+        channel.lastCheckTime = new Date().toISOString();
+        channel.lastProbeTime = channel.lastCheckTime;
+        channel.lastProbeStatus = alive === null ? 'unknown' : alive ? 'online' : 'offline';
+        channel.latency = alive === true ? Date.now() - probeStarted : null;
+        if (alive === true) channel.status = 'online';
       }
+      // 探活只提供观测，统一调度器负责防抖、切号和恢复。
+      // 单次 /models 失败不能停用账号，更不能永久关闭整个业务分组。
+      this.context.evaluateAutoSwitch?.('上游巡检');
 
       // 2. 从已连接的 upstreamPanel (如 New-API) 或上游公开 pricing 探针拉取最新全量列表
       const upstreamOfferings = await this.discoverUpstreamOfferings(channels, upstreamPanel);
+      const groupResult = await this.discoverUpstreamGroups(channels, upstreamPanel);
+      report.newUpstreamGroups = groupResult.newGroups;
+      report.changedUpstreamGroups = groupResult.changedGroups;
+      report.groupDiscoveryErrors = groupResult.errors;
+      report.upstreamGroupCatalog = groupResult.catalog;
 
       // 3. 差分比对：新增通道与新模型
       for (const offering of upstreamOfferings) {
@@ -398,23 +374,18 @@ class UpstreamScanner {
         headers['Authorization'] = `Bearer ${channel.apiKey}`;
         headers['x-api-key'] = channel.apiKey;
       }
-      const res = await fetch(`${cleanUrl}/v1/models`, {
+      const res = await fetch(upstreamUrl(cleanUrl), {
         method: 'GET',
         headers,
         signal: controller.signal
       });
       clearTimeout(timer);
-      // 200 或 401(密钥可能欠费但网关活) 或 404(端点路径差异) < 500 视为存活
-      return res.status < 500 && res.status !== 404;
+      // Unsupported discovery is unknown, not evidence that generation is down.
+      if (res.status === 404 || res.status === 405) return null;
+      return res.status >= 200 && res.status < 300;
     } catch (e) {
       clearTimeout(timer);
-      // 若 /v1/models 失败，降级尝试根路径快速 Ping
-      try {
-        const pingRes = await fetch(cleanUrl, { method: 'GET', signal: AbortSignal.timeout(2500) });
-        return pingRes.status < 500;
-      } catch (pingErr) {
-        return false;
-      }
+      return false;
     }
   }
 
@@ -423,7 +394,7 @@ class UpstreamScanner {
     const cleanId = parseInt(channelId, 10);
     if (isNaN(cleanId)) return;
     const sql = `UPDATE accounts SET schedulable = false, updated_at = NOW() WHERE id = ${cleanId};`;
-    this.context.executeRemoteSQL(sql);
+    if (!this.context.executeRemoteSQL(sql)) throw new Error('通道停用写入失败');
     this.context.invalidateSub2APIScheduler(cleanId);
   }
 
@@ -432,20 +403,11 @@ class UpstreamScanner {
     const gid = parseInt(groupId, 10);
     const excId = parseInt(excludingChannelId, 10);
 
-    // 优先通过 PostgreSQL 数据库精准计算
-    try {
-      const sql = `SELECT COUNT(*) FROM account_groups ag JOIN accounts a ON ag.account_id = a.id WHERE ag.group_id = ${gid} AND a.deleted_at IS NULL AND a.schedulable = true AND a.id != ${excId};`;
-      const res = this.context.execPsql(sql, true).trim();
-      if (res && !isNaN(parseInt(res, 10))) {
-        return parseInt(res, 10);
-      }
-    } catch (e) {}
-
-    // 降级使用本地 state 计算
+    // Database active means administratively enabled, not healthy. Use this scan's probes.
     const state = this.context.getState();
     const activeAccountsInGroup = (state.channels || []).filter(c => {
       if (String(c.id) === String(excId)) return false;
-      if (!c.schedulable || c.status === 'offline') return false;
+      if (c.status === 'offline' || c.balanceStatus === 'empty' || (c.balance != null && Number(c.balance) <= 0.001)) return false;
       const gList = c.groupsDetail || [];
       return gList.some(gd => Number(gd.id) === gid) || (c.groups && c.groups.includes(String(groupId)));
     });
@@ -459,7 +421,7 @@ class UpstreamScanner {
     
     // 数据库关停分组
     const sql = `UPDATE groups SET status = 'inactive', updated_at = NOW() WHERE id = ${gid};`;
-    this.context.executeRemoteSQL(sql);
+    if (!this.context.executeRemoteSQL(sql)) throw new Error('分组停用写入失败');
     this.context.invalidateSub2APIScheduler();
 
     // 更新本地内存 state 中的分组状态
@@ -583,7 +545,7 @@ class UpstreamScanner {
       const chMultiplier = ch.costMultiplier || ch.multiplier || 1.0;
       const chProvider = (ch.provider && ch.provider !== '三方渠道') ? ch.provider : (ch.vendor || ch.name);
       try {
-        const res = await fetch(`${cleanUrl}/v1/models`, {
+        const res = await fetch(upstreamUrl(cleanUrl), {
           headers: {
             'Authorization': `Bearer ${ch.apiKey}`,
             'x-api-key': ch.apiKey
@@ -616,6 +578,72 @@ class UpstreamScanner {
     }
 
     return offerings;
+  }
+
+  // 只读抓取上游后台分组目录；不会创建本站账号、业务分组或修改售价。
+  async discoverUpstreamGroups(channels = [], upstreamPanel = {}) {
+    let panels = this.context.getUpstreamPanels ? (this.context.getUpstreamPanels() || []) : [];
+    if (!panels.length && upstreamPanel && upstreamPanel.backendUrl) panels = [upstreamPanel];
+    const previous = this.context.getUpstreamGroupCatalog ? this.context.getUpstreamGroupCatalog() : readJSON(GROUP_CATALOG_FILE, []);
+    const previousMap = new Map((Array.isArray(previous) ? previous : []).map(item => [item.key, item]));
+    const nextMap = new Map(previousMap), newGroups = [], changedGroups = [], errors = [];
+    for (const panel of panels) {
+      if (panel.enabled === false || !panel.backendUrl) continue;
+      const baseUrl = panel.backendUrl.replace(/\/+$/, ''), panelId = String(panel.id || baseUrl);
+      const headers = { 'User-Agent': 'Mozilla/5.0 RelayTowerScanner' };
+      if (panel.userToken) headers.Authorization = panel.userToken.startsWith('Bearer ') ? panel.userToken : `Bearer ${panel.userToken}`;
+      if (panel.cookie) headers.Cookie = panel.cookie;
+      let list = null, endpoint = null;
+      for (const suffix of ['/api/user/groups', '/api/groups', '/api/user/group', '/api/group']) {
+        try {
+          const response = await fetch(`${baseUrl}${suffix}`, { headers, signal: AbortSignal.timeout(5000) });
+          if (!response.ok) continue;
+          const body = await response.json();
+          const candidate = body?.data?.items || body?.data?.groups || body?.data?.list || body?.items || body?.groups || body?.list || (Array.isArray(body?.data) ? body.data : null);
+          if (Array.isArray(candidate)) { list = candidate; endpoint = suffix; break; }
+        } catch (_) {}
+      }
+      if (!list) {
+        const checkedAt = new Date().toISOString();
+        errors.push({ panelId, panelName: panel.name || panelId, baseUrl, error: '未找到可读的上游分组接口', checkedAt });
+        for (const [key, item] of nextMap) {
+          if (item.panelId === panelId) nextMap.set(key, { ...item, status: 'stale', lastError: '本次未找到可读的上游分组接口', lastCheckedAt: checkedAt });
+        }
+        continue;
+      }
+      const seen = new Set();
+      for (const raw of list) {
+        if (!raw || typeof raw !== 'object') continue;
+        const id = raw.id ?? raw.group_id ?? raw.groupId ?? raw.value;
+        const name = raw.name ?? raw.group_name ?? raw.groupName ?? raw.label;
+        if ((id === undefined || id === null || id === '') && !name) continue;
+        const upstreamGroupId = String(id ?? name), key = `${panelId}:${upstreamGroupId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const normalized = {
+          key, panelId, panelName: panel.name || panelId, baseUrl, endpoint, upstreamGroupId,
+          name: String(name || `分组 ${upstreamGroupId}`),
+          costMultiplier: this.firstFinite(raw.cost_multiplier, raw.costMultiplier, raw.model_ratio, raw.modelRatio, raw.input_ratio, raw.ratio, raw.rate),
+          saleMultiplier: this.firstFinite(raw.sale_multiplier, raw.saleMultiplier, raw.sale_rate, raw.saleRate),
+          models: (Array.isArray(raw.models) ? raw.models : (Array.isArray(raw.model_names) ? raw.model_names : [])).map(m => typeof m === 'string' ? m : (m.id || m.name)).filter(Boolean),
+          capabilities: raw.capabilities || raw.supported || raw.tags || [],
+          apiUrl: raw.api_url || raw.apiUrl || raw.base_url || raw.baseUrl || baseUrl,
+          firstSeenAt: previousMap.get(key)?.firstSeenAt || new Date().toISOString(), lastSeenAt: new Date().toISOString(), status: 'available', lastError: null
+        };
+        const old = previousMap.get(key);
+        if (!old) newGroups.push(normalized);
+        else if (JSON.stringify({ name: old.name, costMultiplier: old.costMultiplier, saleMultiplier: old.saleMultiplier, models: old.models, capabilities: old.capabilities, apiUrl: old.apiUrl }) !== JSON.stringify({ name: normalized.name, costMultiplier: normalized.costMultiplier, saleMultiplier: normalized.saleMultiplier, models: normalized.models, capabilities: normalized.capabilities, apiUrl: normalized.apiUrl })) changedGroups.push({ previous: old, current: normalized });
+        nextMap.set(key, normalized);
+      }
+    }
+    const catalog = [...nextMap.values()];
+    if (this.context.setUpstreamGroupCatalog) this.context.setUpstreamGroupCatalog(catalog); else writeJSON(GROUP_CATALOG_FILE, catalog);
+    return { catalog, newGroups, changedGroups, errors };
+  }
+
+  firstFinite(...values) {
+    for (const value of values) { const number = Number(value); if (Number.isFinite(number) && number > 0) return number; }
+    return null;
   }
 
   // 提取核心模型名，剥离厂商别名前缀（如 xai/、x-ai/、grok/ 等）
@@ -688,44 +716,33 @@ class UpstreamScanner {
     const cleanVendor = offering.vendor || '通用上游';
     const groupName = `${cleanVendor} 优选组`;
 
-    // 1. 如果 Sub2API 远端数据库可用，在远端数据库建组与建号
-    let remoteGroupId = null;
-    let remoteAccountId = null;
-
-    try {
-      // (a) 创建分组 (售价 = 成本 * 1.20)
-      const groupSql = `INSERT INTO groups (name, rate_multiplier, platform, status) VALUES ('${groupName.replace(/'/g, "''")}', ${saleMultiplier}, 'openai', 'active') RETURNING id;`;
-      const gOutput = this.context.execPsql(groupSql, true).trim();
-      if (gOutput && !isNaN(parseInt(gOutput, 10))) {
-        remoteGroupId = parseInt(gOutput, 10);
-      }
-
-      // (b) 创建账号
-      const credentialsJson = JSON.stringify({
-        base_url: offering.baseUrl,
-        api_key: offering.apiKey || '',
-        model_mapping: {}
-      }).replace(/'/g, "''");
-
-      const accSql = `INSERT INTO accounts (name, platform, type, status, priority, schedulable, rate_multiplier, credentials, notes) VALUES ('${cleanName.replace(/'/g, "''")}', 'openai', 'openai', 'active', 50, true, ${costMultiplier}, '${credentialsJson}'::jsonb, '上游优惠通道自动同步 (+20%定价)') RETURNING id;`;
-      const aOutput = this.context.execPsql(accSql, true).trim();
-      if (aOutput && !isNaN(parseInt(aOutput, 10))) {
-        remoteAccountId = parseInt(aOutput, 10);
-      }
-
-      // (c) 关联账号与分组
-      if (remoteAccountId && remoteGroupId) {
-        const linkSql = `INSERT INTO account_groups (account_id, group_id, priority) VALUES (${remoteAccountId}, ${remoteGroupId}, 50);`;
-        this.context.executeRemoteSQL(linkSql);
-        this.context.invalidateSub2APIScheduler(remoteAccountId);
-      }
-    } catch (dbErr) {
-      console.error('[UpstreamScanner] 自动创建 Sub2API 数据库账号/分组异常:', dbErr.message);
-    }
-
-    // 2. 本地内存与 channels.json 数据同步构造
-    const newId = remoteAccountId ? String(remoteAccountId) : `auto_${Date.now()}`;
-    const newGroupId = remoteGroupId || Math.floor(Math.random() * 9000) + 1000;
+    if (![costMultiplier, saleMultiplier].every(n => Number.isFinite(n) && n > 0)) throw new Error('成本或售价无效');
+    const marker = 'upstream-sync:' + createHash('sha256').update(JSON.stringify([
+      offering.baseUrl, offering.apiKey || '', cleanName, costMultiplier, saleMultiplier
+    ])).digest('hex');
+    const credentialsJson = JSON.stringify({ base_url: offering.baseUrl, api_key: offering.apiKey || '', model_mapping: {} }).replace(/'/g, "''");
+    // One statement is atomic. A durable marker reuses the remote result after a local-save failure.
+    const sql = `WITH existing AS (
+      SELECT a.id, ag.group_id FROM accounts a JOIN account_groups ag ON ag.account_id = a.id
+      WHERE a.notes = '${marker}' AND a.deleted_at IS NULL LIMIT 1
+    ), new_group AS (
+      INSERT INTO groups (name, rate_multiplier, platform, status)
+      SELECT '${groupName.replace(/'/g, "''")}', ${saleMultiplier}, 'openai', 'active' WHERE NOT EXISTS (SELECT 1 FROM existing) RETURNING id
+    ), new_account AS (
+      INSERT INTO accounts (name, platform, type, status, priority, schedulable, rate_multiplier, credentials, notes)
+      SELECT '${cleanName.replace(/'/g, "''")}', 'openai', 'openai', 'active', 50, true, ${costMultiplier}, '${credentialsJson}'::jsonb, '${marker}' FROM new_group RETURNING id
+    ), linked AS (
+      INSERT INTO account_groups (account_id, group_id, priority)
+      SELECT a.id, g.id, 50 FROM new_account a CROSS JOIN new_group g RETURNING account_id, group_id
+    ) SELECT id, group_id FROM existing UNION ALL SELECT account_id, group_id FROM linked;`;
+    const output = String(this.context.execPsql(sql, true) || '').trim();
+    const ids = output.match(/^(\d+)\s*\|\s*(\d+)$/);
+    if (!ids || !ids.slice(1).every(x => Number.isSafeInteger(Number(x)) && Number(x) > 0)) throw new Error('数据库未返回有效账号和分组，创建失败');
+    const newId = ids[1];
+    const newGroupId = Number(ids[2]);
+    this.context.invalidateSub2APIScheduler(Number(newId));
+    const existingLocal = state.channels.find(c => String(c.id) === newId);
+    if (existingLocal) return existingLocal;
 
     const newChannel = {
       id: newId,
@@ -763,7 +780,7 @@ class UpstreamScanner {
       configuredModels: [],
       knownModels: [],
       supportedModels: [groupName],
-      latency: 45,
+      latency: null,
       lastCheckTime: new Date().toISOString(),
       notes: `上游价格更优惠 (${costMultiplier}x)，系统已自动建号并按 +20% 定价 (${saleMultiplier}x) 上线`
     };
@@ -836,130 +853,57 @@ class UpstreamScanner {
     writeJSON(PENDING_FILE, this.pendingActions);
   }
 
-  // 处理待审批动作 (同意 / 拒绝) - 支持单个或数组
+  // Resolve only the source channel; commit remote changes before publishing local state.
   async resolveAction(actionId, decision = 'approve', operator = '管理员') {
-    if (Array.isArray(actionId)) {
-      return this.resolveActions(actionId, decision, operator);
-    }
+    if (Array.isArray(actionId)) return this.resolveActions(actionId, decision, operator);
+    if (!['approve', 'reject'].includes(decision)) return { success: false, message: '无效审批决定' };
     this.pendingActions = readJSON(PENDING_FILE, []);
     const action = this.pendingActions.find(a => String(a.id) === String(actionId));
-    if (!action) {
-      return { success: false, message: '未找到该审批项' };
-    }
-
-    if (action.status !== 'pending') {
-      return { success: false, message: `该项已于 ${action.resolvedAt} 被 ${action.resolvedBy} 处理为: ${action.status}` };
-    }
-
-    action.status = decision === 'approve' ? 'approved' : 'rejected';
-    action.resolvedAt = new Date().toISOString();
-    action.resolvedBy = operator;
-
-    let resultMessage = '';
-
-    if (decision === 'approve') {
-      if (action.type === 'same_price_channel') {
-        // 同意同步同价通道：创建账号与分组，按 +20% 定价上线
-        const sale = action.suggestedSaleMultiplier || this.calculateSaleMultiplier(action.costMultiplier);
-        const created = await this.autoCreateChannelAndGroup(action, action.costMultiplier, sale);
-        resultMessage = `已成功同步同价通道 [${action.name}]，已建立分组并按 +20% 定价 (${sale}x) 上线！`;
-      } else if (action.type === 'enable_new_model') {
-        // 同意开启新模型：将模型加入所有活跃通道并开启对外服务
-        const state = this.context.getState();
-        let updatedCount = 0;
-        state.channels.forEach(c => {
-          if (c.schedulable && c.status === 'online') {
-            if (!c.modelMapping) c.modelMapping = {};
-            c.modelMapping[action.modelName] = action.modelName;
-            if (!c.configuredModels) c.configuredModels = [];
-            if (!c.configuredModels.includes(action.modelName)) c.configuredModels.push(action.modelName);
-            if (!c.knownModels) c.knownModels = [];
-            if (!c.knownModels.includes(action.modelName)) c.knownModels.push(action.modelName);
-            updatedCount++;
-          }
-        });
+    if (!action || action.status !== 'pending') return { success: false, message: '审批项不存在或已处理' };
+    try {
+      const state = this.context.getState();
+      if (decision === 'approve') {
+        if (action.type === 'same_price_channel') {
+          await this.autoCreateChannelAndGroup(action, action.costMultiplier,
+            action.suggestedSaleMultiplier || this.calculateSaleMultiplier(action.costMultiplier));
+        } else if (action.type === 'enable_new_model') {
+          const matches = state.channels.filter(c => action.channelId
+            ? String(c.id) === String(action.channelId)
+            : action.upstreamUrl && (c.baseUrl || '').replace(/\/+$/, '') === action.upstreamUrl.replace(/\/+$/, ''));
+          if (matches.length !== 1) throw new Error('无法唯一定位来源通道，请重新扫描');
+          const channel = matches[0];
+          const id = Number(channel.id);
+          if (!Number.isSafeInteger(id) || id <= 0 || !action.modelName) throw new Error('通道或模型无效');
+          const modelMapping = { ...(channel.modelMapping || {}), [action.modelName]: action.modelName };
+          const json = JSON.stringify({ [action.modelName]: action.modelName }).replace(/'/g, "''");
+          const updatedId = String(this.context.execPsql(`UPDATE accounts SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{model_mapping}', COALESCE(credentials->'model_mapping', '{}'::jsonb) || '${json}'::jsonb), updated_at = NOW() WHERE id = ${id} AND deleted_at IS NULL RETURNING id;`, true) || '').trim();
+          if (updatedId !== String(id)) throw new Error('模型映射同步失败或来源通道已不存在');
+          channel.modelMapping = modelMapping;
+          channel.configuredModels = [...new Set([...(channel.configuredModels || []), action.modelName])];
+          channel.knownModels = [...new Set([...(channel.knownModels || []), action.modelName])];
+          this.context.invalidateSub2APIScheduler(id);
+        } else throw new Error('不支持的审批类型');
         this.context.saveState(state);
-        resultMessage = `已成功开启全新模型 [${action.modelName}]，已向 ${updatedCount} 个就绪通道挂载对外服务！`;
       }
-    } else {
-      resultMessage = `已忽略该待办操作 (${action.title})。`;
-    }
-
-    writeJSON(PENDING_FILE, this.pendingActions);
-
-    // 广播更新
-    const state = this.context.getState();
-    this.context.broadcastSSE('CHANNELS_UPDATED', state);
-    this.context.broadcastSSE('UPSTREAM_ACTION_RESOLVED', {
-      actionId,
-      action,
-      resultMessage,
-      pendingActions: this.getPendingActions()
-    });
-
-    return { success: true, message: resultMessage, action };
-  }
-
-  // 批量处理待审批动作 (按通道一键审批)
-  async resolveActions(actionIds, decision = 'approve', operator = '管理员') {
-    if (!Array.isArray(actionIds) || actionIds.length === 0) {
-      return { success: false, message: '请提供待审批项 ID 列表' };
-    }
-    this.pendingActions = readJSON(PENDING_FILE, []);
-    const resolvedList = [];
-    const state = this.context.getState();
-    const approvedModels = [];
-
-    for (const actionId of actionIds) {
-      const action = this.pendingActions.find(a => String(a.id) === String(actionId));
-      if (!action || action.status !== 'pending') continue;
-
       action.status = decision === 'approve' ? 'approved' : 'rejected';
       action.resolvedAt = new Date().toISOString();
       action.resolvedBy = operator;
-      resolvedList.push(action);
-
-      if (decision === 'approve') {
-        if (action.type === 'same_price_channel') {
-          const sale = action.suggestedSaleMultiplier || this.calculateSaleMultiplier(action.costMultiplier);
-          await this.autoCreateChannelAndGroup(action, action.costMultiplier, sale);
-        } else if (action.type === 'enable_new_model') {
-          approvedModels.push(action.modelName);
-        }
-      }
+      if (!writeJSON(PENDING_FILE, this.pendingActions)) throw new Error('审批结果保存失败');
+      const message = decision === 'approve' ? '已成功同步审批项至来源通道' : '已忽略该待办操作';
+      this.context.broadcastSSE('CHANNELS_UPDATED', state);
+      this.context.broadcastSSE('UPSTREAM_ACTION_RESOLVED', { actionId, action, resultMessage: message, pendingActions: this.getPendingActions() });
+      return { success: true, message, action };
+    } catch (error) {
+      return { success: false, message: error.message };
     }
+  }
 
-    if (approvedModels.length > 0) {
-      state.channels.forEach(c => {
-        if (c.schedulable && c.status === 'online') {
-          if (!c.modelMapping) c.modelMapping = {};
-          if (!c.configuredModels) c.configuredModels = [];
-          if (!c.knownModels) c.knownModels = [];
-          approvedModels.forEach(m => {
-            c.modelMapping[m] = m;
-            if (!c.configuredModels.includes(m)) c.configuredModels.push(m);
-            if (!c.knownModels.includes(m)) c.knownModels.push(m);
-          });
-        }
-      });
-      this.context.saveState(state);
-    }
-
-    writeJSON(PENDING_FILE, this.pendingActions);
-
-    const msg = decision === 'approve'
-      ? `已成功开启对外服务！共生效 ${resolvedList.length} 项待办（覆盖 ${approvedModels.length} 个新上线模型）。`
-      : `已暂缓 ${resolvedList.length} 项待审批事项。`;
-
-    this.context.broadcastSSE('CHANNELS_UPDATED', state);
-    this.context.broadcastSSE('UPSTREAM_ACTION_RESOLVED', {
-      actionIds,
-      count: resolvedList.length,
-      resultMessage: msg,
-      pendingActions: this.getPendingActions()
-    });
-
-    return { success: true, message: msg, count: resolvedList.length, actions: resolvedList };
+  async resolveActions(actionIds, decision = 'approve', operator = '管理员') {
+    if (!Array.isArray(actionIds) || !actionIds.length) return { success: false, message: '请提供待审批项 ID 列表' };
+    const results = [];
+    for (const id of [...new Set(actionIds)]) results.push(await this.resolveAction(id, decision, operator));
+    const count = results.filter(r => r.success).length;
+    return { success: count === results.length, count, results, message: `已处理 ${count}/${results.length} 项；失败项保留待审批` };
   }
 
   getLatestReport() {

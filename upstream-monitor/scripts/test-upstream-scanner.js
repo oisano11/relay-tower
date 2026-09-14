@@ -7,7 +7,24 @@ const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
 
-const scanner = require('../upstream_scanner');
+// Load the scanner with an in-memory filesystem; never access production data or network.
+const vm = require('vm');
+const files = new Map();
+const memoryFs = {
+  existsSync: p => files.has(p), mkdirSync: () => {},
+  readFileSync: p => { if (!files.has(p)) throw new Error('ENOENT'); return files.get(p); },
+  writeFileSync: (p, s) => files.set(p, s),
+  renameSync: (a, b) => { files.set(b, files.get(a)); files.delete(a); }
+};
+const sandbox = { module: { exports: {} }, console, URL, AbortController, AbortSignal,
+  __dirname: path.resolve(__dirname, '..'),
+  setTimeout, clearTimeout, setInterval: () => 1, clearInterval: () => {},
+  fetch: (...args) => global.fetch(...args),
+  require: name => name === 'fs' ? memoryFs : name === './gateway' ? require('../gateway') : require(name)
+};
+global.fetch = async () => { throw new Error('Real network disabled in scanner tests'); };
+vm.runInNewContext(fs.readFileSync(path.resolve(__dirname, '../upstream_scanner.js'), 'utf8'), sandbox);
+const scanner = sandbox.module.exports;
 
 console.log('🧪 开始执行上游巡检引擎单元与集成验证测试...\n');
 
@@ -112,6 +129,8 @@ function createMockContext() {
     saveState: (ns) => {},
     execPsql: (sql) => {
       executedSqlList.push(sql);
+      if (sql.startsWith('WITH existing')) return '301|3';
+      if (sql.startsWith('UPDATE accounts') && sql.includes('RETURNING id')) return sql.match(/WHERE id = (\d+)/)[1];
       return '';
     },
     executeRemoteSQL: (sql) => {
@@ -158,7 +177,7 @@ async function main() {
   });
 
   // 测试 3：规则 1 停用处理与孤岛分组熔断
-  await runAsyncTest('规则 1：通道关停时关停该通道；若所属组无备选，自动关停该分组', async () => {
+  await runAsyncTest('显式分组停用操作保留，备选计数正确', async () => {
     const mockCtx = createMockContext();
     scanner.init(mockCtx);
 
@@ -234,7 +253,7 @@ async function main() {
     // 模拟管理员审批同意
     const approveResult = await scanner.resolveAction(samePriceItem.id, 'approve', '单元测试管理员');
     assert.strictEqual(approveResult.success, true, '审批应返回 success=true');
-    assert.ok(approveResult.message.includes('成功同步同价通道'), '审批成功提示信息');
+    assert.ok(approveResult.message.includes('成功同步'), '审批成功提示信息');
 
     // 审批后不再处于 pending 状态
     const pendingAfter = scanner.getPendingActions();
@@ -255,6 +274,7 @@ async function main() {
       type: 'enable_new_model',
       title: `发现上游全新模型: ${newModelName}`,
       modelName: newModelName,
+      channelId: '101',
       status: 'pending',
       message: `检测到上游全新模型 [${newModelName}]，是否开启对外服务？`
     };
@@ -267,10 +287,10 @@ async function main() {
     const resolveModelResult = await scanner.resolveAction(pendingModelItem.id, 'approve', '单元测试管理员');
     assert.strictEqual(resolveModelResult.success, true, '开启新模型审批应成功');
 
-    // 验证所有活跃通道已挂载该新模型
+    // Only the source channel supports this approved model.
     const onlineChannels = mockCtx.getState().channels.filter(c => c.schedulable);
     for (const ch of onlineChannels) {
-      assert.ok(ch.configuredModels.includes(newModelName), `通道 ${ch.name} 应该已开启并包含 ${newModelName}`);
+      assert.strictEqual(ch.configuredModels.includes(newModelName), ch.id === '101', '模型只开启至来源通道');
     }
   });
 
@@ -304,10 +324,10 @@ async function main() {
       assert.strictEqual(scanRes.success, true, '巡检应成功完成');
       const report = scanRes.report;
 
-      assert.strictEqual(report.deactivatedChannels.length, 1, '应有 1 个通道被停用 (通道 201)');
-      assert.strictEqual(report.closedGroups.length, 1, '独苗组应被孤岛熔断关停');
+      assert.strictEqual(report.deactivatedChannels.length, 0, '单次探活失败不得直接停用账号');
+      assert.strictEqual(report.closedGroups.length, 0, '巡检不得永久关闭业务分组');
       assert.strictEqual(report.autoSyncedChannels.length, 1, '低价上游应被自动同步上线');
-      assert.ok(report.summaryText.includes('高危熔断'), '总结必须包含高危熔断预警');
+      assert.ok(!report.summaryText.includes('高危熔断'), '单次探活不触发分组熔断');
       assert.ok(report.summaryText.includes('低价直通上线'), '总结必须包含低价直通上线信息');
 
       // 验证 Telegram 通知有被调用
@@ -360,6 +380,105 @@ async function main() {
     } finally {
       global.fetch = originalFetch;
     }
+  });
+
+  await runAsyncTest('数据库空返回或异常不能生成虚构本地通道', async () => {
+    const ctx = createMockContext();
+    scanner.init(ctx);
+    const offering = { name: '失败创建', baseUrl: 'https://example.invalid' };
+    scanner.context.execPsql = () => '';
+    await assert.rejects(scanner.autoCreateChannelAndGroup(offering, 0.1, 0.12), /创建失败/);
+    scanner.context.execPsql = () => { throw new Error('db offline'); };
+    await assert.rejects(scanner.autoCreateChannelAndGroup(offering, 0.1, 0.12), /db offline/);
+    assert.strictEqual(ctx.getState().channels.length, 3);
+  });
+
+  await runAsyncTest('创建重复重试复用数据库账号，避免重复本地账号', async () => {
+    const ctx = createMockContext();
+    scanner.init(ctx);
+    const offering = { name: '可重试创建', baseUrl: 'https://retry.invalid' };
+    const first = await scanner.autoCreateChannelAndGroup(offering, 0.1, 0.12);
+    const second = await scanner.autoCreateChannelAndGroup(offering, 0.1, 0.12);
+    assert.strictEqual(first.id, '301');
+    assert.strictEqual(first, second);
+    assert.strictEqual(ctx.getState().channels.length, 4);
+    const queries = ctx._internal.executedSqlList.filter(sql => sql.startsWith('WITH existing'));
+    assert.strictEqual(queries.length, 2);
+    assert.strictEqual(queries[0], queries[1]);
+    assert.ok(queries[0].includes('INSERT INTO account_groups'));
+  });
+
+  await runAsyncTest('删除的来源账号审批失败，恢复后可重试且不污染其他通道', async () => {
+    const ctx = createMockContext();
+    scanner.init(ctx);
+    scanner.upsertPendingAction({ id: 'retry-model', type: 'enable_new_model', channelId: '101', modelName: 'retry-model', status: 'pending' });
+    scanner.context.execPsql = () => '';
+    assert.strictEqual((await scanner.resolveAction('retry-model')).success, false);
+    assert.ok(scanner.getPendingActions().some(a => a.id === 'retry-model'));
+    assert.ok(!ctx.getState().channels[0].configuredModels.includes('retry-model'));
+    scanner.context.execPsql = ctx.execPsql;
+    assert.strictEqual((await scanner.resolveAction('retry-model')).success, true);
+    assert.ok(!ctx.getState().channels[1].configuredModels.includes('retry-model'));
+  });
+
+  await runAsyncTest('探活失败只记录观测，交统一调度器处理；不关闭分组', async () => {
+    const ctx = createMockContext();
+    ctx.getState().channels[1].schedulable = false;
+    scanner.init(ctx);
+    scanner.discoverUpstreamOfferings = async () => [];
+    scanner.probeChannelAlive = async c => c.id !== '101';
+    let result = await scanner.runScan('cold backup');
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(ctx.getState().allGroups[0].status, 'active');
+    const ctx2 = createMockContext();
+    let evaluations = 0;
+    ctx2.evaluateAutoSwitch = () => { evaluations++; };
+    ctx2.getState().channels[1].schedulable = false;
+    scanner.init(ctx2);
+    scanner.probeChannelAlive = async c => c.id === '201';
+    result = await scanner.runScan('dead backup');
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(ctx2.getState().allGroups[0].status, 'active');
+    assert.strictEqual(ctx2.getState().channels[0].schedulable, true);
+    assert.strictEqual(ctx2.getState().channels[0].lastProbeStatus, 'offline');
+    assert.strictEqual(evaluations, 1);
+    assert.strictEqual(ctx2._internal.executedSqlList.length, 0);
+    const ctx3 = createMockContext();
+    ctx3.isExemptGroup = g => g.id === 99;
+    ctx3.getState().channels[0].groupsDetail.push({ id: 99, name: '豁免组' });
+    scanner.init(ctx3);
+    scanner.probeChannelAlive = async c => c.id !== '101';
+    await scanner.runScan('shared exempt');
+    assert.strictEqual(ctx3.getState().channels[0].schedulable, true);
+    assert.ok(!ctx3._internal.executedSqlList.some(sql => sql.includes('id = 101')));
+  });
+
+  await runAsyncTest('上游分组目录按面板与分组 ID 隔离，并识别价格变化且失败保留旧记录', async () => {
+    const ctx = createMockContext();
+    let catalog = [];
+    ctx.getUpstreamPanels = () => [
+      { id: 'p1', name: '上游一', backendUrl: 'https://panel.one', userToken: 'tok' },
+      { id: 'p2', name: '上游二', backendUrl: 'https://panel.two', userToken: 'tok' }
+    ];
+    ctx.getUpstreamGroupCatalog = () => catalog;
+    ctx.setUpstreamGroupCatalog = next => { catalog = next; };
+    const originalFetch = global.fetch;
+    global.fetch = async url => {
+      if (url === 'https://panel.one/api/user/groups') return { ok: true, json: async () => ({ data: [{ id: 7, name: '低价组', model_ratio: 0.1, models: ['gpt-4o'] }] }) };
+      if (url === 'https://panel.two/api/user/groups') return { ok: true, json: async () => ({ data: [{ id: 7, name: '低价组', model_ratio: 0.2 }] }) };
+      return { ok: false, json: async () => ({}) };
+    };
+    try {
+      scanner.init(ctx);
+      let result = await scanner.discoverUpstreamGroups([], {});
+      assert.strictEqual(result.newGroups.length, 2);
+      assert.strictEqual(new Set(result.catalog.map(g => g.key)).size, 2);
+      global.fetch = async url => url === 'https://panel.one/api/user/groups' ? { ok: true, json: async () => ({ data: [{ id: 7, name: '低价组', model_ratio: 0.12 }] }) } : { ok: false, json: async () => ({}) };
+      result = await scanner.discoverUpstreamGroups([], {});
+      assert.strictEqual(result.changedGroups.length, 1);
+      assert.strictEqual(result.catalog.find(g => g.key === 'p2:7').status, 'stale');
+      assert.strictEqual(result.catalog.find(g => g.key === 'p2:7').costMultiplier, 0.2);
+    } finally { global.fetch = originalFetch; }
   });
 
   console.log(`\n========================================`);

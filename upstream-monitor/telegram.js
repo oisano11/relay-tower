@@ -233,6 +233,7 @@ class TelegramBotManager {
   isAdmin(id) {
     if (!id) return false;
     const strId = String(id).trim();
+    if (!/^[1-9]\d*$/.test(strId)) return false;
     if (!Array.isArray(this.config.adminChatIds)) return false;
     return this.config.adminChatIds.some(adminId => String(adminId).trim() === strId);
   }
@@ -250,48 +251,34 @@ class TelegramBotManager {
   async handleMessage(msg) {
     if (!msg || !msg.text) return;
     const chatId = msg.chat.id;
-    const fromId = msg.from ? msg.from.id : chatId;
+    const fromId = msg.from?.id;
     const text = msg.text.trim();
     const strChatId = String(chatId);
     const strFromId = String(fromId);
 
-    console.log(`[Telegram] 收到消息 - ChatID: ${strChatId}, FromID: ${strFromId}, 用户: @${msg.from?.username || '无'}, 内容: "${text}"`);
+    console.log(`[Telegram] 收到消息 - ChatID: ${strChatId}, FromID: ${strFromId}, 命令: ${text.startsWith('/bind') ? '/bind [隐藏]' : text.split(/\s/)[0]}`);
 
-    // 1. 管理员自动绑定逻辑 (首次无管理员时，发任意消息或 /start 即可直接绑定)
-    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) {
-      this.config.adminChatIds = [strChatId];
-      if (strFromId !== strChatId && !this.config.adminChatIds.includes(strFromId)) {
-        this.config.adminChatIds.push(strFromId);
-      }
-      this.saveConfig(this.config);
-      console.log(`🎉 [Telegram] 已自动将 Chat ID ${strChatId} / ${strFromId} 绑定为超级管理员！`);
-      await this.sendMessage(chatId, 
-        `🎉 <b>恭喜！您已成功绑定为中控台超级管理员！</b>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `👤 管理员: <b>${msg.from?.first_name || '用户'}</b> (@${msg.from?.username || '无用户名'})\n` +
-        `🆔 Chat ID: <code>${strChatId}</code>` + (strFromId !== strChatId ? ` (User ID: <code>${strFromId}</code>)` : '') + `\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `现在您可以随时接收上游变价推送，并直接在手机端点击按钮进行切线调度！\n` +
-        `👇 发送 /help 或点击下方菜单开始使用。`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '📊 查看大盘状态', callback_data: 'cmd:status' }, { text: '🔀 一键切换线路', callback_data: 'cmd:switch' }],
-              [{ text: '⚡ 自动切线设置', callback_data: 'cmd:auto' }, { text: '🔍 立即全网测速', callback_data: 'cmd:check' }]
-            ]
-          }
-        }
-      );
-      return;
-    }
+    // First contact never grants permissions. Bind privately with the console password.
+    if (!Array.isArray(this.config.adminChatIds)) this.config.adminChatIds = [];
 
     // 2. 动态快捷认证绑定指令：/bind <管理密码>
     if (text.startsWith('/bind')) {
+      if (msg.chat.type !== 'private' || !fromId || String(fromId) !== String(chatId)) {
+        await this.sendMessage(chatId, '请在与机器人的私聊中绑定，不要在群里发送管理密码。');
+        return;
+      }
+      this.bindAttempts = this.bindAttempts || new Map();
+      const attempt = this.bindAttempts.get(strFromId);
+      if (attempt && Date.now() - attempt.at < 15 * 60 * 1000 && attempt.count >= 5) {
+        await this.sendMessage(chatId, '绑定尝试过多，请 15 分钟后重试。');
+        return;
+      }
       const parts = text.split(/\s+/);
       if (parts.length > 1) {
         const inputPwd = parts.slice(1).join(' ').trim();
         const verifyFn = this.context.verifyPassword;
         if (typeof verifyFn === 'function' && verifyFn(inputPwd)) {
+          this.bindAttempts.delete(strFromId);
           // 密码正确！授权绑定当前 Chat ID 与 From ID
           let added = false;
           if (!this.isAdmin(strChatId)) {
@@ -324,6 +311,7 @@ class TelegramBotManager {
           );
           return;
         } else {
+          this.bindAttempts.set(strFromId, { at: Date.now(), count: attempt && Date.now() - attempt.at < 15 * 60 * 1000 ? attempt.count + 1 : 1 });
           console.warn(`⚠️ [Telegram] 用户尝试绑定失败：管理密码不匹配 (Chat: ${strChatId}, From: ${strFromId})`);
           await this.sendMessage(chatId,
             `❌ <b>管理密码错误</b>\n` +
@@ -337,9 +325,9 @@ class TelegramBotManager {
     }
 
     // 3. 权限校验（既支持个人私聊 Chat ID，也支持群组会话中的个人 From ID）
-    const isAuthorized = this.isAdmin(chatId) || this.isAdmin(fromId);
+    const isAuthorized = this.isAdmin(fromId);
     if (!isAuthorized) {
-      console.warn(`🔒 [Telegram] 拦截未授权指令 - ChatID: ${strChatId}, FromID: ${strFromId}, 指令: "${text}"`);
+      console.warn(`🔒 [Telegram] 拦截未授权指令 - ChatID: ${strChatId}, FromID: ${strFromId}`);
       await this.sendMessage(chatId, 
         `🔒 <b>中控台权限未授权</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
@@ -400,7 +388,7 @@ class TelegramBotManager {
     console.log(`[Telegram] 按钮点击 - ChatID: ${chatId}, FromID: ${fromId}, 用户: @${query.from?.username || '无'}, Action: "${data}"`);
 
     // 既校验 message.chat.id，也校验点击按钮的操作者 from.id（支持群组与私聊）
-    const isAuthorized = this.isAdmin(chatId) || this.isAdmin(fromId);
+    const isAuthorized = this.isAdmin(fromId);
 
     if (!isAuthorized) {
       await this.answerCallbackQuery(queryId, { 
@@ -439,12 +427,6 @@ class TelegramBotManager {
     } else if (data.startsWith('scan_act:reject:')) {
       const actionId = data.replace('scan_act:reject:', '');
       await this.handleActionResolve(chatId, queryId, actionId, 'reject');
-    } else if (data.startsWith('failover_act:approve:')) {
-      const proposalId = data.replace('failover_act:approve:', '');
-      await this.handleFailoverResolve(chatId, queryId, proposalId, 'approve');
-    } else if (data.startsWith('failover_act:reject:')) {
-      const proposalId = data.replace('failover_act:reject:', '');
-      await this.handleFailoverResolve(chatId, queryId, proposalId, 'reject');
     } else if (data.startsWith('switch:')) {
       const channelId = data.replace('switch:', '');
       await this.handleDoSwitch(chatId, queryId, channelId, query.message.message_id);
@@ -527,7 +509,7 @@ class TelegramBotManager {
       `📈 <b>销售核算倍率:</b> <code>${active.saleMultiplier !== undefined ? Number(active.saleMultiplier).toFixed(4) : '--'}x</code>\n` +
       `💰 <b>当前毛利率:</b> <b>+${active.marginPercent !== undefined ? active.marginPercent : '--'}%</b>\n` +
       `📶 <b>节点响应状态:</b> ${active.status === 'offline' ? '🔴 离线' : '🟢 正常'}${active.latency ? ` (${active.latency}ms)` : ''}\n` +
-      `⚡ <b>自动切线保护:</b> ${autoConfig.enabled ? '🟢 统一基准运行中' : '🔴 已暂停'} (<code>成本第一·不足80%切副调</code>)\n` +
+      `⚡ <b>自动切号保护:</b> ${autoConfig.enabled ? '🟢 统一基准运行中' : '🔴 已暂停'} (<code>故障切出·充值恢复·稳定回切</code>)\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `👥 <b>【主力线路实时负载】</b>\n` +
       `• 正在使用用户: <b>${activeUsers15m}</b> 人在线 (今日累计: <b>${activeUsers24h}</b> 人)\n` +
@@ -593,14 +575,14 @@ class TelegramBotManager {
     sorted.forEach((c) => {
       const isCurrent = String(c.id) === activeId;
       const p = Number(c.priority);
-      const roleTag = isCurrent ? '🌟主力' : (p >= 100 ? '🟢主调' : (p <= 1 ? '🟡保底' : '🔵副调'));
+      const roleTag = isCurrent ? '🌟主力' : (p <= 1 ? '🟢主调' : (p >= 100 ? '🟡备用' : (p <= 10 ? '🔵副调' : '🟠备选')));
       const act = c.userActivity || {};
       const u15m = act.activeUsers15m || 0;
       const u24h = act.activeUsers24h || 0;
       const inflight = act.inflight || 0;
       const c15m = act.calls15m || 0;
       const c24h = act.calls24h || 0;
-      const statusIcon = c.status === 'offline' ? '🔴 离线' : (c.schedulable ? '🟢 正常' : '⚪ 未开启');
+      const statusIcon = c.autoSwitchDisabled === true ? '⛔ 人工停用' : (c.status === 'offline' ? '🔴 故障观察' : (c.schedulable ? '🟢 使用中' : '⚪ 自动待命'));
       const latencyStr = c.latency ? `${c.latency}ms` : '--';
 
       if (isCurrent || u15m > 0 || inflight > 0 || c15m > 0) {
@@ -671,7 +653,7 @@ class TelegramBotManager {
     state.channels.forEach((c) => {
       const isCurrent = String(c.id) === activeId;
       const p = Number(c.priority);
-      const roleTag = isCurrent ? '🌟' : (p >= 100 ? '🟢' : (p <= 1 ? '🟡' : '🔵'));
+      const roleTag = isCurrent ? '🌟' : (p <= 1 ? '🟢' : (p >= 100 ? '🟡' : '🔵'));
       const uCount = c.userActivity?.activeUsers15m || 0;
       const uTag = uCount > 0 ? `·${uCount}人` : '';
       const label = `${roleTag} ${c.name.slice(0, 7)} (${Number(c.multiplier).toFixed(2)}x${uTag})`;
@@ -751,19 +733,19 @@ class TelegramBotManager {
   // 发送自动切线设置菜单
   async sendAutoSwitchMenu(chatId, editMessageId = null) {
     const autoConfig = this.context.getAutoSwitchConfig();
-    const policyDesc = autoConfig.manualLockPolicy === 'strict_lock' ? '🔒 绝对锁死' : (autoConfig.manualLockPolicy === 'disabled' ? '🔄 自由轮换' : (autoConfig.manualLockPolicy === 'failover_allowed' ? '🛡️ 直接容灾' : '🛡️ 需确认接管 (推荐)'));
+    const policyDesc = '故障自动切号，无需逐次审批；充值后自动检查恢复';
 
     const text = 
       `⚡ <b>【全站统一自动切线与容灾保护】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `运行状态: <b>${autoConfig.enabled ? '🟢 已开启' : '🔴 已暂停'}</b>\n` +
       `单主独占: <b>${autoConfig.singleActiveExclusive !== false ? '🔒 全组独占 (同组严禁多开)' : '⚠️ 允许双开分流'}</b>\n` +
-      `锁定策略: <b>${policyDesc}</b>\n` +
-      `核心主线: 💰 <b>以不赔钱为第一主线，谁便宜谁是主调</b>\n` +
+      `自动策略: <b>${policyDesc}</b>\n` +
+      `选号原则: 💰 <b>同组健康候选择优，不超过售价，不自动改价</b>\n` +
       `调换门槛: 📊 <b>失败率 ≥${autoConfig.failRateThreshold || 50}% 或连续硬报错 ≥${autoConfig.consecutiveFailuresThreshold || 5}次才切</b>\n` +
-      `防抖冷静: ⏱️ <b>${autoConfig.cooldownMinutes || 10} 分钟防抖冷却</b>\n` +
+      `低价回切: ⏱️ <b>稳定恢复后且冷静期满 ${autoConfig.cooldownMinutes || 10} 分钟；故障切出无需等待</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `💡 <i>全站业务分组严格独立，自动切线时原子互斥关闭同组其余全部渠道。</i>`;
+      `💡 <i>人工停用账号不会自动重启。没有合适备用时通知处理充值或账号问题。</i>`;
 
     const reply_markup = {
       inline_keyboard: [
@@ -798,7 +780,10 @@ class TelegramBotManager {
       const loadTag = (u > 0 || inflight > 0) 
         ? ` (👥 ${u}人 · ⚡${inflight}并发)` 
         : (calls15m > 0 ? ` (📊 15m:${calls15m}次)` : '');
-      listText += `${idx + 1}. [<code>${Number(c.multiplier).toFixed(4)}x</code>] <b>${c.name}</b>${loadTag} ${isCurrent ? '🌟 (当前主用)' : ''}${c.schedulable ? '' : ' (🚫已禁)'}\n`;
+      const p = Number(c.priority);
+      const role = isCurrent || p <= 1 ? '主调' : (p <= 10 ? '副调' : (p <= 20 ? '备选' : '备用'));
+      const status = c.autoSwitchDisabled === true ? '⛔人工停用' : (c.status === 'offline' ? '🔴故障观察' : (c.schedulable ? '🟢使用中' : '⚪自动待命'));
+      listText += `${idx + 1}. [<code>${Number(c.multiplier).toFixed(4)}x</code>] <b>${c.name}</b> (${role} · ${status})${loadTag}\n`;
     });
 
     const text = 
@@ -906,53 +891,16 @@ class TelegramBotManager {
     const safeReason = escapeHtml(logEntry.reason);
     const safeGroup = escapeHtml(logEntry.groupName || '默认分组');
 
-    let message = '';
-    if (logEntry.triggerType === 'auto_recover_lowest_cost' || logEntry.priceRestored) {
-      message = 
-        `🟢 <b>【中转塔台 · 低价主线充值恢复 · 自动切回主调并恢复原价】</b>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `🔄 <b>切线路由:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
-        `🎯 <b>恢复原因:</b> ${safeReason}\n` +
-        `💸 <b>进货成本降本:</b> <code>${logEntry.oldCost}x</code> ➔ <b><code>${logEntry.newCost}x</code></b>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        (logEntry.priceRestored ? (
-          `📉 <b>【业务分组售价恢复原价】</b>\n` +
-          `• 调整分组: <b>${safeGroup}</b>\n` +
-          `• 紧急避险价: <code>${logEntry.oldSaleRate}x</code> (避险阶段已结束)\n` +
-          `• <b>恢复原售价:</b> <b><code>${logEntry.restoredSaleRate || logEntry.newSaleRate}x</code></b> (让利客户，重塑价格竞争力)\n` +
-          `• <b>核算新毛利率:</b> <b>+${logEntry.newMarginPercent}%</b>\n` +
-          `━━━━━━━━━━━━━━━━━━\n`
-        ) : '') +
-        `👥 <b>新主线负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
-        `🛡️ <i>闭环完成！Sub2API 调度路由与零售售价已即刻无缝生效。</i>`;
-    } else if (logEntry.priceAdjusted) {
-      message = 
-        `⚡ <b>【智能熔断切线 & 紧急改售价已生效】</b>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `🔄 <b>切线路由:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
-        `🎯 <b>触发原因:</b> ${safeReason}\n` +
-        `💸 <b>进货成本:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `📈 <b>【业务分组售价自动调优保毛利】</b>\n` +
-        `• 调整分组: <b>${safeGroup}</b>\n` +
-        `• 原销售价: <code>${logEntry.oldSaleRate}x</code> (低于新进货成本，已自动调价防倒贴)\n` +
-        `• <b>新销售价:</b> <code>${logEntry.newSaleRate}x</code> (按上游进价 +20% 自动上调)\n` +
-        `• <b>核算新毛利率:</b> <b>+${logEntry.newMarginPercent}%</b>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `👥 <b>新通道负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
-        `🛡️ <i>坚决不赔钱！线上售价与中转路由已即刻同步生效。</i>`;
-    } else {
-      message = 
-        `⚡ <b>【智能自动熔断切线触发】</b>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `🔄 <b>切线动作:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
-        `🎯 <b>触发原因:</b> ${safeReason}\n` +
-        `💸 <b>进货倍率:</b> <code>${logEntry.oldCost}x</code> ➔ <code>${logEntry.newCost}x</code>\n` +
-        `👥 <b>新通道当前负载:</b> <b>${toUsers}</b> 人在线 · <b>${toInflight}</b> 个并发\n` +
-        `${logEntry.oldTtft ? `⏱️ <b>延迟对比:</b> <code>${logEntry.oldTtft}ms</code> ➔ <code>${logEntry.newTtft || '--'}ms</code>\n` : ''}` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `✅ <i>Sub2API 调度网关已即时切换至新通道！</i>`;
-    }
+    const recovered = logEntry.triggerType === 'auto_recover_lowest_cost';
+    const message =
+      `${recovered ? '🟢 <b>【账号稳定恢复，已自动回切】</b>' : '⚡ <b>【故障自动切号完成】</b>'}\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `📁 <b>业务分组:</b> ${safeGroup}\n` +
+      `🔄 <b>切号:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
+      `🎯 <b>原因:</b> ${safeReason}\n` +
+      `💸 <b>进货倍率:</b> <code>${escapeHtml(logEntry.oldCost ?? '--')}x</code> ➔ <code>${escapeHtml(logEntry.newCost ?? '--')}x</code>\n` +
+      `👥 <b>新账号负载:</b> ${toUsers} 人在线 · ${toInflight} 个并发\n` +
+      `✅ <i>对外售价未改动。故障账号继续检查恢复；欠费账号请充值。</i>`;
 
     const reply_markup = {
       inline_keyboard: [
@@ -1000,7 +948,14 @@ class TelegramBotManager {
     if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
     if (operator && operator.includes('Telegram')) return;
 
-    const roleName = role === 'main' ? '⚡ 主调 (优先调度 100)' : (role === 'sub' ? '⚖️ 副调 (备用分流 10)' : '🛡️ 保底 (故障兜底 1)');
+    const roleName = {
+      main: '⚡ 主调 (优先级 1)',
+      sub: '🔵 副调 (优先级 10)',
+      alt: '🟡 备选 (优先级 20)',
+      alternative: '🟡 备选 (优先级 20)',
+      standby: '⚪ 备用 (优先级 100)',
+      fallback: '⚪ 备用 (优先级 100)'
+    }[role] || '⚪ 备用 (优先级 100)';
     const message = 
       `🎯 <b>【上游定性级别调整】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
@@ -1062,62 +1017,6 @@ class TelegramBotManager {
     } catch (e) {
       await this.answerCallbackQuery(queryId, { text: `❌ 异常: ${e.message}`, show_alert: true });
     }
-  }
-
-  // 审批/解决人工主调异常切线请示
-  async handleFailoverResolve(chatId, queryId, proposalId, decision) {
-    if (typeof this.context.resolveFailoverProposal !== 'function') {
-      await this.answerCallbackQuery(queryId, { text: '⚠️ 切线确认接口未就绪', show_alert: true });
-      return;
-    }
-    try {
-      const res = await this.context.resolveFailoverProposal(proposalId, decision, 'Telegram 管理员');
-      if (res.success) {
-        await this.answerCallbackQuery(queryId, { 
-          text: decision === 'approve' ? '✅ 已确认切线并生效！' : '❌ 已驳回切线，保持当前人工主调', 
-          show_alert: true 
-        });
-        await this.sendMessage(chatId, `🔔 <b>【人工主调切线决策已生效】</b>\n${res.message}`);
-      } else {
-        await this.answerCallbackQuery(queryId, { text: `⚠️ ${res.error || res.message}`, show_alert: true });
-      }
-    } catch (e) {
-      await this.answerCallbackQuery(queryId, { text: `❌ 异常: ${e.message}`, show_alert: true });
-    }
-  }
-
-  // 推送人工主调异常切线请示 (带确认/驳回按钮)
-  async notifyFailoverProposal(proposal) {
-    if (!this.config.enabled) return;
-    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
-
-    const safeGroup = escapeHtml(proposal.groupName || '默认分组');
-    const safeFromName = escapeHtml(proposal.fromChannel?.name || '未知主调');
-    const safeToName = escapeHtml(proposal.toChannel?.name || '未知备选');
-    const safeReason = escapeHtml(proposal.reason || '通道异常');
-
-    const text = 
-      `⚠️ <b>【中转塔台 · 人工主调异常切线请示】</b>\n` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `📁 <b>业务分组:</b> <b>${safeGroup}</b>\n` +
-      `👑 <b>当前人工主调:</b> <b>[${safeFromName}]</b> (进价: ${proposal.fromChannel?.cost || 0}x)\n` +
-      `🚨 <b>确诊异常:</b> <code>${safeReason}</code>\n` +
-      `🔀 <b>建议切向备选:</b> <b>[${safeToName}]</b> (进价: ${proposal.toChannel?.cost || 0}x)\n` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `🛡️ <i>安全铁律：人工指定的主调绝不擅自自动切走！请确认是否切换：</i>`;
-
-    const reply_markup = {
-      inline_keyboard: [
-        [
-          { text: `✅ 确认切换至 [${safeToName}]`, callback_data: `failover_act:approve:${proposal.id}` }
-        ],
-        [
-          { text: `❌ 暂不切换 (保持人工主调)`, callback_data: `failover_act:reject:${proposal.id}` }
-        ]
-      ]
-    };
-
-    await this.broadcastToAdmins(text, { reply_markup });
   }
 
   // 7. 推送上游通道巡检报告与一键审批按钮
@@ -1273,28 +1172,7 @@ class TelegramBotManager {
 
   // 尝试从最新收到的 update 中自动绑定管理员
   async tryAutoBindFromUpdates() {
-    try {
-      const updates = await this.apiRequest('getUpdates', { limit: 10, timeout: 0 });
-      if (Array.isArray(updates) && updates.length > 0) {
-        // 取最新的 message
-        for (let i = updates.length - 1; i >= 0; i--) {
-          const u = updates[i];
-          const m = u.message || u.callback_query?.message;
-          if (m && m.chat && m.chat.id) {
-            const strId = String(m.chat.id);
-            if (!this.config.adminChatIds.includes(strId)) {
-              this.config.adminChatIds.push(strId);
-              this.saveConfig(this.config);
-              console.log(`[Telegram] 通过主动探测成功绑定 Chat ID: ${strId}`);
-              return { success: true, chatId: strId, username: m.chat.username || m.from?.username };
-            }
-          }
-        }
-      }
-      return { success: false, message: '未找到近期与机器人互动的消息，请先在 Telegram 手机端给机器人发一条 /start 消息' };
-    } catch (e) {
-      return { success: false, message: e.message };
-    }
+    return { success: false, message: '自动绑定已停用，请私聊机器人发送 /bind <管理密码>，或在控制台填写个人 ID' };
   }
 
   // 获取对外状态

@@ -27,9 +27,13 @@ jobs:
       - name: Validate JavaScript Syntax
         run: |
           cd upstream-monitor
-          node --check server.js
-          node --check auth.js
-          node --check telegram.js
+          for file in *.js public/app.js; do
+            node --check "$file"
+          done
+
+      - name: Run regression tests
+        working-directory: upstream-monitor
+        run: npm test
 
       - name: Validate Example JSON Files
         run: |
@@ -49,3 +53,15 @@ jobs:
       - name: Validate Dockerfile build
         run: |
           docker build -t relay-tower-monitor:test ./upstream-monitor
+
+      - name: Smoke test isolated container startup
+        run: |
+          container_id=$(docker run -d --network none -e IS_VPS=false relay-tower-monitor:test)
+          trap 'docker logs "$container_id"; docker rm -f "$container_id"' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec "$container_id" node -e 'fetch("http://127.0.0.1:3300/api/auth/status").then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1))'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1

@@ -137,18 +137,11 @@ let authConfig = initAuthConfig();
 
 // 提取客户端真实 IP
 function getClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) {
-    const list = forwarded.split(',').map(s => s.trim());
-    if (list.length > 0 && list[0]) return list[0];
-  }
-  const realIp = req.headers['x-real-ip'];
-  if (realIp) return realIp.trim();
   const addr = req.socket && req.socket.remoteAddress;
   if (addr) {
-    return addr.replace(/^.*:/, ''); // 移除 IPv6 映射前缀
+    return addr.replace(/^::ffff:/, '');
   }
-  return '127.0.0.1';
+  return '';
 }
 
 // 检查 IP 是否被拉黑封禁
@@ -306,7 +299,7 @@ function parseCookies(cookieHeader) {
     name = name?.trim();
     if (!name) return;
     const value = rest.join('=').trim();
-    list[name] = decodeURIComponent(value);
+    try { list[name] = decodeURIComponent(value); } catch { /* Ignore malformed cookies. */ }
   });
   return list;
 }
@@ -336,7 +329,10 @@ function getGatewayApiKey() {
 
 // 修改/重置网关 API Key
 function setGatewayApiKey(newKey) {
-  if (!newKey || typeof newKey !== 'string' || newKey.length < 8) {
+  if (process.env.GATEWAY_API_KEY) {
+    return { success: false, error: '网关密钥由 GATEWAY_API_KEY 环境变量管理，请更新部署配置后重启' };
+  }
+  if (!newKey || typeof newKey !== 'string' || newKey.trim().length < 8) {
     return { success: false, error: '网关 API Key 长度至少需要 8 位' };
   }
   authConfig.gatewayApiKey = newKey.trim();

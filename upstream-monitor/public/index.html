@@ -12,8 +12,8 @@
     <!-- 顶部导航栏 -->
     <header class="top-nav">
       <div class="brand-area">
-        <div class="brand-logo" style="display: flex; align-items: center; justify-content: center; background: transparent; padding: 0;">
-          <img src="favicon.png" style="width: 30px; height: 30px; border-radius: 7px; box-shadow: 0 2px 8px rgba(0,0,0,0.25);">
+        <div class="brand-logo" style="display: flex; align-items: center; justify-content: center; background: transparent; padding: 0; border: none;">
+          <img src="favicon.png" alt="中转塔台 · Relay Tower" style="width: 32px; height: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0, 242, 254, 0.3);">
         </div>
         <div class="brand-text">
           <h1>中转塔台 · Relay Tower <span>智能调度与风控中控台</span></h1>
@@ -52,8 +52,8 @@
         <button id="btnOpenJinlongModal" class="btn btn-glass" title="配置上游 New API 后台账号获取余额与倍率">
           <span>🔑</span> 上游后台 <span id="jinlongStatusPill" class="jinlong-status-mini">待配置</span>
         </button>
-        <button id="btnOpenAutoSwitchModal" class="btn btn-glass" title="配置基于首字速度与成本性价比的智能自动切换">
-          <span>⚡</span> 自动切线 <span id="autoSwitchStatusPill" class="auto-switch-status-pill on">已启用</span>
+        <button id="btnOpenAutoSwitchModal" class="btn btn-glass" title="统一设置故障切号、充值后恢复与低价回切">
+          <span>⚡</span> 自动切号设置 <span id="autoSwitchStatusPill" class="auto-switch-status-pill on">已启用</span>
         </button>
         <button id="btnOpenTelegramModal" class="btn btn-glass" title="配置 Telegram 机器人推送与手机端一键切线">
           <span style="color: #0284c7;">✈️</span> Telegram <span id="tgHeaderStatusPill" class="auto-switch-status-pill on">已连接</span>
@@ -271,9 +271,8 @@
 
             <div class="batch-actions">
               <span style="font-size: 0.72rem; color: #71717a;">批量:</span>
-              <button id="btnAutoQualifyCost" class="btn-batch" onclick="triggerAutoQualifyByCost()" style="color: #047857; background: #ecfdf5; border-color: #a7f3d0; font-weight: 700;" title="以不赔钱为第一主线，谁便宜谁是主调，次便宜为副调，保底尤慎重">⚡ 一键按价格定性</button>
-              <button id="btnBatchEnableAll" class="btn-batch" title="开启当前筛选出的所有上游调度">全部开启</button>
-              <button id="btnBatchDisableAll" class="btn-batch" title="关闭当前筛选出的所有上游调度">全部停用</button>
+              <button id="btnBatchEnableAll" class="btn-batch" title="将当前筛选的账号纳入候选池，由自动策略选择使用">全部纳入自动调度</button>
+              <button id="btnBatchDisableAll" class="btn-batch" title="将当前筛选的账号标记为人工停用，不再自动启用">全部人工停用</button>
             </div>
           </div>
         </div>
@@ -428,66 +427,6 @@
             </button>
             <button id="modalBtnDismiss" class="btn btn-secondary">
               知道了，暂不切换
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- 弹窗：人工主调异常切线确认弹窗 (铁律：人工指定的主调必须确认后才变) -->
-    <div id="manualFailoverModal" class="modal-backdrop">
-      <div class="modal-dialog alert-dialog danger" style="max-width: 520px;">
-        <div class="dialog-content">
-          <div class="alert-tag-row">
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-              <span class="alert-type-badge" style="background: #fee2e2; color: #b91c1c; border-color: #fca5a5;">⚠️ 人工主调请示</span>
-              <span class="alert-time" id="failoverModalTime">刚刚</span>
-            </div>
-            <button id="btnCloseFailoverModal" class="modal-close-btn" title="关闭窗口">✕</button>
-          </div>
-          <h2 class="alert-title" style="color: #991b1b; font-size: 1.15rem; margin-top: 0.4rem;">
-            人工指定主调出现异常，请示是否切换！
-          </h2>
-          <p class="alert-reason-text" style="font-size: 0.82rem; margin-bottom: 0.75rem;">
-            根据安全铁律：<b>管理员手动指定的主调绝不擅自动</b>。检测到该主调发生严重故障，系统已生成替补切线提案，请你决策：
-          </p>
-
-          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.85rem; display: flex; flex-direction: column; gap: 0.65rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; border-bottom: 1px dashed #cbd5e1; padding-bottom: 0.4rem;">
-              <span style="color: #64748b;">业务分组：</span>
-              <span id="failoverModalGroupName" style="font-weight: 700; color: #0f172a;">--</span>
-            </div>
-
-            <!-- 当前故障主调 -->
-            <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 0.6rem 0.75rem;">
-              <div style="font-size: 0.72rem; font-weight: 700; color: #991b1b; margin-bottom: 0.2rem;">👑 当前人工主调 (发生故障)</div>
-              <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span id="failoverModalFromName" style="font-weight: 700; color: #b91c1c; font-size: 0.92rem;">--</span>
-                <span id="failoverModalFromCost" class="mono" style="font-size: 0.8rem; color: #7f1d1d;">0.00x</span>
-              </div>
-              <div id="failoverModalFaultReason" style="font-size: 0.75rem; color: #dc2626; margin-top: 0.25rem; font-weight: 600;">
-                故障原因：--
-              </div>
-            </div>
-
-            <div style="text-align: center; color: #94a3b8; font-size: 0.9rem; margin: -0.2rem 0;">⬇️ 建议调换至组内最优备选</div>
-
-            <!-- 建议接替通道 -->
-            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.6rem 0.75rem;">
-              <div style="font-size: 0.72rem; font-weight: 700; color: #166534; margin-bottom: 0.2rem;">🌟 推荐接替备选 (健康且成本最优)</div>
-              <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span id="failoverModalToName" style="font-weight: 700; color: #15803d; font-size: 0.92rem;">--</span>
-                <span id="failoverModalToCost" class="mono" style="font-size: 0.8rem; color: #14532d;">0.00x</span>
-              </div>
-            </div>
-          </div>
-
-          <div class="dialog-actions" style="margin-top: 1.15rem; display: flex; gap: 0.6rem; justify-content: flex-end;">
-            <button id="btnRejectFailover" class="btn btn-secondary" style="font-size: 0.82rem; padding: 0.5rem 1rem;">
-              ❌ 暂不切换 (保持人工主调)
-            </button>
-            <button id="btnApproveFailover" class="btn btn-success" style="font-size: 0.82rem; padding: 0.5rem 1.25rem; font-weight: 700;">
-              ✅ 批准并立即切换
             </button>
           </div>
         </div>
@@ -908,41 +847,41 @@
         <div class="dialog-content">
           <div class="alert-tag-row">
             <span class="alert-type-badge" style="background: #fef3c7; color: #b45309; border-color: #fde68a;">智能自动切线与熔断</span>
-            <span style="font-size: 0.72rem; color: #64748b;">首字速度检测 · 价格防倒贴 · 最优性价比编排</span>
+            <span style="font-size: 0.72rem; color: #64748b;">故障自动切号 · 充值后自动恢复 · 售价由人工设置</span>
           </div>
 
           <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px;">
             <h3 style="color: #0f172a; font-size: 1.22rem; margin-top: 2px;">
-              ⚡ 自动切线与容灾调度策略（全站唯一基准体系）
+              ⚡ 自动切号：全局默认策略
             </h3>
             <button id="btnCloseAutoSwitchModalHeader" class="btn btn-secondary" style="font-size: 0.85rem; padding: 0.2rem 0.5rem;">✕</button>
           </div>
           <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 0.65rem 0.85rem; margin-top: 0.4rem; font-size: 0.78rem; color: #1e40af; line-height: 1.5;">
-            <strong>📌 全站唯一基准调度法则（严禁并存两套规则）：</strong><br/>
-            ① <strong>以不赔钱为第一主线</strong>：进货成本高于销售价的倒贴通道绝不调度，自动降为保底停用。<br/>
-            ② <strong>谁便宜谁是主调，按照价格来是第一要素</strong>：各业务分组内进货价最低者为主调，次低为副调，其余为保底。<br/>
-            ③ <strong>失败率超标（默认 ≥50%）才切副调</strong>：杜绝 1~2 次偶发网络错误误切，全力稳固全站 Prompt Cache 命中率。<br/>
-            ④ <strong>单主调严格独占·严禁主副双开</strong>：同组仅主调开启调度，副调强制冷备关停，杜绝请求跳跃打碎缓存。<br/>
-            ⑤ <strong>保底尤慎重·防横跳死循环</strong>：同业务组内副调可用坚决不动用保底，每次切线进入冷静期与 20 分钟防横跳锁定。
+            <strong>📌 日常只需关注充值：</strong><br/>
+            ① 短暂波动先观察；确认故障或余额耗尽后，自动切到同业务组可用账号，无需逐次批准。<br/>
+            ② 备用账号持续接受健康检查，充值并稳定恢复后重新参与调度。<br/>
+            ③ 低价回切受稳定观察和冷静期约束；当前账号再次故障时仍可及时切出。<br/>
+            ④ 仅选择成本不高于分组售价的候选；不自动修改对外售价，无可用候选时提醒处理。<br/>
+            ⑤ 渠道开关只管理是否参与自动调度；人工停用的账号不会被自动重新启用。分组页面可覆盖本组参数。
           </div>
 
           <!-- 1. 核心规则四大铁律卡片 -->
           <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; margin-top: 0.75rem;">
             <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
-              <div style="font-weight: 700; color: #166534; margin-bottom: 2px;">🟢 谁便宜谁是主调</div>
-              <div style="color: #15803d; line-height: 1.35;">按进货倍率从低到高排列：最低为主调(100)，次低为副调(10)，其余为保底(1)</div>
+              <div style="font-weight: 700; color: #166534; margin-bottom: 2px;">🟢 健康后再比价</div>
+              <div style="color: #15803d; line-height: 1.35;">在同组健康、未人工停用且成本合适的账号中择优</div>
             </div>
             <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
-              <div style="font-weight: 700; color: #1e40af; margin-bottom: 2px;">🔵 失败率 ≥ 50% 切副调</div>
-              <div style="color: #1d4ed8; line-height: 1.35;">主调真实错误率达到门槛 (默认≥50%, 样本≥5) 或连续5次硬报错才触发调换副调</div>
+              <div style="font-weight: 700; color: #1e40af; margin-bottom: 2px;">🔵 故障自动接替</div>
+              <div style="color: #1d4ed8; line-height: 1.35;">按失败率、连续失败和余额判断；一次偶发失败不会立即切号</div>
             </div>
             <div style="background: #fefce8; border: 1px solid #fef08a; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
-              <div style="font-weight: 700; color: #854d0e; margin-bottom: 2px;">🟡 保底尤慎重</div>
-              <div style="color: #a16207; line-height: 1.35;">只要同组有健康副调，坚决使用副调；主调副调全部不可用时，才底线启用保底</div>
+              <div style="font-weight: 700; color: #854d0e; margin-bottom: 2px;">🟡 人工只需充值</div>
+              <div style="color: #a16207; line-height: 1.35;">余额刷新后自动验证恢复，故障号恢复不需要手动开关</div>
             </div>
             <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
               <div style="font-weight: 700; color: #334155; margin-bottom: 2px;">🛡️ 单主独占·防横跳</div>
-              <div style="color: #475569; line-height: 1.35;">副调冷备停调严禁双开；10分钟冷静期与20分钟防横跳锁定，杜绝死循环</div>
+              <div style="color: #475569; line-height: 1.35;">同组保留一个使用中账号；稳定后才低价回切，故障切出不受冷静期阻挡</div>
             </div>
           </div>
 
@@ -955,7 +894,7 @@
               <div class="as-config-row">
                 <div class="as-config-info">
                   <span class="as-config-label">自动切线总开关</span>
-                  <span class="as-config-desc">开启后云端将 24h 自动巡检全业务主调，当且仅当失败率超标或严重宕机时按价格调换</span>
+                  <span class="as-config-desc">持续检查纳管业务组，自动处理故障、欠费和恢复；关闭后暂停自动切号</span>
                 </div>
                 <button id="btnToggleAutoSwitch" class="toggle-switch-btn is-on">
                   <span>●</span> <span>已启用</span>
@@ -966,35 +905,8 @@
 
               <div class="as-config-row">
                 <div class="as-config-info">
-                  <span class="as-config-label">🔒 业务组严格单主独占（严禁同组多渠道同时开启）</span>
-                  <span class="as-config-desc">全站所有业务分组严格仅开启 1 个主调，所有副调强制关停冷备。物理杜绝同组多开分流，自动切线或换组时原子关闭同组其余全部渠道！</span>
-                </div>
-                <button id="btnToggleSingleActive" class="toggle-switch-btn is-on">
-                  <span>●</span> <span>已开启独占</span>
-                </button>
-              </div>
-
-              <div class="as-divider"></div>
-
-              <div class="as-config-row">
-                <div class="as-config-info">
-                  <span class="as-config-label">👑 人工主调锁定策略</span>
-                  <span class="as-config-desc">控制人工手动指定主调后的行为：【需确认接管】（安全铁律：绝不擅自动，确诊故障时弹窗请示）、【绝对锁死】（永不换）、或【直接容灾】</span>
-                </div>
-                <select id="selectManualLockPolicy" class="form-input mono" style="width: 235px; font-weight: 700;">
-                  <option value="confirm_required" selected>🛡️ 需确认接管 (推荐·绝不擅自动)</option>
-                  <option value="strict_lock">🔒 绝对锁死 (人工锁死·永不换)</option>
-                  <option value="failover_allowed">⚡ 直接容灾 (无需确认·自动切备用)</option>
-                  <option value="disabled">🔄 自由轮换 (不锁定·算法自治)</option>
-                </select>
-              </div>
-
-              <div class="as-divider"></div>
-
-              <div class="as-config-row">
-                <div class="as-config-info">
                   <span class="as-config-label">📊 故障切线失败率门槛</span>
-                  <span class="as-config-desc">主调通道错误率达到此百分比才触发调换副调（保全站 Prompt Cache 命中率）</span>
+                  <span class="as-config-desc">近期有效样本达到最低数量后，按此失败率判断故障</span>
                 </div>
                 <select id="selectFailRateThreshold" class="form-input mono" style="width: 185px; font-weight: 700;">
                   <option value="50" selected>50% (失败过半才切·推荐)</option>
@@ -1012,8 +924,8 @@
                   <span class="as-config-desc">主通道累计调用量达到该样本数才计算失败率，杜绝 1~2 次偶发网络抖动误切</span>
                 </div>
                 <select id="selectMinSampleSize" class="form-input mono" style="width: 170px; font-weight: 700;">
-                  <option value="5" selected>5 次 (均衡基准·推荐)</option>
-                  <option value="10">10 次 (高样本稳健)</option>
+                  <option value="5">5 次 (较快响应)</option>
+                  <option value="10" selected>10 次 (推荐)</option>
                   <option value="20">20 次 (超高防抖)</option>
                 </select>
               </div>
@@ -1037,7 +949,7 @@
               <div class="as-config-row">
                 <div class="as-config-info">
                   <span class="as-config-label">🧊 防抖动冷静期时长</span>
-                  <span class="as-config-desc">每次自动调换后锁定该时间段，杜绝频繁切换，保障下游客户端稳定连接</span>
+                  <span class="as-config-desc">限制健康账号之间的低价回切；当前账号故障时不必等冷静期结束</span>
                 </div>
                 <select id="selectCooldownMinutes" class="form-input mono" style="width: 170px; font-weight: 700;">
                   <option value="5">5 分钟</option>
@@ -1047,36 +959,13 @@
                 </select>
               </div>
 
-              <div class="as-divider"></div>
-
-              <div class="as-config-row">
-                <div class="as-config-info">
-                  <span class="as-config-label">🔀 20分钟防死循环横跳锁定</span>
-                  <span class="as-config-desc">刚刚发生故障切离的通道在 20 分钟内禁止作为低价主线切回，彻底打破死循环</span>
-                </div>
-                <button id="btnToggleAntiFlappingLock" class="toggle-switch-btn is-on">
-                  <span>●</span> <span>已锁定防抖</span>
-                </button>
-              </div>
-
-              <div class="as-divider"></div>
-
-              <div class="as-config-row">
-                <div class="as-config-info">
-                  <span class="as-config-label">🛡️ Prompt Cache 优先保护锁</span>
-                  <span class="as-config-desc">锁定主通道调度优先级，只要主调成功率在 80% 以上绝不跳线，力保上下文缓存命中</span>
-                </div>
-                <button id="btnTogglePromptCacheLock" class="toggle-switch-btn is-on">
-                  <span>●</span> <span>已锁定保护</span>
-                </button>
-              </div>
             </div>
           </div>
 
           <!-- 3. 操作按钮与演练评估 -->
           <div class="dialog-actions" style="margin-top: 1rem; display: flex; justify-content: space-between; align-items: center;">
             <button id="btnEvaluateAutoSwitchNow" class="btn btn-secondary" style="font-size: 0.8rem;">
-              ⚡ 立即模拟演练评估
+              ⚡ 立即检查并执行切号
             </button>
             <div style="display: flex; gap: 0.5rem;">
               <button id="btnCloseAutoSwitchModal" class="btn btn-secondary">取消</button>
@@ -1855,6 +1744,14 @@
               </div>
             </div>
 
+            <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 1rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.65rem;">
+                <strong style="color: #0f172a; font-size: 0.88rem;">上游分组资源目录</strong>
+                <button id="btnScanUpstreamGroups" class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.35rem 0.6rem;">立即抓取分组</button>
+              </div>
+              <div id="upstreamGroupCatalogList" style="display: flex; flex-direction: column; gap: 0.4rem; color: #64748b; font-size: 0.76rem;">暂无抓取记录</div>
+            </div>
+
             <!-- 待审批请示区域 (高亮任务队列) -->
             <div id="scanPendingSection" style="background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; padding: 1rem;">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
@@ -1931,9 +1828,6 @@
 
           <div style="display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; margin-top: 2px;">
             <h3 id="orchestrateGroupName" style="color: #0f172a; font-size: 1.18rem; margin: 0;">编排分组通道与角色</h3>
-            <button type="button" class="btn btn-secondary" onclick="autoQualifyOrchestrateModalByCost()" style="font-size: 0.75rem; padding: 0.25rem 0.65rem; color: #047857; background: #ecfdf5; border-color: #a7f3d0; font-weight: 700;" title="以进货成本最低为主调，次便宜为副调，第三为备选，其余全部归入备用通道">
-              ⚡ 一键按成本最优定性
-            </button>
           </div>
 
           <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.65rem 0.85rem; margin-top: 0.5rem; flex-shrink: 0;">
@@ -2128,7 +2022,7 @@
             <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
                 <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">🧊 防颠簸冷静期时长</span>
-                <span class="as-config-desc" style="font-size: 0.72rem;">切换后锁定该时间，防止频繁在主副间来回横跳</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">限制健康账号的低价回切；故障切出不受此时间限制</span>
               </div>
               <select id="selectGroupCooldown" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
                 <option value="5">5 分钟</option>
@@ -2143,7 +2037,7 @@
             <div class="as-config-row" style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
                 <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700; color: #166534;">📉 低成本优质通道充值恢复后自动回切</span>
-                <span class="as-config-desc" style="font-size: 0.72rem; color: #15803d;">原低价主调重新充值且健康后，自动回切并降回原对外售价 (人工主调受保护绝不回切)</span>
+                <span class="as-config-desc" style="font-size: 0.72rem; color: #15803d;">低价账号充值并稳定恢复后，满足冷静期和降本条件时自动回切；对外售价不变</span>
               </div>
               <button id="btnToggleGroupAutoRecover" class="toggle-switch-btn is-on" onclick="toggleGroupAutoRecoverState()">
                 <span>●</span> <span id="textGroupAutoRecoverState">已开启</span>
