@@ -1,9 +1,4 @@
 {
-  "passwordHash": "f76833d66655b53f2c530d39b6f9d0ab93e7d673763ba227ee3eaeb9c7db572e",
-  "salt": "d102d6afeb79b73d261d9c758a0adb1e",
-  "secret": "your-random-session-secret-here",
-  "initialPasswordHint": "RelayTower@2026!",
-  "updatedAt": "2026-09-12T00:00:00.000Z",
-  "gatewayApiKey": "sk-relay-example-key-change-in-control-panel",
+  "_comment": "Documentation only. Do not copy this file as runtime configuration; auth_config.json is created securely at first start.",
   "allowLoopbackWithoutKey": true
 }

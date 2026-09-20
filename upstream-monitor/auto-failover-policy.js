@@ -137,7 +137,17 @@ function evaluateGroup({ group, channels, metrics = {}, config = {}, runtime = {
     groupCostIsSafe(channel, group) && compatible(channel, required));
   candidates.sort((a, b) => Number(a.costMultiplier ?? a.multiplier) - Number(b.costMultiplier ?? b.multiplier) || priority(a) - priority(b) || Number(a.id) - Number(b.id));
   const currentFault = current ? health.get(String(current.id)).fault : 'no_active_account';
-  if (currentFault) return candidates.length ? result('switch', currentFault, candidates[0]) : result('exhausted', currentFault);
+  if (currentFault) {
+    if (!candidates.length) return result('exhausted', currentFault);
+    const target = candidates[0];
+    const lastSwitchAt = timestamp(runtime.lastSwitchAt);
+    if (currentFault === 'no_active_account' && runtime.lastTargetId && String(target.id) === String(runtime.lastTargetId) &&
+        lastSwitchAt != null && now - lastSwitchAt < 180000) {
+      return result('hold', 'cooldown');
+    }
+    next.lastTargetId = target.id;
+    return result('switch', currentFault, target);
+  }
   if (options.autoRecoverLowestCost === false) return result('hold', 'healthy');
   const lastSwitchAt = timestamp(runtime.lastSwitchAt);
   if (lastSwitchAt != null && now - lastSwitchAt < options.cooldownMinutes * 60000) return result('hold', 'cooldown');

@@ -19,7 +19,8 @@ function setup(ok = true, shared = false) {
   const context = { ...policy, state, console: { log: () => {}, warn: x => logs.push(x) }, autoSwitchConfig: { singleActiveExclusive: true },
     isExemptGroup: () => false, executeRemoteSQL: query => { sql.push(query); return ok; },
     invalidateSub2APIScheduler: () => {}, writeJSON: () => {}, broadcastSSE: () => {},
-    CHANNELS_FILE: 'unused', ALERTS_FILE: 'unused', alerts: [], getSub2APISignature: () => 'test', lastSub2APISignature: '', fetchAllSub2APIGroups: () => []
+    CHANNELS_FILE: 'unused', ALERTS_FILE: 'unused', alerts: [], getSub2APISignature: () => 'test', lastSub2APISignature: '',
+    refreshSub2APISignatureAfterDirectMutation: () => 'test', fetchAllSub2APIGroups: () => []
   };
   vm.createContext(context);
   vm.runInContext(extract('enforceSingleActiveState') + '\n' + extract('autoQualifyChannelsByCost'), context);
@@ -34,14 +35,16 @@ for (const name of ['autoQualifyChannelsByCost']) {
   assert.match(failed.sql[0], /UPDATE accounts/);
 
   const shared = setup(true, true);
-  shared.context[name]();
-  assert.equal(shared.state.channels[0].schedulable, false);
-  assert.equal(shared.state.channels[1].schedulable, true);
-  assert.equal(shared.state.channels[1].priority, 1);
-  assert.ok(shared.sql.length > 0);
+  const sharedBefore = JSON.stringify(shared.state);
+  const sharedResult = shared.context[name]();
+  assert.equal(sharedResult.success, false);
+  assert.match(sharedResult.message, /跨组共享通道/);
+  assert.equal(JSON.stringify(shared.state), sharedBefore);
+  assert.equal(shared.sql.length, 0);
 
   const success = setup();
-  success.context[name]();
+  const successResult = success.context[name]();
+  assert.equal(successResult.success, true);
   assert.equal(success.state.channels[0].schedulable, false);
   assert.equal(success.state.channels[1].schedulable, true);
   assert.equal(success.state.channels[1].priority, 1);

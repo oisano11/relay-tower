@@ -2,6 +2,9 @@ const http = require('http');
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
 
+const defaultHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 256, keepAliveMsecs: 60000, timeout: 30000 });
+const defaultHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 256, keepAliveMsecs: 60000, timeout: 30000 });
+
 function upstreamUrl(base, requestPath = '/v1/models') {
   const target = new URL(base);
   const incoming = new URL(requestPath, 'http://gateway.local');
@@ -14,7 +17,7 @@ function upstreamUrl(base, requestPath = '/v1/models') {
 }
 
 function isAvailable(channel) {
-  return !!channel && channel.autoSwitchDisabled !== true && channel.schedulable === true && channel.status === 'online' &&
+  return !!channel && channel.autoSwitchDisabled !== true && channel.safetyPending !== true && channel.schedulable === true && channel.status === 'online' &&
     channel.balanceStatus !== 'empty' &&
     (channel.balance == null || Number(channel.balance) > 0.001) &&
     !!channel.baseUrl && !!channel.apiKey;
@@ -72,7 +75,7 @@ function inspectFrame(frame) {
   } catch { return { error: namedError }; }
 }
 
-function forward(req, res, channel, { timeoutMs = 30000, metrics, onEnd = () => {} } = {}) {
+function forward(req, res, channel, { timeoutMs = 30000, metrics, onEnd = () => {}, agent } = {}) {
   const started = Date.now();
   let ended = false, ttftMs = null, upstreamResponse, pending = '', timer, errorPending = false;
   const decoder = new StringDecoder('utf8');
@@ -103,8 +106,12 @@ function forward(req, res, channel, { timeoutMs = 30000, metrics, onEnd = () => 
     }, Math.max(1, Math.min(timeoutMs, 5000)));
   };
   const target = upstreamUrl(channel.baseUrl, req.url);
-  const upstream = (target.protocol === 'https:' ? https : http).request(target, {
-    method: req.method, headers: requestHeaders(req.headers, channel.apiKey)
+  const isHttps = target.protocol === 'https:';
+  const selectedAgent = agent !== undefined ? agent : (isHttps ? defaultHttpsAgent : defaultHttpAgent);
+  const upstream = (isHttps ? https : http).request(target, {
+    method: req.method,
+    headers: requestHeaders(req.headers, channel.apiKey),
+    agent: selectedAgent
   }, response => {
     upstreamResponse = response;
     const streaming = String(response.headers['content-type'] || '').includes('text/event-stream');
@@ -159,4 +166,4 @@ function forward(req, res, channel, { timeoutMs = 30000, metrics, onEnd = () => 
   return upstream;
 }
 
-module.exports = { upstreamUrl, isAvailable, selectChannel, requestHeaders, GatewayMetrics, forward };
+module.exports = { upstreamUrl, isAvailable, selectChannel, requestHeaders, GatewayMetrics, forward, defaultHttpAgent, defaultHttpsAgent };

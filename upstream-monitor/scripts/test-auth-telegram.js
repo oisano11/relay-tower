@@ -7,16 +7,18 @@ const vm = require('node:vm');
 // Modules see only in-memory files and denied networking; production data is never read.
 function isolated(name) {
   const files = new Map(), logs = [];
+  const chmods = [];
   const fakeFs = { existsSync: p => files.has(p), mkdirSync() {},
     readFileSync: p => { if (!files.has(p)) throw Error('No fixture'); return files.get(p); },
-    writeFileSync: (p, body) => files.set(p, body) };
+    writeFileSync: (p, body) => files.set(p, body),
+    chmodSync: (p, mode) => chmods.push({ path: p, mode }) };
   const context = { module: { exports: {} }, __dirname: '/fixture', Buffer, URL,
     process: { env: { ADMIN_PASSWORD: 'fixture-password' } },
     console: Object.fromEntries(['log', 'warn', 'error'].map(k => [k, (...args) => logs.push(args.join(' '))])),
     setInterval: () => ({ unref() {} }), setTimeout, clearTimeout,
     require: name => name === 'fs' ? fakeFs : ['http', 'https'].includes(name) ? { request() { throw Error('External networking forbidden'); } } : require(name) };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', name), 'utf8'), context, { filename: name });
-  return { api: context.module.exports, logs, files };
+  return { api: context.module.exports, logs, files, chmods };
 }
 
 test('auth rejects spoofed loopback headers and accepts socket loopback / gateway key', () => {
@@ -79,4 +81,16 @@ test('Telegram callbacks require the individual sender authorization', async () 
   await api.handleCallbackQuery({ id: 'callback', from: { id: 2 }, message: { chat: { id: -123 } }, data: 'cmd:status' });
   assert.equal(answers[0].method, 'answerCallbackQuery');
   assert.match(answers[0].payload.text, /权限不足/);
+});
+
+test('Telegram configuration is written with private file and directory permissions', () => {
+  const { api, files, chmods } = isolated('telegram.js');
+  assert.equal(api.saveConfig({ botToken: 'fixture-token', adminChatIds: ['1'] }), true);
+  const configPath = '/fixture/data/telegram_config.json';
+  assert.match(files.get(configPath), /fixture-token/);
+  assert.deepEqual(chmods, [
+    { path: '/fixture/data', mode: 0o700 },
+    { path: '/fixture/data', mode: 0o700 },
+    { path: configPath, mode: 0o600 }
+  ]);
 });
