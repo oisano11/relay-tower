@@ -45,6 +45,8 @@
 
 ## 🚀 启动方式
 
+首次可用启动前，请在部署的密钥管理或未提交的环境文件中设置至少 8 位的 `ADMIN_PASSWORD`。程序不会打印、保存明文提示或回显管理密码/网关密钥；如果首次启动未提供有效密码，服务会保持中控台登录禁用，并在后续设置环境变量、重启后完成初始化。
+
 ```bash
 cd upstream-monitor
 node server.js
@@ -55,6 +57,12 @@ node server.js
 ```
 
 打开浏览器访问：`http://localhost:3300`
+
+### Docker Compose 安全说明
+
+独立部署使用命名卷 `upstream-monitor-data` 保存运行时数据，不再将源码目录挂载进容器。升级旧的 `.:/app` 部署前，应先备份或迁移现有 `data/`；命名卷不会自动读取旧的宿主机目录。
+
+容器进程以非 root 用户运行，且根文件系统只读；设置 `DOCKER_GID` 为目标 Linux 主机 `/var/run/docker.sock` 的属组数字后，现有 `docker exec` 控制面才能继续工作。该 socket 必须保持可写以发起 exec 请求，也仍等同于高权限宿主机控制面访问，不能视为已消除风险。
 
 ## 验收与架构边界
 

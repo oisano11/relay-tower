@@ -15,6 +15,6 @@
   "originalGroupSaleRates": {},
   "lastSwitchTime": null,
   "lastSwitchReason": null,
-  "exemptKeywords": ["通用", "自用", "私人", "private"],
+  "exemptKeywords": ["GPT 通用", "GPT通用", "GPT通用通道", "通用", "自用", "私人", "private"],
   "exemptGroupIds": []
 }

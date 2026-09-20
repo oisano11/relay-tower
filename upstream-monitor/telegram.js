@@ -3,9 +3,62 @@ const http = require('http');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'telegram_config.json');
+const DATA_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+// Telegram configuration contains the bot token and administrator IDs. Keep it
+// private even when the host's umask is permissive, and replace it atomically
+// so an interrupted write cannot leave a half-written credential file.
+function ensurePrivateConfigStorage() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: DATA_DIR_MODE });
+    if (typeof fs.chmodSync === 'function') fs.chmodSync(DATA_DIR, DATA_DIR_MODE);
+    if (fs.existsSync(CONFIG_FILE) && typeof fs.chmodSync === 'function') {
+      fs.chmodSync(CONFIG_FILE, PRIVATE_FILE_MODE);
+    }
+    return true;
+  } catch (e) {
+    console.error('[Telegram] 无法设置配置文件权限:', e.message);
+    return false;
+  }
+}
+
+function writePrivateConfig(config) {
+  if (!ensurePrivateConfigStorage()) return false;
+  const payload = JSON.stringify(config, null, 2);
+  const canWriteAtomically = ['openSync', 'writeFileSync', 'closeSync', 'renameSync']
+    .every(method => typeof fs[method] === 'function');
+
+  try {
+    // Test doubles and unusual virtual filesystems may not expose file
+    // descriptors. Node's real filesystem always takes the atomic path.
+    if (!canWriteAtomically) {
+      fs.writeFileSync(CONFIG_FILE, payload, { encoding: 'utf-8', mode: PRIVATE_FILE_MODE });
+      if (typeof fs.chmodSync === 'function') fs.chmodSync(CONFIG_FILE, PRIVATE_FILE_MODE);
+      return true;
+    }
+
+    const tempFile = path.join(DATA_DIR, `.${path.basename(CONFIG_FILE)}.${process.pid || 'pid'}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+    const fd = fs.openSync(tempFile, 'wx', PRIVATE_FILE_MODE);
+    try {
+      if (typeof fs.fchmodSync === 'function') fs.fchmodSync(fd, PRIVATE_FILE_MODE);
+      fs.writeFileSync(fd, payload, 'utf-8');
+      if (typeof fs.fsyncSync === 'function') fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tempFile, CONFIG_FILE);
+    if (typeof fs.chmodSync === 'function') fs.chmodSync(CONFIG_FILE, PRIVATE_FILE_MODE);
+    return true;
+  } catch (e) {
+    console.error('[Telegram] 保存配置文件失败:', e.message);
+    return false;
+  }
+}
 
 // 默认配置
 const DEFAULT_CONFIG = {
@@ -28,6 +81,27 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;');
 }
 
+// 格式化上海时区完整日期时间 (YYYY-MM-DD HH:mm:ss)
+function formatShanghaiDateTime(inputDate = new Date()) {
+  try {
+    const d = (inputDate instanceof Date) ? inputDate : new Date(inputDate);
+    if (isNaN(d.getTime())) return String(inputDate || '--');
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    });
+    return formatter.format(d).replace(',', '');
+  } catch (e) {
+    return new Date().toISOString();
+  }
+}
+
 class TelegramBotManager {
   constructor() {
     this.config = this.loadConfig();
@@ -46,6 +120,7 @@ class TelegramBotManager {
 
   loadConfig() {
     try {
+      if (!ensurePrivateConfigStorage()) return { ...DEFAULT_CONFIG };
       if (fs.existsSync(CONFIG_FILE)) {
         const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
         const parsed = JSON.parse(raw);
@@ -58,17 +133,10 @@ class TelegramBotManager {
   }
 
   saveConfig(newConfig) {
-    try {
-      this.config = { ...this.config, ...newConfig };
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(this.config, null, 2), 'utf-8');
-      return true;
-    } catch (e) {
-      console.error('[Telegram] 保存配置文件失败:', e.message);
-      return false;
-    }
+    const nextConfig = { ...this.config, ...newConfig };
+    if (!writePrivateConfig(nextConfig)) return false;
+    this.config = nextConfig;
+    return true;
   }
 
   init(contextHooks = {}) {
@@ -522,7 +590,7 @@ class TelegramBotManager {
       `• 全站今日总调用: <b>${Number(totalCalls24h).toLocaleString()}</b> 次\n` +
       `• 渠道调度池: 共接入 ${state.channels.length} 家 (${schedulableCount} 家在池 / ${lossCount} 家倒贴)\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `🕒 <i>更新时间: ${new Date().toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' })}</i>`;
+      `📅 <b>更新时间:</b> <code>${formatShanghaiDateTime()}</code>`;
 
     const reply_markup = {
       inline_keyboard: [
@@ -726,7 +794,7 @@ class TelegramBotManager {
         }
       });
     } else {
-      await this.sendMessage(chatId, `❌ 切换失败: ${res?.error || '调度中心处理异常'}`);
+      await this.sendMessage(chatId, `❌ 切换失败: ${res?.error || '调度中心处理异常'}\n📅 发生时间: <code>${formatShanghaiDateTime()}</code>`);
     }
   }
 
@@ -820,7 +888,7 @@ class TelegramBotManager {
         }
       });
     } catch (e) {
-      await this.sendMessage(chatId, `❌ 巡检失败: ${e.message}`);
+      await this.sendMessage(chatId, `❌ 巡检失败: ${e.message}\n📅 发生时间: <code>${formatShanghaiDateTime()}</code>`);
     }
   }
 
@@ -841,6 +909,7 @@ class TelegramBotManager {
     let message = 
       `${title}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
+      `📅 <b>告警时间:</b> <code>${formatShanghaiDateTime()}</code>\n` +
       `📡 <b>变动渠道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
       `📊 <b>倍率调整:</b> <code>${Number(oldMultiplier).toFixed(4)}x</code> ➔ <b><code>${Number(newMultiplier).toFixed(4)}x</code></b> (<b>${isSurge ? '+' : '-'}${changePercent}%</b>)\n` +
       `🏢 <b>供应商:</b> ${channel.provider || channel.vendor || '通用'}\n` +
@@ -895,6 +964,7 @@ class TelegramBotManager {
     const message =
       `${recovered ? '🟢 <b>【账号稳定恢复，已自动回切】</b>' : '⚡ <b>【故障自动切号完成】</b>'}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
+      `📅 <b>发生时间:</b> <code>${formatShanghaiDateTime(logEntry.timestamp || new Date())}</code>\n` +
       `📁 <b>业务分组:</b> ${safeGroup}\n` +
       `🔄 <b>切号:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
       `🎯 <b>原因:</b> ${safeReason}\n` +
@@ -927,6 +997,7 @@ class TelegramBotManager {
     const message = 
       `🔀 <b>【主力出海线路切换通知】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
+      `📅 <b>操作时间:</b> <code>${formatShanghaiDateTime()}</code>\n` +
       `🌟 <b>新主力通道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
       `💸 <b>进货倍率:</b> <code>${channel.multiplier}x</code>\n` +
       `👥 <b>当前负载:</b> <b>${u15m}</b> 人在线 · <b>${inflight}</b> 个并发\n` +
@@ -959,6 +1030,7 @@ class TelegramBotManager {
     const message = 
       `🎯 <b>【上游定性级别调整】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
+      `📅 <b>调整时间:</b> <code>${formatShanghaiDateTime()}</code>\n` +
       `📌 <b>目标通道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
       `🏷️ <b>最新定性:</b> <b>${roleName}</b>\n` +
       `💸 <b>进货倍率:</b> <code>${channel.costMultiplier !== undefined ? channel.costMultiplier : channel.multiplier}x</code>\n` +
@@ -990,10 +1062,10 @@ class TelegramBotManager {
           } catch (e) {}
         }
       } else {
-        await this.sendMessage(chatId, `❌ 巡检失败: ${res.error || res.message || '未知错误'}`);
+        await this.sendMessage(chatId, `❌ 巡检失败: ${res.error || res.message || '未知错误'}\n📅 发生时间: <code>${formatShanghaiDateTime()}</code>`);
       }
     } catch (err) {
-      await this.sendMessage(chatId, `❌ 执行巡检异常: ${err.message}`);
+      await this.sendMessage(chatId, `❌ 执行巡检异常: ${err.message}\n📅 发生时间: <code>${formatShanghaiDateTime()}</code>`);
     }
   }
 
@@ -1156,7 +1228,7 @@ class TelegramBotManager {
       `🎉 <b>【中转塔台 Telegram 机器人测试成功】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🤖 <b>机器人:</b> ${this.botInfo ? `${this.botInfo.first_name} (@${this.botInfo.username})` : '中转塔台'}\n` +
-      `🕒 <b>测试时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n` +
+      `📅 <b>测试时间:</b> <code>${formatShanghaiDateTime()}</code>\n` +
       `📡 <b>中控台状态:</b> 连通性良好，双向通信正常！\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `💡 您已成功完成绑定，以后上游变价或自动切线时将第一时间通知您。`;

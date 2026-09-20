@@ -3,11 +3,31 @@ services:
     build: .
     container_name: upstream-monitor
     restart: always
+    user: "node"
+    # The app is unprivileged; this grants only the Docker socket's owning group so its existing
+    # docker exec control-plane calls can continue. Set this to `stat -c '%g' /var/run/docker.sock`.
+    group_add:
+      - "${DOCKER_GID:?Set DOCKER_GID to the numeric group ID owning /var/run/docker.sock}"
     ports:
       - "33890:3300"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     volumes:
-      - .:/app
-      - /var/run/docker.sock:/var/run/docker.sock
+      - upstream-monitor-data:/app/data
+      # Kept only because server.js currently issues docker exec calls. Docker's API remains
+      # host-privileged and requires write requests for exec; this mount does not remove that risk.
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
-      - PORT=3300
-      - IS_VPS=true
+      PORT: "3300"
+      IS_VPS: "true"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
+
+volumes:
+  upstream-monitor-data:
+    name: "${UPSTREAM_MONITOR_DATA_VOLUME:-upstream-monitor-data}"

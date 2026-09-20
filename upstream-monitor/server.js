@@ -4,12 +4,16 @@ const fs = require('fs');
 const path = require('path');
 const url = require('url');
 const crypto = require('crypto');
-const { execSync, execFileSync } = require('child_process');
+const { execSync, execFileSync, fork } = require('child_process');
 const gateway = require('./gateway');
 const gatewayMetrics = new gateway.GatewayMetrics();
 const { groupIds, assertExclusiveScope, groupCostIsSafe } = require('./routing-policy');
 const { evaluateGroup } = require('./auto-failover-policy');
 const { EventEmitter } = require('events');
+// A worker is deliberately read-only with respect to local runtime JSON.  It
+// can use the synchronous DB/SSH adapters without blocking the gateway, but
+// it must return observations to the main process for application.
+const IS_CONTROL_PLANE_WORKER = process.env.CONTROL_PLANE_WORKER === 'true';
 
 const PORT = process.env.PORT || 3300;
 const DATA_DIR = path.join(__dirname, 'data');
@@ -20,6 +24,35 @@ const UPSTREAM_PANEL_FILE = path.join(DATA_DIR, 'upstream_panel.json');
 const UPSTREAM_PANELS_FILE = path.join(DATA_DIR, 'upstream_panels.json');
 const UPSTREAM_MODELS_CACHE_FILE = path.join(DATA_DIR, 'upstream_models_cache.json');
 const UPSTREAM_GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
+const DATA_DIR_MODE = 0o700;
+const RUNTIME_DATA_FILE_MODE = 0o600;
+
+function isRuntimeDataFile(filePath) {
+  const dataDir = path.resolve(DATA_DIR);
+  return path.dirname(path.resolve(filePath)) === dataDir;
+}
+
+// Runtime JSON stores upstream API keys, panel cookies and operational state.
+// Keep the containing directory private and repair legacy loose modes before
+// reading them. A permission failure is fail-closed so we never silently load
+// sensitive configuration that the process cannot protect.
+function ensurePrivateRuntimeStorage(filePath) {
+  // The main process establishes and repairs the private data directory. A
+  // short-lived control-plane worker must never chmod or create files while it
+  // is only collecting a snapshot.
+  if (IS_CONTROL_PLANE_WORKER) return true;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: DATA_DIR_MODE });
+    if (typeof fs.chmodSync === 'function') fs.chmodSync(DATA_DIR, DATA_DIR_MODE);
+    if (isRuntimeDataFile(filePath) && fs.existsSync(filePath) && typeof fs.chmodSync === 'function') {
+      fs.chmodSync(filePath, RUNTIME_DATA_FILE_MODE);
+    }
+    return true;
+  } catch (err) {
+    console.error(`[Security] 无法设置运行时存储权限 (${path.basename(filePath)}):`, err.message);
+    return false;
+  }
+}
 
 // 兼容读取与多上游管理池加载
 function loadUpstreamPanels() {
@@ -35,8 +68,8 @@ function loadUpstreamPanels() {
     }
     if (legacy && legacy.backendUrl) {
       list.push({
-        id: 'panel_jinlong',
-        name: '金龙 New-API (jlaudeapi.com)',
+        id: legacy.id || 'panel_default',
+        name: legacy.name || '默认 New-API 平台',
         backendUrl: legacy.backendUrl,
         authMode: legacy.authMode || 'credentials',
         username: legacy.username || '',
@@ -51,7 +84,7 @@ function loadUpstreamPanels() {
         lastError: legacy.lastError || null,
         enabled: true
       });
-      writeJSON(UPSTREAM_PANELS_FILE, list);
+      if (!IS_CONTROL_PLANE_WORKER) writeJSON(UPSTREAM_PANELS_FILE, list);
     }
   }
   return list;
@@ -99,9 +132,13 @@ const SSH_HOST = process.env.SSH_HOST || '';
 const SSH_PORT = process.env.SSH_PORT || '22';
 const SSH_USER = process.env.SSH_USER || 'root';
 
-const auth = require('./auth');
-const telegram = require('./telegram');
-const upstreamScanner = require('./upstream_scanner');
+// A control-plane child never serves HTTP, polls Telegram, or scans upstream
+// APIs.  More importantly, loading these modules initializes their local JSON
+// stores, which would make a nominally read-only snapshot worker a second
+// runtime-state writer.  Keep those modules out of the child entirely.
+const auth = IS_CONTROL_PLANE_WORKER ? null : require('./auth');
+const telegram = IS_CONTROL_PLANE_WORKER ? null : require('./telegram');
+const upstreamScanner = IS_CONTROL_PLANE_WORKER ? null : require('./upstream_scanner');
 const IS_VPS = process.env.IS_VPS === 'true';
 
 // 通用数据库查询封装 (在 VPS 本地直接运行 docker exec，避免远程 SSH 延迟；本地则通过 SSH)
@@ -121,7 +158,7 @@ function execPsql(sql, isTupleOnly = true) {
 // 通用 Redis 命令执行封装 (直连 sub2api-redis，操作调度与鉴权缓存)
 function execRedis(args) {
   try {
-    const safeInner = `redis-cli ${args}`.replace(/'/g, "'\\''");
+    const safeInner = `env -u REDISCLI_AUTH redis-cli ${args}`.replace(/'/g, "'\\''");
     if (IS_VPS) {
       const cmd = `docker exec sub2api-redis sh -c '${safeInner}'`;
       return execSync(cmd, { encoding: 'utf-8', timeout: 4000 });
@@ -140,18 +177,21 @@ function execRedis(args) {
 // 立即刷新 Sub2API 的 Redis 调度缓存，保证模型开关、分组调整毫秒级即时生效
 function invalidateSub2APIScheduler(accountIds = null) {
   try {
+    let succeeded = true;
     if (accountIds) {
       const ids = Array.isArray(accountIds) ? accountIds : [accountIds];
       const validIds = ids.map(id => Number(id)).filter(n => !isNaN(n));
       if (validIds.length > 0) {
         const keys = validIds.flatMap(id => [`sched:acc:${id}`, `sched:meta:${id}`, `concurrency:account:${id}`]);
-        execRedis(`unlink ${keys.join(' ')}`);
+        if (execRedis(`unlink ${keys.join(' ')}`) === null) succeeded = false;
       }
     }
     // 清理调度就绪集与路由版本，迫使 Sub2API 调度器立即按最新 PostgreSQL 数据重构调度池
-    execRedis(`eval "for _,k in ipairs(redis.call('keys','sched:ready:*')) do redis.call('del',k) end for _,k in ipairs(redis.call('keys','sched:ver:*')) do redis.call('del',k) end" 0`);
+    if (execRedis(`eval "for _,k in ipairs(redis.call('keys','sched:ready:*')) do redis.call('del',k) end for _,k in ipairs(redis.call('keys','sched:ver:*')) do redis.call('del',k) end" 0`) === null) succeeded = false;
+    return succeeded;
   } catch (e) {
     console.error('invalidateSub2APIScheduler failed:', e.message);
+    return false;
   }
 }
 
@@ -165,6 +205,9 @@ function maskApiKey(key) {
 const sseClients = new Set();
 
 function readJSON(filePath, defaultValue) {
+  if (!IS_CONTROL_PLANE_WORKER && !ensurePrivateRuntimeStorage(filePath)) {
+    throw new Error(`无法安全读取运行时配置: ${path.basename(filePath)}`);
+  }
   try {
     if (!fs.existsSync(filePath)) return defaultValue;
     const content = fs.readFileSync(filePath, 'utf-8');
@@ -175,13 +218,59 @@ function readJSON(filePath, defaultValue) {
   }
 }
 
+const jsonWriteCache = new Map();
+
 function writeJSON(filePath, data) {
+  // Child workers return snapshots only. This guard prevents an accidental
+  // future call site from racing the main process's JSON writes.
+  if (IS_CONTROL_PLANE_WORKER) return false;
+  let tmpPath = null;
+  let tempCreated = false;
   try {
-    const tmpPath = `${filePath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
+    if (!ensurePrivateRuntimeStorage(filePath)) return false;
+
+    // 滑动窗口裁剪历史队列，避免文件与内存无限膨胀
+    const baseName = path.basename(filePath);
+    if ((baseName === 'alerts.json' || baseName === 'auto_switch_logs.json') && Array.isArray(data) && data.length > 500) {
+      data.length = 500;
+    }
+
+    const payload = JSON.stringify(data, null, 2);
+    const contentHash = crypto.createHash('sha256').update(payload).digest('hex');
+    if (jsonWriteCache.get(filePath) === contentHash && fs.existsSync(filePath)) {
+      return true; // 内容未变动，跳过冗余写盘与 fsyncSync
+    }
+
+    const canWriteAtomically = ['openSync', 'writeFileSync', 'closeSync', 'renameSync']
+      .every(method => typeof fs[method] === 'function');
+    if (!canWriteAtomically) {
+      fs.writeFileSync(filePath, payload, { encoding: 'utf-8', mode: RUNTIME_DATA_FILE_MODE });
+      jsonWriteCache.set(filePath, contentHash);
+      if (isRuntimeDataFile(filePath) && typeof fs.chmodSync === 'function') fs.chmodSync(filePath, RUNTIME_DATA_FILE_MODE);
+      return true;
+    }
+
+    tmpPath = path.join(DATA_DIR, `.${path.basename(filePath)}.${process.pid || 'pid'}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+    const fd = fs.openSync(tmpPath, 'wx', RUNTIME_DATA_FILE_MODE);
+    tempCreated = true;
+    try {
+      if (typeof fs.fchmodSync === 'function') fs.fchmodSync(fd, RUNTIME_DATA_FILE_MODE);
+      fs.writeFileSync(fd, payload, 'utf-8');
+      if (typeof fs.fsyncSync === 'function') fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmpPath, filePath);
+    tempCreated = false;
+    jsonWriteCache.set(filePath, contentHash);
+    if (isRuntimeDataFile(filePath) && typeof fs.chmodSync === 'function') fs.chmodSync(filePath, RUNTIME_DATA_FILE_MODE);
+    return true;
   } catch (err) {
+    if (tempCreated && tmpPath && typeof fs.unlinkSync === 'function') {
+      try { fs.unlinkSync(tmpPath); } catch { /* Preserve the original write error. */ }
+    }
     console.error(`Error writing ${filePath}:`, err);
+    return false;
   }
 }
 
@@ -234,7 +323,9 @@ let autoSwitchConfig = readJSON(AUTO_SWITCH_CONFIG_FILE, {
 autoSwitchConfig.manualLockPolicy = 'failover_allowed';
 autoSwitchConfig.singleActiveExclusive = true;
 state.failoverRuntime = state.failoverRuntime || {};
-state.pendingFailoverProposals = {};
+// Pending proposals are main-process runtime state. A forked worker used to
+// clear its copy and then return it wholesale, erasing live proposals.
+if (!IS_CONTROL_PLANE_WORKER) state.pendingFailoverProposals = {};
 let autoSwitchLogs = readJSON(AUTO_SWITCH_LOGS_FILE, []);
 
 // 判定业务分组是否为“例外分组”(通用、自用、私人等由用户全权手动调优的分组，系统绝不自动切线、比价、改价、关停)
@@ -280,6 +371,16 @@ function isExemptGroup(groupOrIdOrName) {
   return false;
 }
 
+// 判定特定渠道是否为“例外渠道”(如 GPT 通用通道、包含豁免关键字的通道，系统绝不自动切线、不自动调优，纯手动控制)
+function isExemptChannel(channel) {
+  if (!channel) return false;
+  if (channel.autoSwitchDisabled === true) return true;
+  const name = String(channel.name || '').toLowerCase();
+  const config = (typeof autoSwitchConfig === 'object' && autoSwitchConfig !== null) ? autoSwitchConfig : {};
+  const exemptKeywords = config.exemptKeywords || ['GPT 通用', 'GPT通用', 'GPT通用通道', '通用', '自用', '私人', 'private'];
+  return exemptKeywords.some(kw => name.includes(kw.toLowerCase()));
+}
+
 function broadcastSSE(eventType, data) {
   // 核心拦截保护：当广播 CHANNELS_UPDATED 时，自动补齐完整 modelsStability 并对 API Key 脱敏
   if (eventType === 'CHANNELS_UPDATED') {
@@ -293,35 +394,17 @@ function broadcastSSE(eventType, data) {
     }
 
     if (channels) {
-      const stabilityMap = fetchChannelStabilityMetrics(false);
-      const userActivityMap = fetchChannelUserActivity(false);
-      const safeChannels = channels.map(c => {
-        const copy = { ...c };
-        if (copy.apiKey) copy.apiKey = maskApiKey(copy.apiKey);
-        if (!copy.modelsStability || copy.modelsStability.length === 0) {
-          copy.modelsStability = stabilityMap[String(c.id)] || [];
-        }
-        if (!copy.stability) {
-          copy.stability = getChannelStabilitySummary(c.id, stabilityMap);
-        }
-        copy.userActivity = userActivityMap[String(c.id)] || {
-          activeUsers15m: 0,
-          activeUsers1h: 0,
-          activeUsers24h: 0,
-          calls15m: 0,
-          calls1h: 0,
-          calls24h: 0,
-          lastUsedAt: null,
-          recentUsers: []
-        };
-        return copy;
-      });
+      // SSE delivery is on the same event loop as /v1. It must never turn a
+      // notification into a synchronous Docker/SSH query. A control-plane
+      // worker refreshes these caches independently; this path serves the
+      // last known snapshot plus live in-process gateway counters.
+      const safeChannels = getEnrichedChannels(false, true, channels);
       data = {
         activeChannelId: state.activeChannelId,
         autoPollIntervalSeconds: state.autoPollIntervalSeconds,
         channels: safeChannels,
         groups: state.allGroups || [],
-        globalUserStats: fetchGlobalUserStats(false)
+        globalUserStats: getCachedGlobalUserStats()
       };
     }
   }
@@ -626,11 +709,74 @@ async function syncSingleUpstreamPanel(params = {}) {
   let models = params.models || [];
 
   try {
-    // 若提供账号密码，智能自适应登录 (同时支持 Sub2API 与 New-API)
-    if (username && password) {
-      let loginOk = false;
-      let lastLoginErr = '';
+    let loginOk = false;
+    let lastLoginErr = '';
 
+    // 若已有凭据（token 或 cookie），优先尝试轻量预检 Session 探活，避免频繁触发登录风控 (409 Conflict)
+    if (token || cookie) {
+      // 优先尝试 Sub2API 会话探活 (/api/v1/auth/me)
+      if (token && !loginOk) {
+        try {
+          const probeRes = await fetch(`${backendUrl}/api/v1/auth/me`, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'User-Agent': 'Mozilla/5.0'
+            },
+            signal: AbortSignal.timeout(5000)
+          });
+          if (probeRes.ok) {
+            const probeData = await probeRes.json();
+            if (probeData.code === 0 && probeData.data) {
+              const u = probeData.data.user || probeData.data;
+              const rawBal = u.balance !== undefined ? u.balance : 0;
+              userInfo = {
+                id: u.id,
+                username: u.email || u.username || username,
+                role: u.role,
+                quota: Math.round(Number(rawBal) * 500000),
+                balanceUSD: Number(Number(rawBal).toFixed(2)),
+                usedQuota: 0
+              };
+              loginOk = true;
+            }
+          }
+        } catch (e) {}
+      }
+
+      // 优先尝试 New-API / One-API 会话探活 (/api/user/self)
+      if (!loginOk && (token || cookie)) {
+        try {
+          const probeHeaders = { 'User-Agent': 'Mozilla/5.0' };
+          if (token) probeHeaders['Authorization'] = `Bearer ${token}`;
+          if (cookie) probeHeaders['Cookie'] = cookie;
+          const probeRes = await fetch(`${backendUrl}/api/user/self`, {
+            method: 'GET',
+            headers: probeHeaders,
+            signal: AbortSignal.timeout(5000)
+          });
+          if (probeRes.ok) {
+            const probeData = await probeRes.json();
+            if (probeData.success && probeData.data) {
+              const u = probeData.data;
+              const quota = u.quota || 0;
+              userInfo = {
+                id: u.id,
+                username: u.username || username,
+                role: u.role,
+                quota,
+                balanceUSD: Number((quota / 500000).toFixed(2)),
+                usedQuota: u.used_quota || 0
+              };
+              loginOk = true;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    // 若未通过 Session 探活且提供账号密码，智能自适应登录 (同时支持 Sub2API 与 New-API)
+    if (!loginOk && username && password) {
       // 方式 1: 尝试 Sub2API 登录协议 (/api/v1/auth/login)
       try {
         const sub2Res = await fetch(`${backendUrl}/api/v1/auth/login`, {
@@ -766,7 +912,7 @@ async function syncSingleUpstreamPanel(params = {}) {
       } catch (e) {}
     }
 
-    // 尝试 3: /v1/usage 协议 (适用于 Token/API Key 模式，如 子桐)
+    // 尝试 3: /v1/usage 协议 (适用于 Token/API Key 模式)
     if ((token || cookie) && !userInfo) {
       try {
         const usageRes = await fetch(`${backendUrl}/v1/usage`, {
@@ -957,7 +1103,7 @@ function switchRemoteAccountBaseUrl(accountId, newUrl) {
   const ok = executeRemoteSQL(sql);
   if (ok) {
     invalidateSub2APIScheduler(accountId);
-    lastSub2APISignature = getSub2APISignature();
+    refreshSub2APISignatureAfterDirectMutation('上游主线路更新');
   }
   const ch = state.channels.find(c => String(c.id) === String(accountId));
   if (ch) {
@@ -983,33 +1129,62 @@ function switchRemoteAccountBaseUrl(accountId, newUrl) {
   return ok;
 }
 
-function handleRatioChange(channel, oldMultiplier, newMultiplier, reason = '上游接口自动巡检检测到倍率变动') {
-  if (oldMultiplier === newMultiplier) return null;
-  const changePercent = Number((((newMultiplier - oldMultiplier) / oldMultiplier) * 100).toFixed(2));
-  const direction = newMultiplier > oldMultiplier ? 'up' : 'down';
+function buildRatioChangeAlert(channel, oldMultiplier, newMultiplier, reason = '上游接口自动巡检检测到倍率变动') {
+  const oldValue = Number(oldMultiplier);
+  const newValue = Number(newMultiplier);
+  if (!Number.isFinite(oldValue) || !Number.isFinite(newValue) || Math.abs(oldValue - newValue) <= 0.0001) return null;
+  const changePercent = oldValue === 0
+    ? 0
+    : Number((((newValue - oldValue) / oldValue) * 100).toFixed(2));
+  const direction = newValue > oldValue ? 'up' : 'down';
   const isActive = state.activeChannelId === String(channel.id);
 
-  const alert = {
+  return {
     id: 'alt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
     channelId: String(channel.id),
     channelName: channel.name,
     vendor: channel.vendor,
     schedulable: !!channel.schedulable,
     type: 'ratio_change',
-    oldMultiplier: Number(oldMultiplier.toFixed(4)),
-    newMultiplier: Number(newMultiplier.toFixed(4)),
+    oldMultiplier: Number(oldValue.toFixed(4)),
+    newMultiplier: Number(newValue.toFixed(4)),
     changePercent: Math.abs(changePercent),
     direction,
     isActiveChannel: isActive,
     timestamp: new Date().toISOString(),
     acknowledged: false,
     reason,
-    note: `${channel.name} 进货倍率由 ${Number(oldMultiplier).toFixed(4)}x 调整为 ${Number(newMultiplier).toFixed(4)}x (${direction === 'up' ? '涨价 +' : '降价 -'}${Math.abs(changePercent)}%)`
+    note: `${channel.name} 进货倍率由 ${oldValue.toFixed(4)}x 调整为 ${newValue.toFixed(4)}x (${direction === 'up' ? '涨价 +' : '降价 -'}${Math.abs(changePercent)}%)`
   };
+}
+
+function publishRatioChangeAlert(alert, channel, options = {}) {
+  if (IS_CONTROL_PLANE_WORKER || !alert || !channel) return;
+  broadcastSSE('RATIO_ALERT', { alert, channel });
+  if (options.broadcastChannels !== false) broadcastSSE('CHANNELS_UPDATED', state);
+
+  // 实时向 Telegram 管理员推送倍率变动告警
+  try {
+    Promise.resolve(telegram.notifyRatioChange({
+      channel,
+      oldMultiplier: alert.oldMultiplier,
+      newMultiplier: alert.newMultiplier,
+      direction: alert.direction,
+      changePercent: alert.changePercent,
+      isActiveChannel: alert.isActiveChannel,
+      reason: alert.reason
+    })).catch(error => console.error('[Telegram] notifyRatioChange 异常:', error.message));
+  } catch (err) {
+    console.error('[Telegram] notifyRatioChange 异常:', err.message);
+  }
+}
+
+function handleRatioChange(channel, oldMultiplier, newMultiplier, reason = '上游接口自动巡检检测到倍率变动', options = {}) {
+  const alert = buildRatioChangeAlert(channel, oldMultiplier, newMultiplier, reason);
+  if (!alert) return null;
 
   alerts.unshift(alert);
   if (alerts.length > 200) alerts = alerts.slice(0, 200);
-  writeJSON(ALERTS_FILE, alerts);
 
   ratioHistory.unshift({
     timestamp: alert.timestamp,
@@ -1019,30 +1194,17 @@ function handleRatioChange(channel, oldMultiplier, newMultiplier, reason = '上�
     direction
   });
   if (ratioHistory.length > 500) ratioHistory = ratioHistory.slice(0, 500);
-  writeJSON(HISTORY_FILE, ratioHistory);
 
-  channel.previousMultiplier = oldMultiplier;
-  channel.multiplier = newMultiplier;
+  channel.previousMultiplier = alert.oldMultiplier;
+  channel.multiplier = alert.newMultiplier;
   channel.lastCheckTime = new Date().toISOString();
-  writeJSON(CHANNELS_FILE, state);
 
-  broadcastSSE('RATIO_ALERT', { alert, channel });
-  broadcastSSE('CHANNELS_UPDATED', state);
-
-  // 实时向 Telegram 管理员推送倍率变动告警
-  try {
-    telegram.notifyRatioChange({
-      channel,
-      oldMultiplier,
-      newMultiplier,
-      direction,
-      changePercent,
-      isActiveChannel: isActive,
-      reason
-    });
-  } catch (err) {
-    console.error('[Telegram] notifyRatioChange 异常:', err.message);
+  if (options.persist !== false) {
+    writeJSON(ALERTS_FILE, alerts);
+    writeJSON(HISTORY_FILE, ratioHistory);
+    writeJSON(CHANNELS_FILE, state);
   }
+  if (options.notify !== false) publishRatioChangeAlert(alert, channel);
 
   return alert;
 }
@@ -1076,8 +1238,22 @@ function fetchAllSub2APIGroups() {
   }
 }
 
-// 从 Sub2API 远端数据库拉取真实上游及完整销售分组关联
-function syncRealSub2APIAccounts() {
+// 从 Sub2API 远端数据库拉取真实上游及完整销售分组关联。
+// snapshotOnly is used by the control-plane child: it must observe remote
+// state only and return a plan for the main process to apply.
+function syncRealSub2APIAccounts(options = {}) {
+  const snapshotOnly = Boolean(options && options.snapshotOnly);
+  const sourceState = snapshotOnly && options && options.baseState && typeof options.baseState === 'object'
+    ? options.baseState
+    : state;
+  // Direct startup/admin synchronizations capture the configuration version
+  // before reading the account snapshot. Any safety action is then delegated
+  // to the locked worker with this exact version; a concurrent rename, group
+  // edit, or manual adjustment makes the plan stale instead of overwriting it.
+  const directSnapshotSignature = !snapshotOnly && typeof getSub2APISignature === 'function'
+    ? getSub2APISignature()
+    : '';
+  const sourceChannels = Array.isArray(sourceState.channels) ? sourceState.channels : [];
   try {
     const sql = `
 SELECT json_agg(t) FROM (
@@ -1122,9 +1298,10 @@ SELECT json_agg(t) FROM (
     // 保留所有未删除的真实上游账号（包含暂未分配分组的独立通道，便于在控制台统一查看与指派分组）
     const realAccounts = allAccountsRaw;
     const allGroups = fetchAllSub2APIGroups();
-    state.allGroups = allGroups;
+    if (!snapshotOnly) state.allGroups = allGroups;
 
-    const existingMap = new Map(state.channels.map(c => [String(c.id), c]));
+    const existingMap = new Map(sourceChannels.map(c => [String(c.id), c]));
+    const ratioChanges = [];
     const updatedChannels = realAccounts.map(acc => {
       const existing = existingMap.get(String(acc.id));
       const oldMultiplier = existing ? existing.multiplier : acc.multiplier;
@@ -1133,36 +1310,54 @@ SELECT json_agg(t) FROM (
       const vendor = detectVendor(acc);
       const provider = detectProvider(acc);
 
-      // 核心盈利计算：进货倍率 vs 销售倍率
+      // 主分组指标仅用于展示；实际调度准入必须按触发的业务分组单独核算。
       const groupsDetailRaw = acc.groups_detail || [];
       const primaryGroup = selectPrimaryGroup(groupsDetailRaw);
       const costMultiplier = Number(newMultiplier.toFixed(4));
       const saleMultiplier = Number((primaryGroup.sale_rate !== undefined ? primaryGroup.sale_rate : 1.0).toFixed(4));
       const profitSpread = Number((saleMultiplier - costMultiplier).toFixed(4)); // 倍率利差 (Sale - Cost)
       const marginPercent = saleMultiplier > 0 ? Number(((profitSpread / saleMultiplier) * 100).toFixed(1)) : 0; // 毛利率
-      const isLoss = costMultiplier > saleMultiplier; // 是否倒贴亏损
+      const rawConfiguredMultiplier = acc.configured_multiplier;
+      // Keep the exact configured value for safety decisions. Rounding a
+      // deliberate value such as 1.00004 to 1.0 would create a calibration
+      // plan which the remote `rate_multiplier = 1` guard correctly refuses,
+      // causing an unnecessary sync/safety retry loop.
+      const configuredMultiplier = rawConfiguredMultiplier === null || rawConfiguredMultiplier === undefined || rawConfiguredMultiplier === ''
+        ? null
+        : (Number.isFinite(Number(rawConfiguredMultiplier)) ? Number(rawConfiguredMultiplier) : null);
 
       // 丰富各业务分组的独立盈利情况
       const enrichedGroups = groupsDetailRaw.map(g => {
-        const sRate = Number(Number(g.sale_rate).toFixed(4));
-        const sp = Number((sRate - costMultiplier).toFixed(4));
-        const mp = sRate > 0 ? Number(((sp / sRate) * 100).toFixed(1)) : 0;
+        const rawSaleRate = Number(g.sale_rate);
+        const sRate = Number.isFinite(rawSaleRate) ? Number(rawSaleRate.toFixed(4)) : null;
+        const pricingSafe = groupCostIsSafe({ costMultiplier }, { sale_rate: sRate });
+        const sp = sRate === null ? null : Number((sRate - costMultiplier).toFixed(4));
+        const mp = sRate !== null && sRate > 0 ? Number(((sp / sRate) * 100).toFixed(1)) : null;
         return {
           id: g.id,
           name: g.name,
           sale_rate: sRate,
           spread: sp,
           margin_percent: mp,
-          is_loss: costMultiplier > sRate,
+          is_loss: !pricingSafe,
           is_primary: g.id === primaryGroup.id
         };
       });
+      const lossGroups = enrichedGroups.filter(g => g.is_loss);
+      // isLoss signals a pricing risk in at least one group. Only an account
+      // that is unsafe in every attached group may be globally quarantined.
+      const isLoss = enrichedGroups.length > 0
+        ? lossGroups.length > 0
+        : !groupCostIsSafe({ costMultiplier }, primaryGroup);
+      const isLossInEveryGroup = enrichedGroups.length > 0
+        ? lossGroups.length === enrichedGroups.length
+        : isLoss;
 
       // 备选线路池初始化与状态同步
       const currentBaseUrlClean = (acc.base_url || '').replace(/\/+$/, '');
       let existingBackupLines = (existing && Array.isArray(existing.backupLines) && existing.backupLines.length > 0)
-        ? existing.backupLines
-        : getDefaultBackupLines(provider, acc.base_url);
+        ? existing.backupLines.map(line => ({ ...line }))
+        : getDefaultBackupLines(provider, acc.base_url).map(line => ({ ...line }));
 
       existingBackupLines.forEach(l => {
         l.isCurrent = ((l.url || '').replace(/\/+$/, '') === currentBaseUrlClean);
@@ -1207,12 +1402,16 @@ SELECT json_agg(t) FROM (
         pricingUrl: '',
         multiplier: newMultiplier,
         costMultiplier,
+        configuredMultiplier,
         saleMultiplier,
         primaryGroupName: primaryGroup.name,
         primaryGroupId: primaryGroup.id,
         profitSpread,
         marginPercent,
         isLoss,
+        isLossInEveryGroup,
+        lossGroupIds: lossGroups.map(g => g.id),
+        lossGroupNames: lossGroups.map(g => g.name),
         groupsDetail: enrichedGroups,
         previousMultiplier: existing ? existing.previousMultiplier || oldMultiplier : oldMultiplier,
         configuredStatus: acc.status,
@@ -1228,7 +1427,7 @@ SELECT json_agg(t) FROM (
         knownModels: (() => {
           const validMapped = (acc.model_mapping && typeof acc.model_mapping === 'object') ? Object.keys(acc.model_mapping) : [];
           const validUpstream = upstreamModelsCache[String(acc.id)] || [];
-          const validCustom = (state.customChannelModels && state.customChannelModels[String(acc.id)]) || [];
+          const validCustom = (sourceState.customChannelModels && sourceState.customChannelModels[String(acc.id)]) || [];
           const candidateModels = (validUpstream.length === 0)
             ? getVendorCandidateModels({ name: acc.name, vendor, platform: acc.platform, modelMapping: acc.model_mapping, groups: acc.groups })
             : [];
@@ -1246,7 +1445,7 @@ SELECT json_agg(t) FROM (
         supportedModels: (acc.model_mapping && typeof acc.model_mapping === 'object' && Object.keys(acc.model_mapping).length > 0)
           ? Object.keys(acc.model_mapping)
           : (acc.groups || ['通用模型']),
-        isActive: state.activeChannelId === String(acc.id),
+        isActive: sourceState.activeChannelId === String(acc.id),
         lastCheckTime: new Date().toISOString(),
         notes: acc.notes || (acc.groups.length ? `所属分组: ${acc.groups.join(', ')}` : ''),
         backupLines: existingBackupLines,
@@ -1254,17 +1453,53 @@ SELECT json_agg(t) FROM (
         balanceUnit,
         balanceUpdated,
         balanceStatus,
-        manualLocked: existing ? Boolean(existing.manualLocked) : (String(state.manualLockedChannelId) === String(acc.id))
+        manualLocked: existing ? Boolean(existing.manualLocked) : (String(sourceState.manualLockedChannelId) === String(acc.id))
       };
 
       if (existing && Math.abs(oldMultiplier - newMultiplier) > 0.0001) {
-        handleRatioChange(channelObj, oldMultiplier, newMultiplier, 'Sub2API 线上探针检测到倍率变动');
+        if (snapshotOnly) {
+          ratioChanges.push({
+            channelId: String(channelObj.id),
+            oldMultiplier: Number(oldMultiplier),
+            newMultiplier: Number(newMultiplier),
+            reason: 'Sub2API 线上探针检测到倍率变动'
+          });
+        } else {
+          handleRatioChange(channelObj, oldMultiplier, newMultiplier, 'Sub2API 线上探针检测到倍率变动');
+        }
       }
 
       return channelObj;
     });
 
+    // The child never writes remote state. It returns these candidates so the
+    // main process can re-check/apply the safety action after its three-way
+    // merge. This keeps remote, JSON, SSE, and Telegram ownership in one
+    // process and prevents worker-local state from becoming a second writer.
+    const safetyPlan = buildSub2APISyncSafetyPlan(updatedChannels);
+    if (snapshotOnly) {
+      return { channels: updatedChannels, allGroups, ratioChanges, safetyPlan };
+    }
+    // All automatic remote safety writes go through the serialised worker
+    // below. Before it returns, a newly observed all-group loss is locally
+    // fail-closed so /v1 cannot route it in the short asynchronous window.
+    if (hasSub2APISyncSafetyWork(safetyPlan)) {
+      safetyReconciliationPending = true;
+      const unresolvedQuarantineIds = new Set(safetyPlan.quarantineIds.map(Number));
+      updatedChannels.forEach(channel => {
+        if (unresolvedQuarantineIds.has(Number(channel.id))) channel.safetyPending = true;
+      });
+      if (typeof lastSub2APISignature !== 'undefined') lastSub2APISignature = '';
+      console.warn('[安全熔断] 已交由后台事务安全动作复核；本地网关已临时停止路由未确认的倒贴通道。');
+    } else {
+      // A direct administrative refresh can observe a remote manual repair
+      // before the next child snapshot. It is then safe to clear the retry
+      // marker; any still-running old worker is signature-guarded.
+      safetyReconciliationPending = false;
+    }
+
     state.channels = updatedChannels;
+
     if (!state.activeChannelId && state.channels.length > 0) {
       const schedulableOne = state.channels.find(c => c.schedulable) || state.channels[0];
       state.activeChannelId = String(schedulableOne.id);
@@ -1272,11 +1507,260 @@ SELECT json_agg(t) FROM (
     }
     writeJSON(CHANNELS_FILE, state);
     triggerBackgroundModelDiscovery();
+    if (hasSub2APISyncSafetyWork(safetyPlan) && directSnapshotSignature &&
+        typeof requestBackgroundSub2APISafetyPlan === 'function') {
+      requestBackgroundSub2APISafetyPlan(safetyPlan, updatedChannels, directSnapshotSignature);
+    }
     return state.channels;
   } catch (err) {
     console.error('Error syncing Sub2API accounts via SSH:', err.message);
     return null;
   }
+}
+
+// Safety automation has the same hard manual-exception boundary as automatic
+// failover: a GPT/general/private channel or group is user-owned and must
+// never be stopped or re-priced by a background worker.
+function isSub2APISyncSafetyExempt(channel) {
+  if (!channel) return true;
+  if (typeof isExemptChannel === 'function' && isExemptChannel(channel)) return true;
+  if (typeof isExemptGroup !== 'function') return false;
+  const details = Array.isArray(channel.groupsDetail) ? channel.groupsDetail : [];
+  if (details.some(group => isExemptGroup(group))) return true;
+  const ids = typeof groupIds === 'function' ? groupIds(channel) : [];
+  return ids.some(id => isExemptGroup(id));
+}
+
+function buildSub2APISyncSafetyPlan(channels) {
+  const safeChannels = Array.isArray(channels) ? channels : [];
+  const quarantineIds = safeChannels
+    .filter(channel => channel && !isSub2APISyncSafetyExempt(channel) && channel.isLossInEveryGroup && channel.schedulable)
+    .map(channel => Number(channel.id))
+    .filter(id => Number.isSafeInteger(id) && id > 0);
+  const calibrations = safeChannels.reduce((items, channel) => {
+    if (isSub2APISyncSafetyExempt(channel)) return items;
+    const id = Number(channel && channel.id);
+    const cost = Number(channel && channel.costMultiplier);
+    const configured = safetyExactNumber(channel && channel.configuredMultiplier);
+    if (Number.isSafeInteger(id) && id > 0 && Number.isFinite(cost) && cost < 1 &&
+        configured === 1) {
+      items.push({ id, correctRate: Number(cost.toFixed(4)) });
+    }
+    return items;
+  }, []);
+  return { quarantineIds, calibrations };
+}
+
+function hasSub2APISyncSafetyWork(plan) {
+  return Boolean(
+    plan && (
+      (Array.isArray(plan.quarantineIds) && plan.quarantineIds.length > 0) ||
+      (Array.isArray(plan.calibrations) && plan.calibrations.length > 0)
+    )
+  );
+}
+
+function safetyComparableNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? Number(number.toFixed(4)) : null;
+}
+
+// Cost comparisons intentionally use four decimal places because the remote
+// SQL uses ROUND(..., 4). The configured multiplier has a different contract:
+// automatic calibration is allowed only for an exact default value of 1.
+function safetyExactNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function isDefaultConfiguredMultiplier(value) {
+  return safetyExactNumber(value) === 1;
+}
+
+function buildSub2APISyncSafetyExpected(plan, channels) {
+  const wantedIds = new Set([
+    ...((plan && Array.isArray(plan.quarantineIds)) ? plan.quarantineIds : []),
+    ...((plan && Array.isArray(plan.calibrations)) ? plan.calibrations.map(item => item && item.id) : [])
+  ].map(Number).filter(id => Number.isSafeInteger(id) && id > 0));
+  const expected = {};
+  for (const channel of Array.isArray(channels) ? channels : []) {
+    const id = Number(channel && channel.id);
+    if (!wantedIds.has(id)) continue;
+    expected[id] = {
+      schedulable: channel.schedulable === true,
+      isLossInEveryGroup: channel.isLossInEveryGroup === true,
+      costMultiplier: safetyComparableNumber(channel.costMultiplier),
+      configuredMultiplier: safetyExactNumber(channel.configuredMultiplier)
+    };
+  }
+  return expected;
+}
+
+function parseControlPlaneJson(value, fallback) {
+  const raw = String(value || '').trim();
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : fallback;
+  } catch {
+    // `psql -q -t -A` normally returns only the tuple, but this parser also
+    // tolerates command-status lines from a transaction wrapper on unusual
+    // psql builds without mistaking them for a successful safety outcome.
+    for (const line of raw.split(/\r?\n/).map(item => item.trim()).reverse()) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch { /* Keep looking for the JSON result row. */ }
+    }
+    return fallback;
+  }
+}
+
+function controlPlaneSqlLiteral(value) {
+  return `'${String(value === undefined || value === null ? '' : value).replace(/'/g, "''")}'`;
+}
+
+// This is deliberately shared by the watcher and the safety-write statement.
+// `extra` carries the observed effective upstream cost, so omitting it would
+// allow a changed probe result to reuse an older quarantine/calibration plan.
+function sub2APIConfigurationSignatureSql() {
+  return `MD5(
+    COALESCE((
+      SELECT string_agg(
+        COALESCE(a.id::text, '') || ':' || COALESCE(a.name::text, '') || ':' || COALESCE(a.status::text, '') || ':' ||
+        COALESCE(a.schedulable::text, '') || ':' || COALESCE(a.priority::text, '') || ':' ||
+        COALESCE(a.rate_multiplier::text, '') || ':' || MD5(COALESCE(a.credentials::text, '')) || ':' ||
+        COALESCE(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '') || ':' ||
+        COALESCE(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', ''),
+        ',' ORDER BY a.id
+      )
+      FROM accounts a
+      WHERE a.deleted_at IS NULL
+    ), '') || '|' || COALESCE((
+      SELECT string_agg(
+        COALESCE(g.id::text, '') || ':' || COALESCE(g.name::text, '') || ':' || COALESCE(g.rate_multiplier::text, ''),
+        ',' ORDER BY g.id
+      )
+      FROM groups g
+      WHERE g.deleted_at IS NULL
+    ), '') || '|' || COALESCE((
+      SELECT string_agg(COALESCE(ag.account_id::text, '') || '-' || COALESCE(ag.group_id::text, ''), ',' ORDER BY ag.account_id, ag.group_id)
+      FROM account_groups ag
+    ), '')
+  )`;
+}
+
+// Runs only in the dedicated `safety` worker. It confirms the configuration
+// signature inside the same atomic DB statement, and returns only rows
+// PostgreSQL actually changed. This keeps the gateway process out of the slow
+// DB/Redis path and prevents an old snapshot from blindly overwriting a newer
+// remote configuration.
+function executeControlPlaneSafetyPlan(plan, expectedSignature) {
+  const signature = String(expectedSignature || '').trim();
+  if (!signature) {
+    return {
+      stale: true,
+      quarantinedIds: [],
+      calibrations: [],
+      cacheInvalidated: true
+    };
+  }
+
+  const quarantineIds = Array.from(new Set(
+    ((plan && Array.isArray(plan.quarantineIds)) ? plan.quarantineIds : [])
+      .map(Number)
+      .filter(id => Number.isSafeInteger(id) && id > 0)
+  ));
+  const calibrationById = new Map();
+  for (const item of ((plan && Array.isArray(plan.calibrations)) ? plan.calibrations : [])) {
+    const id = Number(item && item.id);
+    const correctRate = Number(item && item.correctRate);
+    if (Number.isSafeInteger(id) && id > 0 && Number.isFinite(correctRate) && correctRate >= 0 && correctRate < 1) {
+      calibrationById.set(id, Number(correctRate.toFixed(4)));
+    }
+  }
+  const calibrations = Array.from(calibrationById, ([id, correctRate]) => ({ id, correctRate })).sort((a, b) => a.id - b.id);
+  if (quarantineIds.length === 0 && calibrations.length === 0) {
+    return { stale: false, quarantinedIds: [], calibrations: [], cacheInvalidated: true };
+  }
+
+  const calibrationIds = calibrations.map(item => item.id);
+  const targetIds = Array.from(new Set([...quarantineIds, ...calibrationIds])).sort((a, b) => a - b);
+  const correctRateCase = calibrations.length > 0
+    ? `CASE a.id ${calibrations.map(item => `WHEN ${item.id} THEN ${item.correctRate.toFixed(4)}`).join(' ')} ELSE NULL::numeric END`
+    : 'NULL::numeric';
+  const currentCostSql = `COALESCE(
+    NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+    NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+    a.rate_multiplier
+  )`;
+  const hasSafeAttachedGroupSql = `SELECT 1
+    FROM account_groups ag
+    JOIN groups g ON g.id = ag.group_id AND g.deleted_at IS NULL
+    CROSS JOIN LATERAL (SELECT ${currentCostSql} AS effective_cost) cost
+    WHERE ag.account_id = a.id
+      AND cost.effective_cost IS NOT NULL
+      AND cost.effective_cost >= 0
+      AND g.rate_multiplier IS NOT NULL
+      AND g.rate_multiplier > 0
+      AND cost.effective_cost <= g.rate_multiplier`;
+  const shouldQuarantineSql = quarantineIds.length > 0
+    ? `a.id IN (${quarantineIds.join(',')}) AND a.schedulable = true AND NOT EXISTS (${hasSafeAttachedGroupSql})`
+    : 'false';
+  const shouldCalibrateSql = calibrations.length > 0
+    ? `a.id IN (${calibrationIds.join(',')}) AND a.rate_multiplier = 1 AND ROUND((${currentCostSql})::numeric, 4) = ${correctRateCase}`
+    : 'false';
+  const signatureSql = controlPlaneSqlLiteral(signature);
+  const sql = `
+BEGIN;
+LOCK TABLE accounts, groups, account_groups IN SHARE ROW EXCLUSIVE MODE;
+WITH current_config AS (
+  SELECT ${sub2APIConfigurationSignatureSql()} AS signature
+), safety_candidates AS (
+  SELECT a.id,
+    (${shouldQuarantineSql}) AS should_quarantine,
+    (${shouldCalibrateSql}) AS should_calibrate,
+    ${correctRateCase} AS correct_rate
+  FROM accounts a
+  CROSS JOIN current_config current_config
+  WHERE a.id IN (${targetIds.join(',')})
+    AND a.deleted_at IS NULL
+    AND current_config.signature = ${signatureSql}
+), changed AS (
+  UPDATE accounts a
+  SET schedulable = CASE WHEN candidate.should_quarantine THEN false ELSE a.schedulable END,
+      rate_multiplier = CASE WHEN candidate.should_calibrate THEN candidate.correct_rate ELSE a.rate_multiplier END
+  FROM safety_candidates candidate
+  WHERE a.id = candidate.id
+    AND (candidate.should_quarantine OR candidate.should_calibrate)
+  RETURNING a.id, candidate.should_quarantine, candidate.should_calibrate, candidate.correct_rate::float AS correct_rate
+)
+SELECT json_build_object(
+  'stale', NOT EXISTS (SELECT 1 FROM current_config WHERE signature = ${signatureSql}),
+  'quarantinedIds', COALESCE((SELECT json_agg(id) FROM changed WHERE should_quarantine), '[]'::json),
+  'calibrations', COALESCE((SELECT json_agg(json_build_object('id', id, 'correctRate', correct_rate)) FROM changed WHERE should_calibrate), '[]'::json)
+);
+COMMIT;`;
+  const outcome = parseControlPlaneJson(execPsql(sql, true), null);
+  if (!outcome) throw new Error('远端安全动作未返回确认结果');
+  const confirmedQuarantinedIds = Array.isArray(outcome.quarantinedIds)
+    ? outcome.quarantinedIds.map(Number).filter(id => quarantineIds.includes(id))
+    : [];
+  const expectedRates = new Map(calibrations.map(item => [item.id, item.correctRate]));
+  const confirmedCalibrations = Array.isArray(outcome.calibrations)
+    ? outcome.calibrations
+      .map(item => ({ id: Number(item && item.id), correctRate: Number(item && item.correctRate) }))
+      .filter(item => expectedRates.has(item.id) && Math.abs(expectedRates.get(item.id) - item.correctRate) < 0.0001)
+    : [];
+  const changedIds = Array.from(new Set([...confirmedQuarantinedIds, ...confirmedCalibrations.map(item => item.id)]));
+  const cacheInvalidated = changedIds.length === 0 || invalidateSub2APIScheduler(changedIds) !== false;
+  return {
+    stale: outcome.stale === true,
+    quarantinedIds: confirmedQuarantinedIds,
+    calibrations: confirmedCalibrations,
+    cacheInvalidated
+  };
 }
 
 // 远端执行 SQL
@@ -1296,23 +1780,24 @@ function setRemoteAccountRole(accountId, role) {
   const priority = { main: 1, sub: 10, alt: 20, alternative: 20, fallback: 100, standby: 100 }[role];
   if (!priority) throw new Error('无效调度角色');
   const enabled = role === 'main' || !exclusive;
+  // accounts.schedulable is global. Any role that enables an account must be
+  // profitable in every group it can serve, not just its primary group.
+  if (enabled) assertChannelPricingIsSafe(target);
+  const safeToDisableIds = role === 'main' && exclusive
+    ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(peerId => Number.isSafeInteger(peerId) && peerId > 0)
+    : [];
   let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${id} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Account missing'; END IF; END $$;
 UPDATE accounts SET schedulable = ${enabled}, priority = ${priority} WHERE id = ${id};`;
-  const peerIds = peers.map(c => Number(c.id)).filter(Number.isSafeInteger);
-  if (role === 'main' && peerIds.length) {
-    // 独占时仅对完全属于当前范围的同组渠道关闭 schedulable；若渠道还挂载了其他分组，仅调低优先级 (priority = 10)，杜绝跨组误杀
-    const safeToDisable = exclusive ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(Number.isSafeInteger) : [];
-    const sharedPeers = peerIds.filter(pid => !safeToDisable.includes(pid));
-    if (safeToDisable.length) {
-      sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisable.join(',')});`;
-    }
-    if (sharedPeers.length) {
-      sql += `UPDATE accounts SET priority = GREATEST(priority, 10) WHERE id IN (${sharedPeers.join(',')});`;
-    }
+  if (safeToDisableIds.length) {
+    // Shared peers keep their global priority and schedulable state. Without
+    // verified group-scoped priority, changing either could disrupt a group
+    // outside this manual role change.
+    sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisableIds.join(',')});`;
   }
-  executeRemoteSQL(sql);
-  invalidateSub2APIScheduler([id, ...peerIds]);
-  lastSub2APISignature = getSub2APISignature();
+  const remoteOk = executeRemoteSQL(sql);
+  if (remoteOk !== true) throw new Error('远端调度角色写入未确认，本地状态未改变');
+  invalidateSub2APIScheduler([id, ...safeToDisableIds]);
+  refreshSub2APISignatureAfterDirectMutation('手动调度角色更新');
   return true;
 }
 
@@ -1349,10 +1834,16 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
   };
 
   const currentMeta = roleMeta[normalizedRole];
-  const targetGroupIds = (targetChannel.groupsDetail || []).map(g => g.id).filter(Boolean);
-  if (targetChannel.primaryGroupId) targetGroupIds.push(targetChannel.primaryGroupId);
-  const nonExemptGroupIds = targetGroupIds.filter(gid => !isExemptGroup(gid));
+  const nonExemptGroupIds = groupIds(targetChannel).filter(gid => !isExemptGroup(gid));
   const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
+  const safeToDisableIdSet = new Set(
+    normalizedRole === 'main' && isSingleActive
+      ? state.channels
+        .filter(c => String(c.id) !== String(targetId) && groupIds(c).some(gid => nonExemptGroupIds.includes(gid)) && !groupIds(c).some(gid => !nonExemptGroupIds.includes(gid)))
+        .map(c => Number(c.id))
+        .filter(id => Number.isSafeInteger(id) && id > 0)
+      : []
+  );
 
   // Remote commit is the success boundary. Do not change local roles on failure.
   const remoteOk = setRemoteAccountRole(targetId, role);
@@ -1368,18 +1859,17 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
         c.schedulable = true;
         c.manualLocked = true;
       } else {
-        // 同业务分组内的其他旧主调降为副调(10)，若开启单主独占则彻底关停调度(schedulable=false)
-        // 🔒 核心保护：排除通用/自用等例外分组，绝不株连例外分组的其它渠道
-        const sharedGroup = (c.groupsDetail || []).some(g => nonExemptGroupIds.includes(g.id)) || (c.primaryGroupId && nonExemptGroupIds.includes(c.primaryGroupId));
-        if (sharedGroup) {
+        // Only peers wholly inside the target scope were changed remotely.
+        // Keep shared peers locally untouched as well, avoiding a remote/JSON
+        // split and protecting the groups they also serve.
+        if (safeToDisableIdSet.has(Number(c.id))) {
           c.priority = Math.max(10, Number(c.priority) || 10);
           c.isActive = false;
           c.manualLocked = false;
-          if (isSingleActive) {
-            c.schedulable = false; // 🔒 关停副调调度，杜绝双开破坏 Prompt Cache
-          }
+          c.schedulable = false; // 单主独占下的同范围副调
         } else if (String(c.id) === String(previousActiveId)) {
           c.isActive = false;
+          c.manualLocked = false;
         }
       }
     });
@@ -1506,6 +1996,22 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
     groupsToProcess = (state.allGroups && state.allGroups.length) ? state.allGroups : fetchAllSub2APIGroups();
   }
 
+  const processedGroupIds = new Set(groupsToProcess.map(group => Number(group.id)).filter(id => Number.isSafeInteger(id) && id > 0));
+  const sharedChannelsInScope = state.channels.filter(channel => {
+    const memberships = groupIds(channel);
+    return memberships.length > 1 && memberships.some(groupId => processedGroupIds.has(groupId));
+  });
+  if (sharedChannelsInScope.length > 0) {
+    const names = sharedChannelsInScope.slice(0, 5).map(channel => `[${channel.name}]`).join('、');
+    const suffix = sharedChannelsInScope.length > 5 ? ` 等 ${sharedChannelsInScope.length} 条` : '';
+    return {
+      success: false,
+      message: `检测到跨组共享通道 ${names}${suffix}；当前调度字段为全局 priority/schedulable，无法安全执行按成本批量定性。请先配置经验证的端到端组级调度能力。`,
+      updatedCount: 0,
+      assignedRoles: {}
+    };
+  }
+
   const updates = [];
   const assignedRoles = {};
 
@@ -1515,8 +2021,9 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
       return;
     }
 
-    // 找出挂载在此分组的所有通道
+    // 找出挂载在此分组的所有通道 (排除例外通道，如 GPT 通用通道，由用户全权手动管理)
     const groupChannels = plannedChannels.filter(c => {
+      if (typeof isExemptChannel === 'function' && isExemptChannel(c)) return false;
       if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(group.id))) return true;
       if (String(c.primaryGroupId) === String(group.id)) return true;
       if (c.groups && c.groups.includes(group.name)) return true;
@@ -1602,7 +2109,7 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
     plannedChannels.forEach((c, index) => Object.assign(state.channels[index], c));
     state.activeChannelId = plannedActiveId;
     invalidateSub2APIScheduler(updates.map(u => u.accountId));
-    lastSub2APISignature = getSub2APISignature();
+    refreshSub2APISignatureAfterDirectMutation('按成本自动定性');
   }
 
   writeJSON(CHANNELS_FILE, state);
@@ -1626,153 +2133,825 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
   };
 }
 
-// 开启/关闭单个渠道调度
-function toggleRemoteAccountSchedulable(accountId, schedulable) {
-  const sql = `UPDATE accounts SET schedulable = ${schedulable ? 'true' : 'false'} WHERE id = ${accountId};`;
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler(accountId);
-    lastSub2APISignature = getSub2APISignature();
+// Resolve prices from the live group list when it is available. The account
+// switch itself is global, so a manual enable must be safe for every group it
+// can serve; group-specific automatic switching passes one explicit group.
+function getChannelPricingGroups(channel, targetGroupId = null) {
+  const attachedGroups = Array.isArray(channel.groupsDetail) ? channel.groupsDetail : [];
+  const allGroups = Array.isArray(state.allGroups) ? state.allGroups : [];
+  const withCurrentSaleRate = group => {
+    const current = allGroups.find(candidate => String(candidate.id) === String(group.id));
+    // Never use a stale channel snapshot to approve a global write. A missing
+    // or invalid live group rate must fail closed until the group catalog is
+    // refreshed, including when the live record explicitly has a null rate.
+    return current ? { ...group, ...current } : { ...group, sale_rate: null };
+  };
+
+  if (targetGroupId !== null && targetGroupId !== undefined) {
+    const id = Number(targetGroupId);
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error('目标业务分组无效');
+    const target = allGroups.find(group => Number(group.id) === id) || attachedGroups.find(group => Number(group.id) === id);
+    if (!target) throw new Error('目标业务分组不存在或售价不可用');
+    return [withCurrentSaleRate(target)];
   }
-  return ok;
+
+  if (attachedGroups.length > 0) return attachedGroups.map(withCurrentSaleRate);
+  return [withCurrentSaleRate({
+    id: channel.primaryGroupId || 0,
+    name: channel.primaryGroupName || '默认分组',
+    sale_rate: channel.saleMultiplier
+  })];
+}
+
+function assertChannelPricingIsSafe(channel, targetGroupId = null) {
+  const pricingGroups = getChannelPricingGroups(channel, targetGroupId);
+  const unsafeGroups = pricingGroups.filter(group => !groupCostIsSafe(channel, group));
+  if (unsafeGroups.length > 0) {
+    const cost = channel.costMultiplier !== undefined ? channel.costMultiplier : channel.multiplier;
+    const groupSummary = unsafeGroups.map(group => {
+      const rate = group.sale_rate === null || group.sale_rate === undefined ? '未核验' : `${group.sale_rate}x`;
+      return `[${group.name || `分组 ${group.id}`}] 售价 ${rate}`;
+    }).join('、');
+    throw new Error(`安全拦截：通道 [${channel.name}] 进货成本 (${cost}x) 对 ${groupSummary} 倒贴或无法核验，严禁开启调度！`);
+  }
+  return pricingGroups;
+}
+
+// Group membership and sale-rate writes affect the global accounts.schedulable
+// flag.  Keep one conservative planner at that boundary: an enabled account
+// may never be left in a group whose sale price or cost cannot be verified.
+function normalizePositivePlanId(value, label) {
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`${label}必须是正整数`);
+  return id;
+}
+
+function normalizePositivePlanIds(values, label) {
+  if (!Array.isArray(values)) throw new Error(`${label}必须是数组`);
+  const ids = values.map(value => normalizePositivePlanId(value, label));
+  if (new Set(ids).size !== ids.length) throw new Error(`${label}不能重复`);
+  return ids;
+}
+
+function normalizePositiveSaleRate(value, label = '售价') {
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate <= 0) throw new Error(`${label}必须是正的有限数值`);
+  const normalized = Number(rate.toFixed(4));
+  if (!Number.isFinite(normalized) || normalized <= 0) throw new Error(`${label}精度不足，必须至少为 0.0001`);
+  return normalized;
+}
+
+function normalizeNonNegativeMultiplier(value, label = '进货倍率') {
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate < 0) throw new Error(`${label}必须是非负的有限数值`);
+  const normalized = Number(rate.toFixed(4));
+  if (!Number.isFinite(normalized) || normalized < 0) throw new Error(`${label}格式不正确`);
+  return normalized;
+}
+
+function getCachedGroupForPlan(groupId, operation) {
+  const id = normalizePositivePlanId(groupId, '分组 ID');
+  const groups = Array.isArray(state.allGroups) ? state.allGroups : [];
+  const group = groups.find(candidate => Number(candidate.id) === id);
+  if (!group) {
+    throw new Error(`安全拦截：${operation}前无法从当前分组目录核验分组 #${id} 的售价，请先刷新配置后重试`);
+  }
+  return { ...group, id, sale_rate: normalizePositiveSaleRate(group.sale_rate, `分组 [${group.name || id}] 售价`) };
+}
+
+function getCachedChannelsForPlan(accountIds, operation) {
+  const ids = normalizePositivePlanIds(accountIds, '账号 ID');
+  const channels = Array.isArray(state.channels) ? state.channels : [];
+  const byId = new Map(channels.map(channel => [Number(channel.id), channel]));
+  const missing = ids.filter(id => !byId.has(id));
+  if (missing.length > 0) {
+    throw new Error(`安全拦截：${operation}前无法从当前账号目录核验账号 #${missing.join(', #')}`);
+  }
+  return ids.map(id => byId.get(id));
+}
+
+function resolveCachedGroupPlans(groupIds, operation, overrides = {}) {
+  const ids = [...new Set(groupIds.map(id => normalizePositivePlanId(id, '分组 ID')) )];
+  return ids.map(id => {
+    const override = overrides[String(id)];
+    if (!override) return getCachedGroupForPlan(id, operation);
+    return {
+      ...override,
+      id,
+      sale_rate: normalizePositiveSaleRate(override.sale_rate, `分组 [${override.name || id}] 售价`)
+    };
+  });
+}
+
+function currentCachedGroupIds(channel) {
+  return groupIds(channel);
+}
+
+function assertPlannedChannelMembershipIsSafe(channel, plannedGroups, operation, forceSchedulable = false) {
+  // Only a global schedulable account can immediately serve traffic.  A main
+  // role is explicitly forced through this same gate even before it is enabled.
+  if (channel.schedulable !== true && !forceSchedulable) return;
+  if (!Array.isArray(plannedGroups) || plannedGroups.length === 0) {
+    throw new Error(`安全拦截：已开启调度的通道 [${channel.name || channel.id}] 在${operation}后没有可核验售价分组，拒绝写入`);
+  }
+  const unsafeGroups = plannedGroups.filter(group => !groupCostIsSafe(channel, group));
+  if (unsafeGroups.length === 0) return;
+  const cost = channel.costMultiplier !== undefined ? channel.costMultiplier : channel.multiplier;
+  const summary = unsafeGroups.map(group => {
+    const rate = group.sale_rate === null || group.sale_rate === undefined ? '未核验' : `${group.sale_rate}x`;
+    return `[${group.name || `分组 ${group.id}`}] 售价 ${rate}`;
+  }).join('、');
+  throw new Error(`安全拦截：已开启调度的通道 [${channel.name || channel.id}] 成本 (${cost}x) 在${operation}后对 ${summary} 倒贴或无法核验，拒绝写入`);
+}
+
+function refreshCachedChannelPricing(channel) {
+  const details = Array.isArray(channel.groupsDetail) ? channel.groupsDetail : [];
+  const oldPrimaryId = Number(channel.primaryGroupId);
+  const primary = details.find(group => Number(group.id) === oldPrimaryId) || details[0] || null;
+  const cost = channel.costMultiplier !== undefined ? channel.costMultiplier : channel.multiplier;
+  const lossGroups = details.filter(group => !groupCostIsSafe(channel, group));
+  channel.isLoss = details.length > 0 ? lossGroups.length > 0 : true;
+  channel.isLossInEveryGroup = details.length > 0 ? lossGroups.length === details.length : true;
+  channel.lossGroupIds = lossGroups.map(group => group.id);
+  channel.lossGroupNames = lossGroups.map(group => group.name);
+  if (!primary) {
+    channel.primaryGroupId = null;
+    channel.primaryGroupName = '默认分组';
+    channel.saleMultiplier = null;
+    channel.profitSpread = null;
+    channel.marginPercent = null;
+    return;
+  }
+  channel.primaryGroupId = primary.id;
+  channel.primaryGroupName = primary.name;
+  channel.saleMultiplier = primary.sale_rate;
+  if (Number.isFinite(Number(cost)) && Number.isFinite(Number(primary.sale_rate))) {
+    channel.profitSpread = Number((Number(primary.sale_rate) - Number(cost)).toFixed(4));
+    channel.marginPercent = Number(primary.sale_rate) > 0
+      ? Number((((Number(primary.sale_rate) - Number(cost)) / Number(primary.sale_rate)) * 100).toFixed(1))
+      : null;
+  }
+}
+
+function applyCachedChannelMembership(channel, plannedGroups) {
+  const oldDetails = new Map((channel.groupsDetail || []).map(group => [Number(group.id), group]));
+  channel.groupsDetail = plannedGroups.map(group => ({
+    ...(oldDetails.get(Number(group.id)) || {}),
+    ...group,
+    id: Number(group.id),
+    sale_rate: Number(group.sale_rate)
+  }));
+  channel.groups = channel.groupsDetail.map(group => group.name).filter(Boolean);
+  refreshCachedChannelPricing(channel);
+}
+
+function applyCachedGroupRate(groupId, saleRate, name) {
+  const id = normalizePositivePlanId(groupId, '分组 ID');
+  const groups = Array.isArray(state.allGroups) ? state.allGroups : [];
+  const group = groups.find(candidate => Number(candidate.id) === id);
+  if (group) {
+    group.sale_rate = saleRate;
+    if (name !== undefined) group.name = name;
+  }
+  for (const channel of (state.channels || [])) {
+    let touched = false;
+    for (const detail of (channel.groupsDetail || [])) {
+      if (Number(detail.id) !== id) continue;
+      detail.sale_rate = saleRate;
+      if (name !== undefined) detail.name = name;
+      touched = true;
+    }
+    if (touched) refreshCachedChannelPricing(channel);
+  }
+}
+
+function confirmRemoteGroupMutation(accountIds = []) {
+  const ids = [...new Set(accountIds.map(id => Number(id)).filter(id => Number.isSafeInteger(id) && id > 0))];
+  if (ids.length > 0) invalidateSub2APIScheduler(ids);
+  else invalidateSub2APIScheduler();
+  refreshSub2APISignatureAfterDirectMutation('业务分组配置更新');
+}
+
+function remoteEffectiveCostSql(accountAlias = 'a') {
+  return `COALESCE(
+    NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+    NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+    ${accountAlias}.rate_multiplier
+  )`;
+}
+
+function remoteAccountExistenceGuardSql(accountIds) {
+  if (accountIds.length === 0) return '';
+  const ids = [...accountIds].sort((a, b) => a - b).join(',');
+  return `DO $$ BEGIN
+  PERFORM 1 FROM accounts WHERE id IN (${ids}) AND deleted_at IS NULL FOR UPDATE;
+  IF (SELECT count(*) FROM accounts WHERE id IN (${ids}) AND deleted_at IS NULL) <> ${accountIds.length} THEN
+    RAISE EXCEPTION 'Account missing';
+  END IF;
+END $$;`;
+}
+
+function remoteGroupExistenceGuardSql(groupIds) {
+  if (groupIds.length === 0) return '';
+  const ids = [...groupIds].sort((a, b) => a - b).join(',');
+  return `DO $$ BEGIN
+  PERFORM 1 FROM groups WHERE id IN (${ids}) AND deleted_at IS NULL FOR UPDATE;
+  IF (SELECT count(*) FROM groups WHERE id IN (${ids}) AND deleted_at IS NULL) <> ${groupIds.length} THEN
+    RAISE EXCEPTION 'Group missing';
+  END IF;
+END $$;`;
+}
+
+function remoteProspectiveMembershipSafetyGuardSql(accountIds, groupIds, forceSchedulableIds = []) {
+  if (accountIds.length === 0 || groupIds.length === 0) return '';
+  const accounts = accountIds.join(',');
+  const groups = groupIds.join(',');
+  const forced = forceSchedulableIds.length > 0 ? ` OR a.id IN (${forceSchedulableIds.join(',')})` : '';
+  const cost = remoteEffectiveCostSql('a');
+  return `DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM accounts a
+    CROSS JOIN groups g
+    CROSS JOIN LATERAL (SELECT ${cost} AS effective_cost) cost
+    WHERE a.id IN (${accounts})
+      AND a.deleted_at IS NULL
+      AND g.id IN (${groups})
+      AND g.deleted_at IS NULL
+      AND (a.schedulable = true${forced})
+      AND (cost.effective_cost IS NULL OR cost.effective_cost < 0 OR g.rate_multiplier IS NULL OR g.rate_multiplier <= 0 OR cost.effective_cost > g.rate_multiplier)
+  ) THEN
+    RAISE EXCEPTION 'Unsafe scheduled account pricing';
+  END IF;
+END $$;`;
+}
+
+// A manual cost edit changes the effective cost of every group an account can
+// serve. Check the proposed value under the same transaction and table lock as
+// the write, otherwise a concurrent group-price or membership edit could make
+// a previously safe local preview turn into a loss before UPDATE executes.
+function remoteProposedAccountMultiplierSafetyGuardSql(accountId, proposedMultiplier) {
+  const id = normalizePositivePlanId(accountId, '账号 ID');
+  const cost = normalizeNonNegativeMultiplier(proposedMultiplier).toFixed(4);
+  return `LOCK TABLE accounts, groups, account_groups IN SHARE ROW EXCLUSIVE MODE;
+DO $$ BEGIN
+  PERFORM 1 FROM accounts a
+  WHERE a.id = ${id} AND a.deleted_at IS NULL
+  FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Account missing'; END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM accounts a
+    WHERE a.id = ${id}
+      AND a.deleted_at IS NULL
+      AND a.schedulable = true
+      AND (
+        NOT EXISTS (
+          SELECT 1
+          FROM account_groups ag
+          JOIN groups g ON g.id = ag.group_id AND g.deleted_at IS NULL
+          WHERE ag.account_id = a.id
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM account_groups ag
+          LEFT JOIN groups g ON g.id = ag.group_id AND g.deleted_at IS NULL
+          WHERE ag.account_id = a.id
+            AND (g.id IS NULL OR g.rate_multiplier IS NULL OR g.rate_multiplier <= 0 OR ${cost} > g.rate_multiplier)
+        )
+      )
+  ) THEN
+    RAISE EXCEPTION 'Unsafe scheduled account pricing';
+  END IF;
+END $$;`;
+}
+
+function remoteProposedSaleRateSafetyGuardSql(accountIds, saleRate, forceSchedulableIds = []) {
+  if (accountIds.length === 0) return '';
+  const accounts = accountIds.join(',');
+  const forced = forceSchedulableIds.length > 0 ? ` OR a.id IN (${forceSchedulableIds.join(',')})` : '';
+  const cost = remoteEffectiveCostSql('a');
+  return `DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM accounts a
+    CROSS JOIN LATERAL (SELECT ${cost} AS effective_cost) cost
+    WHERE a.id IN (${accounts})
+      AND a.deleted_at IS NULL
+      AND (a.schedulable = true${forced})
+      AND (cost.effective_cost IS NULL OR cost.effective_cost < 0 OR cost.effective_cost > ${saleRate})
+  ) THEN
+    RAISE EXCEPTION 'Unsafe scheduled account pricing';
+  END IF;
+END $$;`;
+}
+
+function remoteNoGroupForScheduledAccountsGuardSql(accountIds) {
+  if (accountIds.length === 0) return '';
+  return `DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM accounts WHERE id IN (${accountIds.join(',')}) AND deleted_at IS NULL AND schedulable = true) THEN
+    RAISE EXCEPTION 'Scheduled account cannot be left without a priced group';
+  END IF;
+END $$;`;
+}
+
+function remoteGroupRemovalLeavesScheduledUngroupedGuardSql(groupId, retainedAccountIds) {
+  const retained = retainedAccountIds.length > 0 ? ` AND a.id NOT IN (${retainedAccountIds.join(',')})` : '';
+  return `DO $$ BEGIN
+  PERFORM 1
+  FROM accounts a
+  JOIN account_groups ag ON ag.account_id = a.id
+  WHERE ag.group_id = ${groupId} AND a.deleted_at IS NULL AND a.schedulable = true${retained}
+  FOR UPDATE OF a;
+  IF EXISTS (
+    SELECT 1
+    FROM accounts a
+    JOIN account_groups ag ON ag.account_id = a.id
+    WHERE ag.group_id = ${groupId}
+      AND a.deleted_at IS NULL
+      AND a.schedulable = true${retained}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM account_groups other
+        JOIN groups other_group ON other_group.id = other.group_id AND other_group.deleted_at IS NULL
+        WHERE other.account_id = a.id AND other.group_id <> ${groupId}
+      )
+  ) THEN
+    RAISE EXCEPTION 'Scheduled account cannot be left without a priced group';
+  END IF;
+END $$;`;
+}
+
+function remoteRemainingMembershipSafetyAfterGroupRemovalGuardSql(groupId) {
+  const cost = remoteEffectiveCostSql('a');
+  return `DO $$ BEGIN
+  PERFORM 1
+  FROM accounts a
+  JOIN account_groups removed ON removed.account_id = a.id AND removed.group_id = ${groupId}
+  JOIN account_groups remaining ON remaining.account_id = a.id AND remaining.group_id <> ${groupId}
+  JOIN groups g ON g.id = remaining.group_id AND g.deleted_at IS NULL
+  WHERE a.deleted_at IS NULL AND a.schedulable = true
+  FOR UPDATE OF a, g;
+  IF EXISTS (
+    SELECT 1
+    FROM accounts a
+    JOIN account_groups removed ON removed.account_id = a.id AND removed.group_id = ${groupId}
+    JOIN account_groups remaining ON remaining.account_id = a.id AND remaining.group_id <> ${groupId}
+    JOIN groups g ON g.id = remaining.group_id AND g.deleted_at IS NULL
+    CROSS JOIN LATERAL (SELECT ${cost} AS effective_cost) cost
+    WHERE a.deleted_at IS NULL
+      AND a.schedulable = true
+      AND (cost.effective_cost IS NULL OR cost.effective_cost < 0 OR g.rate_multiplier IS NULL OR g.rate_multiplier <= 0 OR cost.effective_cost > g.rate_multiplier)
+  ) THEN
+    RAISE EXCEPTION 'Unsafe scheduled account pricing after group removal';
+  END IF;
+END $$;`;
+}
+
+function remoteCurrentGroupRateSafetyGuardSql(groupId, saleRate) {
+  const cost = remoteEffectiveCostSql('a');
+  return `DO $$ BEGIN
+  PERFORM 1 FROM groups WHERE id = ${groupId} AND deleted_at IS NULL FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Group missing'; END IF;
+  PERFORM 1 FROM accounts a JOIN account_groups ag ON ag.account_id = a.id WHERE ag.group_id = ${groupId} AND a.deleted_at IS NULL FOR UPDATE OF a;
+  IF EXISTS (
+    SELECT 1
+    FROM accounts a
+    JOIN account_groups ag ON ag.account_id = a.id
+    CROSS JOIN LATERAL (SELECT ${cost} AS effective_cost) cost
+    WHERE ag.group_id = ${groupId}
+      AND a.deleted_at IS NULL
+      AND a.schedulable = true
+      AND (cost.effective_cost IS NULL OR cost.effective_cost < 0 OR cost.effective_cost > ${saleRate})
+  ) THEN
+    RAISE EXCEPTION 'Unsafe scheduled account pricing';
+  END IF;
+END $$;`;
+}
+
+function prepareGroupSaleRatePlan(groupId, newSaleRate, operation) {
+  const group = getCachedGroupForPlan(groupId, operation);
+  const saleRate = normalizePositiveSaleRate(newSaleRate, `分组 [${group.name || group.id}] 售价`);
+  const proposedGroup = { ...group, sale_rate: saleRate };
+  const overrides = { [String(group.id)]: proposedGroup };
+  const affectedChannels = (state.channels || []).filter(channel => currentCachedGroupIds(channel).includes(group.id));
+  for (const channel of affectedChannels) {
+    const groups = resolveCachedGroupPlans(currentCachedGroupIds(channel), operation, overrides);
+    assertPlannedChannelMembershipIsSafe(channel, groups, operation);
+  }
+  return { group, saleRate, proposedGroup, affectedChannels };
+}
+
+function prepareAccountGroupsPlan(accountId, requestedGroupIds, operation) {
+  const id = normalizePositivePlanId(accountId, '账号 ID');
+  const groupIds = normalizePositivePlanIds(requestedGroupIds, '分组 ID');
+  const [channel] = getCachedChannelsForPlan([id], operation);
+  const groups = resolveCachedGroupPlans(groupIds, operation);
+  assertPlannedChannelMembershipIsSafe(channel, groups, operation);
+  return { accountId: id, groupIds, channel, groups };
+}
+
+function prepareAccountMultiplierPlan(accountId, requestedMultiplier) {
+  const id = normalizePositivePlanId(accountId, '账号 ID');
+  const [channel] = getCachedChannelsForPlan([id], '修改进货倍率');
+  const multiplier = normalizeNonNegativeMultiplier(requestedMultiplier);
+  const exempt = isSub2APISyncSafetyExempt(channel);
+  // GPT/general/private channels remain user-owned. Their manual changes are
+  // deliberately not reclassified as an automatic safety action. All other
+  // enabled channels must pass every attached group's current sale price.
+  if (channel.schedulable === true && !exempt) {
+    assertChannelPricingIsSafe({ ...channel, multiplier, costMultiplier: multiplier });
+  }
+  return { id, channel, multiplier, exempt };
+}
+
+function prepareGroupAccountsPlan(groupId, requestedAccountIds, operation) {
+  const group = getCachedGroupForPlan(groupId, operation);
+  const accountIds = normalizePositivePlanIds(requestedAccountIds, '账号 ID');
+  const selectedChannels = getCachedChannelsForPlan(accountIds, operation);
+  const selectedIdSet = new Set(accountIds);
+  const affectedChannels = (state.channels || []).filter(channel => selectedIdSet.has(Number(channel.id)) || currentCachedGroupIds(channel).includes(group.id));
+  const changes = affectedChannels.map(channel => {
+    const selected = selectedIdSet.has(Number(channel.id));
+    const groupIds = selected
+      ? [...new Set([...currentCachedGroupIds(channel).filter(id => id !== group.id), group.id])]
+      : currentCachedGroupIds(channel).filter(id => id !== group.id);
+    const groups = resolveCachedGroupPlans(groupIds, operation);
+    assertPlannedChannelMembershipIsSafe(channel, groups, operation);
+    return { channel, groupIds, groups, selected };
+  });
+  return { group, accountIds, selectedChannels, affectedChannels, changes };
+}
+
+function prepareDeleteRemoteGroupPlan(groupId) {
+  const operation = '删除分组';
+  const group = getCachedGroupForPlan(groupId, operation);
+  const affectedChannels = (state.channels || []).filter(channel => currentCachedGroupIds(channel).includes(group.id));
+  const changes = affectedChannels.map(channel => {
+    const groupIds = currentCachedGroupIds(channel).filter(id => id !== group.id);
+    const groups = resolveCachedGroupPlans(groupIds, operation);
+    assertPlannedChannelMembershipIsSafe(channel, groups, operation);
+    return { channel, groupIds, groups };
+  });
+  return { group, affectedChannels, changes };
+}
+
+function prepareAddAccountsToGroupPlan(groupId, requestedAccountIds, operation) {
+  const group = getCachedGroupForPlan(groupId, operation);
+  const accountIds = normalizePositivePlanIds(requestedAccountIds, '账号 ID');
+  const channels = getCachedChannelsForPlan(accountIds, operation);
+  const changes = channels.map(channel => {
+    const groupIds = [...new Set([...currentCachedGroupIds(channel), group.id])];
+    const groups = resolveCachedGroupPlans(groupIds, operation);
+    assertPlannedChannelMembershipIsSafe(channel, groups, operation);
+    return { channel, groupIds, groups };
+  });
+  return { group, accountIds, channels, changes };
+}
+
+function prepareCreateRemoteGroupPlan(name, rateMultiplier, platform, requestedAccountIds) {
+  const cleanName = String(name || '').trim();
+  if (!cleanName) throw new Error('分组名称不能为空');
+  const saleRate = normalizePositiveSaleRate(rateMultiplier, '新分组售价');
+  const normalizedPlatform = String(platform || 'openai').toLowerCase().includes('claude') ? 'anthropic' : 'openai';
+  const accountIds = normalizePositivePlanIds(requestedAccountIds, '账号 ID');
+  const channels = getCachedChannelsForPlan(accountIds, '创建分组');
+  const proposedGroup = { id: null, name: cleanName, sale_rate: saleRate, platform: normalizedPlatform };
+  const changes = channels.map(channel => {
+    const groups = [
+      ...resolveCachedGroupPlans(currentCachedGroupIds(channel), '创建分组'),
+      proposedGroup
+    ];
+    assertPlannedChannelMembershipIsSafe(channel, groups, '创建分组');
+    return { channel, groups };
+  });
+  return { cleanName, saleRate, platform: normalizedPlatform, accountIds, channels, proposedGroup, changes };
+}
+
+function prepareGroupOrchestrationPlan(groupId, input = {}) {
+  const operation = '分组编排';
+  const group = getCachedGroupForPlan(groupId, operation);
+  const mainId = input.mainId === null || input.mainId === undefined || input.mainId === '' ? null : normalizePositivePlanId(input.mainId, '主调账号 ID');
+  const subId = input.subId === null || input.subId === undefined || input.subId === '' ? null : normalizePositivePlanId(input.subId, '副调账号 ID');
+  const altId = input.altId === null || input.altId === undefined || input.altId === '' ? null : normalizePositivePlanId(input.altId, '备选账号 ID');
+  const standbyIds = normalizePositivePlanIds(Array.isArray(input.standbyIds) ? input.standbyIds : [], '备用账号 ID');
+  const assignedIds = [mainId, subId, altId, ...standbyIds].filter(id => id !== null);
+  if (new Set(assignedIds).size !== assignedIds.length) throw new Error('调度角色不能重复');
+  if (assignedIds.length > 0 && mainId === null) throw new Error('分组编排必须指定主调账号');
+  const saleRateProvided = input.saleRate !== null && input.saleRate !== undefined && input.saleRate !== '';
+  const saleRate = !saleRateProvided
+    ? normalizePositiveSaleRate(group.sale_rate, `分组 [${group.name || group.id}] 售价`)
+    : normalizePositiveSaleRate(input.saleRate, `分组 [${group.name || group.id}] 售价`);
+  const proposedGroup = { ...group, sale_rate: saleRate };
+  const assignedChannels = getCachedChannelsForPlan(assignedIds, operation);
+  const assignedIdSet = new Set(assignedIds);
+  const affectedChannels = (state.channels || []).filter(channel => assignedIdSet.has(Number(channel.id)) || currentCachedGroupIds(channel).includes(group.id));
+  const changes = affectedChannels.map(channel => {
+    const selected = assignedIdSet.has(Number(channel.id));
+    const otherGroupIds = currentCachedGroupIds(channel).filter(id => id !== group.id);
+    const groupIds = selected ? [...otherGroupIds, group.id] : otherGroupIds;
+    const groups = groupIds.length > 0
+      ? resolveCachedGroupPlans(groupIds, operation, { [String(group.id)]: proposedGroup })
+      : [];
+    assertPlannedChannelMembershipIsSafe(channel, groups, operation, Number(channel.id) === mainId);
+    return { channel, groupIds, groups, selected };
+  });
+  return { group, saleRate, saleRateProvided, proposedGroup, mainId, subId, altId, standbyIds, assignedIds, assignedChannels, affectedChannels, changes };
+}
+
+function executeRemoteGroupOrchestrationPlan(plan) {
+  const statements = [
+    remoteGroupExistenceGuardSql([plan.group.id]),
+    remoteAccountExistenceGuardSql(plan.assignedIds),
+    plan.saleRateProvided
+      ? remoteProposedSaleRateSafetyGuardSql(plan.assignedIds, plan.saleRate, plan.mainId === null ? [] : [plan.mainId])
+      : remoteProspectiveMembershipSafetyGuardSql(plan.assignedIds, [plan.group.id], plan.mainId === null ? [] : [plan.mainId]),
+    remoteGroupRemovalLeavesScheduledUngroupedGuardSql(plan.group.id, plan.assignedIds),
+    remoteRemainingMembershipSafetyAfterGroupRemovalGuardSql(plan.group.id),
+    plan.saleRateProvided
+      ? `UPDATE groups SET rate_multiplier = ${plan.saleRate}, updated_at = NOW() WHERE id = ${plan.group.id} AND deleted_at IS NULL;`
+      : '',
+    `DELETE FROM account_groups WHERE group_id = ${plan.group.id};`,
+    plan.assignedIds.length > 0
+      ? `INSERT INTO account_groups (account_id, group_id, priority) VALUES ${plan.assignedIds.map(id => {
+          const priority = id === plan.mainId ? 1 : id === plan.subId ? 10 : id === plan.altId ? 20 : 100;
+          return `(${id}, ${plan.group.id}, ${priority})`;
+        }).join(', ')};`
+      : ''
+  ].filter(Boolean);
+  for (const id of plan.assignedIds) {
+    const channel = plan.assignedChannels.find(c => Number(c.id) === id);
+    const isShared = channel && currentCachedGroupIds(channel).some(gid => gid !== plan.group.id);
+    const priority = id === plan.mainId ? 1 : id === plan.subId ? 10 : id === plan.altId ? 20 : 100;
+    const keepSchedulable = id === plan.mainId || (isShared && channel.schedulable === true);
+    statements.push(`UPDATE accounts SET schedulable = ${keepSchedulable}, priority = ${priority} WHERE id = ${id};`);
+  }
+  if (executeRemoteSQL(statements.join('\n')) !== true) {
+    throw new Error('远端分组编排写入未确认，本地状态未改变');
+  }
+  if (plan.saleRateProvided) applyCachedGroupRate(plan.group.id, plan.saleRate);
+  for (const change of plan.changes) applyCachedChannelMembership(change.channel, change.groups);
+  for (const channel of plan.assignedChannels) {
+    const id = Number(channel.id);
+    const isShared = currentCachedGroupIds(channel).some(gid => gid !== plan.group.id);
+    const keepSchedulable = id === plan.mainId || (isShared && channel.schedulable === true);
+    channel.manualLocked = id === plan.mainId;
+    channel.schedulable = keepSchedulable;
+    channel.priority = id === plan.mainId ? 1 : (isShared ? channel.priority : (id === plan.subId ? 10 : id === plan.altId ? 20 : 100));
+    channel.isActive = id === plan.mainId;
+  }
+  if (plan.mainId !== null) {
+    state.activeChannelId = String(plan.mainId);
+    state.manualLockedChannelId = String(plan.mainId);
+  }
+  confirmRemoteGroupMutation(plan.affectedChannels.map(channel => channel.id));
+  return {
+    groupId: plan.group.id,
+    mainId: plan.mainId === null ? null : String(plan.mainId),
+    subId: plan.subId === null ? null : String(plan.subId),
+    altId: plan.altId === null ? null : String(plan.altId),
+    standbyCount: plan.standbyIds.length
+  };
+}
+
+// The remote update is one all-or-nothing transaction. Local callers mutate
+// their cached channels only after this returns, so a failed batch cannot
+// leave memory/JSON claiming a change that did not reach Sub2API.
+function toggleRemoteAccountsSchedulable(accountIds, schedulable) {
+  if (typeof schedulable !== 'boolean') throw new Error('schedulable 必须为布尔值');
+  const rawIds = Array.isArray(accountIds) ? accountIds : [accountIds];
+  if (rawIds.length === 0) throw new Error('请提供至少一个通道 ID');
+  const parsedIds = rawIds.map(id => Number(id));
+  if (!parsedIds.every(id => Number.isSafeInteger(id) && id > 0)) throw new Error('无效通道 ID');
+  const ids = [...new Set(parsedIds)];
+  const targets = ids.map(id => state.channels.find(channel => String(channel.id) === String(id)));
+  if (targets.some(channel => !channel)) throw new Error('目标通道不存在');
+  // accounts.schedulable is global, so every requested account must be safe
+  // for every attached business group before an enable operation can proceed.
+  if (schedulable) targets.forEach(target => assertChannelPricingIsSafe(target));
+
+  const remoteOk = executeRemoteSQL(`UPDATE accounts SET schedulable = ${schedulable ? 'true' : 'false'} WHERE id IN (${ids.join(',')});`);
+  if (remoteOk !== true) throw new Error('远端调度写入未确认，本地状态未改变');
+  invalidateSub2APIScheduler(ids);
+  refreshSub2APISignatureAfterDirectMutation('手动调度开关更新');
+  return targets;
+}
+
+// 开启/关闭单个渠道调度。由于 accounts.schedulable 是全局字段，开启前
+// 必须确认所有关联业务分组均不倒贴，不能再只看一个 primary group。
+function toggleRemoteAccountSchedulable(accountId, schedulable) {
+  toggleRemoteAccountsSchedulable([accountId], schedulable);
+  return true;
 }
 
 // 直接修改上游进货倍率 (免登后台)
 function updateRemoteAccountMultiplier(accountId, newMultiplier) {
+  const plan = prepareAccountMultiplierPlan(accountId, newMultiplier);
+  const safetyGuard = plan.exempt
+    ? remoteAccountExistenceGuardSql([plan.id])
+    : remoteProposedAccountMultiplierSafetyGuardSql(plan.id, plan.multiplier);
   const sql = `
+    ${safetyGuard}
     UPDATE accounts 
-    SET rate_multiplier = ${newMultiplier}, 
+    SET rate_multiplier = ${plan.multiplier},
         extra = CASE 
           WHEN extra ? 'upstream_billing_probe' AND (extra->'upstream_billing_probe') ? 'data' 
-          THEN jsonb_set(extra, '{upstream_billing_probe,data,effective_rate_multiplier}', '${newMultiplier}'::jsonb, true)
+          THEN jsonb_set(extra, '{upstream_billing_probe,data,effective_rate_multiplier}', '${plan.multiplier}'::jsonb, true)
           ELSE extra
         END
-    WHERE id = ${accountId};
+    WHERE id = ${plan.id} AND deleted_at IS NULL;
   `;
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler(accountId);
-    lastSub2APISignature = getSub2APISignature();
+  if (executeRemoteSQL(sql) !== true) throw new Error('远端进货倍率写入未确认，本地状态未改变');
+
+  const channel = plan.channel;
+  const oldMultiplier = channel.multiplier;
+  channel.multiplier = plan.multiplier;
+  channel.costMultiplier = plan.multiplier;
+  channel.configuredMultiplier = plan.multiplier;
+  channel.previousMultiplier = oldMultiplier;
+  channel.lastCheckTime = new Date().toISOString();
+  refreshCachedChannelPricing(channel);
+  // A user just committed a freshly checked safe value. It supersedes an
+  // older, now signature-stale automatic quarantine plan for this channel.
+  if (!plan.exempt && channel.safetyPending === true) delete channel.safetyPending;
+  if (invalidateSub2APIScheduler(plan.id) === false && typeof requestBackgroundSchedulerInvalidation === 'function') {
+    requestBackgroundSchedulerInvalidation([plan.id]);
   }
-  return ok;
+  // Always reconcile a rate edit in a child. Besides refreshing any fields
+  // not represented in the UI cache, this ensures an old safety worker sees
+  // the new signature as stale rather than silently acting on its old plan.
+  refreshSub2APISignatureAfterDirectMutation('管理员修改进货倍率', true);
+  return true;
 }
 
 // 直接修改销售分组对外倍率 (免登后台修改卖出去的倍率)
 function updateRemoteGroupSaleRate(groupId, newSaleRate) {
-  const sql = `UPDATE groups SET rate_multiplier = ${newSaleRate}, updated_at = now() WHERE id = ${groupId};`;
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler();
-    lastSub2APISignature = getSub2APISignature();
-  }
-  return ok;
+  const plan = prepareGroupSaleRatePlan(groupId, newSaleRate, '修改分组售价');
+  const sql = `${remoteCurrentGroupRateSafetyGuardSql(plan.group.id, plan.saleRate)}
+UPDATE groups
+SET rate_multiplier = ${plan.saleRate}, updated_at = NOW()
+WHERE id = ${plan.group.id} AND deleted_at IS NULL;`;
+  if (executeRemoteSQL(sql) !== true) throw new Error('远端分组售价写入未确认，本地状态未改变');
+  applyCachedGroupRate(plan.group.id, plan.saleRate);
+  confirmRemoteGroupMutation(plan.affectedChannels.map(channel => channel.id));
+  return true;
 }
 
 // 调整指定上游渠道绑定的分组 (更新 account_groups)
 function updateAccountGroups(accountId, groupIds) {
-  const cleanId = parseInt(accountId, 10);
-  const idList = (groupIds || []).map(g => parseInt(g, 10)).filter(g => !isNaN(g));
-  let sql = `DELETE FROM account_groups WHERE account_id = ${cleanId};`;
-  if (idList.length > 0) {
-    const values = idList.map(gid => `(${cleanId}, ${gid}, 50)`).join(', ');
-    sql += `\nINSERT INTO account_groups (account_id, group_id, priority) VALUES ${values};`;
+  const plan = prepareAccountGroupsPlan(accountId, groupIds, '调整账号分组');
+  const guards = [];
+  if (plan.groupIds.length > 0) {
+    guards.push(remoteGroupExistenceGuardSql(plan.groupIds));
+    guards.push(remoteAccountExistenceGuardSql([plan.accountId]));
+    guards.push(remoteProspectiveMembershipSafetyGuardSql([plan.accountId], plan.groupIds));
+  } else {
+    guards.push(remoteAccountExistenceGuardSql([plan.accountId]));
+    guards.push(remoteNoGroupForScheduledAccountsGuardSql([plan.accountId]));
   }
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler(cleanId);
-    lastSub2APISignature = getSub2APISignature();
-  }
-  return ok;
+  const statements = [
+    ...guards.filter(Boolean),
+    `DELETE FROM account_groups WHERE account_id = ${plan.accountId};`,
+    plan.groupIds.length > 0
+      ? `INSERT INTO account_groups (account_id, group_id, priority) VALUES ${plan.groupIds.map(id => `(${plan.accountId}, ${id}, 50)`).join(', ')};`
+      : ''
+  ].filter(Boolean);
+  if (executeRemoteSQL(statements.join('\n')) !== true) throw new Error('远端账号分组写入未确认，本地状态未改变');
+  applyCachedChannelMembership(plan.channel, plan.groups);
+  confirmRemoteGroupMutation([plan.accountId]);
+  return true;
 }
 
 // 创建新分组 (支持直接绑定初始通道)
 function createRemoteGroup(name, rateMultiplier, platform = 'openai', accountIds = []) {
-  const cleanName = (name || '').trim().replace(/'/g, "''");
-  const rate = Number(rateMultiplier) || 1.0;
-  const p = (platform || 'openai').toLowerCase().includes('claude') ? 'anthropic' : 'openai';
-  const sql = `INSERT INTO groups (name, rate_multiplier, platform) VALUES ('${cleanName}', ${rate}, '${p}') RETURNING id;`;
-  const rawId = execPsql(sql, true);
-  const newGroupId = parseInt((rawId || '').trim(), 10);
-  if (newGroupId && !isNaN(newGroupId)) {
-    const aidList = (accountIds || []).map(a => parseInt(a, 10)).filter(a => !isNaN(a));
-    if (aidList.length > 0) {
-      const values = aidList.map(aid => `(${aid}, ${newGroupId}, 50)`).join(', ');
-      execPsql(`INSERT INTO account_groups (account_id, group_id, priority) VALUES ${values};`, false);
-      invalidateSub2APIScheduler(aidList);
-    }
-    invalidateSub2APIScheduler();
-    lastSub2APISignature = getSub2APISignature();
-    return { ok: true, groupId: newGroupId };
+  const plan = prepareCreateRemoteGroupPlan(name, rateMultiplier, platform, accountIds);
+  const escapedName = plan.cleanName.replace(/'/g, "''");
+  const accountValues = plan.accountIds.length > 0
+    ? `, bindings AS (
+  INSERT INTO account_groups (account_id, group_id, priority)
+  SELECT selected.account_id, new_group.id, 50
+  FROM (VALUES ${plan.accountIds.map(id => `(${id})`).join(', ')}) AS selected(account_id)
+  CROSS JOIN new_group
+)`
+    : '';
+  // The data-modifying CTE commits the group and all initial bindings as one
+  // transaction; no partially-created group is observable if a binding fails.
+  const sql = `${remoteAccountExistenceGuardSql(plan.accountIds)}
+${remoteProposedSaleRateSafetyGuardSql(plan.accountIds, plan.saleRate)}
+WITH new_group AS (
+  INSERT INTO groups (name, rate_multiplier, platform)
+  VALUES ('${escapedName}', ${plan.saleRate}, '${plan.platform}')
+  RETURNING id
+)${accountValues}
+SELECT id FROM new_group;`;
+  const output = execPsql(`BEGIN;\n${sql}\nCOMMIT;`, true);
+  const ids = String(output || '').split(/\r?\n/).map(value => value.trim()).filter(value => /^\d+$/.test(value));
+  const newGroupId = Number(ids[ids.length - 1]);
+  if (!Number.isSafeInteger(newGroupId) || newGroupId <= 0) {
+    throw new Error('远端创建分组未返回有效 ID，本地状态未改变');
   }
-  return { ok: false };
+  if (!Array.isArray(state.allGroups)) state.allGroups = [];
+  const newGroup = { id: newGroupId, name: plan.cleanName, sale_rate: plan.saleRate, platform: plan.platform };
+  state.allGroups.push(newGroup);
+  for (const change of plan.changes) {
+    applyCachedChannelMembership(change.channel, [...change.groups.filter(group => group.id !== null), newGroup]);
+  }
+  confirmRemoteGroupMutation(plan.accountIds);
+  return { ok: true, groupId: newGroupId };
 }
 
 // 修改分组名称或倍率
 function updateRemoteGroup(groupId, newName, newRateMultiplier) {
-  const gid = parseInt(groupId, 10);
+  const gid = normalizePositivePlanId(groupId, '分组 ID');
+  const hasName = newName !== undefined && newName !== null;
+  const cleanName = hasName ? String(newName).trim() : null;
+  if (hasName && !cleanName) throw new Error('分组名称不能为空');
+  const hasRate = newRateMultiplier !== undefined && newRateMultiplier !== null && newRateMultiplier !== '';
+  const ratePlan = hasRate ? prepareGroupSaleRatePlan(gid, newRateMultiplier, '修改分组') : null;
   const sets = [];
-  if (newName) sets.push(`name = '${newName.trim().replace(/'/g, "''")}'`);
-  if (newRateMultiplier !== undefined && !isNaN(Number(newRateMultiplier))) {
-    sets.push(`rate_multiplier = ${Number(newRateMultiplier)}`);
-  }
+  if (cleanName) sets.push(`name = '${cleanName.replace(/'/g, "''")}'`);
+  if (ratePlan) sets.push(`rate_multiplier = ${ratePlan.saleRate}`);
   sets.push(`updated_at = now()`);
-  const sql = `UPDATE groups SET ${sets.join(', ')} WHERE id = ${gid};`;
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler();
-    lastSub2APISignature = getSub2APISignature();
+  const guards = ratePlan
+    ? [remoteCurrentGroupRateSafetyGuardSql(gid, ratePlan.saleRate)]
+    : [remoteGroupExistenceGuardSql([gid])];
+  const sql = `${guards.join('\n')}
+UPDATE groups SET ${sets.join(', ')} WHERE id = ${gid} AND deleted_at IS NULL;`;
+  if (executeRemoteSQL(sql) !== true) throw new Error('远端分组写入未确认，本地状态未改变');
+  if (ratePlan) {
+    applyCachedGroupRate(gid, ratePlan.saleRate, cleanName || undefined);
+    confirmRemoteGroupMutation(ratePlan.affectedChannels.map(channel => channel.id));
+  } else {
+    const cachedGroup = (state.allGroups || []).find(group => Number(group.id) === gid);
+    if (cachedGroup && cleanName) {
+      cachedGroup.name = cleanName;
+      for (const channel of (state.channels || [])) {
+        for (const detail of (channel.groupsDetail || [])) {
+          if (Number(detail.id) === gid) detail.name = cleanName;
+        }
+        if (Number(channel.primaryGroupId) === gid) channel.primaryGroupName = cleanName;
+      }
+    }
+    confirmRemoteGroupMutation();
   }
-  return ok;
+  return true;
 }
 
 // 删除或停用分组
 function deleteRemoteGroup(groupId) {
-  const gid = parseInt(groupId, 10);
-  const sql = `UPDATE groups SET deleted_at = now() WHERE id = ${gid}; DELETE FROM account_groups WHERE group_id = ${gid};`;
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler();
-    lastSub2APISignature = getSub2APISignature();
-  }
-  return ok;
+  const plan = prepareDeleteRemoteGroupPlan(groupId);
+  const sql = [
+    remoteGroupExistenceGuardSql([plan.group.id]),
+    remoteGroupRemovalLeavesScheduledUngroupedGuardSql(plan.group.id, []),
+    remoteRemainingMembershipSafetyAfterGroupRemovalGuardSql(plan.group.id),
+    `UPDATE groups SET deleted_at = NOW() WHERE id = ${plan.group.id} AND deleted_at IS NULL;`,
+    `DELETE FROM account_groups WHERE group_id = ${plan.group.id};`
+  ].join('\n');
+  if (executeRemoteSQL(sql) !== true) throw new Error('远端删除分组写入未确认，本地状态未改变');
+  for (const change of plan.changes) applyCachedChannelMembership(change.channel, change.groups);
+  state.allGroups = (state.allGroups || []).filter(group => Number(group.id) !== plan.group.id);
+  confirmRemoteGroupMutation(plan.affectedChannels.map(channel => channel.id));
+  return true;
 }
 
 // 在分组维度批量分配上游渠道
 function updateGroupAccounts(groupId, accountIds) {
-  const gid = parseInt(groupId, 10);
-  const aidList = (accountIds || []).map(a => parseInt(a, 10)).filter(a => !isNaN(a));
-  let sql = `DELETE FROM account_groups WHERE group_id = ${gid};`;
-  if (aidList.length > 0) {
-    const values = aidList.map(aid => `(${aid}, ${gid}, 50)`).join(', ');
-    sql += `\nINSERT INTO account_groups (account_id, group_id, priority) VALUES ${values};`;
-  }
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler(aidList);
-    lastSub2APISignature = getSub2APISignature();
-  }
-  return ok;
+  const plan = prepareGroupAccountsPlan(groupId, accountIds, '调整分组账号');
+  const statements = [
+    remoteGroupExistenceGuardSql([plan.group.id]),
+    remoteAccountExistenceGuardSql(plan.accountIds),
+    remoteProspectiveMembershipSafetyGuardSql(plan.accountIds, [plan.group.id]),
+    remoteGroupRemovalLeavesScheduledUngroupedGuardSql(plan.group.id, plan.accountIds),
+    remoteRemainingMembershipSafetyAfterGroupRemovalGuardSql(plan.group.id),
+    `DELETE FROM account_groups WHERE group_id = ${plan.group.id};`,
+    plan.accountIds.length > 0
+      ? `INSERT INTO account_groups (account_id, group_id, priority) VALUES ${plan.accountIds.map(id => `(${id}, ${plan.group.id}, 50)`).join(', ')};`
+      : ''
+  ].filter(Boolean);
+  if (executeRemoteSQL(statements.join('\n')) !== true) throw new Error('远端分组账号写入未确认，本地状态未改变');
+  for (const change of plan.changes) applyCachedChannelMembership(change.channel, change.groups);
+  confirmRemoteGroupMutation(plan.affectedChannels.map(channel => channel.id));
+  return true;
 }
 
 // 向已有业务分组中批量追加绑定上游渠道 (保留组内原有其他通道)
 function addAccountsToGroup(groupId, accountIds) {
-  const gid = parseInt(groupId, 10);
-  if (isNaN(gid)) return false;
-  const aidList = (accountIds || []).map(a => parseInt(a, 10)).filter(a => !isNaN(a));
-  if (aidList.length === 0) return true;
-
-  // 使用 WHERE NOT EXISTS 避免重复关联造成数据库异常
-  const unions = aidList.map(aid => 
-    `SELECT ${aid} AS account_id, ${gid} AS group_id, 50 AS priority WHERE NOT EXISTS (SELECT 1 FROM account_groups WHERE account_id = ${aid} AND group_id = ${gid})`
+  const plan = prepareAddAccountsToGroupPlan(groupId, accountIds, '向分组追加账号');
+  if (plan.accountIds.length === 0) return true;
+  // 使用 WHERE NOT EXISTS 避免重复关联造成数据库异常。
+  const unions = plan.accountIds.map(accountId =>
+    `SELECT ${accountId} AS account_id, ${plan.group.id} AS group_id, 50 AS priority WHERE NOT EXISTS (SELECT 1 FROM account_groups WHERE account_id = ${accountId} AND group_id = ${plan.group.id})`
   ).join('\nUNION ALL\n');
-
-  const sql = `INSERT INTO account_groups (account_id, group_id, priority) ${unions};`;
-  const ok = executeRemoteSQL(sql);
-  if (ok) {
-    invalidateSub2APIScheduler(aidList);
-    lastSub2APISignature = getSub2APISignature();
-  }
-  return ok;
+  const statements = [
+    remoteGroupExistenceGuardSql([plan.group.id]),
+    remoteAccountExistenceGuardSql(plan.accountIds),
+    remoteProspectiveMembershipSafetyGuardSql(plan.accountIds, [plan.group.id]),
+    `INSERT INTO account_groups (account_id, group_id, priority) ${unions};`
+  ];
+  if (executeRemoteSQL(statements.join('\n')) !== true) throw new Error('远端追加分组账号写入未确认，本地状态未改变');
+  for (const change of plan.changes) applyCachedChannelMembership(change.channel, change.groups);
+  confirmRemoteGroupMutation(plan.accountIds);
+  return true;
 }
 
 // 获取全部业务分组详细信息（包含挂载的渠道列表与数量）
@@ -1981,6 +3160,10 @@ async function discoverChannelUpstreamModels(channel, force = false) {
 
 let isDiscoveringUpstreamModels = false;
 function triggerBackgroundModelDiscovery() {
+  // A control-plane worker only produces a DB snapshot. Model discovery is
+  // network I/O and remains owned by the main process after it merges that
+  // snapshot.
+  if (IS_CONTROL_PLANE_WORKER) return false;
   if (isDiscoveringUpstreamModels) return;
   isDiscoveringUpstreamModels = true;
   setTimeout(async () => {
@@ -2000,7 +3183,7 @@ function triggerBackgroundModelDiscovery() {
 }
 
 // 从 Sub2API 数据库抽取各渠道、各模型过去 24 小时的真实首字速度与稳定性
-function fetchChannelStabilityMetrics(forceRefresh = false) {
+function fetchChannelStabilityMetrics(forceRefresh = false, options = {}) {
   const now = Date.now();
   if (!forceRefresh && cachedStability && (now - lastStabilityFetch < 30000)) {
     return cachedStability;
@@ -2223,6 +3406,7 @@ SELECT json_agg(t) FROM (
     return channelMap;
   } catch (err) {
     console.error('Error fetching stability metrics:', err.message);
+    if (options.throwOnError) throw err;
     return cachedStability || {};
   }
 }
@@ -2374,7 +3558,7 @@ const gatewayTrafficTracker = {
 let cachedUserActivity = null;
 let lastUserActivityFetch = 0;
 
-function fetchChannelUserActivity(forceRefresh = false) {
+function fetchChannelUserActivity(forceRefresh = false, options = {}) {
   const now = Date.now();
   if (!forceRefresh && cachedUserActivity && (now - lastUserActivityFetch < 60000)) {
     return cachedUserActivity;
@@ -2433,6 +3617,7 @@ SELECT json_agg(t) FROM (
     return activityMap;
   } catch (err) {
     console.error('Error fetching channel user activity:', err.message);
+    if (options.throwOnError) throw err;
     return cachedUserActivity || {};
   }
 }
@@ -2440,7 +3625,22 @@ SELECT json_agg(t) FROM (
 let cachedGlobalUserStats = null;
 let lastGlobalUserStatsFetch = 0;
 
-function fetchGlobalUserStats(forceRefresh = false) {
+function mergeGlobalUserStats(dbStats) {
+  const memGlobal = gatewayTrafficTracker.getGlobalStats();
+  const base = dbStats || { totalOnline15m: 0, totalUsers24h: 0, totalCalls24h: 0 };
+  return {
+    totalOnline15m: Math.max(Number(base.totalOnline15m || 0), memGlobal.totalOnline15m || 0),
+    totalUsers24h: Math.max(Number(base.totalUsers24h || 0), memGlobal.totalOnline15m || 0),
+    totalCalls24h: Number(base.totalCalls24h || 0) + (memGlobal.totalCalls24h || 0),
+    totalInflight: memGlobal.totalInflight || 0
+  };
+}
+
+function getCachedGlobalUserStats() {
+  return mergeGlobalUserStats(cachedGlobalUserStats);
+}
+
+function fetchGlobalUserStats(forceRefresh = false, options = {}) {
   const now = Date.now();
   let dbStats = cachedGlobalUserStats;
   if (forceRefresh || !cachedGlobalUserStats || (now - lastGlobalUserStatsFetch >= 20000)) {
@@ -2460,24 +3660,18 @@ SELECT json_build_object(
       }
     } catch (err) {
       console.error('Error fetching global user stats:', err.message);
+      if (options.throwOnError) throw err;
     }
   }
 
-  const memGlobal = gatewayTrafficTracker.getGlobalStats();
-  const base = dbStats || { totalOnline15m: 0, totalUsers24h: 0, totalCalls24h: 0 };
-  return {
-    totalOnline15m: Math.max(Number(base.totalOnline15m || 0), memGlobal.totalOnline15m || 0),
-    totalUsers24h: Math.max(Number(base.totalUsers24h || 0), memGlobal.totalOnline15m || 0),
-    totalCalls24h: Number(base.totalCalls24h || 0) + (memGlobal.totalCalls24h || 0),
-    totalInflight: memGlobal.totalInflight || 0
-  };
+  return mergeGlobalUserStats(dbStats);
 }
 
 // ====== 💳 全站用户充值金额、消费消耗与财务大盘数据引擎 ======
 let cachedUserFinancialStats = null;
 let lastUserFinancialStatsFetch = 0;
 
-function fetchUserFinancialStats(forceRefresh = false) {
+function fetchUserFinancialStats(forceRefresh = false, options = {}) {
   const now = Date.now();
   if (!forceRefresh && cachedUserFinancialStats && (now - lastUserFinancialStatsFetch < 15000)) {
     return cachedUserFinancialStats;
@@ -2507,32 +3701,49 @@ r_stats AS (
   FROM redeem_codes
   WHERE status = 'used'
 ),
+normalized_usage AS (
+  SELECT
+    u.user_id,
+    u.created_at,
+    u.actual_cost,
+    (u.total_cost * COALESCE(
+      CASE
+        WHEN u.account_rate_multiplier IS NOT NULL AND u.account_rate_multiplier != 1.0 THEN u.account_rate_multiplier
+        WHEN a.rate_multiplier IS NOT NULL AND a.rate_multiplier < 1.0 THEN a.rate_multiplier
+        ELSE u.account_rate_multiplier
+      END,
+      a.rate_multiplier,
+      0
+    )) as effective_cost
+  FROM usage_logs u
+  LEFT JOIN accounts a ON u.account_id = a.id
+),
 s_stats AS (
   SELECT 
     COALESCE(SUM(actual_cost), 0) as total_spent_all,
     COALESCE(SUM(actual_cost) FILTER (WHERE user_id NOT IN (1, 8)), 0) as total_spent_customers,
-    COALESCE(SUM(total_cost * COALESCE(account_rate_multiplier, 0)) FILTER (WHERE user_id NOT IN (1, 8)), 0) as total_cost_customers,
-    COALESCE(SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE user_id NOT IN (1, 8)), 0) as total_profit_customers,
+    COALESCE(SUM(effective_cost) FILTER (WHERE user_id NOT IN (1, 8)), 0) as total_cost_customers,
+    COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE user_id NOT IN (1, 8)), 0) as total_profit_customers,
     
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= CURRENT_DATE), 0) as today_spent_all,
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as today_spent_customers,
-    COALESCE(SUM(total_cost * COALESCE(account_rate_multiplier, 0)) FILTER (WHERE created_at >= CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as today_cost_customers,
-    COALESCE(SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE created_at >= CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as today_profit_customers,
+    COALESCE(SUM(effective_cost) FILTER (WHERE created_at >= CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as today_cost_customers,
+    COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as today_profit_customers,
     COUNT(DISTINCT user_id) FILTER (WHERE created_at >= CURRENT_DATE AND user_id NOT IN (1, 8)) as today_active_customers,
     COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE AND user_id NOT IN (1, 8)) as today_requests_customers,
     
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE), 0) as yesterday_spent_all,
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as yesterday_spent_customers,
-    COALESCE(SUM(total_cost * COALESCE(account_rate_multiplier, 0)) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as yesterday_cost_customers,
-    COALESCE(SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as yesterday_profit_customers,
+    COALESCE(SUM(effective_cost) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as yesterday_cost_customers,
+    COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id NOT IN (1, 8)), 0) as yesterday_profit_customers,
     COUNT(DISTINCT user_id) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id NOT IN (1, 8)) as yesterday_active_customers,
     COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id NOT IN (1, 8)) as yesterday_requests_customers,
     
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id NOT IN (1, 8)), 0) as past7d_spent_customers,
-    COALESCE(SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id NOT IN (1, 8)), 0) as past7d_profit_customers,
+    COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id NOT IN (1, 8)), 0) as past7d_profit_customers,
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND user_id NOT IN (1, 8)), 0) as past30d_spent_customers,
-    COALESCE(SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND user_id NOT IN (1, 8)), 0) as past30d_profit_customers
-  FROM usage_logs
+    COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND user_id NOT IN (1, 8)), 0) as past30d_profit_customers
+  FROM normalized_usage
 ),
 paying_count AS (
   SELECT COUNT(DISTINCT user_id) as paying_users
@@ -2567,9 +3778,9 @@ daily_s AS (
     COUNT(DISTINCT user_id) FILTER (WHERE user_id NOT IN (1, 8)) as active_users_customers,
     SUM(actual_cost) as spent_all,
     SUM(actual_cost) FILTER (WHERE user_id NOT IN (1, 8)) as spent_customers,
-    SUM(total_cost * COALESCE(account_rate_multiplier, 0)) FILTER (WHERE user_id NOT IN (1, 8)) as cost_customers,
-    SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE user_id NOT IN (1, 8)) as profit_customers
-  FROM usage_logs
+    SUM(effective_cost) FILTER (WHERE user_id NOT IN (1, 8)) as cost_customers,
+    SUM(actual_cost - effective_cost) FILTER (WHERE user_id NOT IN (1, 8)) as profit_customers
+  FROM normalized_usage
   WHERE created_at >= CURRENT_DATE - INTERVAL '14 days'
   GROUP BY 1
 ),
@@ -2611,17 +3822,17 @@ user_s AS (
   SELECT 
     user_id,
     SUM(actual_cost) as total_spent,
-    SUM(total_cost * COALESCE(account_rate_multiplier, 0)) as total_cost,
-    SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) as total_profit,
+    SUM(effective_cost) as total_cost,
+    SUM(actual_cost - effective_cost) as total_profit,
     SUM(actual_cost) FILTER (WHERE created_at >= CURRENT_DATE) as today_spent,
-    SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE created_at >= CURRENT_DATE) as today_profit,
+    SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= CURRENT_DATE) as today_profit,
     SUM(actual_cost) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE) as yesterday_spent,
-    SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE) as yesterday_profit,
+    SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE) as yesterday_profit,
     SUM(actual_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as past7d_spent,
-    SUM(actual_cost - (total_cost * COALESCE(account_rate_multiplier, 0))) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as past7d_profit,
+    SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') as past7d_profit,
     COUNT(*) as total_requests,
     MAX(created_at) as last_active_at
-  FROM usage_logs
+  FROM normalized_usage
   GROUP BY user_id
 ),
 users_list AS (
@@ -2726,9 +3937,11 @@ FROM u_summary u, r_stats r, s_stats s, paying_count pc, daily_trends dt, users_
       lastUserFinancialStatsFetch = now;
       return cachedUserFinancialStats;
     }
+    if (options.throwOnError) throw new Error('财务看板未返回有效数据');
     return cachedUserFinancialStats || { summary: {}, dailyTrends: [], users: [], recentRecharges: [] };
   } catch (err) {
     console.error('Error fetching user financial stats:', err.message);
+    if (options.throwOnError) throw err;
     return cachedUserFinancialStats || { summary: {}, dailyTrends: [], users: [], recentRecharges: [] };
   }
 }
@@ -2818,10 +4031,10 @@ COMMIT;
 
 
 // 封装获取携带完整模型明细与稳定性的对外安全渠道数据
-function getEnrichedChannels(forceStabilityRefresh = false) {
-  const stabilityMap = fetchChannelStabilityMetrics(forceStabilityRefresh);
-  const userActivityMap = fetchChannelUserActivity(forceStabilityRefresh);
-  return state.channels.map(c => {
+function getEnrichedChannels(forceStabilityRefresh = false, cacheOnly = false, channels = state.channels) {
+  const stabilityMap = cacheOnly ? (cachedStability || {}) : fetchChannelStabilityMetrics(forceStabilityRefresh);
+  const userActivityMap = cacheOnly ? (cachedUserActivity || {}) : fetchChannelUserActivity(forceStabilityRefresh);
+  return channels.map(c => {
     const copy = { ...c };
     if (copy.apiKey) {
       copy.apiKey = maskApiKey(copy.apiKey);
@@ -2859,7 +4072,7 @@ function getEnrichedChannels(forceStabilityRefresh = false) {
 // 统一对外广播渠道更新事件 (携带全量 modelsStability，杜绝前端空数据覆盖)
 function broadcastChannelsUpdate(forceStabilityRefresh = false) {
   try {
-    const safeChannels = getEnrichedChannels(forceStabilityRefresh);
+    const safeChannels = getEnrichedChannels(forceStabilityRefresh, true);
     broadcastSSE('CHANNELS_UPDATED', {
       activeChannelId: state.activeChannelId,
       autoPollIntervalSeconds: state.autoPollIntervalSeconds,
@@ -2990,37 +4203,56 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
   const balanceUnavailable = toChannel.balanceStatus === 'empty' ||
     (toChannel.balance != null && Number.isFinite(Number(toChannel.balance)) && Number(toChannel.balance) <= 0.001);
   if (!Number.isSafeInteger(id) || id <= 0 || toChannel.autoSwitchDisabled ||
+      (typeof isExemptChannel === 'function' && isExemptChannel(toChannel)) ||
       (toChannel.configuredStatus && toChannel.configuredStatus !== 'active') ||
       toChannel.status !== 'online' || toChannel.lastProbeStatus === 'offline' || balanceUnavailable) {
-    throw new Error('备选通道已不可用，请重新评估');
+    throw new Error('备选通道已不可用或属于用户手动调优例外通道，禁止自动切换');
   }
-  const scope = meta.groupId ? [Number(meta.groupId)] : groupIds(toChannel).filter(gid => !isExemptGroup(gid));
-  if (meta.groupId && !groupIds(toChannel).includes(Number(meta.groupId))) throw new Error('备选通道已不属于目标分组');
+  const hasTargetGroup = meta.groupId !== null && meta.groupId !== undefined;
+  const targetGroupId = hasTargetGroup ? Number(meta.groupId) : null;
+  if (hasTargetGroup && (!Number.isSafeInteger(targetGroupId) || targetGroupId <= 0)) throw new Error('目标业务分组无效');
+  const scope = hasTargetGroup ? [targetGroupId] : groupIds(toChannel).filter(gid => !isExemptGroup(gid));
+  if (hasTargetGroup && !groupIds(toChannel).includes(targetGroupId)) throw new Error('备选通道已不属于目标分组');
+  // The decision layer already filters by group price; repeat the check at
+  // the write boundary so stale proposals and future direct callers cannot
+  // promote a channel that loses money in the target business group.
+  assertChannelPricingIsSafe(toChannel, targetGroupId);
+  if (hasTargetGroup && groupIds(toChannel).some(groupId => !scope.includes(groupId))) {
+    throw new Error('安全拦截：共享通道不能通过组级自动切换改写全局调度状态，请先配置经验证的组级调度能力');
+  }
+  if (hasTargetGroup && groupIds(fromChannel).some(groupId => !scope.includes(groupId))) {
+    throw new Error('安全拦截：共享来源通道不能通过组级自动切换改写全局调度状态，请先配置经验证的组级调度能力');
+  }
   const exclusive = autoSwitchConfig.singleActiveExclusive !== false && !scope.some(gid => isExemptGroup(gid));
   const peers = state.channels.filter(c => String(c.id) !== targetId && groupIds(c).some(gid => scope.includes(gid)));
-  const safeToDisableIds = exclusive ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(Number.isSafeInteger) : [];
-  const sharedPeerIds = peers.filter(c => !safeToDisableIds.includes(Number(c.id))).map(c => Number(c.id)).filter(Number.isSafeInteger);
+  const safeToDisableIds = exclusive
+    ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(peerId => Number.isSafeInteger(peerId) && peerId > 0)
+    : [];
+  const safeToDisableIdSet = new Set(safeToDisableIds);
   let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${id} AND deleted_at IS NULL AND status = 'active') THEN RAISE EXCEPTION 'Target unavailable'; END IF; END $$;
 UPDATE accounts SET schedulable = true, priority = 1 WHERE id = ${id};`;
   if (safeToDisableIds.length) sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisableIds.join(',')});`;
-  if (sharedPeerIds.length) sql += `UPDATE accounts SET priority = GREATEST(priority, 10) WHERE id IN (${sharedPeerIds.join(',')});`;
+  // account priority is global. Do not downgrade shared peers while handling
+  // one group, because that would silently reshape another group's routing.
   // Automatic routing never changes business sale prices.
   const remoteOk = executeRemoteSQL(sql);
+  if (remoteOk !== true) throw new Error('远端自动切线写入未确认，本地状态未改变');
   toChannel.priority = 1;
   toChannel.isActive = true;
   toChannel.schedulable = true;
   toChannel.manualLocked = Boolean(meta.manualConfirmed);
   if (String(state.manualLockedChannelId) === oldId) state.manualLockedChannelId = meta.manualConfirmed ? targetId : null;
   for (const peer of peers) {
-    if (exclusive && !groupIds(peer).some(gid => !scope.includes(gid))) peer.schedulable = false;
+    if (!safeToDisableIdSet.has(Number(peer.id))) continue;
+    peer.schedulable = false;
     peer.priority = Math.max(10, Number(peer.priority) || 10);
     peer.isActive = false;
     peer.manualLocked = false;
   }
   if (String(state.activeChannelId) === oldId || !state.activeChannelId) state.activeChannelId = targetId;
   writeJSON(CHANNELS_FILE, state);
-  invalidateSub2APIScheduler([id, ...peers.map(c => Number(c.id)).filter(Number.isSafeInteger)]);
-  lastSub2APISignature = getSub2APISignature();
+  invalidateSub2APIScheduler([id, ...safeToDisableIds]);
+  refreshSub2APISignatureAfterDirectMutation('自动切线写入');
 
   // 记录自动切换日志
   const logEntry = {
@@ -3212,39 +4444,82 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
     const channels = state.channels.filter(c => groupIds(c).includes(Number(group.id)));
     if (!channels.length) continue;
     try {
+      // `schedulable` and priority are account-wide settings, but pricing is
+      // group-wide. Keep an already-active shared route visible for health
+      // assessment, while hiding shared backups from group-level promotion:
+      // without verified group-scoped scheduler state, promoting one would
+      // alter every other group that shares it.
+      const groupCurrent = [...channels].filter(channel => channel.schedulable).sort((a, b) => {
+        const left = Number.isFinite(Number(a.priority)) ? Number(a.priority) : Number.MAX_SAFE_INTEGER;
+        const right = Number.isFinite(Number(b.priority)) ? Number(b.priority) : Number.MAX_SAFE_INTEGER;
+        return left - right || Number(a.id) - Number(b.id);
+      })[0];
+      const groupCurrentId = groupCurrent ? String(groupCurrent.id) : null;
+      const isExclusiveToGroup = channel => !groupIds(channel).some(groupId => groupId !== Number(group.id));
+      const pricingEligibleChannels = channels.map(channel => {
+        const mayRemainCurrent = String(channel.id) === groupCurrentId;
+        const canBePromoted = (isExclusiveToGroup(channel) || mayRemainCurrent) &&
+          !(typeof isExemptChannel === 'function' && isExemptChannel(channel));
+        return groupCostIsSafe(channel, group) && canBePromoted
+          ? channel
+          : { ...channel, schedulable: false, autoSwitchDisabled: true };
+      });
       const metrics = Object.fromEntries(channels.map(c => {
         const observed = gatewayMetrics.summary(c.id), production = productionMetrics[String(c.id)];
         return [String(c.id), production?.totalCalls ? production : observed];
       }));
-      const decision = evaluateGroup({ group, channels, metrics, config: { ...autoSwitchConfig, ...policy }, runtime: state.failoverRuntime[key] || {}, now });
+      const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, config: { ...autoSwitchConfig, ...policy }, runtime: state.failoverRuntime[key] || {}, now });
       state.failoverRuntime[key] = decision.runtime;
-      const current = channels.find(c => String(c.id) === String(decision.currentId));
+      const current = channels.find(c => String(c.id) === String(decision.currentId)) || groupCurrent;
       if (decision.action === 'switch') {
+        if (current && !isExclusiveToGroup(current)) {
+          const warnNote = `${group.name}：当前活跃通道 [${current.name}] 发生故障(${reasonNames[decision.reason] || decision.reason})，但由于该通道被多个业务组共享，系统已保守保持以避免跨组影响，建议在控制台单独核实调度`;
+          details.push(warnNote);
+          if (!decision.runtime.sharedHoldNotified) {
+            alerts.unshift({ id: 'shared_hold_' + key + '_' + now, type: 'pool_exhausted', groupId: group.id, timestamp: new Date(now).toISOString(), note: warnNote });
+            if (alerts.length > 200) alerts = alerts.slice(0, 200);
+            writeJSON(ALERTS_FILE, alerts);
+            broadcastSSE('POOL_EXHAUSTED', { groupId: group.id, note: warnNote });
+            decision.runtime.sharedHoldNotified = true;
+          }
+          continue;
+        }
+        decision.runtime.sharedHoldNotified = false;
         const target = channels.find(c => String(c.id) === String(decision.targetId));
         const result = executeAutoSwitch(current || { id: 0, name: '无活动账号' }, target, group.name + '：' + (reasonNames[decision.reason] || decision.reason), { groupId: group.id, groupName: group.name, triggerType: decision.reason });
         decision.runtime.lastSwitchAt = now;
+        decision.runtime.lastTargetId = decision.targetId;
         decision.runtime.exhaustedNotified = false;
         reports.push(result);
       } else if (decision.action === 'exhausted') {
         const active = channels.filter(c => c.schedulable);
-        if (active.length) {
-          const ids = active.map(c => Number(c.id));
+        // `accounts.schedulable` is global. Never turn off a shared account
+        // merely because this one group has no viable route; another group may
+        // still be using it. Group-local scheduler state is not available yet.
+        const exclusiveActive = active.filter(channel => !groupIds(channel).some(groupId => groupId !== Number(group.id)));
+        const sharedActive = active.filter(channel => !exclusiveActive.includes(channel));
+        if (exclusiveActive.length) {
+          const ids = exclusiveActive.map(c => Number(c.id));
           if (!ids.every(id => Number.isSafeInteger(id) && id > 0)) throw new Error('无效账号ID');
-          executeRemoteSQL('UPDATE accounts SET schedulable = false WHERE id IN (' + ids.join(',') + ');');
-          active.forEach(c => { c.schedulable = false; c.isActive = false; });
-          if (active.some(c => String(c.id) === String(state.activeChannelId))) state.activeChannelId = '';
+          const remoteOk = executeRemoteSQL('UPDATE accounts SET schedulable = false WHERE id IN (' + ids.join(',') + ');');
+          if (remoteOk !== true) throw new Error('远端未确认耗尽组停用写入');
+          exclusiveActive.forEach(c => { c.schedulable = false; c.isActive = false; });
+          if (exclusiveActive.some(c => String(c.id) === String(state.activeChannelId))) state.activeChannelId = '';
           invalidateSub2APIScheduler(ids);
           broadcastSSE('CHANNELS_UPDATED', state);
         }
         if (!decision.runtime.exhaustedNotified) {
-          const note = group.name + ' 暂无可用且不亏损的备用账号，请检查余额并充值；系统会继续探测并自动恢复。';
+          const sharedProtection = sharedActive.length
+            ? ` 已保留 ${sharedActive.length} 条共享账号的全局调度状态，避免影响其他业务组。`
+            : '';
+          const note = group.name + ' 暂无可用且不亏损的备用账号，请检查余额并充值；系统会继续探测并自动恢复。' + sharedProtection;
           alerts.unshift({ id: 'pool_' + key + '_' + now, type: 'pool_exhausted', groupId: group.id, timestamp: new Date(now).toISOString(), note });
           writeJSON(ALERTS_FILE, alerts);
           broadcastSSE('POOL_EXHAUSTED', { groupId: group.id, note });
           Promise.resolve(telegram.broadcastToAdmins(note.replace(/[&<>]/g, ''))).catch(error => console.error('[切号通知]', error.message));
           decision.runtime.exhaustedNotified = true;
         }
-        details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason));
+        details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason) + (sharedActive.length ? `（已保留 ${sharedActive.length} 条共享账号）` : ''));
       } else {
         details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason));
       }
@@ -3263,7 +4538,7 @@ async function refreshFailoverHealth() {
   if (healthPollRunning || !autoSwitchConfig.enabled) return;
   healthPollRunning = true;
   try {
-    const channels = state.channels.filter(c => !c.autoSwitchDisabled && groupIds(c).some(gid => !isExemptGroup(gid)));
+    const channels = state.channels.filter(c => !c.autoSwitchDisabled && !(typeof isExemptChannel === 'function' && isExemptChannel(c)) && groupIds(c).some(gid => !isExemptGroup(gid)));
     for (let offset = 0; offset < channels.length; offset += 8) {
       await Promise.all(channels.slice(offset, offset + 8).map(async channel => {
         const endpoint = channel.baseUrl, apiKey = channel.apiKey;
@@ -3293,36 +4568,709 @@ function startAutoSwitchPoller() {
 
 let lastSub2APISignature = '';
 
+function hasUnresolvedSub2APISafetyGate() {
+  return safetyReconciliationPending === true ||
+    (Array.isArray(state.channels) && state.channels.some(channel => channel && channel.safetyPending === true));
+}
+
+// A direct control-plane mutation must not acknowledge a configuration while
+// another channel is still fail-closed awaiting a safety worker. Otherwise a
+// failed/timeout safety task could be hidden by this unrelated write and leave
+// the pending gate stuck forever. Keep the version dirty and request a fresh
+// snapshot, which will re-create the still-valid plan or clear the stale gate.
+function refreshSub2APISignatureAfterDirectMutation(reason = '直接控制面写入', forceSnapshot = false) {
+  if (forceSnapshot || hasUnresolvedSub2APISafetyGate()) {
+    lastSub2APISignature = '';
+    if (!IS_CONTROL_PLANE_WORKER && typeof requestBackgroundControlPlaneSync === 'function') {
+      requestBackgroundControlPlaneSync(reason, true);
+    }
+    return '';
+  }
+  lastSub2APISignature = getSub2APISignature();
+  return lastSub2APISignature;
+}
+
 function getSub2APISignature() {
   try {
-    // 采用核心配置特征指纹哈希（排除 last_used_at/updated_at 等非配置项变动，杜绝后台调用产生 SSE 广播风暴引起的前端反复重绘与页面抖动）
-    const sql = `SELECT MD5(COALESCE((SELECT string_agg(id || ':' || status || ':' || schedulable::text || ':' || priority || ':' || rate_multiplier || ':' || MD5(COALESCE(credentials::text, '')), ',' ORDER BY id) FROM accounts WHERE deleted_at IS NULL), '') || '|' || COALESCE((SELECT string_agg(id || ':' || name || ':' || rate_multiplier, ',' ORDER BY id) FROM groups WHERE deleted_at IS NULL), '') || '|' || COALESCE((SELECT string_agg(account_id || '-' || group_id, ',' ORDER BY account_id, group_id) FROM account_groups), ''));`;
+    // Exclude volatile timestamps but include `extra`, whose billing probe is
+    // the effective cost used by the safety plan.
+    const sql = `SELECT ${sub2APIConfigurationSignatureSql()};`;
     return execPsql(sql, true).trim();
   } catch (e) {
     return '';
   }
 }
 
-// ⚡ 极速秒级双向同步监听器 (每 2 秒极速检测底层数据库变更，发现变动即毫秒级全量更新并 SSE 广播至全部前端)
+// All scheduled PostgreSQL/Docker work runs in a short-lived child process.
+// The adapters above stay synchronous for explicit control operations, but a
+// slow VPS or SSH connection can no longer freeze the /v1 event loop merely
+// because a watcher, SSE broadcast, or dashboard read is due.
+const CONTROL_PLANE_WORKER_TIMEOUT_MS = 60000;
+const CONTROL_PLANE_MAX_BACKOFF_MS = 120000;
+const controlPlaneTasks = {
+  // Rate-limit from dispatch time, rather than completion time. Otherwise a
+  // 5-second poll that takes even a few milliseconds to complete skips its
+  // next tick and silently becomes a 10-second poll.
+  sync: { running: false, failures: 0, lastStartedAt: null, lastSuccessAt: null, lastFailureAt: null, nextAttemptAt: 0, lastReason: null, minIntervalMs: 5000 },
+  dashboard: { running: false, failures: 0, lastStartedAt: null, lastSuccessAt: null, lastFailureAt: null, nextAttemptAt: 0, lastReason: null, minIntervalMs: 180000 },
+  cleanup: { running: false, failures: 0, lastStartedAt: null, lastSuccessAt: null, lastFailureAt: null, nextAttemptAt: 0, lastReason: null, minIntervalMs: 10 * 60 * 1000 },
+  // Cache eviction is retried independently from the authoritative database
+  // write. A transient Redis failure must not replay a completed safety plan.
+  cache: { running: false, failures: 0, lastStartedAt: null, lastSuccessAt: null, lastFailureAt: null, nextAttemptAt: 0, lastReason: null, minIntervalMs: 0 },
+  // A sync worker only observes the database. Safety writes use their own
+  // worker so a slow PostgreSQL/Redis round-trip cannot block the gateway.
+  safety: { running: false, failures: 0, lastStartedAt: null, lastSuccessAt: null, lastFailureAt: null, nextAttemptAt: 0, lastReason: null, minIntervalMs: 0 }
+};
+let controlPlaneRunSequence = 0;
+let queuedControlPlaneSafety = null;
+let activeControlPlaneSafety = null;
+let safetyReconciliationPending = false;
+const queuedControlPlaneCacheInvalidationIds = new Set();
+let controlPlaneCacheRetryTimer = null;
+let controlPlaneSafetyRetryTimer = null;
+
+function getControlPlaneSyncStatus() {
+  const task = controlPlaneTasks.sync;
+  return {
+    running: task.running,
+    stale: !task.lastSuccessAt || Boolean(task.lastFailureAt && task.lastFailureAt > task.lastSuccessAt),
+    lastSuccessAt: task.lastSuccessAt ? new Date(task.lastSuccessAt).toISOString() : null,
+    lastFailureAt: task.lastFailureAt ? new Date(task.lastFailureAt).toISOString() : null,
+    nextRetryAt: task.nextAttemptAt ? new Date(task.nextAttemptAt).toISOString() : null
+  };
+}
+
+function recordControlPlaneFailure(task, reason) {
+  task.failures += 1;
+  task.lastFailureAt = Date.now();
+  task.nextAttemptAt = task.lastFailureAt + Math.min(
+    CONTROL_PLANE_MAX_BACKOFF_MS,
+    5000 * (2 ** Math.min(task.failures - 1, 5))
+  );
+  console.error(`[后台控制面] ${reason} 失败；将在 ${Math.ceil((task.nextAttemptAt - task.lastFailureAt) / 1000)} 秒后重试`);
+}
+
+const CONTROL_PLANE_LOCAL_CHANNEL_FIELDS = new Set([
+  // These values are produced by the gateway, health checks, or direct UI
+  // actions, not by the remote account snapshot.
+  'balance', 'balanceUnit', 'balanceUpdated', 'balanceStatus',
+  'lastProbeStatus', 'lastProbeTime', 'latency', 'backupLines',
+  'autoSwitchDisabled', 'manualLocked', 'isActive', 'knownModels',
+  'previousMultiplier', 'upstreamPanelId', 'panelSync'
+]);
+
+function controlPlaneOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object || {}, key);
+}
+
+function controlPlaneValuesEqual(left, right) {
+  if (left === right) return true;
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
+function cloneControlPlaneState(value) {
+  try {
+    return JSON.parse(JSON.stringify(value || {}));
+  } catch {
+    return { channels: [] };
+  }
+}
+
+function mergeControlPlaneBackupLines(baseChannel, currentChannel, remoteChannel, mergedChannel) {
+  const currentLines = currentChannel && Array.isArray(currentChannel.backupLines) ? currentChannel.backupLines : null;
+  const baseLines = baseChannel && Array.isArray(baseChannel.backupLines) ? baseChannel.backupLines : null;
+  const remoteLines = Array.isArray(remoteChannel.backupLines) ? remoteChannel.backupLines : [];
+  const currentChangedSinceStart = Boolean(baseChannel && !controlPlaneValuesEqual(currentLines, baseLines));
+  const source = currentLines && currentChangedSinceStart ? currentLines : (remoteLines.length ? remoteLines : currentLines);
+  if (!Array.isArray(source)) return [];
+
+  const baseUrl = String(mergedChannel.baseUrl || '').replace(/\/+$/, '');
+  const lines = source.map(line => ({ ...line }));
+  lines.forEach(line => {
+    line.isCurrent = Boolean(baseUrl && String(line.url || '').replace(/\/+$/, '') === baseUrl);
+  });
+  if (baseUrl && !lines.some(line => line.isCurrent)) {
+    lines.unshift({
+      url: mergedChannel.baseUrl,
+      label: '当前主线',
+      status: 'online',
+      latency: currentChannel && currentChannel.latency !== undefined ? currentChannel.latency : null,
+      isCurrent: true
+    });
+  }
+  return lines;
+}
+
+function mergeControlPlaneChannel(baseChannel, currentChannel, remoteChannel) {
+  const merged = { ...(currentChannel || {}) };
+  const hasConcurrentLocalChange = key => Boolean(
+    currentChannel && baseChannel && !controlPlaneValuesEqual(currentChannel[key], baseChannel[key])
+  );
+
+  for (const [key, value] of Object.entries(remoteChannel || {})) {
+    if (CONTROL_PLANE_LOCAL_CHANNEL_FIELDS.has(key)) continue;
+    if (!currentChannel || !baseChannel || !hasConcurrentLocalChange(key)) {
+      merged[key] = value;
+    }
+  }
+  merged.id = String(remoteChannel.id);
+  merged.backupLines = mergeControlPlaneBackupLines(baseChannel, currentChannel, remoteChannel, merged);
+
+  // The worker does no model discovery. Preserve runtime discoveries while
+  // still exposing any mapped models contained in the authoritative snapshot.
+  const knownModels = [
+    ...(currentChannel && Array.isArray(currentChannel.knownModels) ? currentChannel.knownModels : []),
+    ...(remoteChannel && Array.isArray(remoteChannel.knownModels) ? remoteChannel.knownModels : [])
+  ];
+  if (knownModels.length) merged.knownModels = Array.from(new Set(knownModels));
+  return merged;
+}
+
+function mergeControlPlaneSyncSnapshot(snapshot, baseline) {
+  if (!snapshot || !Array.isArray(snapshot.channels)) throw new Error('后台同步返回的快照无效');
+  const baselineState = baseline && typeof baseline === 'object' ? baseline : { channels: [] };
+  const baseChannels = Array.isArray(baselineState.channels) ? baselineState.channels : [];
+  const currentChannels = Array.isArray(state.channels) ? state.channels : [];
+  const baselineById = new Map(baseChannels.map(channel => [String(channel.id), channel]));
+  const previousById = new Map(currentChannels.map(channel => [String(channel.id), channel]));
+  const remoteIds = new Set();
+  const mergedChannels = [];
+
+  for (const remoteChannel of snapshot.channels) {
+    if (!remoteChannel || remoteChannel.id === undefined || remoteChannel.id === null) continue;
+    const id = String(remoteChannel.id);
+    remoteIds.add(id);
+    mergedChannels.push(mergeControlPlaneChannel(
+      baselineById.get(id),
+      previousById.get(id),
+      remoteChannel
+    ));
+  }
+
+  // A channel which appeared after the worker started cannot be in its remote
+  // snapshot yet. Keep it until a later snapshot that also had it in baseline
+  // confirms a remote deletion.
+  for (const currentChannel of currentChannels) {
+    const id = String(currentChannel.id);
+    if (!remoteIds.has(id) && !baselineById.has(id)) mergedChannels.push(currentChannel);
+  }
+
+  state.channels = mergedChannels;
+  const baselineGroups = Array.isArray(baselineState.allGroups) ? baselineState.allGroups : [];
+  if (!baseline || controlPlaneValuesEqual(state.allGroups || [], baselineGroups)) {
+    state.allGroups = Array.isArray(snapshot.allGroups) ? snapshot.allGroups : [];
+  }
+
+  const activeId = String(state.activeChannelId || '');
+  if (!activeId || !state.channels.some(channel => String(channel.id) === activeId)) {
+    const nextActive = state.channels.find(channel => channel.schedulable) || state.channels[0];
+    state.activeChannelId = nextActive ? String(nextActive.id) : '';
+  }
+  if (state.manualLockedChannelId && !state.channels.some(channel => String(channel.id) === String(state.manualLockedChannelId))) {
+    state.manualLockedChannelId = null;
+  }
+  state.channels.forEach(channel => {
+    channel.isActive = String(channel.id) === String(state.activeChannelId);
+  });
+  return { baselineById, previousById };
+}
+
+function applyControlPlaneRatioChanges(changes, mergeContext) {
+  if (!Array.isArray(changes) || !mergeContext) return [];
+  const emitted = [];
+  for (const change of changes) {
+    const id = String(change && change.channelId);
+    const oldMultiplier = Number(change && change.oldMultiplier);
+    const newMultiplier = Number(change && change.newMultiplier);
+    const baselineChannel = mergeContext.baselineById.get(id);
+    const previousChannel = mergeContext.previousById.get(id);
+    const currentChannel = state.channels.find(channel => String(channel.id) === id);
+    // Only alert when this worker's multiplier was actually merged. A direct
+    // web action after fork wins over a stale child result and must not receive
+    // a misleading alert.
+    if (!baselineChannel || !previousChannel || !currentChannel ||
+        !Number.isFinite(oldMultiplier) || !Number.isFinite(newMultiplier) ||
+        Math.abs(oldMultiplier - newMultiplier) <= 0.0001 ||
+        !controlPlaneValuesEqual(previousChannel.multiplier, baselineChannel.multiplier) ||
+        !Number.isFinite(Number(currentChannel.multiplier)) ||
+        Math.abs(Number(currentChannel.multiplier) - newMultiplier) > 0.0001) {
+      continue;
+    }
+    const alert = handleRatioChange(
+      currentChannel,
+      oldMultiplier,
+      newMultiplier,
+      typeof change.reason === 'string' ? change.reason : 'Sub2API 线上探针检测到倍率变动',
+      { persist: false, notify: false }
+    );
+    if (alert) emitted.push({ alert, channel: currentChannel });
+  }
+  return emitted;
+}
+
+function controlPlaneSafetyExpectationMatches(channel, expected) {
+  if (!channel || !expected) return false;
+  return channel.schedulable === expected.schedulable &&
+    (channel.isLossInEveryGroup === true) === expected.isLossInEveryGroup &&
+    safetyComparableNumber(channel.costMultiplier) === expected.costMultiplier &&
+    safetyExactNumber(channel.configuredMultiplier) === expected.configuredMultiplier;
+}
+
+// The main gateway fails closed while a newly observed all-group loss waits
+// for its separate safety worker. This is a transient route gate, not a
+// claimed remote mutation; a later fresh snapshot reconciles it either way.
+function reconcileControlPlaneSafetyPending(plan) {
+  const pendingIds = new Set(
+    ((plan && Array.isArray(plan.quarantineIds)) ? plan.quarantineIds : [])
+      .map(Number)
+      .filter(id => Number.isSafeInteger(id) && id > 0)
+  );
+  let changed = false;
+  for (const channel of state.channels || []) {
+    const shouldGate = pendingIds.has(Number(channel && channel.id)) && channel.schedulable === true;
+    if (shouldGate && channel.safetyPending !== true) {
+      channel.safetyPending = true;
+      changed = true;
+    } else if (!shouldGate && channel.safetyPending === true) {
+      delete channel.safetyPending;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function applyControlPlaneSafetyOutcome(outcome, expectedById = {}) {
+  const quarantinedIds = new Set(
+    ((outcome && Array.isArray(outcome.quarantinedIds)) ? outcome.quarantinedIds : [])
+      .map(Number)
+      .filter(id => Number.isSafeInteger(id) && id > 0)
+  );
+  const calibratedRates = new Map(
+    ((outcome && Array.isArray(outcome.calibrations)) ? outcome.calibrations : [])
+      .map(item => [Number(item && item.id), Number(item && item.correctRate)])
+      .filter(([id, rate]) => Number.isSafeInteger(id) && id > 0 && Number.isFinite(rate) && rate >= 0 && rate < 1)
+  );
+  let changed = false;
+  const applicableQuarantines = new Set();
+  const applicableCalibrations = new Map();
+  for (const channel of state.channels || []) {
+    const id = Number(channel && channel.id);
+    const expected = expectedById && expectedById[id];
+    if (!controlPlaneSafetyExpectationMatches(channel, expected)) continue;
+    if (quarantinedIds.has(id)) applicableQuarantines.add(id);
+    if (calibratedRates.has(id)) applicableCalibrations.set(id, calibratedRates.get(id));
+  }
+  for (const channel of state.channels || []) {
+    const id = Number(channel && channel.id);
+    if (applicableQuarantines.has(id)) {
+      if (channel.schedulable !== false) {
+        channel.schedulable = false;
+        channel.isActive = false;
+        changed = true;
+      }
+      if (channel.safetyPending === true) {
+        delete channel.safetyPending;
+        changed = true;
+      }
+    }
+    if (applicableCalibrations.has(id) && channel.configuredMultiplier !== applicableCalibrations.get(id)) {
+      channel.configuredMultiplier = applicableCalibrations.get(id);
+      changed = true;
+    }
+  }
+  if (applicableQuarantines.has(Number(state.activeChannelId))) {
+    const nextActive = (state.channels || []).find(channel => channel.schedulable) || (state.channels || [])[0];
+    state.activeChannelId = nextActive ? String(nextActive.id) : '';
+    (state.channels || []).forEach(channel => {
+      channel.isActive = String(channel.id) === state.activeChannelId;
+    });
+    changed = true;
+  }
+  return changed;
+}
+
+function applyControlPlaneWorkerResult(type, result, baseline = null) {
+  if (type === 'sync' && result.changed) {
+    const mergeContext = mergeControlPlaneSyncSnapshot(result.snapshot, baseline);
+    // The child snapshot can be older than a local manual-only policy change.
+    // Rebuild after the three-way merge in the main process so only the
+    // currently effective exemption rules can dispatch a safety writer.
+    const currentSafetyPlan = buildSub2APISyncSafetyPlan(state.channels);
+    const safetyPending = hasSub2APISyncSafetyWork(currentSafetyPlan);
+    safetyReconciliationPending = safetyPending;
+    reconcileControlPlaneSafetyPending(currentSafetyPlan);
+    const ratioAlerts = applyControlPlaneRatioChanges(result.snapshot.ratioChanges, mergeContext);
+    // Do not acknowledge a signature while its automatic safety action is
+    // pending. If the remote write fails, the next sync will re-create the
+    // plan instead of silently accepting an unsafe configuration forever.
+    if (!safetyPending) lastSub2APISignature = result.signature || lastSub2APISignature;
+    cachedStability = null;
+    cachedUserActivity = null;
+    cachedGlobalUserStats = null;
+    cachedUserFinancialStats = null;
+    writeJSON(CHANNELS_FILE, state);
+    if (ratioAlerts.length > 0) {
+      writeJSON(ALERTS_FILE, alerts);
+      writeJSON(HISTORY_FILE, ratioHistory);
+    }
+    console.log('⚡ [后台同步] 已应用 Sub2API 配置变更并广播缓存快照');
+    triggerBackgroundModelDiscovery();
+    broadcastChannelsUpdate(false);
+    ratioAlerts.forEach(({ alert, channel }) => publishRatioChangeAlert(alert, channel, { broadcastChannels: false }));
+    requestBackgroundDashboardSnapshot('配置变更');
+    // Any confirmed remote configuration change can invalidate a scheduler
+    // cache, including the narrow case where a safety worker committed its DB
+    // mutation but its Redis result/IPC reply was interrupted. Rebuild from
+    // the freshly observed authoritative account IDs rather than replaying a
+    // safety write.
+    requestBackgroundSchedulerInvalidation(result.snapshot.channels.map(channel => channel && channel.id));
+    if (safetyPending) {
+      requestBackgroundSub2APISafetyPlan(currentSafetyPlan, state.channels, result.signature, result.runId);
+    }
+  } else if (type === 'sync' && result.signature && !hasUnresolvedSub2APISafetyGate()) {
+    lastSub2APISignature = result.signature;
+  }
+
+  if (type === 'safety') {
+    const changed = applyControlPlaneSafetyOutcome(result.outcome, result.expected);
+    if (changed) {
+      writeJSON(CHANNELS_FILE, state);
+      broadcastChannelsUpdate(false);
+    }
+    if (result.outcome && result.outcome.cacheInvalidated === false) {
+      const changedIds = normalizeControlPlaneAccountIds([
+        ...((Array.isArray(result.outcome.quarantinedIds)) ? result.outcome.quarantinedIds : []),
+        ...((Array.isArray(result.outcome.calibrations)) ? result.outcome.calibrations.map(item => item && item.id) : [])
+      ]);
+      console.error('[后台控制面] 远端安全动作已确认，但 Redis 调度缓存未能确认失效；已排入独立重试队列。');
+      requestBackgroundSchedulerInvalidation(changedIds);
+    }
+    // A database mutation is already committed even when Redis is temporarily
+    // unavailable. Its cache-only retry must not replay or back off the
+    // completed safety plan.
+    return { retryable: false };
+  }
+
+  if (type === 'dashboard') {
+    const now = Date.now();
+    // A degraded worker response only replaces sections it successfully
+    // observed. A DB failure therefore cannot turn a healthy cached dashboard
+    // into an empty one.
+    if (controlPlaneOwn(result, 'stability') && result.stability && typeof result.stability === 'object') {
+      cachedStability = result.stability;
+      lastStabilityFetch = now;
+    }
+    if (controlPlaneOwn(result, 'userActivity') && result.userActivity && typeof result.userActivity === 'object') {
+      cachedUserActivity = result.userActivity;
+      lastUserActivityFetch = now;
+    }
+    if (controlPlaneOwn(result, 'globalUserStats') && result.globalUserStats && typeof result.globalUserStats === 'object') {
+      cachedGlobalUserStats = result.globalUserStats;
+      lastGlobalUserStatsFetch = now;
+    }
+    if (controlPlaneOwn(result, 'userFinancialStats') && result.userFinancialStats && typeof result.userFinancialStats === 'object') {
+      cachedUserFinancialStats = result.userFinancialStats;
+      lastUserFinancialStatsFetch = now;
+    }
+  }
+  return { retryable: false };
+}
+
+function normalizeControlPlaneAccountIds(values) {
+  const list = Array.isArray(values) ? values : [values];
+  return Array.from(new Set(list.map(Number).filter(id => Number.isSafeInteger(id) && id > 0))).sort((a, b) => a - b);
+}
+
+function scheduleBackgroundSchedulerInvalidation() {
+  const task = controlPlaneTasks.cache;
+  if (!task || queuedControlPlaneCacheInvalidationIds.size === 0) return false;
+  if (task.running) return false;
+  const now = Date.now();
+  const delay = Math.max(0, Number(task.nextAttemptAt || 0) - now);
+  if (delay > 0) {
+    if (!controlPlaneCacheRetryTimer) {
+      controlPlaneCacheRetryTimer = setTimeout(() => {
+        controlPlaneCacheRetryTimer = null;
+        scheduleBackgroundSchedulerInvalidation();
+      }, delay);
+      controlPlaneCacheRetryTimer.unref?.();
+    }
+    return false;
+  }
+
+  const accountIds = Array.from(queuedControlPlaneCacheInvalidationIds).sort((a, b) => a - b);
+  queuedControlPlaneCacheInvalidationIds.clear();
+  const started = requestBackgroundControlPlaneTask('cache', '重试 Sub2API 调度缓存失效', { accountIds });
+  if (started) return true;
+
+  // Keep the exact completed database rows queued if a fork cannot be made or
+  // a new backoff began between the checks above. The timer is unref'd so this
+  // recovery bookkeeping never keeps a process alive on its own.
+  accountIds.forEach(id => queuedControlPlaneCacheInvalidationIds.add(id));
+  const retryDelay = Math.max(1000, Number(task.nextAttemptAt || 0) - Date.now());
+  if (!controlPlaneCacheRetryTimer) {
+    controlPlaneCacheRetryTimer = setTimeout(() => {
+      controlPlaneCacheRetryTimer = null;
+      scheduleBackgroundSchedulerInvalidation();
+    }, retryDelay);
+    controlPlaneCacheRetryTimer.unref?.();
+  }
+  return false;
+}
+
+function requestBackgroundSchedulerInvalidation(accountIds) {
+  for (const id of normalizeControlPlaneAccountIds(accountIds)) {
+    queuedControlPlaneCacheInvalidationIds.add(id);
+  }
+  return scheduleBackgroundSchedulerInvalidation();
+}
+
+function scheduleBackgroundSub2APISafetyRetry() {
+  const task = controlPlaneTasks.safety;
+  if (!task || !queuedControlPlaneSafety) return false;
+  if (task.running) return false;
+  const now = Date.now();
+  const delay = Math.max(0, Number(task.nextAttemptAt || 0) - now);
+  if (delay > 0) {
+    if (!controlPlaneSafetyRetryTimer) {
+      controlPlaneSafetyRetryTimer = setTimeout(() => {
+        controlPlaneSafetyRetryTimer = null;
+        scheduleBackgroundSub2APISafetyRetry();
+      }, delay);
+      controlPlaneSafetyRetryTimer.unref?.();
+    }
+    return false;
+  }
+
+  const candidate = queuedControlPlaneSafety;
+  queuedControlPlaneSafety = null;
+  const started = requestBackgroundSub2APISafetyPlan(
+    candidate.plan,
+    candidate.channels,
+    candidate.signature,
+    candidate.originSyncRunId
+  );
+  if (started) return true;
+  // requestBackgroundSub2APISafetyPlan restores the candidate when it cannot
+  // dispatch. Arm a bounded retry even if a synchronous fork failure made the
+  // task enter backoff between the checks above.
+  if (queuedControlPlaneSafety && !controlPlaneSafetyRetryTimer) {
+    const retryDelay = Math.max(1000, Number(task.nextAttemptAt || 0) - Date.now());
+    controlPlaneSafetyRetryTimer = setTimeout(() => {
+      controlPlaneSafetyRetryTimer = null;
+      scheduleBackgroundSub2APISafetyRetry();
+    }, retryDelay);
+    controlPlaneSafetyRetryTimer.unref?.();
+  }
+  return false;
+}
+
+function requestBackgroundControlPlaneTask(type, reason, payload = {}) {
+  const task = controlPlaneTasks[type];
+  const force = Boolean(payload && payload.force);
+  const now = Date.now();
+  if (!task || typeof fork !== 'function' || task.running || now < task.nextAttemptAt) return false;
+  if (!force && task.lastStartedAt && now - task.lastStartedAt < task.minIntervalMs) return false;
+  task.running = true;
+  task.lastStartedAt = now;
+  task.lastReason = reason;
+  const runId = `${process.pid || 'main'}-${Date.now()}-${++controlPlaneRunSequence}`;
+  // Pass the exact state seen before fork. The worker uses it only to build a
+  // diff; the main process uses it for a three-way merge when the reply lands.
+  const baseline = type === 'sync' ? cloneControlPlaneState(state) : null;
+  const signatureAtDispatch = lastSub2APISignature;
+
+  let worker;
+  let settled = false;
+  let timeout = null;
+  const settle = (error = null) => {
+    if (settled) return;
+    settled = true;
+    if (timeout) clearTimeout(timeout);
+    task.running = false;
+    if (error) {
+      // The dispatcher removes these IDs only while a cache worker owns them.
+      // Put them back before backoff so a second Redis failure cannot lose the
+      // invalidation permanently.
+      if (type === 'cache') {
+        for (const id of normalizeControlPlaneAccountIds(payload.accountIds)) {
+          queuedControlPlaneCacheInvalidationIds.add(id);
+        }
+      }
+      if (type === 'safety') {
+        // Keep the exact plan whose worker errored. A 5-second observer is a
+        // useful second line of defense, but this explicit retry prevents a
+        // calibration-only plan from being lost behind an unrelated mutation.
+        if (!queuedControlPlaneSafety && activeControlPlaneSafety) {
+          queuedControlPlaneSafety = activeControlPlaneSafety;
+        }
+        safetyReconciliationPending = true;
+      }
+      recordControlPlaneFailure(task, `${type}/${reason}`);
+    } else {
+      task.failures = 0;
+      task.nextAttemptAt = 0;
+      task.lastSuccessAt = Date.now();
+    }
+    if (type === 'safety') activeControlPlaneSafety = null;
+    if (type === 'cache') scheduleBackgroundSchedulerInvalidation();
+    if (type === 'safety') scheduleBackgroundSub2APISafetyRetry();
+  };
+
+  try {
+    worker = fork(__filename, [], {
+      env: { ...process.env, CONTROL_PLANE_WORKER: 'true' },
+      silent: true
+    });
+    // `silent: true` creates pipes. Drain both even though worker output is
+    // intentionally not surfaced, otherwise verbose dependency errors can
+    // back-pressure a child and turn a recoverable sync into a timeout.
+    worker.stdout?.on?.('data', () => {});
+    worker.stderr?.on?.('data', () => {});
+    worker.stdout?.resume?.();
+    worker.stderr?.resume?.();
+    timeout = setTimeout(() => {
+      try { worker.kill('SIGTERM'); } catch { /* Worker has already exited. */ }
+      settle(new Error('后台控制面任务超时'));
+    }, CONTROL_PLANE_WORKER_TIMEOUT_MS);
+    if (timeout.unref) timeout.unref();
+
+    worker.once('message', result => {
+      // A timed-out process can still win a race to emit IPC after SIGTERM.
+      // Ignore it rather than letting an old snapshot roll current state back.
+      if (settled || !result || result.runId !== runId) return;
+      // The child waits for this acknowledgement before exiting, which makes
+      // the result/exit ordering deterministic even while the main process is
+      // busy applying a snapshot.
+      try {
+        worker.send?.({ type: 'control-plane-ack', runId }, () => {});
+      } catch { /* The result was already received; normal settle logic remains authoritative. */ }
+      if (result.type !== 'control-plane-result' || result.task !== type || result.ok !== true) {
+        settle(new Error(result && result.error ? result.error : '后台控制面任务未确认成功'));
+        return;
+      }
+      try {
+        const application = applyControlPlaneWorkerResult(type, result, baseline) || {};
+        settle(application.retryable ? new Error('后台控制面任务需重试') : null);
+        if (type === 'safety') {
+          // Do not drop a newer plan that arrived while this worker was
+          // running. The latest plan is serialized after the prior worker
+          // settles; otherwise a fresh snapshot is requested below.
+          const queued = queuedControlPlaneSafety;
+          queuedControlPlaneSafety = null;
+          if (!application.retryable && queued) {
+            requestBackgroundSub2APISafetyPlan(queued.plan, queued.channels, queued.signature, queued.originSyncRunId);
+          }
+          // The safety worker is now settled, so this refresh cannot be lost
+          // behind its single-flight guard. Keep the old signature until this
+          // new read observes the remote action.
+          requestBackgroundControlPlaneSync('安全动作后复核', true);
+        }
+      } catch (error) {
+        settle(error);
+      }
+    });
+    worker.once('error', error => {
+      if (!settled) settle(error);
+    });
+    worker.once('exit', code => {
+      if (!settled) settle(new Error(`后台控制面任务异常退出 (${code})`));
+    });
+    worker.send({ type, ...payload, lastSignature: signatureAtDispatch, runId, baseState: baseline }, error => {
+      if (error && !settled) settle(error);
+    });
+  } catch (error) {
+    settle(error);
+  }
+  return true;
+}
+
+function requestBackgroundSub2APISafetyPlan(plan, channels, signature, originSyncRunId = null) {
+  if (!hasSub2APISyncSafetyWork(plan)) return false;
+  safetyReconciliationPending = true;
+  const candidate = {
+    plan: cloneControlPlaneState(plan),
+    channels: cloneControlPlaneState(channels),
+    signature: String(signature || ''),
+    originSyncRunId: typeof originSyncRunId === 'string' ? originSyncRunId : null
+  };
+  const task = controlPlaneTasks.safety;
+  if (task.running || Date.now() < task.nextAttemptAt) {
+    queuedControlPlaneSafety = candidate;
+    if (!task.running) scheduleBackgroundSub2APISafetyRetry();
+    return false;
+  }
+  activeControlPlaneSafety = candidate;
+  const started = requestBackgroundControlPlaneTask('safety', '执行自动安全动作', {
+    safetyPlan: candidate.plan,
+    expected: buildSub2APISyncSafetyExpected(candidate.plan, candidate.channels),
+    expectedSignature: candidate.signature,
+    originSyncRunId: candidate.originSyncRunId
+  });
+  if (!started) {
+    activeControlPlaneSafety = null;
+    queuedControlPlaneSafety = candidate;
+    scheduleBackgroundSub2APISafetyRetry();
+  }
+  return started;
+}
+
+// A group-level "disable automatic switching" rule is local policy, rather
+// than remote PostgreSQL configuration.  It is therefore deliberately kept
+// out of the SQL signature.  Serialize a policy change with the safety worker
+// so an already-forked plan cannot act after the administrator has made that
+// group manual-only.  A queued plan has not touched the database yet and can
+// be safely discarded; the forced fresh snapshot below rebuilds it with the
+// newly saved policy when automatic safety still applies.
+function reconcileSub2APISafetyAfterPolicyChange(reason = '分组自动切换策略更新') {
+  const safetyTask = controlPlaneTasks && controlPlaneTasks.safety;
+  if (safetyTask && safetyTask.running) return { ok: false, reason: '安全任务正在执行' };
+
+  queuedControlPlaneSafety = null;
+  if (controlPlaneSafetyRetryTimer) {
+    clearTimeout(controlPlaneSafetyRetryTimer);
+    controlPlaneSafetyRetryTimer = null;
+  }
+
+  const currentPlan = buildSub2APISyncSafetyPlan(state.channels);
+  safetyReconciliationPending = hasSub2APISyncSafetyWork(currentPlan);
+  const gateChanged = reconcileControlPlaneSafetyPending(currentPlan);
+  if (gateChanged) {
+    writeJSON(CHANNELS_FILE, state);
+    broadcastChannelsUpdate(false);
+  }
+
+  // Do not reuse a remote signature that was acknowledged under a different
+  // local exception policy.  The child is read-only and will recreate any
+  // still-applicable safety plan from the current policy.
+  lastSub2APISignature = '';
+  requestBackgroundControlPlaneSync(reason, true);
+  return { ok: true, plan: currentPlan, gateChanged };
+}
+
+function requestBackgroundControlPlaneSync(reason, force = false) {
+  return requestBackgroundControlPlaneTask('sync', reason, { force: Boolean(force) });
+}
+
+function requestBackgroundDashboardSnapshot(reason) {
+  return requestBackgroundControlPlaneTask('dashboard', reason);
+}
+
+function requestBackgroundAnnouncementCleanup() {
+  return requestBackgroundControlPlaneTask('cleanup', '清理跨天公告');
+}
+
+// ⚡ 5 秒检测只派发后台任务，绝不在网关事件循环执行 Docker/SSH。
 let fastSyncTimer = null;
 function startFastSyncWatcher() {
   if (fastSyncTimer) clearInterval(fastSyncTimer);
-  lastSub2APISignature = getSub2APISignature();
-
-  fastSyncTimer = setInterval(() => {
-    try {
-      const currentSignature = getSub2APISignature();
-      if (currentSignature && currentSignature !== lastSub2APISignature) {
-        console.log(`⚡ [秒级同步] 检测到 Sub2API 数据发生变更，立即实时刷新并广播...`);
-        lastSub2APISignature = currentSignature;
-        cachedStability = null;
-        syncRealSub2APIAccounts();
-        broadcastChannelsUpdate(false);
-      }
-    } catch (e) {
-      // 忽略瞬时探测偶发错误
-    }
-  }, 5000); // 每 5 秒快速校验一次
+  const poll = () => requestBackgroundControlPlaneSync('5 秒配置检测');
+  fastSyncTimer = setInterval(poll, 5000);
+  poll();
 }
 
 // 定时轮询 (倍率巡检：5分钟/次；账户余额：10分钟/次)
@@ -3330,11 +5278,18 @@ let pollerTimer = null;
 function startPoller() {
   if (pollerTimer) clearInterval(pollerTimer);
   const interval = (state.autoPollIntervalSeconds || 300) * 1000;
-  pollerTimer = setInterval(async () => {
-    console.log('🔄 [自动巡检] 5分钟周期：开始检测上游进货倍率与配置...');
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
+  pollerTimer = setInterval(() => {
+    console.log('🔄 [自动巡检] 5分钟周期：后台检测上游进货倍率与配置...');
+    requestBackgroundControlPlaneSync('5 分钟倍率巡检', true);
   }, interval);
+}
+
+let dashboardSnapshotTimer = null;
+function startDashboardSnapshotPoller() {
+  if (dashboardSnapshotTimer) clearInterval(dashboardSnapshotTimer);
+  const poll = () => requestBackgroundDashboardSnapshot('30 秒看板快照');
+  dashboardSnapshotTimer = setInterval(poll, 30000);
+  poll();
 }
 
 let balancePollerTimer = null;
@@ -3353,16 +5308,9 @@ let announcementCleanupTimer = null;
 function startAnnouncementCleanup() {
   if (announcementCleanupTimer) clearInterval(announcementCleanupTimer);
   const interval = 10 * 60 * 1000; // 10分钟检测一次
-  announcementCleanupTimer = setInterval(() => {
-    try {
-      execPsql('DELETE FROM announcement_reads WHERE read_at < CURRENT_DATE;', false);
-    } catch (e) {
-      // 忽略偶发错误
-    }
-  }, interval);
-  try {
-    execPsql('DELETE FROM announcement_reads WHERE read_at < CURRENT_DATE;', false);
-  } catch (e) {}
+  const cleanup = () => requestBackgroundAnnouncementCleanup();
+  announcementCleanupTimer = setInterval(cleanup, interval);
+  cleanup();
 }
 
 
@@ -3693,13 +5641,11 @@ async function handleRequest(req, res) {
 
   // 获取上游列表与分类元数据及全局盈利汇总
   if (pathname === '/api/channels' && req.method === 'GET') {
-    // 兜底秒级实时同步检测：如果 Sub2API 底层数据已变动，立即触发毫秒级全量同步
-    const currentSignature = getSub2APISignature();
-    if (currentSignature && currentSignature !== lastSub2APISignature) {
-      lastSub2APISignature = currentSignature;
-      cachedStability = null;
-      syncRealSub2APIAccounts();
-    }
+    // Do not synchronously inspect Docker/SSH from a console read. The
+    // response is a coherent cached snapshot while a single background worker
+    // checks for fresh control-plane state.
+    requestBackgroundControlPlaneSync('控制台读取');
+    requestBackgroundDashboardSnapshot('控制台读取');
 
     const activeChannels = state.channels.filter(c => c.schedulable);
     const totalActive = activeChannels.length;
@@ -3717,9 +5663,9 @@ async function handleRequest(req, res) {
       avgMargin = Number((sumMargin / totalActive).toFixed(1));
     }
 
-    const safeChannels = getEnrichedChannels();
-    const globalUserStats = fetchGlobalUserStats();
-    const userFinances = fetchUserFinancialStats();
+    const safeChannels = getEnrichedChannels(false, true);
+    const globalUserStats = getCachedGlobalUserStats();
+    const userFinances = cachedUserFinancialStats || { summary: null };
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -3728,6 +5674,7 @@ async function handleRequest(req, res) {
       channels: safeChannels,
       groups: state.allGroups || [],
       globalUserStats,
+      controlPlaneSync: getControlPlaneSyncStatus(),
       financialSummary: userFinances.summary || null,
       profitSummary: {
         avgMargin,
@@ -3821,18 +5768,22 @@ async function handleRequest(req, res) {
     }
 
     const newSaleRate = Number(Number(body.sale_rate).toFixed(4));
-    const remoteOk = updateRemoteGroupSaleRate(groupId, newSaleRate);
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      groupId,
-      newSaleRate,
-      remoteSynced: remoteOk,
-      message: `成功将分组销售倍率修改为 ${newSaleRate}x，线上已同步生效！`
-    }));
+    try {
+      const remoteOk = updateRemoteGroupSaleRate(groupId, newSaleRate);
+      syncRealSub2APIAccounts();
+      broadcastSSE('CHANNELS_UPDATED', state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        groupId,
+        newSaleRate,
+        remoteSynced: remoteOk,
+        message: `成功将分组销售倍率修改为 ${newSaleRate}x，线上已同步生效！`
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
@@ -3885,17 +5836,22 @@ async function handleRequest(req, res) {
     const targetId = match[1];
     const body = await getBody();
     const groupIds = Array.isArray(body.groupIds) ? body.groupIds : [];
-    const remoteOk = updateAccountGroups(targetId, groupIds);
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-    const updatedCh = state.channels.find(c => String(c.id) === String(targetId));
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      channel: updatedCh,
-      remoteSynced: remoteOk,
-      message: `渠道所属分组已更新，线上数据库与利差重算已同步生效！`
-    }));
+    try {
+      const remoteOk = updateAccountGroups(targetId, groupIds);
+      syncRealSub2APIAccounts();
+      broadcastSSE('CHANNELS_UPDATED', state);
+      const updatedCh = state.channels.find(c => String(c.id) === String(targetId));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        channel: updatedCh,
+        remoteSynced: remoteOk,
+        message: `渠道所属分组已更新，线上数据库与利差重算已同步生效！`
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
@@ -3908,10 +5864,17 @@ async function handleRequest(req, res) {
       return;
     }
     const accountIds = Array.isArray(body.accountIds) ? body.accountIds : [];
-    const result = createRemoteGroup(body.name, body.rateMultiplier || 1.0, body.platform || 'openai', accountIds);
-    if (result.ok) {
+    try {
+      const result = createRemoteGroup(body.name, body.rateMultiplier === undefined ? 1.0 : body.rateMultiplier, body.platform || 'openai', accountIds);
       syncRealSub2APIAccounts();
-      enforceSingleActiveState();
+      try {
+        enforceSingleActiveState();
+      } catch (err) {
+        // The create transaction has already committed.  Do not misreport it
+        // as a failed creation if a later best-effort routing reconciliation
+        // cannot reach the remote control plane.
+        console.error('新分组创建后的调度重整失败:', err.message);
+      }
       broadcastSSE('CHANNELS_UPDATED', state);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -3920,9 +5883,9 @@ async function handleRequest(req, res) {
         remoteSynced: true,
         message: `业务销售分组 [${body.name}] 已成功创建${accountIds.length > 0 ? `并绑定了 ${accountIds.length} 个通道` : ''}！`
       }));
-    } else {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: '创建分组失败，未能写入数据库' }));
+    } catch (err) {
+      res.writeHead(err.statusCode || (/不能为空|必须|数值/.test(err.message) ? 400 : 500), { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
     }
     return;
   }
@@ -3932,15 +5895,20 @@ async function handleRequest(req, res) {
     const match = pathname.match(/^\/api\/groups\/([^/]+)$/);
     const groupId = match[1];
     const body = await getBody();
-    const remoteOk = updateRemoteGroup(groupId, body.name, body.rateMultiplier);
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      remoteSynced: remoteOk,
-      message: `业务分组已成功更新！`
-    }));
+    try {
+      const remoteOk = updateRemoteGroup(groupId, body.name, body.rateMultiplier);
+      syncRealSub2APIAccounts();
+      broadcastSSE('CHANNELS_UPDATED', state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        remoteSynced: remoteOk,
+        message: `业务分组已成功更新！`
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
@@ -3948,15 +5916,20 @@ async function handleRequest(req, res) {
   if (pathname.match(/^\/api\/groups\/([^/]+)$/) && req.method === 'DELETE') {
     const match = pathname.match(/^\/api\/groups\/([^/]+)$/);
     const groupId = match[1];
-    const remoteOk = deleteRemoteGroup(groupId);
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      remoteSynced: remoteOk,
-      message: `业务分组已成功删除并解绑关联！`
-    }));
+    try {
+      const remoteOk = deleteRemoteGroup(groupId);
+      syncRealSub2APIAccounts();
+      broadcastSSE('CHANNELS_UPDATED', state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        remoteSynced: remoteOk,
+        message: `业务分组已成功删除并解绑关联！`
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
@@ -3966,15 +5939,20 @@ async function handleRequest(req, res) {
     const groupId = match[1];
     const body = await getBody();
     const accountIds = Array.isArray(body.accountIds) ? body.accountIds : [];
-    const remoteOk = updateGroupAccounts(groupId, accountIds);
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      remoteSynced: remoteOk,
-      message: `分组上游渠道关联配置已更新！`
-    }));
+    try {
+      const remoteOk = updateGroupAccounts(groupId, accountIds);
+      syncRealSub2APIAccounts();
+      broadcastSSE('CHANNELS_UPDATED', state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        remoteSynced: remoteOk,
+        message: `分组上游渠道关联配置已更新！`
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
@@ -3989,77 +5967,44 @@ async function handleRequest(req, res) {
       res.end(JSON.stringify({ error: '请选择要加入分组的通道' }));
       return;
     }
-    const remoteOk = addAccountsToGroup(groupId, accountIds);
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      remoteSynced: remoteOk,
-      message: `已成功将 ${accountIds.length} 个通道归入已有分组！`
-    }));
+    try {
+      const remoteOk = addAccountsToGroup(groupId, accountIds);
+      syncRealSub2APIAccounts();
+      broadcastSSE('CHANNELS_UPDATED', state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        remoteSynced: remoteOk,
+        message: `已成功将 ${accountIds.length} 个通道归入已有分组！`
+      }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
   // 【核心功能】业务销售分组通道四层编排 (主调/副调/备选/备用) 与售价更新
   if (pathname.match(/^\/api\/groups\/([^/]+)\/orchestrate$/) && req.method === 'POST') {
     const match = pathname.match(/^\/api\/groups\/([^/]+)\/orchestrate$/);
-    const groupId = parseInt(match[1], 10);
     const body = await getBody();
-    const mainId = body.mainId ? String(body.mainId) : null;
-    const subId = body.subId ? String(body.subId) : null;
-    const altId = body.altId ? String(body.altId) : null;
-    const standbyIds = Array.isArray(body.standbyIds) ? body.standbyIds.map(String) : [];
-    const newSaleRate = (body.saleRate !== undefined && !isNaN(Number(body.saleRate))) ? Number(Number(body.saleRate).toFixed(4)) : null;
+    try {
+      const plan = prepareGroupOrchestrationPlan(match[1], body);
+      const result = executeRemoteGroupOrchestrationPlan(plan);
+      writeJSON(CHANNELS_FILE, state);
+      syncRealSub2APIAccounts();
+      broadcastSSE('CHANNELS_UPDATED', state);
 
-    if (!Number.isSafeInteger(groupId) || groupId <= 0) throw Object.assign(new Error('无效分组'), { statusCode: 400 });
-    const assigned = [mainId, subId, altId, ...standbyIds].filter(Boolean);
-    const allAssignedAccountIds = [...new Set(assigned)];
-    if (assigned.length !== allAssignedAccountIds.length || assigned.some(id => !Number.isSafeInteger(Number(id)) || Number(id) <= 0)) {
-      throw Object.assign(new Error('调度角色不能重复，账号 ID 必须有效'), { statusCode: 400 });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        ...result,
+        message: `业务分组编排已保存生效！主调已激活，副调/备选/备用就绪。`
+      }));
+    } catch (err) {
+      res.writeHead(err.statusCode || (/不能为空|必须|数值|重复/.test(err.message) ? 400 : 500), { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
     }
-    for (const id of allAssignedAccountIds) {
-      const channel = state.channels.find(c => String(c.id) === id);
-      if (!channel) throw Object.assign(new Error('通道不存在'), { statusCode: 400 });
-      if (groupIds(channel).some(gid => gid !== groupId)) throw Object.assign(new Error('共享账号无法独立编排，请先为该组配置独立账号'), { statusCode: 409 });
-    }
-    if (newSaleRate !== null && (!Number.isFinite(newSaleRate) || newSaleRate <= 0)) throw Object.assign(new Error('售价必须为正数'), { statusCode: 400 });
-    const sqlStatements = [`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM groups WHERE id = ${groupId} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Group missing'; END IF; END $$;`];
-    if (newSaleRate !== null) sqlStatements.push(`UPDATE groups SET rate_multiplier = ${newSaleRate}, updated_at = NOW() WHERE id = ${groupId};`);
-    sqlStatements.push(`DELETE FROM account_groups WHERE group_id = ${groupId};`);
-    if (allAssignedAccountIds.length) {
-      sqlStatements.push(`INSERT INTO account_groups (account_id, group_id, priority) VALUES ${allAssignedAccountIds.map(id => '(' + Number(id) + ',' + groupId + ',50)').join(',')};`);
-      for (const id of allAssignedAccountIds) {
-        const priority = id === mainId ? 1 : id === subId ? 10 : id === altId ? 20 : 100;
-        sqlStatements.push(`UPDATE accounts SET schedulable = ${id === mainId}, priority = ${priority} WHERE id = ${Number(id)};`);
-      }
-    }
-    executeRemoteSQL(sqlStatements.join('\n'));
-    if (mainId) {
-      state.activeChannelId = mainId;
-      state.manualLockedChannelId = mainId;
-    }
-    for (const channel of state.channels) {
-      if (!allAssignedAccountIds.includes(String(channel.id))) continue;
-      channel.manualLocked = String(channel.id) === mainId;
-      channel.schedulable = String(channel.id) === mainId;
-      channel.priority = String(channel.id) === mainId ? 1 : String(channel.id) === subId ? 10 : String(channel.id) === altId ? 20 : 100;
-    }
-    writeJSON(CHANNELS_FILE, state);
-    invalidateSub2APIScheduler(allAssignedAccountIds);
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      groupId,
-      mainId,
-      subId,
-      altId,
-      standbyCount: standbyIds.length,
-      message: `业务分组编排已保存生效！主调已激活，副调/备选/备用就绪。`
-    }));
     return;
   }
 
@@ -4097,6 +6042,17 @@ async function handleRequest(req, res) {
     const match = pathname.match(/^\/api\/groups\/([^/]+)\/auto-switch$/);
     const groupId = String(match[1]);
     const body = await getBody();
+    // `enabled: false` makes this group manual-only, including automatic
+    // safety actions. Do not let that policy change race a child which has
+    // already received the previous policy's remote write plan.
+    if (controlPlaneTasks.safety.running) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: '安全任务正在执行，尚不能修改本组自动策略；请稍后重试',
+        retryable: true
+      }));
+      return;
+    }
     if (!autoSwitchConfig.groupPolicies) {
       autoSwitchConfig.groupPolicies = {};
     }
@@ -4109,6 +6065,7 @@ async function handleRequest(req, res) {
       autoRecoverLowestCost: body.autoRecoverLowestCost !== undefined ? Boolean(body.autoRecoverLowestCost) : true
     };
     writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
+    reconcileSub2APISafetyAfterPolicyChange('分组自动切换策略更新');
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       success: true,
@@ -4182,8 +6139,16 @@ async function handleRequest(req, res) {
     }
 
     const newSchedulable = body.schedulable !== undefined ? Boolean(body.schedulable) : Boolean(targetChannel.autoSwitchDisabled);
-    const remoteOk = newSchedulable ? true : toggleRemoteAccountSchedulable(targetId, false);
-    if (!newSchedulable) targetChannel.schedulable = false;
+    let remoteOk = false;
+    try {
+      remoteOk = toggleRemoteAccountSchedulable(targetId, newSchedulable);
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+      return;
+    }
+
+    targetChannel.schedulable = newSchedulable;
     targetChannel.autoSwitchDisabled = !newSchedulable;
     writeJSON(CHANNELS_FILE, state);
     evaluateAutoSwitch('候选号池调整');
@@ -4221,45 +6186,51 @@ async function handleRequest(req, res) {
     }
 
     const oldRate = targetChannel.multiplier;
-    const newRate = Number(Number(body.multiplier).toFixed(4));
-    if (!Number.isFinite(newRate) || newRate < 0) throw Object.assign(new Error('倍率必须为非负有限数值'), { statusCode: 400 });
-    const remoteOk = updateRemoteAccountMultiplier(targetId, newRate);
+    try {
+      // The helper validates the proposed cost against every live group,
+      // confirms the same condition inside the remote transaction, and only
+      // then updates all local pricing-derived fields.
+      const remoteOk = updateRemoteAccountMultiplier(targetId, body.multiplier);
+      const newRate = targetChannel.multiplier;
+      writeJSON(CHANNELS_FILE, state);
 
-    targetChannel.multiplier = newRate;
-    targetChannel.previousMultiplier = oldRate;
-    targetChannel.lastCheckTime = new Date().toISOString();
-    writeJSON(CHANNELS_FILE, state);
+      // 记录到调价记录
+      const oldRateNumber = Number(oldRate);
+      const changePercent = Number.isFinite(oldRateNumber) && oldRateNumber !== 0
+        ? Number((Math.abs(newRate - oldRateNumber) / Math.abs(oldRateNumber) * 100).toFixed(2))
+        : 0;
+      const alert = {
+        id: 'alt_manual_' + Date.now(),
+        channelId: String(targetChannel.id),
+        channelName: targetChannel.name,
+        type: 'ratio_change',
+        oldMultiplier: oldRate,
+        newMultiplier: newRate,
+        changePercent,
+        direction: newRate > oldRate ? 'up' : 'down',
+        isActiveChannel: state.activeChannelId === String(targetChannel.id),
+        timestamp: new Date().toISOString(),
+        acknowledged: true,
+        reason: '管理员在中控台直接修改进货倍率',
+        note: `中控台直改: [${targetChannel.name}] 进货倍率由 ${oldRate}x 调整为 ${newRate}x`
+      };
+      alerts.unshift(alert);
+      writeJSON(ALERTS_FILE, alerts);
 
-
-    // 记录到调价记录
-    const alert = {
-      id: 'alt_manual_' + Date.now(),
-      channelId: String(targetChannel.id),
-      channelName: targetChannel.name,
-      type: 'ratio_change',
-      oldMultiplier: oldRate,
-      newMultiplier: newRate,
-      changePercent: Number((Math.abs(newRate - oldRate) / oldRate * 100).toFixed(2)),
-      direction: newRate > oldRate ? 'up' : 'down',
-      isActiveChannel: state.activeChannelId === String(targetChannel.id),
-      timestamp: new Date().toISOString(),
-      acknowledged: true,
-      reason: '管理员在中控台直接修改进货倍率',
-      note: `中控台直改: [${targetChannel.name}] 进货倍率由 ${oldRate}x 调整为 ${newRate}x`
-    };
-    alerts.unshift(alert);
-    writeJSON(ALERTS_FILE, alerts);
-
-    broadcastSSE('CHANNELS_UPDATED', state);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      success: true,
-      channel: targetChannel,
-      oldMultiplier: oldRate,
-      newMultiplier: newRate,
-      remoteSynced: remoteOk,
-      message: `已成功将 [${targetChannel.name}] 的进货倍率修改为 ${newRate}x，已同步至 Sub2API！`
-    }));
+      broadcastSSE('CHANNELS_UPDATED', state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        channel: targetChannel,
+        oldMultiplier: oldRate,
+        newMultiplier: newRate,
+        remoteSynced: remoteOk,
+        message: `已成功将 [${targetChannel.name}] 的进货倍率修改为 ${newRate}x，已同步至 Sub2API！`
+      }));
+    } catch (err) {
+      res.writeHead(err.statusCode || 400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
@@ -4272,26 +6243,29 @@ async function handleRequest(req, res) {
       res.end(JSON.stringify({ error: '请提供 channelIds 数组' }));
       return;
     }
-
-    const idList = channelIds.map(id => Number(id)).filter(n => !isNaN(n)).join(',');
-    if (!schedulable) {
-      executeRemoteSQL(`UPDATE accounts SET schedulable = false WHERE id IN (${idList});`);
-      invalidateSub2APIScheduler(channelIds);
-      lastSub2APISignature = getSub2APISignature();
+    if (typeof schedulable !== 'boolean') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'schedulable 必须为布尔值' }));
+      return;
     }
-
-    state.channels.forEach(c => {
-      if (channelIds.includes(String(c.id))) {
-        if (!schedulable) c.schedulable = false;
-        c.autoSwitchDisabled = !schedulable;
-      }
+    let changedChannels;
+    try {
+      changedChannels = toggleRemoteAccountsSchedulable(channelIds, schedulable);
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+      return;
+    }
+    changedChannels.forEach(channel => {
+      channel.schedulable = schedulable;
+      channel.autoSwitchDisabled = !schedulable;
     });
     writeJSON(CHANNELS_FILE, state);
     broadcastSSE('CHANNELS_UPDATED', state);
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     evaluateAutoSwitch('批量候选号池调整');
-    res.end(JSON.stringify({ success: true, count: channelIds.length, schedulable }));
+    res.end(JSON.stringify({ success: true, count: changedChannels.length, schedulable, remoteSynced: true }));
     return;
   }
 
@@ -4426,7 +6400,7 @@ async function handleRequest(req, res) {
       const updateSql = `UPDATE accounts SET credentials = jsonb_set(credentials, '{model_mapping}', '${mappingJson}'::jsonb), updated_at = NOW() WHERE id = ${targetId};`;
       execPsql(updateSql, false);
       invalidateSub2APIScheduler(targetId);
-      lastSub2APISignature = getSub2APISignature();
+      refreshSub2APISignatureAfterDirectMutation('模型映射更新');
 
       // 3. 更新内存缓存与持久化
       targetChannel.modelMapping = modelMapping;
@@ -4505,7 +6479,7 @@ async function handleRequest(req, res) {
       const updateSql = `UPDATE accounts SET credentials = jsonb_set(credentials, '{model_mapping}', '${mappingJson}'::jsonb), updated_at = NOW() WHERE id = ${targetId};`;
       execPsql(updateSql, false);
       invalidateSub2APIScheduler(targetId);
-      lastSub2APISignature = getSub2APISignature();
+      refreshSub2APISignatureAfterDirectMutation('模型映射更新');
 
       targetChannel.modelMapping = modelMapping;
       targetChannel.configuredModels = Object.keys(modelMapping);
@@ -4624,7 +6598,7 @@ async function handleRequest(req, res) {
         const updateSql = `UPDATE accounts SET credentials = jsonb_set(credentials, '{model_mapping}', '${mappingJson}'::jsonb), updated_at = NOW() WHERE id = ${targetId};`;
         execPsql(updateSql, false);
         invalidateSub2APIScheduler(targetId);
-        lastSub2APISignature = getSub2APISignature();
+        refreshSub2APISignatureAfterDirectMutation('模型映射更新');
 
         targetChannel.modelMapping = modelMapping;
         targetChannel.configuredModels = Object.keys(modelMapping);
@@ -5309,88 +7283,267 @@ async function handleRequest(req, res) {
   });
 }
 
-console.log('Connecting to Sub2API backend to load upstream channels...');
-const initialAccounts = syncRealSub2APIAccounts();
-if (initialAccounts) {
-  console.log(`✅ 成功同步加载中转站真实上游渠道: ${initialAccounts.length} 个`);
-  // Wait for fresh health observations before changing any startup routing.
+function sendControlPlaneWorkerResult(result) {
+  if (typeof process.send !== 'function') {
+    process.exitCode = result.ok ? 0 : 1;
+    return;
+  }
+  let finished = false;
+  let fallbackTimer = null;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    if (fallbackTimer && typeof clearTimeout === 'function') clearTimeout(fallbackTimer);
+    process.exit(result.ok ? 0 : 1);
+  };
+  const acknowledge = acknowledgement => {
+    if (!acknowledgement || acknowledgement.type !== 'control-plane-ack' || acknowledgement.runId !== result.runId) return;
+    finish();
+  };
+  try {
+    // Do not exit merely because the IPC write was handed to Node. In a busy
+    // parent, `exit` can otherwise win the event race and turn a valid reply
+    // into a spurious worker failure. The parent acknowledges the exact run
+    // after receiving it; the fallback still bounds a dead-parent child.
+    process.once?.('message', acknowledge);
+    process.once?.('disconnect', finish);
+    process.send(result, error => {
+      if (error) finish();
+    });
+    if (typeof setTimeout === 'function') {
+      // The parent deliberately allows a control-plane worker up to 60s. It
+      // may also be briefly busy with an explicit administrative DB/SSH call,
+      // so a 5s child fallback can race a valid acknowledgement. Keep this
+      // longer than the parent watchdog; a dead parent closes IPC or kills
+      // its child first.
+      fallbackTimer = setTimeout(finish, 65000);
+      fallbackTimer.unref?.();
+    }
+  } catch {
+    finish();
+  }
 }
 
-// 初始化上游通道 3 小时自动扫描巡检引擎
-upstreamScanner.init({
-  getState: () => state,
-  saveState: (newState) => {
-    state = newState;
-    writeJSON(CHANNELS_FILE, state);
-  },
-  execPsql,
-  executeRemoteSQL,
-  evaluateAutoSwitch,
-  invalidateSub2APIScheduler,
-  broadcastSSE,
-  telegram,
-  getUpstreamPanels: () => upstreamPanels,
-  getUpstreamPanelConfig: () => (upstreamPanels[0] || upstreamPanelConfig),
-  getUpstreamModelsCache: () => upstreamModelsCache,
-  setUpstreamModelsCache: (cache) => {
-    upstreamModelsCache = cache;
-    writeJSON(UPSTREAM_MODELS_CACHE_FILE, upstreamModelsCache);
-  },
-  getUpstreamGroupCatalog: () => upstreamGroupCatalog,
-  setUpstreamGroupCatalog: (catalog) => {
-    upstreamGroupCatalog = Array.isArray(catalog) ? catalog : [];
-    writeJSON(UPSTREAM_GROUP_CATALOG_FILE, upstreamGroupCatalog);
-  },
-  isExemptGroup: (g) => isExemptGroup(g)
-});
+function runControlPlaneWorker() {
+  process.once('message', request => {
+    const task = request && request.type;
+    const runId = request && typeof request.runId === 'string' ? request.runId : null;
+    const sendResult = result => sendControlPlaneWorkerResult({ runId, ...result });
+    try {
+      if (task === 'sync') {
+        const signature = getSub2APISignature();
+        if (!signature) throw new Error('无法读取 Sub2API 配置签名');
+        const changed = Boolean(request.force) || signature !== String(request.lastSignature || '');
+        if (!changed) {
+          sendResult({ type: 'control-plane-result', task, ok: true, changed: false, signature });
+          return;
+        }
+        const snapshot = syncRealSub2APIAccounts({
+          snapshotOnly: true,
+          baseState: request.baseState
+        });
+        if (!snapshot || !Array.isArray(snapshot.channels)) throw new Error('无法读取 Sub2API 上游账号');
+        // Keep the signature captured before the snapshot query. A second
+        // post-query signature could include a concurrent DB write that is not
+        // represented by this snapshot and make the next poll skip a refresh.
+        sendResult({
+          type: 'control-plane-result',
+          task,
+          ok: true,
+          changed: true,
+          signature,
+          snapshot
+        });
+        return;
+      }
 
-// 初始化 Telegram 机器人与移动调度引擎
-telegram.init({
-  getState: () => ({
-    ...state,
-    channels: getEnrichedChannels(false),
-    globalUserStats: fetchGlobalUserStats(false)
-  }),
-  getAutoSwitchConfig: () => autoSwitchConfig,
-  activateChannel: async (targetId, operator = 'Telegram Bot') => {
-    return activateChannel(targetId, operator);
-  },
-  toggleAutoSwitch: async (partialConfig) => {
-    if (partialConfig.enabled !== undefined) autoSwitchConfig.enabled = Boolean(partialConfig.enabled);
-    if (partialConfig.strategy) autoSwitchConfig.strategy = partialConfig.strategy;
-    writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
-    broadcastSSE('AUTO_SWITCH_CONFIG_UPDATED', autoSwitchConfig);
-    return { success: true };
-  },
-  forceCheck: async () => {
-    syncRealSub2APIAccounts();
-    broadcastSSE('CHANNELS_UPDATED', state);
-    return { success: true };
-  },
-  triggerUpstreamScan: async (source) => {
-    return upstreamScanner.runScan(source);
-  },
-  resolveUpstreamAction: async (actionId, decision, operator) => {
-    return upstreamScanner.resolveAction(actionId, decision, operator);
-  },
-  resolveFailoverProposal: async (proposalId, decision, operator) => {
-    return resolveFailoverProposal(proposalId, decision, operator);
-  },
-  verifyPassword: (pwd) => auth.verifyPassword(pwd)
-});
+      if (task === 'safety') {
+        const outcome = executeControlPlaneSafetyPlan(request.safetyPlan, request.expectedSignature);
+        sendResult({
+          type: 'control-plane-result',
+          task,
+          ok: true,
+          originSyncRunId: typeof request.originSyncRunId === 'string' ? request.originSyncRunId : null,
+          expected: request.expected && typeof request.expected === 'object' ? request.expected : {},
+          outcome,
+          // Database changes are authoritative even if cache eviction needs a
+          // later retry. The main process applies only confirmed rows and
+          // schedules that cache-only retry separately.
+          retryable: false
+        });
+        return;
+      }
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`====================================================`);
-  console.log(`🚀 中转站上游监控中控台已启动: http://0.0.0.0:${PORT}`);
-  console.log(`📡 统一转发入口: http://localhost:${PORT}/v1`);
-  console.log(`⏱️ 自动巡检频率: 倍率每 ${state.autoPollIntervalSeconds} 秒 (5分钟) 检测一次，账户余额每 600 秒 (10分钟) 检测一次`);
-  console.log(`📡 上游自动化扫描: 每 ${upstreamScanner.config.intervalHours} 小时自动执行一次差分比对与熔断保护`);
-  console.log(`✈️ Telegram Bot 移动端调度: 待机监听中`);
-  console.log(`====================================================`);
-  startFastSyncWatcher();
-  startPoller();
-  startBalancePoller();
-  startAnnouncementCleanup();
-  startAutoSwitchPoller();
-  refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
-});
+      if (task === 'cache') {
+        const accountIds = Array.from(new Set(
+          (Array.isArray(request.accountIds) ? request.accountIds : [])
+            .map(Number)
+            .filter(id => Number.isSafeInteger(id) && id > 0)
+        ));
+        if (accountIds.length === 0 || invalidateSub2APIScheduler(accountIds) !== true) {
+          throw new Error('无法确认 Sub2API 调度缓存失效');
+        }
+        sendResult({ type: 'control-plane-result', task, ok: true });
+        return;
+      }
+
+      if (task === 'dashboard') {
+        const dashboard = {};
+        const degraded = [];
+        const readDashboardSection = (name, reader) => {
+          try {
+            const value = reader();
+            // A legitimately empty metric map means "no activity", not a
+            // failed read. Worker calls request explicit errors from adapters
+            // so successful empty snapshots can safely replace stale caches.
+            if (value && typeof value === 'object') dashboard[name] = value;
+            else degraded.push(name);
+          } catch (error) {
+            degraded.push(name);
+          }
+        };
+        const throwOnError = { throwOnError: true };
+        readDashboardSection('stability', () => fetchChannelStabilityMetrics(true, throwOnError));
+        readDashboardSection('userActivity', () => fetchChannelUserActivity(true, throwOnError));
+        readDashboardSection('globalUserStats', () => fetchGlobalUserStats(true, throwOnError));
+        readDashboardSection('userFinancialStats', () => fetchUserFinancialStats(true, throwOnError));
+        // A partial dashboard snapshot is useful, but treating an all-failed
+        // read as success would continually clear backoff while serving stale
+        // numbers forever.
+        if (degraded.length === 4) throw new Error('看板快照全部读取失败');
+        sendResult({
+          type: 'control-plane-result',
+          task,
+          ok: true,
+          degraded,
+          ...dashboard
+        });
+        return;
+      }
+
+      if (task === 'cleanup') {
+        execPsql('DELETE FROM announcement_reads WHERE read_at < CURRENT_DATE;', false);
+        sendResult({ type: 'control-plane-result', task, ok: true });
+        return;
+      }
+
+      throw new Error('未知后台控制面任务');
+    } catch (error) {
+      console.error(`[后台控制面] ${task || 'unknown'} 失败:`, error.message);
+      sendResult({
+        type: 'control-plane-result',
+        task,
+        ok: false,
+        // Do not pass command/connection errors over IPC to an HTTP-serving
+        // process; detailed diagnostics stay in the worker's local stderr.
+        error: '后台控制面任务失败'
+      });
+    }
+  });
+}
+
+function initializeMainProcess() {
+  console.log('Connecting to Sub2API backend to load upstream channels...');
+  const initialAccounts = syncRealSub2APIAccounts();
+  if (initialAccounts) {
+    const unresolvedStartupSafety = hasSub2APISyncSafetyWork(buildSub2APISyncSafetyPlan(initialAccounts));
+    // Do not acknowledge a snapshot whose direct startup safety action could
+    // not be confirmed. The first background poll will retry it instead.
+    lastSub2APISignature = unresolvedStartupSafety ? '' : getSub2APISignature();
+    // Redis cache state is intentionally disposable. Rebuild it asynchronously
+    // from the authoritative database on every successful boot, which also
+    // recovers a cache-only retry that was interrupted by a process restart.
+    const initialAccountIds = normalizeControlPlaneAccountIds(initialAccounts.map(account => account.id));
+    if (initialAccountIds.length > 0) requestBackgroundSchedulerInvalidation(initialAccountIds);
+    console.log(`✅ 成功同步加载中转站真实上游渠道: ${initialAccounts.length} 个`);
+    // Wait for fresh health observations before changing any startup routing.
+  }
+
+  // 初始化上游通道 3 小时自动扫描巡检引擎
+  upstreamScanner.init({
+    getState: () => state,
+    saveState: (newState) => {
+      state = newState;
+      writeJSON(CHANNELS_FILE, state);
+    },
+    execPsql,
+    executeRemoteSQL,
+    evaluateAutoSwitch,
+    invalidateSub2APIScheduler,
+    broadcastSSE,
+    telegram,
+    getUpstreamPanels: () => upstreamPanels,
+    getUpstreamPanelConfig: () => (upstreamPanels[0] || upstreamPanelConfig),
+    getUpstreamModelsCache: () => upstreamModelsCache,
+    setUpstreamModelsCache: (cache) => {
+      upstreamModelsCache = cache;
+      writeJSON(UPSTREAM_MODELS_CACHE_FILE, upstreamModelsCache);
+    },
+    getUpstreamGroupCatalog: () => upstreamGroupCatalog,
+    setUpstreamGroupCatalog: (catalog) => {
+      upstreamGroupCatalog = Array.isArray(catalog) ? catalog : [];
+      writeJSON(UPSTREAM_GROUP_CATALOG_FILE, upstreamGroupCatalog);
+    },
+    isExemptGroup: (g) => isExemptGroup(g),
+    isExemptChannel: (c) => isExemptChannel(c)
+  });
+
+  // 初始化 Telegram 机器人与移动调度引擎
+  telegram.init({
+    getState: () => ({
+      ...state,
+      channels: getEnrichedChannels(false, true),
+      globalUserStats: getCachedGlobalUserStats()
+    }),
+    getAutoSwitchConfig: () => autoSwitchConfig,
+    activateChannel: async (targetId, operator = 'Telegram Bot') => {
+      return activateChannel(targetId, operator);
+    },
+    toggleAutoSwitch: async (partialConfig) => {
+      if (partialConfig.enabled !== undefined) autoSwitchConfig.enabled = Boolean(partialConfig.enabled);
+      if (partialConfig.strategy) autoSwitchConfig.strategy = partialConfig.strategy;
+      writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
+      broadcastSSE('AUTO_SWITCH_CONFIG_UPDATED', autoSwitchConfig);
+      return { success: true };
+    },
+    forceCheck: async () => {
+      const started = requestBackgroundControlPlaneSync('Telegram 手动巡检', true);
+      return started
+        ? { success: true, message: '巡检已在后台启动，完成后会推送最新快照。' }
+        : { success: false, message: '巡检正在进行或处于短暂退避，请稍后重试。' };
+    },
+    triggerUpstreamScan: async (source) => {
+      return upstreamScanner.runScan(source);
+    },
+    resolveUpstreamAction: async (actionId, decision, operator) => {
+      return upstreamScanner.resolveAction(actionId, decision, operator);
+    },
+    resolveFailoverProposal: async (proposalId, decision, operator) => {
+      return resolveFailoverProposal(proposalId, decision, operator);
+    },
+    verifyPassword: (pwd) => auth.verifyPassword(pwd)
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`====================================================`);
+    console.log(`🚀 中转站上游监控中控台已启动: http://0.0.0.0:${PORT}`);
+    console.log(`📡 统一转发入口: http://localhost:${PORT}/v1`);
+    console.log(`⏱️ 自动巡检频率: 倍率每 ${state.autoPollIntervalSeconds} 秒 (5分钟) 检测一次，账户余额每 600 秒 (10分钟) 检测一次`);
+    console.log(`📡 上游自动化扫描: 每 ${upstreamScanner.config.intervalHours} 小时自动执行一次差分比对与熔断保护`);
+    console.log(`✈️ Telegram Bot 移动端调度: 待机监听中`);
+    console.log(`====================================================`);
+    startFastSyncWatcher();
+    startPoller();
+    startDashboardSnapshotPoller();
+    startBalancePoller();
+    startAnnouncementCleanup();
+    startAutoSwitchPoller();
+    refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
+  });
+}
+
+if (IS_CONTROL_PLANE_WORKER) {
+  runControlPlaneWorker();
+} else {
+  initializeMainProcess();
+}

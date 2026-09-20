@@ -23,6 +23,25 @@ const CONFIG_FILE = path.join(DATA_DIR, 'upstream_sync_config.json');
 const PENDING_FILE = path.join(DATA_DIR, 'upstream_pending_actions.json');
 const REPORTS_FILE = path.join(DATA_DIR, 'upstream_scan_reports.json');
 const GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
+const DATA_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+// Scanner state can retain upstream URLs, credentials-derived metadata and
+// pending administration actions. Store it in a private directory and write
+// each JSON file atomically.
+function ensurePrivateStorage(filePath = null) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: DATA_DIR_MODE });
+    if (typeof fs.chmodSync === 'function') fs.chmodSync(DATA_DIR, DATA_DIR_MODE);
+    if (filePath && fs.existsSync(filePath) && typeof fs.chmodSync === 'function') {
+      fs.chmodSync(filePath, PRIVATE_FILE_MODE);
+    }
+    return true;
+  } catch (err) {
+    console.error(`[UpstreamScanner] 无法设置 ${filePath || DATA_DIR} 的存储权限:`, err.message);
+    return false;
+  }
+}
 
 const DEFAULT_CONFIG = {
   enabled: true,
@@ -38,6 +57,7 @@ const DEFAULT_CONFIG = {
 
 function readJSON(filePath, defaultValue) {
   try {
+    if (!ensurePrivateStorage(filePath)) return defaultValue;
     if (!fs.existsSync(filePath)) return defaultValue;
     const raw = fs.readFileSync(filePath, 'utf-8');
     return JSON.parse(raw);
@@ -49,12 +69,26 @@ function readJSON(filePath, defaultValue) {
 
 function writeJSON(filePath, data) {
   try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!ensurePrivateStorage(filePath)) return false;
+    const payload = JSON.stringify(data, null, 2);
+    const canWriteAtomically = ['openSync', 'writeFileSync', 'closeSync', 'renameSync']
+      .every(method => typeof fs[method] === 'function');
+    if (!canWriteAtomically) {
+      fs.writeFileSync(filePath, payload, { encoding: 'utf-8', mode: PRIVATE_FILE_MODE });
+      if (typeof fs.chmodSync === 'function') fs.chmodSync(filePath, PRIVATE_FILE_MODE);
+      return true;
     }
-    const tmpPath = `${filePath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
+    const tmpPath = path.join(DATA_DIR, `.${path.basename(filePath)}.${process.pid || 'pid'}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
+    const fd = fs.openSync(tmpPath, 'wx', PRIVATE_FILE_MODE);
+    try {
+      if (typeof fs.fchmodSync === 'function') fs.fchmodSync(fd, PRIVATE_FILE_MODE);
+      fs.writeFileSync(fd, payload, 'utf-8');
+      if (typeof fs.fsyncSync === 'function') fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmpPath, filePath);
+    if (typeof fs.chmodSync === 'function') fs.chmodSync(filePath, PRIVATE_FILE_MODE);
     return true;
   } catch (err) {
     console.error(`[UpstreamScanner] 写入 ${filePath} 失败:`, err.message);
@@ -288,9 +322,13 @@ class UpstreamScanner {
       report.endTime = endTime.toISOString();
       report.durationMs = endTime.getTime() - startTime.getTime();
 
+      const pad = n => String(n).padStart(2, '0');
+      const scanDateStr = `${endTime.getFullYear()}-${pad(endTime.getMonth() + 1)}-${pad(endTime.getDate())} ${pad(endTime.getHours())}:${pad(endTime.getMinutes())}:${pad(endTime.getSeconds())}`;
+
       const summaryLines = [
         `📊 <b>中转塔台 · 上游通道巡检简报 (${triggerSource})</b>`,
         `━━━━━━━━━━━━━━━━━━`,
+        `📅 <b>巡检时间:</b> <code>${scanDateStr}</code>`,
         `⏱️ <b>巡检耗时:</b> ${(report.durationMs / 1000).toFixed(1)} 秒 · 共探测 <b>${report.totalProbed}</b> 个通道`,
         `🛑 <b>停用通道:</b> <b>${report.deactivatedChannels.length}</b> 个`,
         `⚠️ <b>熔断关停分组:</b> <b>${report.closedGroups.length}</b> 个 ${report.closedGroups.length > 0 ? '(孤岛空组已安全阻断)' : ''}`,

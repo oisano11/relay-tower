@@ -31,146 +31,212 @@
           </select>
           <span id="headerMultiplierBadge" class="ratio-pill">--x</span>
         </div>
+
+        <!-- 实时服务精简胶囊 (合并状态，节省横向空间) -->
+        <div class="nav-status-capsule">
+          <div class="status-capsule-item" title="本地 /v1 智能反向代理网关服务正常">
+            <span class="status-dot-pulse"></span>
+            <span class="mono-code">/v1 正常</span>
+          </div>
+          <div class="capsule-divider"></div>
+          <div class="status-capsule-item" id="globalUserStatusBadge" style="cursor: pointer;" title="全站实时在线与活跃客户（点击打开充值与消费看板）">
+            <span class="mono-code" id="globalUserStatusText">👥 0 人在线</span>
+          </div>
+          <div class="capsule-divider"></div>
+          <div class="status-capsule-item poller-mini" id="pollerBadge" title="自动巡检倒计时 (倍率5分钟/次，余额10分钟/次)">
+            <span>⏱</span>
+            <span id="pollerCountdown" class="mono-code">5分00秒</span>
+          </div>
+        </div>
       </div>
 
       <div class="header-actions">
-        <div class="gateway-status">
-          <span class="mono-code">/v1 本地转发正常</span>
-        </div>
-        <div class="gateway-status" id="globalUserStatusBadge" style="cursor: pointer;" title="全站实时在线与活跃客户（点击打开充值与消费统计看板）">
-          <span class="mono-code" id="globalUserStatusText">👥 0 人在线 · 今日 0 人活跃</span>
-        </div>
-        <button id="btnOpenUserFinancesModal" class="btn btn-finance-nav" title="打开全站用户充值金额、消费明细与每日财务统计大盘">
-          <span>💳</span> 充值与消费看板
-        </button>
-        <div class="poller-badge" id="pollerBadge" title="自动巡检倒计时 (倍率5分钟/次，余额10分钟/次)">
-          <span>⏱</span>
-          <span id="pollerCountdown">5分00秒</span>
-        </div>
-        <button id="btnRefreshBalances" class="btn btn-glass" title="一键抓取并刷新所有上游钱包余额">
-          <span>💰</span> 刷新余额
-        </button>
-        <button id="btnOpenJinlongModal" class="btn btn-glass" title="配置上游 New API 后台账号获取余额与倍率">
-          <span>🔑</span> 上游后台 <span id="jinlongStatusPill" class="jinlong-status-mini">待配置</span>
-        </button>
-        <button id="btnOpenAutoSwitchModal" class="btn btn-glass" title="统一设置故障切号、充值后恢复与低价回切">
-          <span>⚡</span> 自动切号设置 <span id="autoSwitchStatusPill" class="auto-switch-status-pill on">已启用</span>
-        </button>
-        <button id="btnOpenTelegramModal" class="btn btn-glass" title="配置 Telegram 机器人推送与手机端一键切线">
-          <span style="color: #0284c7;">✈️</span> Telegram <span id="tgHeaderStatusPill" class="auto-switch-status-pill on">已连接</span>
-        </button>
-        <button id="btnOpenUpstreamScanModal" class="btn btn-glass" title="查看 3 小时上游通道巡检、差分同步、孤岛分组熔断与待办审批">
-          <span style="color: #6366f1;">🔄</span> 上游巡检 <span id="scanPendingBadge" class="auto-switch-status-pill on" style="display: none; background: #ef4444; color: #fff; padding: 1px 6px; border-radius: 999px; font-weight: 700;">0</span>
+        <!-- 高频核心动作 -->
+        <button id="btnRefreshAll" class="btn btn-glass" title="立刻检查全部上游状态、首字测速与倍率">
+          <span>⟳</span> 立即检测
         </button>
         <button id="btnOpenAlertsDrawer" class="btn btn-glass btn-alerts-box" title="打开报错与告警信息盒 (查看全部上游调价、自动切线熔断与报错流水)">
           <span class="bell-icon" id="alertsBellIcon">🔔</span> 报错信息盒 <span id="alertsBadgeCount" class="alerts-badge-count" style="display: none;">0</span>
         </button>
-        <button id="btnRefreshAll" class="btn btn-glass" title="立刻检查全部上游">
-          <span>⟳</span> 立即检测
+        <button id="btnOpenUserFinancesModal" class="btn btn-finance-nav" title="打开全站用户充值金额、消费明细与每日财务统计大盘">
+          <span>💳</span> 充值看板
         </button>
-        <button id="btnSimulate" class="btn btn-warning-glass" title="模拟上游变价，测试弹窗效果">
-          <span>⚡</span> 模拟调价测试
-        </button>
-        <button id="btnOpenSecurityModal" class="btn btn-glass" title="查看系统防御状态与修改管理员密码">
-          <span>🛡️</span> 安全设置
-        </button>
-        <button id="btnLogout" class="btn btn-glass" title="安全退出登录并注销凭据">
-          <span>🚪</span> 退出
-        </button>
+
+        <!-- 统一收纳：系统管理与后台配置下拉菜单 -->
+        <div class="nav-dropdown-wrap" id="navSettingsDropdownWrap">
+          <button id="btnNavDropdownToggle" class="btn btn-glass dropdown-toggle" type="button" title="系统设置与运维中枢">
+            <span>⚙️</span> 系统管理 ▾
+            <span id="navDropdownPendingDot" class="nav-dropdown-pending-dot" style="display: none;"></span>
+          </button>
+          <div class="nav-dropdown-menu" id="navDropdownMenu">
+            <div class="dropdown-header">系统策略与调度中枢</div>
+            <button id="btnOpenAutoSwitchModal" class="dropdown-item" title="统一设置故障切号、充值后恢复与低价回切">
+              <span class="dropdown-item-icon">⚡</span>
+              <span class="dropdown-item-label">自动切号与容灾策略</span>
+              <span id="autoSwitchStatusPill" class="auto-switch-status-pill on">已启用</span>
+            </button>
+            <button id="btnOpenJinlongModal" class="dropdown-item" title="配置上游 New API 后台账号获取余额与倍率">
+              <span class="dropdown-item-icon">🔑</span>
+              <span class="dropdown-item-label">上游 New-API 后台</span>
+              <span id="jinlongStatusPill" class="jinlong-status-mini">待配置</span>
+            </button>
+            <button id="btnOpenUpstreamScanModal" class="dropdown-item" title="查看 3 小时上游通道巡检、差分同步、孤岛分组熔断与待办审批">
+              <span class="dropdown-item-icon">🔄</span>
+              <span class="dropdown-item-label">上游巡检待办审批</span>
+              <span id="scanPendingBadge" class="auto-switch-status-pill on" style="display: none; background: #ef4444; color: #fff; padding: 1px 6px; border-radius: 999px; font-weight: 700;">0</span>
+            </button>
+            <button id="btnOpenTelegramModal" class="dropdown-item" title="配置 Telegram 机器人推送与手机端一键切线">
+              <span class="dropdown-item-icon">✈️</span>
+              <span class="dropdown-item-label">Telegram 机器人通知</span>
+              <span id="tgHeaderStatusPill" class="auto-switch-status-pill on">已连接</span>
+            </button>
+            <button id="btnOpenSecurityModal" class="dropdown-item" title="查看系统防御状态与修改管理员密码">
+              <span class="dropdown-item-icon">🛡️</span>
+              <span class="dropdown-item-label">安全设置与改密</span>
+            </button>
+            <div class="dropdown-divider"></div>
+            <button id="btnSimulate" class="dropdown-item dropdown-item-subtle" title="模拟上游变价，测试弹窗效果">
+              <span class="dropdown-item-icon">🧪</span>
+              <span class="dropdown-item-label">模拟变价演练 (开发测试)</span>
+            </button>
+            <button id="btnLogout" class="dropdown-item dropdown-item-danger" title="安全退出登录并注销凭据">
+              <span class="dropdown-item-icon">🚪</span>
+              <span class="dropdown-item-label">退出登录</span>
+            </button>
+          </div>
+        </div>
       </div>
     </header>
 
     <!-- 主体内容 -->
     <main class="main-container">
-      <!-- 1. 全局轻量化运营态势中枢 (一体化精简排版，大幅上提渠道监控) -->
-      <section class="ops-ribbon-section">
-        <div class="ops-ribbon-bar">
+      <!-- 1. 核心运营态势大盘 (4 大突出 KPI 卡片，第一屏显眼展示) -->
+      <section class="kpi-dashboard-section">
+        <div class="kpi-grid">
           
-          <!-- 左侧：客户财务实况 (最重要业务数据) -->
-          <div class="ops-ribbon-group group-finance" id="userFinanceQuickBar" style="cursor: pointer;" title="点击打开全景财务与客户盈利统计看板">
-            <div class="ops-pill-item pill-recharge" title="客户实际累计总充值（不含测试号）">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💳</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">客户实充</span>
-                <strong id="barTotalRecharge" class="ops-pill-val mono">¥--</strong>
+          <!-- 卡片 1: 💳 客户营收与毛利 (最核心业务数据) -->
+          <div class="kpi-card card-finance" id="userFinanceQuickBar" style="cursor: pointer;" title="点击打开全景财务与客户盈利统计看板">
+            <div class="kpi-card-header">
+              <div class="kpi-card-title">
+                <span class="kpi-icon-badge icon-finance">💳</span>
+                <span>客户营收与毛利</span>
+              </div>
+              <span class="kpi-action-link">全景对账 ↗</span>
+            </div>
+            <div class="kpi-card-body">
+              <div class="kpi-hero-num">
+                <span class="kpi-symbol">¥</span>
+                <strong id="barTotalRecharge" class="mono">--</strong>
+              </div>
+              <div class="kpi-sub-metrics">
+                <div class="kpi-sub-item">
+                  <span class="kpi-sub-label">累计净利</span>
+                  <strong id="barGrossProfit" class="mono profit">+¥--</strong>
+                </div>
+                <div class="kpi-sub-item">
+                  <span class="kpi-sub-label">综合毛利率</span>
+                  <strong id="barProfitMargin" class="mono margin-badge">--%</strong>
+                </div>
               </div>
             </div>
-
-            <div class="ops-pill-item pill-profit" title="扣除上游采购成本后的客户累计净毛利">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">📈</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">客户净利</span>
-                <strong id="barGrossProfit" class="ops-pill-val mono">¥--</strong>
-              </div>
-            </div>
-
-            <div class="ops-pill-item pill-ratio" title="整体销售利润率与利差">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">⚖️</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">综合利率</span>
-                <strong id="barProfitMargin" class="ops-pill-val mono">--%</strong>
-              </div>
-            </div>
-          </div>
-
-          <div class="ops-ribbon-divider"></div>
-
-          <!-- 中间：上游池水位与实时安全 (监控核心) -->
-          <div class="ops-ribbon-group group-pool">
-            <div class="ops-pill-item" id="quickOpenPoolBtn" style="cursor: pointer;" title="上游总备付金余额折算（含USD/CNY）">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">💰</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">上游余池</span>
-                <strong id="barUpstreamBalance" class="ops-pill-val mono">¥--</strong>
-              </div>
-            </div>
-
-            <div class="ops-pill-item" title="正在开启调度的生产通道与总上游数">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">⚡</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">调度通道</span>
-                <strong id="barActiveChannels" class="ops-pill-val mono">-- / --</strong>
-              </div>
-            </div>
-
-            <div class="ops-pill-item" id="riskLossPillItem" style="cursor: pointer;" title="进货成本高于销售价的倒贴亏损通道（点击可快速筛选定位）">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">🚨</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">倒贴预警</span>
-                <strong id="barLossCount" class="ops-pill-val mono safe">0 条</strong>
-              </div>
+            <div class="kpi-card-footer">
+              <span>扣除上游采购成本后的累计实充与净毛利</span>
             </div>
           </div>
 
-          <div class="ops-ribbon-divider"></div>
-
-          <!-- 右侧：全局并发与在线 (健康态势) -->
-          <div class="ops-ribbon-group group-traffic">
-            <div class="ops-pill-item" id="quickConcurrencyItem" style="cursor: pointer;" title="全站 15 分钟内发起请求的活跃终端客户与当前承载并发">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">👥</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">活跃并发</span>
-                <strong id="barActiveUsers" class="ops-pill-val mono">-- 人在线</strong>
+          <!-- 卡片 2: 💰 上游资金池水位 (1:1 美金/人民币等额结算，严禁汇率换算) -->
+          <div class="kpi-card card-pool" id="kpiPoolCard" title="上游总备付金余额（美金/人民币 1:1 等额结算，绝无汇率折损）">
+            <div class="kpi-card-header">
+              <div class="kpi-card-title">
+                <span class="kpi-icon-badge icon-pool">💰</span>
+                <span>上游总备付金</span>
+                <span class="kpi-tag-1to1" title="美金与人民币严格 1:1 结算，无汇率折算">1:1 等额</span>
+              </div>
+              <button id="btnRefreshBalances" class="btn-kpi-action" title="一键抓取并刷新所有上游钱包余额">
+                <span>🔄</span> 查余额
+              </button>
+            </div>
+            <div class="kpi-card-body">
+              <div class="kpi-hero-num">
+                <span class="kpi-symbol">$</span>
+                <strong id="barUpstreamBalance" class="mono">--</strong>
+              </div>
+              <div class="kpi-sub-metrics">
+                <div class="kpi-sub-item" id="quickOpenPoolBtn" style="cursor: pointer;">
+                  <span class="kpi-sub-label">断粮风险</span>
+                  <strong id="barBalanceAlert" class="mono safe">🟢 储备充裕</strong>
+                </div>
+                <div class="kpi-sub-item">
+                  <span class="kpi-sub-label">最低进价</span>
+                  <strong id="barLowestMultiplier" class="mono">--x</strong>
+                </div>
               </div>
             </div>
-
-            <div class="ops-pill-item" title="全站 24h 调用成功率与首字稳定性">
-              <span class="ops-pill-icon-wrap"><span class="ops-pill-icon">🛡️</span></span>
-              <div class="ops-pill-text">
-                <span class="ops-pill-label">全站成功率</span>
-                <strong id="barGlobalHealth" class="ops-pill-val mono">--%</strong>
-              </div>
+            <div class="kpi-card-footer">
+              <span id="kpiPoolFooter">已接入各平台账户可用资金总池 (1 美金 = 1 人民币)</span>
             </div>
           </div>
 
-          <!-- 最右侧快捷功能触发按钮 -->
-          <div class="ops-ribbon-actions">
-            <button id="btnQuickShowLossChannels" class="btn-micro-pill" title="一键筛选正在倒贴亏损的通道" style="display: none;">
-              <span>🚨</span> 查看倒贴
-            </button>
-            <button id="btnToggleProfitCalc" class="btn-micro-pill" title="展开/收起业务利润实时测算面板">
-              <span>🧮</span> 测算器
-            </button>
+          <!-- 卡片 3: ⚡ 通道调度态势与风控 -->
+          <div class="kpi-card card-dispatch" id="kpiDispatchCard">
+            <div class="kpi-card-header">
+              <div class="kpi-card-title">
+                <span class="kpi-icon-badge icon-dispatch">⚡</span>
+                <span>通道调度与风控</span>
+              </div>
+              <span class="kpi-status-tag" id="kpiDispatchModeTag">180s 防抖保护</span>
+            </div>
+            <div class="kpi-card-body">
+              <div class="kpi-hero-num">
+                <strong id="barActiveChannels" class="mono">-- / --</strong>
+                <span class="kpi-unit">生产开启</span>
+              </div>
+              <div class="kpi-sub-metrics">
+                <div class="kpi-sub-item" id="riskLossPillItem" style="cursor: pointer;" title="点击可快速筛选定位倒贴亏损通道">
+                  <span class="kpi-sub-label">倒贴预警</span>
+                  <strong id="barLossCount" class="mono safe">0 条</strong>
+                </div>
+                <div class="kpi-sub-item">
+                  <span class="kpi-sub-label">当前主力</span>
+                  <span id="kpiCurrentMainName" class="kpi-main-name" title="当前主调">--</span>
+                </div>
+              </div>
+            </div>
+            <div class="kpi-card-footer">
+              <span>智能防抖抑制中，GPT 通用通道保持严格豁免</span>
+            </div>
+          </div>
+
+          <!-- 卡片 4: 🛡️ 全网可用率与并发流量 -->
+          <div class="kpi-card card-traffic" id="quickConcurrencyItem" style="cursor: pointer;">
+            <div class="kpi-card-header">
+              <div class="kpi-card-title">
+                <span class="kpi-icon-badge icon-traffic">🛡️</span>
+                <span>网关服务与并发</span>
+              </div>
+              <button id="btnToggleProfitCalc" class="btn-kpi-action" title="展开/收起业务利润实时测算面板">
+                <span>🧮</span> 测算器
+              </button>
+            </div>
+            <div class="kpi-card-body">
+              <div class="kpi-hero-num">
+                <strong id="barGlobalHealth" class="mono">100%</strong>
+                <span class="kpi-unit">全网可用率</span>
+              </div>
+              <div class="kpi-sub-metrics">
+                <div class="kpi-sub-item">
+                  <span class="kpi-sub-label">活跃并发</span>
+                  <strong id="barActiveUsers" class="mono">-- 人在线</strong>
+                </div>
+                <div class="kpi-sub-item">
+                  <span class="kpi-sub-label">网关状态</span>
+                  <strong class="mono safe" style="color: #10b981;">🟢 毫秒响应</strong>
+                </div>
+              </div>
+            </div>
+            <div class="kpi-card-footer">
+              <span>反向代理就绪，流式首字 TTFT 实时熔断监控中</span>
+            </div>
           </div>
 
         </div>
@@ -510,7 +576,7 @@
           <div class="alert-tag-row">
             <div style="display: flex; align-items: center; gap: 0.5rem;">
               <span class="alert-type-badge" style="background: #f0fdf4; color: #15803d; border-color: #bbf7d0;">多上游供应商管理池</span>
-              <span style="font-size: 0.72rem; color: #64748b;">支持同时接入金龙 / 子桐 / LIKE / LAO 等多家平台</span>
+              <span style="font-size: 0.72rem; color: #64748b;">支持同时接入多家 New-API / One-API 平台</span>
             </div>
             <button id="btnCloseJinlongModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
@@ -556,7 +622,7 @@
             <div style="display: grid; grid-template-columns: 1fr 1.2fr; gap: 0.5rem; margin-bottom: 0.5rem;">
               <div>
                 <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">供应商名称:</label>
-                <input type="text" id="upstreamFormName" placeholder="例如: 子桐网络 / 金龙 / LIKE" class="form-input" style="width: 100%; font-size: 0.82rem;" />
+                <input type="text" id="upstreamFormName" placeholder="例如: 平台 A / 平台 B / 主备镜像" class="form-input" style="width: 100%; font-size: 0.82rem;" />
               </div>
               <div>
                 <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">后台地址 (URL):</label>
@@ -1029,7 +1095,7 @@
               <div>
                 <div style="font-weight: 700; font-size: 0.95rem; color: #0f172a; display: flex; align-items: center; gap: 0.4rem;">
                   <span id="tgBotDisplayName">中转塔台</span>
-                  <a id="tgBotLink" href="https://t.me/tianshuzhongzhuan_bot" target="_blank" class="mono" style="color: #0284c7; font-size: 0.82rem; text-decoration: none;">@tianshuzhongzhuan_bot</a>
+                  <a id="tgBotLink" href="#" target="_blank" class="mono" style="color: #0284c7; font-size: 0.82rem; text-decoration: none;">@未配置Bot</a>
                 </div>
                 <div id="tgAdminStatusText" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">
                   管理员状态: <span id="tgAdminCountText" style="color: #059669; font-weight: 600;">已绑定 0 位管理员</span>
@@ -1040,7 +1106,7 @@
               </div>
             </div>
             <div id="tgAutoBindBanner" style="margin-top: 0.6rem; padding: 0.45rem 0.65rem; background: #eff6ff; border-radius: 6px; border: 1px dashed #93c5fd; font-size: 0.76rem; color: #1e40af; display: flex; justify-content: space-between; align-items: center;">
-              <span>💡 在手机 Telegram 搜索 <a href="https://t.me/tianshuzhongzhuan_bot" target="_blank" style="font-weight: 700; color: #1d4ed8;">@tianshuzhongzhuan_bot</a> 发送 <code>/start</code> 即可一键自动绑定！</span>
+              <span>💡 在手机 Telegram 搜索机器人并发送 <code>/start</code> 即可一键自动绑定！</span>
               <button id="btnTgAutoBind" class="btn-micro-edit" style="white-space: nowrap; margin-left: 0.5rem; background: #2563eb; color: #fff; border: none; padding: 2px 8px; border-radius: 4px; cursor: pointer;">⚡ 自动捕获</button>
             </div>
           </div>
@@ -1903,14 +1969,21 @@
 
             <!-- 通道勾选纳管列表 (全站合规通道一览) -->
             <div>
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem; flex-wrap: wrap; gap: 0.35rem;">
                 <span style="font-size: 0.76rem; font-weight: 700; color: #334155;">
-                  📦 组内归属通道管理 (仅展示符合分类且成本低于售价的合规通道):
+                  📦 组内归属通道管理:
                 </span>
-                <div style="display: flex; gap: 0.35rem;">
+                <div style="display: flex; gap: 0.45rem; align-items: center;">
+                  <label style="font-size: 0.72rem; color: #475569; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none;">
+                    <input type="checkbox" id="orchestrateShowAllToggle" onchange="toggleOrchestrateShowAll(this.checked)" style="cursor: pointer;" />
+                    <span>显示全站所有渠道</span>
+                  </label>
                   <button type="button" class="btn btn-secondary" onclick="orchestrateSelectAllChannels(true)" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选合规</button>
                   <button type="button" class="btn btn-secondary" onclick="orchestrateSelectAllChannels(false)" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">清空非指定</button>
                 </div>
+              </div>
+              <div style="margin-bottom: 0.35rem;">
+                <input type="text" id="orchestrateSearchInput" placeholder="🔍 快速过滤通道名称 / #ID / 厂商..." oninput="handleOrchestrateSearch(this.value)" class="form-input" style="width: 100%; font-size: 0.75rem; height: 26px; padding: 0 8px; border-radius: 4px; box-sizing: border-box;" />
               </div>
               <div id="orchestrateChannelsCheckboxList" style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 180px; overflow-y: auto; background: #ffffff; padding: 0.45rem; border-radius: 6px; border: 1px solid #e2e8f0;">
                 <!-- 由 app.js 动态渲染通道列表 -->

@@ -340,9 +340,9 @@ async function main() {
   // 测试 8：多上游供应商后台管理池遍历与模型/报价聚合
   await runAsyncTest('多上游平台：管理池同时配置多个供应商时，引擎应遍历所有已启用平台并聚合模型', async () => {
     const mockPanels = [
-      { id: 'p1', name: '金龙 New-API', backendUrl: 'https://jlaudeapi.com', enabled: true },
-      { id: 'p2', name: '子桐网络', backendUrl: 'https://sub2.zitongwl.cn', enabled: true },
-      { id: 'p3', name: 'LIKE API (已禁用)', backendUrl: 'https://like.api.com', enabled: false }
+      { id: 'p1', name: 'Mock Provider A', backendUrl: 'https://upstream-a.example.com', enabled: true },
+      { id: 'p2', name: 'Mock Provider B', backendUrl: 'https://upstream-b.example.com', enabled: true },
+      { id: 'p3', name: 'Mock Provider C (已禁用)', backendUrl: 'https://upstream-c.example.com', enabled: false }
     ];
 
     const mockCtx = createMockContext();
@@ -352,16 +352,16 @@ async function main() {
     // Mock fetch for the panels
     const originalFetch = global.fetch;
     global.fetch = async (url) => {
-      if (url.includes('jlaudeapi.com/api/user/models')) {
+      if (url.includes('upstream-a.example.com/api/user/models')) {
         return { json: async () => ({ success: true, data: ['gpt-5.4', 'gemini-2.5-pro'] }) };
       }
-      if (url.includes('jlaudeapi.com/api/pricing')) {
+      if (url.includes('upstream-a.example.com/api/pricing')) {
         return { json: async () => ({ success: true, data: [{ model_name: 'gpt-5.4', model_ratio: 0.1 }] }) };
       }
-      if (url.includes('sub2.zitongwl.cn/api/user/models')) {
+      if (url.includes('upstream-b.example.com/api/user/models')) {
         return { json: async () => ({ success: true, data: ['deepseek-v4-pro', 'kimi-k3'] }) };
       }
-      if (url.includes('sub2.zitongwl.cn/api/pricing')) {
+      if (url.includes('upstream-b.example.com/api/pricing')) {
         return { json: async () => ({ success: true, data: [{ model_name: 'deepseek-v4-pro', model_ratio: 0.08 }] }) };
       }
       return { ok: false, status: 404 };
@@ -369,13 +369,13 @@ async function main() {
 
     try {
       const offerings = await scanner.discoverUpstreamOfferings([], null);
-      // 应包含来自 金龙 和 子桐 的模型，不包含禁用的 LIKE
-      const p1Offerings = offerings.filter(o => o.provider === '金龙 New-API');
-      const p2Offerings = offerings.filter(o => o.provider === '子桐网络');
-      const p3Offerings = offerings.filter(o => o.provider === 'LIKE API (已禁用)');
+      // 应包含来自 Provider A 和 Provider B 的模型，不包含禁用的 Provider C
+      const p1Offerings = offerings.filter(o => o.provider === 'Mock Provider A');
+      const p2Offerings = offerings.filter(o => o.provider === 'Mock Provider B');
+      const p3Offerings = offerings.filter(o => o.provider === 'Mock Provider C (已禁用)');
 
-      assert.ok(p1Offerings.length > 0, '应成功拉取金龙平台的数据');
-      assert.ok(p2Offerings.length > 0, '应成功拉取子桐网络的数据');
+      assert.ok(p1Offerings.length > 0, '应成功拉取 Mock Provider A 平台的数据');
+      assert.ok(p2Offerings.length > 0, '应成功拉取 Mock Provider B 平台的数据');
       assert.strictEqual(p3Offerings.length, 0, '已禁用的平台不应被拉取');
     } finally {
       global.fetch = originalFetch;

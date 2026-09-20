@@ -227,9 +227,65 @@ body {
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 0.35rem;
+  gap: 0.45rem;
   flex-shrink: 0;
-  flex-wrap: wrap;
+}
+
+/* 导航栏状态精简胶囊 */
+.nav-status-capsule {
+  display: flex;
+  align-items: center;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.22rem 0.55rem;
+  gap: 0.5rem;
+  margin-left: 0.6rem;
+}
+
+.status-capsule-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.status-capsule-item .mono-code {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.capsule-divider {
+  width: 1px;
+  height: 14px;
+  background: #cbd5e1;
+}
+
+.status-dot-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+  animation: statusPulse 2s infinite;
+  display: inline-block;
+}
+
+@keyframes statusPulse {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 5px rgba(16, 185, 129, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
 }
 
 .gateway-status .mono-code {
@@ -262,7 +318,7 @@ body {
 
 #pollerCountdown {
   display: inline-block;
-  min-width: 50px;
+  min-width: 46px;
   text-align: center;
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
@@ -270,10 +326,130 @@ body {
 }
 
 .header-actions .btn {
-  padding: 0.3rem 0.55rem;
-  font-size: 0.76rem;
-  gap: 0.25rem;
+  padding: 0.32rem 0.65rem;
+  font-size: 0.78rem;
+  gap: 0.3rem;
   white-space: nowrap;
+  font-weight: 600;
+}
+
+/* 系统管理下拉菜单组件 */
+.nav-dropdown-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.nav-dropdown-wrap .dropdown-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.nav-dropdown-wrap .dropdown-toggle.active {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+.nav-dropdown-pending-dot {
+  width: 7px;
+  height: 7px;
+  background: #ef4444;
+  border-radius: 50%;
+  display: inline-block;
+  margin-left: 2px;
+  box-shadow: 0 0 6px #ef4444;
+}
+
+.nav-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 250px;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.15), 0 8px 10px -6px rgba(15, 23, 42, 0.08);
+  padding: 0.4rem;
+  z-index: 1000;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  animation: dropdownFadeIn 0.15s cubic-bezier(0, 0, 0.2, 1);
+}
+
+.nav-dropdown-menu.show {
+  display: flex;
+}
+
+@keyframes dropdownFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.dropdown-header {
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #94a3b8;
+  padding: 0.35rem 0.6rem 0.2rem 0.6rem;
+  letter-spacing: 0.3px;
+}
+
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  padding: 0.45rem 0.65rem;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #334155;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-sizing: border-box;
+}
+
+.dropdown-item:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+.dropdown-item-icon {
+  font-size: 0.95rem;
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.dropdown-item-label {
+  flex: 1;
+}
+
+.dropdown-divider {
+  height: 1px;
+  background: #e2e8f0;
+  margin: 0.3rem 0;
+}
+
+.dropdown-item-subtle {
+  color: #64748b;
+  font-size: 0.78rem;
+}
+
+.dropdown-item-danger:hover {
+  background: #fef2f2;
+  color: #dc2626;
 }
 
 /* 按钮通用风格：干净素雅明快 */
@@ -2106,7 +2282,23 @@ body {
 .alert-item-header {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   font-size: 0.72rem;
+  gap: 0.5rem;
+}
+
+.alert-time-badge {
+  font-size: 0.70rem;
+  font-family: var(--font-mono);
+  color: #64748b;
+  background: rgba(148, 163, 184, 0.14);
+  padding: 0.12rem 0.4rem;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  white-space: nowrap;
+  font-weight: 600;
 }
 
 .alert-item-title {
@@ -2239,17 +2431,116 @@ body {
 }
 
 .badge-bal-low {
-  background: #fffbeb;
-  color: #b45309;
-  border: 1px solid #fde68a;
+  background: #ffe4e6;
+  color: #e11d48;
+  border: 1px solid #fda4af;
+  font-weight: 700;
   animation: pulse-slow 2s infinite;
 }
 
 .badge-bal-empty {
-  background: #fef2f2;
-  color: #b91c1c;
-  border: 1px solid #fecaca;
+  background: #fee2e2;
+  color: #dc2626;
+  border: 1.5px solid #ef4444;
   font-weight: 800;
+}
+
+/* 渠道条目全局余额标红警示 */
+.channel-strip.is-balance-empty {
+  background: #fff5f5 !important;
+  border-left: 5.5px solid #ef4444 !important;
+  border-color: #fca5a5 !important;
+}
+
+.channel-strip.is-balance-low {
+  background: #fffafb !important;
+  border-left: 5.5px solid #f43f5e !important;
+  border-color: #fecdd3 !important;
+}
+
+.strip-bal-warning-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 0.66rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  line-height: 1.3;
+}
+
+.strip-bal-warning-pill.empty {
+  background: #fee2e2;
+  color: #dc2626;
+  border: 1px solid #f87171;
+}
+
+.strip-bal-warning-pill.low {
+  background: #ffe4e6;
+  color: #e11d48;
+  border: 1px solid #fda4af;
+}
+
+/* 余额徽标与标签红显加固 */
+.strip-bal-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.strip-bal-badge {
+  display: inline-block;
+  font-size: 0.76rem;
+  font-weight: 700;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  font-family: var(--font-mono, monospace);
+  line-height: 1;
+}
+
+.strip-bal-badge.bal-empty {
+  background: #fee2e2;
+  color: #dc2626;
+  border: 1.5px solid #ef4444;
+  font-weight: 800;
+}
+
+.strip-bal-badge.bal-low {
+  background: #ffe4e6;
+  color: #e11d48;
+  border: 1.5px solid #f43f5e;
+  font-weight: 700;
+}
+
+.strip-bal-badge.bal-ok {
+  background: #ecfdf5;
+  color: #059669;
+  border: 1px solid #a7f3d0;
+}
+
+.strip-bal-badge.bal-unknown {
+  background: #f1f5f9;
+  color: #94a3b8;
+  border: 1px solid #e2e8f0;
+}
+
+.strip-bal-tag {
+  display: inline-block;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  line-height: 1.2;
+}
+
+.strip-bal-tag.tag-empty {
+  background: #dc2626;
+  color: #ffffff;
+}
+
+.strip-bal-tag.tag-low {
+  background: #e11d48;
+  color: #ffffff;
 }
 
 .badge-bal-btn {
@@ -3476,271 +3767,277 @@ body {
   box-shadow: 0 2px 8px rgba(16, 185, 129, 0.4) !important;
 }
 
-.ops-ribbon-section {
-  margin: 0.45rem 0 0.65rem 0;
+/* ==========================================================================
+   全新核心运营态势大盘 (Executive KPI Dashboard) - 4 大焦点卡片
+   醒目大气、数据突出、1:1 汇率红线、响应式自适应 Grid 布局
+   ========================================================================== */
+.kpi-dashboard-section {
+  margin: 0.65rem 0 1rem 0;
+  width: 100%;
 }
 
-.ops-ribbon-bar {
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.85rem;
+  width: 100%;
+}
+
+@media (max-width: 1200px) {
+  .kpi-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .kpi-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.kpi-card {
   background: #ffffff;
   border: 1px solid #cbd5e1;
   border-radius: 12px;
-  padding: 0.38rem 0.85rem;
-  box-shadow: 0 3px 12px -2px rgba(15, 23, 42, 0.07), 0 1px 4px -1px rgba(15, 23, 42, 0.04);
+  padding: 0.85rem 1rem;
+  box-shadow: 0 2px 8px -2px rgba(15, 23, 42, 0.06), 0 1px 3px -1px rgba(15, 23, 42, 0.04);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0.6rem;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.2s ease;
+  position: relative;
+  overflow: hidden;
+  user-select: none;
+}
+
+.kpi-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px -4px rgba(15, 23, 42, 0.12);
+}
+
+/* 4 大卡片顶部微色带 */
+.card-finance {
+  border-top: 3px solid #10b981;
+}
+.card-pool {
+  border-top: 3px solid #f59e0b;
+}
+.card-dispatch {
+  border-top: 3px solid #3b82f6;
+}
+.card-traffic {
+  border-top: 3px solid #8b5cf6;
+}
+
+.kpi-card-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.65rem;
-  flex-wrap: wrap;
+  gap: 0.4rem;
 }
 
-.ops-ribbon-group {
+.kpi-card-title {
   display: flex;
   align-items: center;
-  gap: 0.6rem;
-  flex-wrap: wrap;
+  gap: 0.45rem;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #334155;
 }
 
-.ops-ribbon-divider {
-  width: 1px;
-  height: 28px;
-  background: #cbd5e1;
-  margin: 0 0.2rem;
-}
-
-/* 基础胶囊卡片容器 */
-.ops-pill-item {
+.kpi-icon-badge {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
   display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.28rem 0.65rem;
-  border-radius: 9px;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-  user-select: none;
-}
-
-.ops-pill-item:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
-}
-
-.ops-pill-icon-wrap {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
-  display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.95rem;
+  font-size: 0.85rem;
   flex-shrink: 0;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 
-.ops-pill-icon {
-  line-height: 1;
+.icon-finance {
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+}
+.icon-pool {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+}
+.icon-dispatch {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+}
+.icon-traffic {
+  background: #faf5ff;
+  border: 1px solid #e9d5ff;
 }
 
-.ops-pill-text {
+.kpi-tag-1to1 {
+  font-size: 0.65rem;
+  font-weight: 800;
+  background: #fef3c7;
+  color: #b45309;
+  border: 1px solid #fcd34d;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.kpi-action-link {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: #059669;
+  transition: color 0.15s ease;
+}
+.kpi-card:hover .kpi-action-link {
+  color: #047857;
+  text-decoration: underline;
+}
+
+.btn-kpi-action {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #334155;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  transition: all 0.15s ease;
+}
+
+.btn-kpi-action:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+  color: #0f172a;
+}
+
+.kpi-card-body {
   display: flex;
   flex-direction: column;
+  gap: 0.45rem;
 }
 
-.ops-pill-label-row {
+.kpi-hero-num {
+  display: flex;
+  align-items: baseline;
+  gap: 0.3rem;
+}
+
+.kpi-symbol {
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: #64748b;
+  font-family: var(--font-mono);
+}
+
+.kpi-hero-num strong {
+  font-size: 1.55rem;
+  font-weight: 900;
+  color: #0f172a;
+  font-family: var(--font-mono);
+  line-height: 1.1;
+  letter-spacing: -0.5px;
+}
+
+.kpi-unit {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #64748b;
+  margin-left: 0.2rem;
+}
+
+.kpi-sub-metrics {
   display: flex;
   align-items: center;
-  gap: 4px;
+  justify-content: space-between;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  padding: 0.35rem 0.6rem;
+  gap: 0.5rem;
 }
 
-.ops-pill-label {
-  font-size: 0.66rem;
-  font-weight: 700;
-  line-height: 1.1;
-  letter-spacing: 0.2px;
-}
-
-.ops-pill-val {
-  font-size: 0.94rem;
-  font-weight: 800;
-  line-height: 1.2;
-}
-
-/* 1. 客户实充: 鲜绿翡翠主题 */
-.pill-recharge {
-  background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
-  border: 1px solid #6ee7b7;
-}
-.pill-recharge .ops-pill-icon-wrap {
-  background: #10b981;
-  color: #ffffff;
-}
-.pill-recharge .ops-pill-label {
-  color: #065f46;
-}
-.pill-recharge .ops-pill-val {
-  color: #047857 !important;
-}
-
-/* 2. 客户实消: 湛蓝深海主题 */
-.pill-spent {
-  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
-  border: 1px solid #93c5fd;
-}
-.pill-spent .ops-pill-icon-wrap {
-  background: #3b82f6;
-  color: #ffffff;
-}
-.pill-spent .ops-pill-label {
-  color: #1e40af;
-}
-.pill-spent .ops-pill-val {
-  color: #1d4ed8 !important;
-}
-
-/* 3. 净赚毛利: 翡翠黑金至尊卡 (HERO 焦点卡片，视觉最夺目) */
-.highlight-profit-pill,
-.pill-profit {
-  background: linear-gradient(135deg, #059669 0%, #047857 50%, #064e3b 100%);
-  border: 1px solid #10b981;
-  box-shadow: 0 3px 12px rgba(5, 150, 105, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.2);
-  padding: 0.3rem 0.75rem;
-}
-.pill-profit:hover {
-  transform: translateY(-1.5px);
-  box-shadow: 0 6px 16px rgba(5, 150, 105, 0.45);
-}
-.pill-profit .ops-pill-icon-wrap {
-  background: rgba(255, 255, 255, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.35);
-}
-.pill-profit .ops-pill-label {
-  color: #d1fae5;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
-}
-.pill-profit .ops-pill-val {
-  color: #ffffff !important;
-  font-size: 1.05rem;
-  font-weight: 900;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
-}
-.ops-pill-margin-badge {
-  background: linear-gradient(135deg, #fef08a 0%, #fde047 100%);
-  color: #854d0e;
-  font-size: 0.68rem;
-  font-weight: 800;
-  padding: 1px 6px;
-  border-radius: 12px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
-  line-height: 1.2;
-}
-
-/* 4. 资金池结存: 琥珀曜金主题 */
-.pill-balance {
-  background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
-  border: 1px solid #fcd34d;
-}
-.pill-balance .ops-pill-icon-wrap {
-  background: #f59e0b;
-  color: #ffffff;
-}
-.pill-balance .ops-pill-label {
-  color: #92400e;
-}
-.pill-balance .ops-pill-val {
-  color: #b45309 !important;
-}
-
-/* 5. 昨日消/透: 典雅罗兰紫主题 */
-.pill-yesterday {
-  background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%);
-  border: 1px solid #d8b4fe;
-}
-.pill-yesterday .ops-pill-icon-wrap {
-  background: #8b5cf6;
-  color: #ffffff;
-}
-.pill-yesterday .ops-pill-label {
-  color: #6b21a8;
-}
-.pill-yesterday .ops-pill-val {
-  color: #7e22ce !important;
-}
-
-/* 财务对账 CTA 按钮 */
-.ops-pill-action .ops-action-tag {
-  font-size: 0.76rem;
-  font-weight: 700;
-  color: #ffffff;
-  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
-  border: 1px solid #1d4ed8;
-  padding: 0.38rem 0.8rem;
-  border-radius: 8px;
-  display: inline-flex;
+.kpi-sub-item {
+  display: flex;
   align-items: center;
   gap: 0.35rem;
-  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.38);
-  cursor: pointer;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-}
-.ops-pill-action .ops-action-tag:hover {
-  background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%);
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.5);
-}
-.ops-pill-action .action-arrow {
-  font-size: 0.85rem;
-  font-weight: 800;
-  transition: transform 0.2s ease;
-}
-.ops-pill-action:hover .action-arrow {
-  transform: translate(2px, -2px);
+  font-size: 0.75rem;
 }
 
-/* 右侧系统态势高饱和胶囊微章 */
-.ops-status-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.3rem 0.65rem;
+.kpi-sub-label {
+  color: #64748b;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.kpi-sub-item strong {
+  font-size: 0.82rem;
+  font-weight: 800;
+  font-family: var(--font-mono);
+}
+
+.kpi-main-name {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: #0369a1;
+  background: #e0f2fe;
+  padding: 1px 6px;
+  border-radius: 4px;
+  max-width: 105px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+}
+
+.profit {
+  color: #059669 !important;
+}
+
+.margin-badge {
+  background: #ecfdf5;
+  color: #059669;
+  border: 1px solid #a7f3d0;
+  padding: 1px 6px;
   border-radius: 8px;
   font-size: 0.74rem;
-  font-weight: 600;
-  transition: all 0.2s ease;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
-}
-.ops-status-badge:hover {
-  transform: translateY(-1px);
-}
-
-/* 通道调度池 */
-.ops-status-badge.badge-channels {
-  background: linear-gradient(135deg, #f0fdfa 0%, #ccfbf1 100%);
-  border: 1px solid #5eead4;
-  color: #0f766e;
-}
-.badge-channels .ops-badge-label {
-  color: #0d9488;
-  font-weight: 600;
-}
-.badge-channels strong {
-  color: #042f2e !important;
   font-weight: 800;
 }
 
-/* 倒贴风控微章 */
-.ops-status-badge.badge-risk {
-  background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
-  border: 1px solid #86efac;
-  color: #15803d;
-  cursor: pointer;
-  user-select: none;
-  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+.kpi-status-tag {
+  font-size: 0.68rem;
+  font-weight: 700;
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  padding: 1px 6px;
+  border-radius: 4px;
 }
-.ops-status-badge.badge-risk:hover {
-  transform: translateY(-1.5px);
-  filter: brightness(1.04);
+
+.kpi-card-footer {
+  font-size: 0.68rem;
+  color: #94a3b8;
+  line-height: 1.3;
+  border-top: 1px dashed #e2e8f0;
+  padding-top: 0.35rem;
 }
-.ops-status-badge.badge-risk:active {
-  transform: translateY(1px);
+
+.mono.danger {
+  color: #dc2626 !important;
+  font-weight: 800;
+}
+.mono.warning {
+  color: #d97706 !important;
+  font-weight: 800;
+}
+.mono.safe {
+  color: #059669 !important;
+  font-weight: 800;
 }
 .badge-risk strong {
   color: #15803d !important;

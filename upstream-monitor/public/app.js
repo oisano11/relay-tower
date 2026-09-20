@@ -147,7 +147,7 @@ function playAlertTone(isDanger = true) {
   }
 }
 
-// 浮动通知提示
+// 浮动通知提示 (消息警告、报错强制包含完整日期与时间)
 function showToast(message, type = 'success') {
   const container = document.getElementById('toastContainer');
   if (!container) return;
@@ -156,25 +156,70 @@ function showToast(message, type = 'success') {
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
   const icon = type === 'success' ? '✅' : type === 'warning' ? '⚠️' : '❌';
-  toast.innerHTML = `<span>${icon}</span><span>${displayMessage}</span>`;
+  
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+  toast.innerHTML = `
+    <span class="toast-icon">${icon}</span>
+    <div style="display: flex; flex-direction: column; gap: 2px; text-align: left;">
+      <span style="font-size: 0.68rem; opacity: 0.85; font-family: var(--font-mono); font-weight: 700; letter-spacing: 0.2px;">📅 ${dateStr}</span>
+      <span style="font-size: 0.82rem; font-weight: 600;">${displayMessage}</span>
+    </div>
+  `;
   container.appendChild(toast);
 
   setTimeout(() => {
     toast.style.opacity = '0';
     toast.style.transform = 'translateY(10px)';
     setTimeout(() => toast.remove(), 300);
-  }, 3500);
+  }, 4000);
 }
 
-// 时间转换
+// 格式化标准完整日期时间 (YYYY-MM-DD HH:mm:ss)
+function formatDateTime(isoString) {
+  if (!isoString) return '--';
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return String(isoString);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// 格式化带日期的消息警告与报错时间 (严格包含 YYYY-MM-DD 日期，近阶段附带相对耗时)
+function formatAlertDateTime(isoString) {
+  if (!isoString) return '--';
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return String(isoString);
+  const pad = n => String(n).padStart(2, '0');
+  const datePart = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const timePart = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+  const now = new Date();
+  const diffSec = Math.floor((now - d) / 1000);
+  let rel = '';
+  if (diffSec >= 0) {
+    if (diffSec < 60) rel = ` (${Math.max(1, diffSec)}秒前)`;
+    else if (diffSec < 3600) rel = ` (${Math.floor(diffSec / 60)}分前)`;
+    else if (diffSec < 86400) rel = ` (${Math.floor(diffSec / 3600)}小时前)`;
+  }
+  return `${datePart} ${timePart}${rel}`;
+}
+
+// 通用时间转换 (强制包含 YYYY-MM-DD 日期，避免历史/跨天记录丢失日期信息)
 function formatTime(isoString) {
   if (!isoString) return '--';
-  const date = new Date(isoString);
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return String(isoString);
+  const pad = n => String(n).padStart(2, '0');
+  const datePart = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const timePart = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
   const now = new Date();
-  const diffSec = Math.floor((now - date) / 1000);
-  if (diffSec < 60) return `${Math.max(1, diffSec)}秒前`;
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}分钟前`;
-  return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const diffSec = Math.floor((now - d) / 1000);
+  if (diffSec >= 0 && diffSec < 60) return `${datePart} ${timePart} (${Math.max(1, diffSec)}秒前)`;
+  if (diffSec >= 0 && diffSec < 3600) return `${datePart} ${timePart} (${Math.floor(diffSec / 60)}分前)`;
+  return `${datePart} ${timePart}`;
 }
 
 function formatTimeAgo(isoString) {
@@ -390,6 +435,10 @@ function renderOverviewMetrics() {
   if (elLowest && currentLowestChannel) {
     elLowest.textContent = `最低 ${formatRate(currentLowestChannel.multiplier)}x`;
   }
+  const barLowestMultiplier = document.getElementById('barLowestMultiplier');
+  if (barLowestMultiplier && currentLowestChannel) {
+    barLowestMultiplier.textContent = `${formatRate(currentLowestChannel.multiplier)}x`;
+  }
   const enabledCount = channelsData.filter(c => c.schedulable).length;
   const elEnabledCount = document.getElementById('metricEnabledCount');
   if (elEnabledCount) elEnabledCount.textContent = `${enabledCount} / ${channelsData.length} 开`;
@@ -398,35 +447,66 @@ function renderOverviewMetrics() {
   const elLastProbe = document.getElementById('metricLastProbeTime');
   if (elLastProbe) elLastProbe.textContent = `上次同步: ${formatTime(activeChannel ? activeChannel.lastCheckTime : null)}`;
 
-  // 4. 更新全局轻量化运营态势中枢 (Ops Ribbon)
+  // 4. 更新全局核心运营态势大盘 (KPI Dashboard)
   const barActiveChannels = document.getElementById('barActiveChannels');
   if (barActiveChannels) {
     barActiveChannels.textContent = `${enabledCount} / ${channelsData.length}`;
+  }
+
+  const kpiCurrentMainName = document.getElementById('kpiCurrentMainName');
+  if (kpiCurrentMainName) {
+    if (activeChannel) {
+      kpiCurrentMainName.textContent = activeChannel.name;
+    } else {
+      const topP1 = channelsData.find(c => c.priority === 1);
+      kpiCurrentMainName.textContent = topP1 ? topP1.name : '智能分流';
+    }
   }
 
   const barLossCount = document.getElementById('barLossCount');
   if (barLossCount) {
     if (activeLoss > 0) {
       barLossCount.textContent = `🚨 ${activeLoss} 条倒贴`;
-      barLossCount.className = 'ops-pill-val mono danger';
+      barLossCount.className = 'mono danger';
     } else if (totalLoss > 0) {
       barLossCount.textContent = `${totalLoss} 条潜在`;
-      barLossCount.className = 'ops-pill-val mono warning';
+      barLossCount.className = 'mono warning';
     } else {
       barLossCount.textContent = '0 条';
-      barLossCount.className = 'ops-pill-val mono safe';
+      barLossCount.className = 'mono safe';
     }
   }
 
   const barUpstreamBalance = document.getElementById('barUpstreamBalance');
   if (barUpstreamBalance) {
     let totalUSD = 0;
+    let emptyCount = 0;
+    let lowCount = 0;
     channelsData.forEach(c => {
       const b = Number(c.balance);
       if (!isNaN(b) && b > 0) totalUSD += b;
+      if (c.balanceStatus === 'empty' || (!isNaN(b) && b <= 0.001)) {
+        emptyCount++;
+      } else if (c.balanceStatus === 'low' || (!isNaN(b) && b < 5.0)) {
+        lowCount++;
+      }
     });
-    const totalCNY = (totalUSD * 7.2).toFixed(2);
-    barUpstreamBalance.textContent = `$${totalUSD.toFixed(1)} (¥${totalCNY})`;
+    // 严禁汇率换算！美金与人民币严格 1:1 结算
+    barUpstreamBalance.textContent = totalUSD.toFixed(2);
+
+    const barBalanceAlert = document.getElementById('barBalanceAlert');
+    if (barBalanceAlert) {
+      if (emptyCount > 0) {
+        barBalanceAlert.textContent = `🚨 ${emptyCount} 家已断粮`;
+        barBalanceAlert.className = 'mono danger';
+      } else if (lowCount > 0) {
+        barBalanceAlert.textContent = `⚠️ ${lowCount} 家低余额`;
+        barBalanceAlert.className = 'mono warning';
+      } else {
+        barBalanceAlert.textContent = '🟢 储备充裕';
+        barBalanceAlert.className = 'mono safe';
+      }
+    }
   }
 
   const barActiveUsers = document.getElementById('barActiveUsers');
@@ -536,7 +616,7 @@ function getVendorTheme(vendor) {
 function getGroupCategory(groupName, channels = channelsData) {
   if (!groupName) return '通用';
   const n = groupName.toLowerCase();
-  if (n.includes('codex') || n.includes('gpt') || n.includes('openai')) return 'OpenAI / GPT';
+  if (n.includes('codex') || n.includes('gpt') || n.includes('openai') || n.includes('降智')) return 'OpenAI / GPT';
   if (n.includes('claude') || n.includes('ccmax') || n.includes('kiro') || n.includes('cursor')) return 'Claude';
   if (n.includes('grok') || n.includes('xai')) return 'Grok';
   if (n.includes('deepseek') || n.includes('kimi') || n.includes('国模') || n.includes('qwen') || n.includes('glm')) return '国模专区';
@@ -603,6 +683,7 @@ function renderFilterPills() {
       const isSchedulable = !!c.schedulable;
       const p = Number(c.priority);
       const isLoss = c.isLoss || ((c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier) > (c.saleMultiplier !== undefined ? c.saleMultiplier : 1.0));
+      const isZeroBal = (c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001));
 
       if (isLoss) lossCount++;
       if (hasTraffic) hasTrafficCount++;
@@ -618,6 +699,10 @@ function renderFilterPills() {
     const activePills = [];
     if (lossCount > 0) {
       activePills.push({ key: 'loss', label: `🚨 倒贴亏损 (${lossCount})`, badgeClass: 'pill-active-loss' });
+    }
+    const emptyCount = channelsData.filter(c => c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001)).length;
+    if (emptyCount > 0) {
+      activePills.push({ key: 'empty', label: `⚠️ 欠费断粮 (${emptyCount})`, badgeClass: 'pill-active-empty' });
     }
     activePills.push(
       { key: 'has_traffic', label: `🔥 活跃有调用 (${hasTrafficCount})`, badgeClass: 'pill-active-hot' },
@@ -754,6 +839,7 @@ function renderChannels() {
         const isOnline = (ua.activeUsers15m > 0);
         const p = Number(c.priority);
         if (currentFilterPill === 'loss' && !(c.isLoss || ((c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier) > (c.saleMultiplier !== undefined ? c.saleMultiplier : 1.0)))) return false;
+        if (currentFilterPill === 'empty' && !(c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001))) return false;
         if (currentFilterPill === 'has_traffic' && !hasTraffic) return false;
         if (currentFilterPill === 'online' && !isOnline) return false;
         if (currentFilterPill === 'schedulable' && !c.schedulable) return false;
@@ -866,7 +952,7 @@ function renderChannels() {
         warningBanner.innerHTML = `
           <div class="asw-icon">⚠️</div>
           <div class="asw-content">
-            <div class="asw-title" style="cursor: pointer;" onclick="jumpToProblemChannel('${firstProb.id}')" title="点击直接定位跳转至该异常渠道"><strong>【正在调度】上游异常警报：</strong>当前开启调度的通道 <strong>[${escapeHtml(firstProb.name)}]</strong> 存在稳定性异常！ <span style="font-size: 0.72rem; color: #b91c1c; font-weight: normal; text-decoration: underline;">(点击定位)</span></div>
+            <div class="asw-title" style="cursor: pointer;" onclick="jumpToProblemChannel('${firstProb.id}')" title="点击直接定位跳转至该异常渠道"><span style="display: inline-block; font-size: 0.72rem; font-family: var(--font-mono); background: #fee2e2; color: #991b1b; padding: 0.1rem 0.4rem; border-radius: 4px; margin-right: 0.35rem; font-weight: 700;">📅 ${formatDateTime(new Date())}</span><strong>【正在调度】上游异常警报：</strong>当前开启调度的通道 <strong>[${escapeHtml(firstProb.name)}]</strong> 存在稳定性异常！ <span style="font-size: 0.72rem; color: #b91c1c; font-weight: normal; text-decoration: underline;">(点击定位)</span></div>
             <div class="asw-desc">
               过去 24 小时在 <strong>${escapeHtml(s.worstModel || '部分模型')}</strong> 发生 <strong>${s.totalErr || 0}</strong> 次错误，成功率仅 <strong>${s.successRate || 0}%</strong>。
               <span style="color: #b91c1c; font-weight: 600; margin-left: 0.35rem;">判定归属：${escapeHtml(s.tooltipTitle || '上游服务商责任')}</span>
@@ -1031,19 +1117,21 @@ function renderStripsView(enabledChannels, standbyChannels) {
     const balUnit = ch.balanceUnit || 'USD';
     const balUnitSymbol = balUnit === 'CNY' ? '¥' : '$';
     const balStatus = ch.balanceStatus || 'unknown';
+    const isZeroBalance = (balStatus === 'empty' || (balVal !== null && balVal !== undefined && Number(balVal) <= 0.001));
+    const isLowBalance = !isZeroBalance && (balStatus === 'low' || (balVal !== null && balVal !== undefined && Number(balVal) < 5.0));
 
     if (balVal === null || balVal === undefined) {
       balanceHtml = `<span class="strip-bal-badge bal-unknown" title="尚未抓取余额或无需余额">--</span>`;
-    } else if (balStatus === 'empty' || Number(balVal) <= 0.001) {
+    } else if (isZeroBalance) {
       balanceHtml = `
         <div class="strip-bal-wrap" title="⚠️ 余额已耗尽 ($0.00)！将触发自动换通道保护">
           <span class="strip-bal-badge bal-empty">${balUnitSymbol}0.00</span>
           <span class="strip-bal-tag tag-empty">已欠费</span>
         </div>
       `;
-    } else if (balStatus === 'low' || Number(balVal) < 5.0) {
+    } else if (isLowBalance) {
       balanceHtml = `
-        <div class="strip-bal-wrap" title="余额不足 $5.00，请及时充值">
+        <div class="strip-bal-wrap" title="⚠️ 余额不足 $5.00，请及时充值">
           <span class="strip-bal-badge bal-low">${balUnitSymbol}${Number(balVal).toFixed(2)}</span>
           <span class="strip-bal-tag tag-low">告急</span>
         </div>
@@ -1056,8 +1144,14 @@ function renderStripsView(enabledChannels, standbyChannels) {
       `;
     }
 
+    const balWarningPill = isZeroBalance
+      ? `<span class="strip-bal-warning-pill empty" title="⚠️ 余额已耗尽 ($0.00) · 无法承接流量">⚠️ 已欠费</span>`
+      : (isLowBalance ? `<span class="strip-bal-warning-pill low" title="⚠️ 余额告急不足 $5.00 · 建议尽快充值">⚠️ 余额告急</span>` : '');
+
+    const balanceStripClass = isZeroBalance ? 'is-balance-empty' : (isLowBalance ? 'is-balance-low' : '');
+
     return `
-      <div class="channel-strip ${isActive ? 'is-active' : ''} ${!isSchedulable ? 'is-disabled' : ''} ${effectiveIsLoss ? 'is-loss' : ''}" data-channel-id="${ch.id}">
+      <div class="channel-strip ${isActive ? 'is-active' : ''} ${!isSchedulable ? 'is-disabled' : ''} ${effectiveIsLoss ? 'is-loss' : ''} ${balanceStripClass}" data-channel-id="${ch.id}">
         <!-- 1. 状态指示器与主副标签 -->
         <div class="strip-col-status">
           ${statusPillHtml}
@@ -1068,6 +1162,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
         <div class="strip-col-info">
           <div class="strip-name-row">
             <strong class="strip-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</strong>
+            ${balWarningPill}
             <span class="vendor-tag ${vTheme.pillClass}">${vTheme.shortLabel}</span>
             <span class="strip-provider-tag" title="上游供应商 / 平台">${escapeHtml(ch.provider || '三方')}</span>
             ${userBadgeHtml}
@@ -1229,10 +1324,18 @@ function renderStripsView(enabledChannels, standbyChannels) {
     let html = '';
 
     // 1. 🌟 主调
+    const isMultiMain = mains.length > 1;
+    const mainBadgeText = isMultiMain
+      ? `🌟 活跃主调 (${mains.length} 条) · 多模型分流`
+      : `🌟 当前主调 (1 条) · 正在调度 · 独占承接`;
+    const mainDescText = isMultiMain
+      ? `当前线上生产流量按专属模型分流承接的通道（若模型重叠建议单主独占以提高 Prompt Cache 命中率）`
+      : `当前线上生产流量正在独占承接的通道 · 全组严格单主独占力保 Prompt Cache 缓存命中率`;
+
     html += `
       <div class="channel-section-header group-tier-header tier-main">
-        <span class="section-badge active-badge" style="background: #166534; color: #fff; font-weight: 700;">🌟 当前主调 (${mains.length} 条) · 正在调度 · 独占承接</span>
-        <span class="section-desc">当前线上生产流量正在分流承接的通道 · 全组严格单主独占力保 Prompt Cache 缓存命中率</span>
+        <span class="section-badge active-badge" style="background: #166534; color: #fff; font-weight: 700;">${mainBadgeText}</span>
+        <span class="section-desc">${mainDescText}</span>
       </div>
     `;
     if (mains.length > 0) {
@@ -1521,7 +1624,7 @@ async function toggleChannelSchedulable(channelId, newSchedulable) {
 async function batchToggleVisible(schedulable) {
   const container = document.getElementById('channelsStripsList');
   const stripEls = container.querySelectorAll('.channel-strip');
-  const ids = Array.from(stripEls).map(el => el.getAttribute('data-id')).filter(Boolean);
+  const ids = Array.from(stripEls).map(el => el.getAttribute('data-channel-id')).filter(Boolean);
 
   if (!ids.length) {
     showToast('当前分类下没有可用上游', 'warning');
@@ -1949,7 +2052,7 @@ function triggerPriceChangeModal(alert, channel, isManualInspect = false) {
 
   const displayName = currentCh.name || alert.channelName || '未知上游';
   document.getElementById('modalAlertTitle').textContent = `注意：[${displayName}] 调整了进货价格！`;
-  document.getElementById('modalAlertTime').textContent = formatTime(alert.timestamp);
+  document.getElementById('modalAlertTime').textContent = '📅 ' + formatAlertDateTime(alert.timestamp);
   document.getElementById('modalAlertReason').textContent = alert.reason || alert.note || '系统检测到进货倍率变动';
 
   document.getElementById('modalOldRate').textContent = `${formatRate(alert.oldMultiplier || 0)}x`;
@@ -2074,9 +2177,12 @@ function renderAlertsDrawer() {
 
   container.innerHTML = alertsData.map((a, idx) => {
     const isUp = a.direction === 'up';
+    const isRatio = a.type === 'ratio_change';
     const isSwitch = a.type === 'channel_switch';
     const isLineSwitch = a.type === 'line_switch';
     const isAutoSwitch = a.type === 'auto_switch';
+    const isRole = a.type === 'role_change';
+    const isPool = a.type === 'pool_exhausted';
     const isError = a.type === 'error';
     const itemTs = new Date(a.timestamp).getTime();
     const isUnread = !isNaN(itemTs) && itemTs > lastReadTs;
@@ -2093,28 +2199,39 @@ function renderAlertsDrawer() {
     } else if (isLineSwitch) {
       cardClass = 'is-channel-switch';
       badgeHtml = `<span style="color: #7c3aed; font-weight: 700;">🌐 线路切换</span>`;
+    } else if (isRole) {
+      cardClass = 'is-channel-switch';
+      badgeHtml = `<span style="color: #0284c7; font-weight: 700;">🏷️ 调度角色调整</span>`;
+    } else if (isPool) {
+      cardClass = 'is-error';
+      badgeHtml = `<span style="color: #ea580c; font-weight: 700;">⚠️ 备用号池告警</span>`;
     } else if (isError) {
       cardClass = 'is-error';
       badgeHtml = `<span style="color: #dc2626; font-weight: 700;">❌ 上游故障报错</span>`;
-    } else {
+    } else if (isRatio) {
       cardClass = isUp ? 'is-up' : 'is-down';
       badgeHtml = `<span style="color: ${isUp ? 'var(--color-red)' : 'var(--color-green)'}; font-weight: 700;">${isUp ? '↗ 进货倍率上涨' : '↘ 进货倍率下调'}</span>`;
+    } else {
+      cardClass = 'is-channel-switch';
+      badgeHtml = `<span style="color: #64748b; font-weight: 700;">ℹ️ 运行提示</span>`;
     }
 
     if (isUnread) cardClass += ' is-unread';
 
+    const alertTitle = a.channelName || (a.groupId ? '业务分组 #' + a.groupId : '中转塔台系统');
+
     return `
-      <div class="alert-item-card ${cardClass}" style="cursor: ${(a.type === 'ratio_change' || isAutoSwitch) ? 'pointer' : 'default'};" data-alert-idx="${idx}">
+      <div class="alert-item-card ${cardClass}" style="cursor: ${(isRatio || isAutoSwitch) ? 'pointer' : 'default'};" data-alert-idx="${idx}">
         <div class="alert-item-header">
           <div style="display: flex; align-items: center; gap: 0.35rem;">
             ${badgeHtml}
             ${isUnread ? '<span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #ef4444;" title="未读"></span>' : ''}
           </div>
-          <span style="color: var(--text-muted);">${formatTime(a.timestamp)}</span>
+          <span class="alert-time-badge mono">📅 ${formatAlertDateTime(a.timestamp)}</span>
         </div>
-        <div class="alert-item-title">${escapeHtml(a.channelName || '')}</div>
+        <div class="alert-item-title">${escapeHtml(alertTitle)}</div>
         <div class="alert-item-body">${escapeHtml(a.note || a.reason || '')}</div>
-        ${a.type === 'ratio_change' ? '<div style="margin-top: 0.4rem; font-size: 0.74rem; color: var(--color-blue); text-align: right;">点击查看同品类比价详情 →</div>' : ''}
+        ${isRatio ? '<div style="margin-top: 0.4rem; font-size: 0.74rem; color: var(--color-blue); text-align: right;">点击查看同品类比价详情 →</div>' : ''}
         ${isAutoSwitch ? '<div style="margin-top: 0.4rem; font-size: 0.74rem; color: #d97706; text-align: right;">点击查看自动切线流水 →</div>' : ''}
       </div>
     `;
@@ -2228,6 +2345,30 @@ function setupSSE() {
       if (document.getElementById('autoSwitchModal')?.style.display === 'flex') {
         loadAutoSwitchLogs();
       }
+    } catch (e) {
+      console.error(e);
+    }
+  });
+
+  evtSource.addEventListener('CHANNEL_ROLE_CHANGED', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload.alert && payload.alert.note) {
+        showToast(`🏷️【调度变更】${payload.alert.note}`, 'info');
+      }
+      loadAlerts();
+      loadChannels();
+    } catch (e) {
+      console.error(e);
+    }
+  });
+
+  evtSource.addEventListener('POOL_EXHAUSTED', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      playAlertTone(true);
+      showToast(`⚠️【号池预警】${payload.note}`, 'warning');
+      loadAlerts();
     } catch (e) {
       console.error(e);
     }
@@ -2522,7 +2663,7 @@ async function loadUpstreamPanelsList() {
           <div style="font-size: 1.8rem; margin-bottom: 0.4rem;">🔑</div>
           <div style="font-size: 0.88rem; font-weight: 600; color: #334155;">暂无已接入的上游供应商后台</div>
           <div style="font-size: 0.75rem; margin-top: 0.2rem; color: #94a3b8;">
-            点击右上角「➕ 添加新上游」接入金龙、子桐、LIKE、LAO、Auash 等 New-API 平台
+            点击右上角「➕ 添加新上游」接入各类 New-API / One-API 平台
           </div>
         </div>
       `;
@@ -3077,6 +3218,68 @@ function initApp() {
     if (e.target.id === 'alertsDrawer') {
       document.getElementById('alertsDrawer').classList.remove('open');
     }
+  });
+
+  // ====== 顶部「系统管理」下拉菜单交互 ======
+  const btnNavDropdownToggle = document.getElementById('btnNavDropdownToggle');
+  const navDropdownMenu = document.getElementById('navDropdownMenu');
+  const navSettingsDropdownWrap = document.getElementById('navSettingsDropdownWrap');
+
+  btnNavDropdownToggle?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isOpen = navDropdownMenu?.classList.contains('show');
+    if (isOpen) {
+      navDropdownMenu?.classList.remove('show');
+      btnNavDropdownToggle.classList.remove('active');
+    } else {
+      navDropdownMenu?.classList.add('show');
+      btnNavDropdownToggle.classList.add('active');
+    }
+  });
+
+  // 点击下拉菜单项时自动收起
+  navDropdownMenu?.querySelectorAll('.dropdown-item').forEach(item => {
+    item.addEventListener('click', () => {
+      navDropdownMenu?.classList.remove('show');
+      btnNavDropdownToggle?.classList.remove('active');
+    });
+  });
+
+  // 点击外部收起下拉菜单
+  document.addEventListener('click', (e) => {
+    if (navSettingsDropdownWrap && !navSettingsDropdownWrap.contains(e.target)) {
+      navDropdownMenu?.classList.remove('show');
+      btnNavDropdownToggle?.classList.remove('active');
+    }
+  });
+
+  // ====== KPI 卡片快捷下钻联动 ======
+  // 1. 倒贴亏损下钻联动：点击后快速定位倒贴通道
+  document.getElementById('riskLossPillItem')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    currentDimension = 'active';
+    currentFilterPill = 'loss';
+    document.querySelectorAll('.dim-tab').forEach(t => {
+      t.classList.toggle('active', t.getAttribute('data-dim') === 'active');
+    });
+    renderFilterPills();
+    renderChannels();
+    document.getElementById('channelsStripsList')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    showToast('已定位至所有倒贴亏损通道', 'warning');
+  });
+
+  // 2. 断粮风险下钻联动：点击后快速筛选所有已欠费断粮通道
+  document.getElementById('quickOpenPoolBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    currentDimension = 'active';
+    currentFilterPill = 'empty';
+    document.querySelectorAll('.dim-tab').forEach(t => {
+      t.classList.toggle('active', t.getAttribute('data-dim') === 'active');
+    });
+    renderFilterPills();
+    renderChannels();
+    document.getElementById('channelsStripsList')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    showToast('已筛选显示欠费与低余额通道', 'info');
   });
 
   // ====== 业务分组管理事件监听 ======
@@ -3659,25 +3862,34 @@ function renderNewGroupChannelSelector() {
     const cost = formatRate(c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier);
     const bal = c.balance !== null && c.balance !== undefined ? `$${Number(c.balance).toFixed(2)}` : '未同步';
     const isOut = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
-    const balColor = isOut ? '#ef4444' : (c.balanceStatus === 'low' ? '#f59e0b' : '#10b981');
-    const balText = isOut ? '欠费' : bal;
+    const isLow = !isOut && ((c.balanceStatus === 'low') || (c.balance !== null && c.balance !== undefined && Number(c.balance) < 5.0));
+    const balColor = isOut ? '#dc2626' : (isLow ? '#e11d48' : '#10b981');
+    const balText = isOut ? '欠费 ($0.00)' : (isLow ? `告急 (${bal})` : bal);
+    const balTag = isOut 
+      ? `<span style="font-size: 0.62rem; color: #dc2626; background: #fee2e2; border: 1px solid #f87171; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 欠费</span>`
+      : (isLow ? `<span style="font-size: 0.62rem; color: #e11d48; background: #ffe4e6; border: 1px solid #fda4af; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 告急</span>` : '');
     const hasGroup = (c.groupsDetail && c.groupsDetail.length > 0) || (c.groups && c.groups.length > 0 && !c.groups.includes('未分配分组'));
     const groupBadge = hasGroup 
       ? `<span style="font-size: 0.62rem; color: #475569; background: #e2e8f0; padding: 0 4px; border-radius: 3px;">已有组</span>`
       : `<span style="font-size: 0.62rem; color: #d97706; background: #fef3c7; padding: 0 4px; border-radius: 3px; font-weight: bold;">待分配</span>`;
     const isChecked = currentlyChecked.has(String(c.id));
+    const rowBg = isOut ? '#fff5f5' : (isLow ? '#fffafb' : (isChecked ? '#eff6ff' : '#f8fafc'));
+    const rowBorder = isOut ? '#fca5a5' : (isLow ? '#fecdd3' : (isChecked ? '#93c5fd' : '#e2e8f0'));
 
     return `
-      <label style="display: flex; align-items: center; gap: 0.35rem; background: ${isChecked ? '#eff6ff' : '#f8fafc'}; border: 1px solid ${isChecked ? '#93c5fd' : '#e2e8f0'}; border-radius: 4px; padding: 0.3rem 0.45rem; cursor: pointer; font-size: 0.74rem; user-select: none;">
+      <label style="display: flex; align-items: center; gap: 0.35rem; background: ${rowBg}; border: 1px solid ${rowBorder}; border-radius: 4px; padding: 0.3rem 0.45rem; cursor: pointer; font-size: 0.74rem; user-select: none;">
         <input type="checkbox" name="newGroupChannel" value="${c.id}" ${isChecked ? 'checked' : ''} onchange="updateNewGroupSelectedCount()" style="cursor: pointer;" />
         <div style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
           <div style="display: flex; justify-content: space-between; align-items: center;">
             <strong style="color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${c.name}</strong>
-            ${groupBadge}
+            <div style="display: flex; gap: 0.25rem; align-items: center;">
+              ${balTag}
+              ${groupBadge}
+            </div>
           </div>
           <div style="font-size: 0.68rem; color: #64748b; display: flex; gap: 0.35rem;">
             <span>进价: ${cost}x</span>
-            <span style="color: ${balColor};">余额: ${balText}</span>
+            <span style="color: ${balColor}; font-weight: ${isOut || isLow ? '700' : 'normal'};">余额: ${balText}</span>
           </div>
         </div>
       </label>
@@ -3858,18 +4070,25 @@ function openAssignAccountsModal(groupId, groupName) {
     const cost = formatRate(ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier);
     const bal = ch.balance !== null && ch.balance !== undefined ? `$${Number(ch.balance).toFixed(2)}` : '未同步';
     const isOut = (ch.balanceStatus === 'empty') || (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) <= 0.001);
-    const balColor = isOut ? '#ef4444' : (ch.balanceStatus === 'low' ? '#f59e0b' : '#10b981');
-    const balText = isOut ? '欠费' : bal;
+    const isLow = !isOut && ((ch.balanceStatus === 'low') || (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) < 5.0));
+    const balColor = isOut ? '#dc2626' : (isLow ? '#e11d48' : '#10b981');
+    const balText = isOut ? '欠费 ($0.00)' : (isLow ? `告急 (${bal})` : bal);
+    const balTag = isOut
+      ? `<span style="font-size: 0.62rem; color: #dc2626; background: #fee2e2; border: 1px solid #f87171; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 欠费</span>`
+      : (isLow ? `<span style="font-size: 0.62rem; color: #e11d48; background: #ffe4e6; border: 1px solid #fda4af; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 告急</span>` : '');
+    const rowBg = isOut ? '#fff5f5' : (isLow ? '#fffafb' : '#ffffff');
+    const rowBorder = isOut ? '#fca5a5' : (isLow ? '#fecdd3' : '#e2e8f0');
 
     return `
-      <label class="assign-acc-row" data-name="${(ch.name || '').toLowerCase()}" style="display: flex; align-items: center; justify-content: space-between; padding: 0.35rem 0.6rem; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 5px; cursor: pointer; user-select: none;">
+      <label class="assign-acc-row" data-name="${(ch.name || '').toLowerCase()}" style="display: flex; align-items: center; justify-content: space-between; padding: 0.35rem 0.6rem; background: ${rowBg}; border: 1px solid ${rowBorder}; border-radius: 5px; cursor: pointer; user-select: none;">
         <div style="display: flex; align-items: center; gap: 0.45rem; flex: 1; overflow: hidden;">
           <input type="checkbox" value="${ch.id}" class="assign-acc-checkbox" ${isChecked ? 'checked' : ''} style="cursor: pointer;" />
           <span style="font-size: 0.8rem; font-weight: 600; color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${ch.name}</span>
+          ${balTag}
         </div>
         <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.72rem;">
           <span class="mono" style="color: #64748b;">进价: ${cost}x</span>
-          <span style="color: ${balColor};">余额: ${balText}</span>
+          <span style="color: ${balColor}; font-weight: ${isOut || isLow ? '700' : 'normal'};">余额: ${balText}</span>
         </div>
       </label>
     `;
@@ -4046,6 +4265,19 @@ function renderGroupControlBanner(groupName) {
 }
 
 // 打开业务分组通道编排弹窗
+let orchestrateShowAllChannels = false;
+let orchestrateChannelSearch = '';
+
+function getAssignedChannelsForGroup(groupId, groupName) {
+  return (channelsData || []).filter(c => {
+    if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(groupId))) return true;
+    if (String(c.primaryGroupId) === String(groupId)) return true;
+    if (c.groups && c.groups.includes(groupName)) return true;
+    return false;
+  });
+}
+
+// 打开业务分组通道编排弹窗
 function openGroupOrchestrateModal(groupId) {
   const group = (allGroups || []).find(g => String(g.id) === String(groupId));
   if (!group) {
@@ -4053,22 +4285,40 @@ function openGroupOrchestrateModal(groupId) {
     return;
   }
   currentOrchestratingGroupId = String(groupId);
+  orchestrateShowAllChannels = false;
+  orchestrateChannelSearch = '';
+
+  const showAllToggle = document.getElementById('orchestrateShowAllToggle');
+  if (showAllToggle) showAllToggle.checked = false;
+  const searchInput = document.getElementById('orchestrateSearchInput');
+  if (searchInput) searchInput.value = '';
 
   const category = getGroupCategory(group.name, channelsData);
   const saleRate = group.sale_rate !== undefined ? Number(group.sale_rate) : 1.0;
 
   document.getElementById('orchestrateGroupName').textContent = `编排【${group.name}】通道与四层角色`;
   document.getElementById('orchestrateGroupCategoryBadge').textContent = `${category} 分类`;
-  document.getElementById('orchestrateSaleRateInput').value = formatRate(saleRate);
+
+  const saleRateInput = document.getElementById('orchestrateSaleRateInput');
+  if (saleRateInput) {
+    saleRateInput.value = formatRate(saleRate);
+    saleRateInput.oninput = () => {
+      const currentRate = parseFloat(saleRateInput.value);
+      const effectiveRate = (!isNaN(currentRate) && currentRate > 0) ? currentRate : saleRate;
+      document.getElementById('orchestrateRuleText').textContent = `${category} 分类 且 进货成本 < ${formatRate(effectiveRate)}x`;
+      const effGroup = { ...group, sale_rate: effectiveRate };
+      const currentAssigned = getAssignedChannelsForGroup(groupId, group.name);
+      const newEligible = getEligibleChannelsForGroup(effGroup, channelsData);
+      document.getElementById('orchestrateCapacityText').innerHTML = `
+        📊 全站合规可容纳通道：<strong>${newEligible.length}</strong> 条 · 当前已纳管：<strong>${currentAssigned.length}</strong> 条
+      `;
+      renderOrchestrateSelectsAndCheckboxes(effGroup, newEligible, currentAssigned);
+    };
+  }
   document.getElementById('orchestrateRuleText').textContent = `${category} 分类 且 进货成本 < ${formatRate(saleRate)}x`;
 
   const eligible = getEligibleChannelsForGroup(group, channelsData);
-  const currentAssigned = channelsData.filter(c => {
-    if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(groupId))) return true;
-    if (String(c.primaryGroupId) === String(groupId)) return true;
-    if (c.groups && c.groups.includes(group.name)) return true;
-    return false;
-  });
+  const currentAssigned = getAssignedChannelsForGroup(groupId, group.name);
 
   document.getElementById('orchestrateCapacityText').innerHTML = `
     📊 全站合规可容纳通道：<strong>${eligible.length}</strong> 条 · 当前已纳管：<strong>${currentAssigned.length}</strong> 条
@@ -4084,12 +4334,42 @@ function closeGroupOrchestrateModal() {
   const modal = document.getElementById('groupOrchestrateModal');
   if (modal) modal.style.display = 'none';
   currentOrchestratingGroupId = null;
+  orchestrateChannelSearch = '';
+}
+
+// 切换全站所有渠道 / 仅合规渠道
+function toggleOrchestrateShowAll(checked) {
+  orchestrateShowAllChannels = Boolean(checked);
+  if (!currentOrchestratingGroupId) return;
+  const group = (allGroups || []).find(g => String(g.id) === String(currentOrchestratingGroupId));
+  if (!group) return;
+  const saleRateInput = document.getElementById('orchestrateSaleRateInput');
+  const currentRate = parseFloat(saleRateInput?.value);
+  const effGroup = { ...group, sale_rate: (!isNaN(currentRate) && currentRate > 0) ? currentRate : group.sale_rate };
+  const eligible = getEligibleChannelsForGroup(effGroup, channelsData);
+  const currentAssigned = getAssignedChannelsForGroup(currentOrchestratingGroupId, group.name);
+  renderOrchestrateSelectsAndCheckboxes(effGroup, eligible, currentAssigned);
+}
+
+// 快速过滤通道搜索
+function handleOrchestrateSearch(val) {
+  orchestrateChannelSearch = val || '';
+  if (!currentOrchestratingGroupId) return;
+  const group = (allGroups || []).find(g => String(g.id) === String(currentOrchestratingGroupId));
+  if (!group) return;
+  const saleRateInput = document.getElementById('orchestrateSaleRateInput');
+  const currentRate = parseFloat(saleRateInput?.value);
+  const effGroup = { ...group, sale_rate: (!isNaN(currentRate) && currentRate > 0) ? currentRate : group.sale_rate };
+  const eligible = getEligibleChannelsForGroup(effGroup, channelsData);
+  const currentAssigned = getAssignedChannelsForGroup(currentOrchestratingGroupId, group.name);
+  renderOrchestrateSelectsAndCheckboxes(effGroup, eligible, currentAssigned);
 }
 
 // 渲染编排弹窗内的下拉框与通道勾选列表
 function renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned) {
   const poolMap = new Map();
-  [...eligible, ...currentAssigned].forEach(c => {
+  const basePool = orchestrateShowAllChannels ? channelsData : [...eligible, ...currentAssigned];
+  basePool.forEach(c => {
     if (!poolMap.has(String(c.id))) {
       poolMap.set(String(c.id), c);
     }
@@ -4101,13 +4381,24 @@ function renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned)
     return costA - costB;
   });
 
+  // Preserve previous dropdown selections if user toggles view or types search
+  const prevMainId = document.getElementById('selectOrchestrateMain')?.value;
+  const prevSubId = document.getElementById('selectOrchestrateSub')?.value;
+  const prevAltId = document.getElementById('selectOrchestrateAlt')?.value;
+
   const currentMain = currentAssigned.find(c => getChannelRole(c) === 'main');
   const currentSub = currentAssigned.find(c => getChannelRole(c) === 'sub');
   const currentAlt = currentAssigned.find(c => getChannelRole(c) === 'alt');
 
-  const mainId = currentMain ? String(currentMain.id) : (channelPool[0] ? String(channelPool[0].id) : '');
-  const subId = currentSub ? String(currentSub.id) : '';
-  const altId = currentAlt ? String(currentAlt.id) : '';
+  const mainId = prevMainId !== undefined && prevMainId !== ''
+    ? prevMainId
+    : (currentMain ? String(currentMain.id) : (channelPool[0] ? String(channelPool[0].id) : ''));
+  const subId = prevSubId !== undefined
+    ? prevSubId
+    : (currentSub ? String(currentSub.id) : '');
+  const altId = prevAltId !== undefined
+    ? prevAltId
+    : (currentAlt ? String(currentAlt.id) : '');
 
   const mainSelect = document.getElementById('selectOrchestrateMain');
   const subSelect = document.getElementById('selectOrchestrateSub');
@@ -4128,29 +4419,47 @@ function renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned)
 
   const listContainer = document.getElementById('orchestrateChannelsCheckboxList');
   if (listContainer) {
+    const existingChecked = new Set();
+    listContainer.querySelectorAll('.orch-ch-checkbox:checked').forEach(cb => existingChecked.add(String(cb.value)));
     const assignedIds = new Set(currentAssigned.map(c => String(c.id)));
     const saleRate = group.sale_rate !== undefined ? Number(group.sale_rate) : 1.0;
 
-    listContainer.innerHTML = channelPool.map(c => {
-      const isChecked = assignedIds.has(String(c.id)) || String(c.id) === String(mainId) || String(c.id) === String(subId) || String(c.id) === String(altId);
-      const cost = c.costMultiplier !== undefined ? Number(c.costMultiplier) : Number(c.multiplier || 0);
-      const isOver = cost >= saleRate;
-      const vTheme = getVendorTheme(c.vendor);
+    const query = (orchestrateChannelSearch || '').trim().toLowerCase();
+    const displayPool = query
+      ? channelPool.filter(c => {
+          const matchName = (c.name || '').toLowerCase().includes(query);
+          const matchId = String(c.id).includes(query);
+          const matchVendor = (c.vendor || '').toLowerCase().includes(query);
+          return matchName || matchId || matchVendor;
+        })
+      : channelPool;
 
-      return `
-        <label class="orchestrate-chk-item ${isOver ? 'over-price' : ''}" id="orchItem_${c.id}">
-          <input type="checkbox" class="orch-ch-checkbox" value="${c.id}" ${isChecked ? 'checked' : ''} onchange="updateOrchestrateStandbySummary()" />
-          <div class="orch-ch-info">
-            <span class="orch-ch-name" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>
-            <span class="strip-id mono">#${c.id}</span>
-            <span class="vendor-tag ${vTheme.pillClass}">${vTheme.shortLabel}</span>
-            <span class="mono orch-cost-val" style="color: ${isOver ? '#dc2626' : '#059669'}; font-weight: 700;">进价: ${formatRate(cost)}x</span>
-            ${isOver ? '<span class="orch-loss-tag">⚠️ 倒贴售价</span>' : ''}
-          </div>
-          <span class="orch-role-tag" id="orchRoleTag_${c.id}"></span>
-        </label>
-      `;
-    }).join('');
+    if (displayPool.length === 0) {
+      listContainer.innerHTML = `<div style="text-align: center; color: #94a3b8; font-size: 0.78rem; padding: 1rem;">暂无匹配的通道数据</div>`;
+    } else {
+      listContainer.innerHTML = displayPool.map(c => {
+        const isChecked = existingChecked.size > 0
+          ? existingChecked.has(String(c.id))
+          : (assignedIds.has(String(c.id)) || String(c.id) === String(mainId) || String(c.id) === String(subId) || String(c.id) === String(altId));
+        const cost = c.costMultiplier !== undefined ? Number(c.costMultiplier) : Number(c.multiplier || 0);
+        const isOver = cost >= saleRate;
+        const vTheme = getVendorTheme(c.vendor);
+
+        return `
+          <label class="orchestrate-chk-item ${isOver ? 'over-price' : ''}" id="orchItem_${c.id}">
+            <input type="checkbox" class="orch-ch-checkbox" value="${c.id}" ${isChecked ? 'checked' : ''} onchange="updateOrchestrateStandbySummary()" />
+            <div class="orch-ch-info">
+              <span class="orch-ch-name" title="${escapeHtml(c.name)}">${escapeHtml(c.name)}</span>
+              <span class="strip-id mono">#${c.id}</span>
+              <span class="vendor-tag ${vTheme.pillClass}">${vTheme.shortLabel}</span>
+              <span class="mono orch-cost-val" style="color: ${isOver ? '#dc2626' : '#059669'}; font-weight: 700;">进价: ${formatRate(cost)}x</span>
+              ${isOver ? '<span class="orch-loss-tag">⚠️ 倒贴售价</span>' : ''}
+            </div>
+            <span class="orch-role-tag" id="orchRoleTag_${c.id}"></span>
+          </label>
+        `;
+      }).join('');
+    }
   }
 
   const handleSelectChange = () => {
@@ -4227,6 +4536,10 @@ function orchestrateSelectAllChannels(select) {
   const checkboxes = document.querySelectorAll('.orch-ch-checkbox');
   checkboxes.forEach(cb => {
     if (cb.value === mainId || cb.value === subId || cb.value === altId) return;
+    if (select) {
+      const item = document.getElementById(`orchItem_${cb.value}`);
+      if (item && item.classList.contains('over-price')) return;
+    }
     cb.checked = Boolean(select);
   });
   updateOrchestrateStandbySummary();
@@ -5649,8 +5962,10 @@ async function loadAutoSwitchLogs() {
     }
 
     tbody.innerHTML = data.logs.map(log => {
-      const timeStr = log.timestamp ? new Date(log.timestamp).toLocaleTimeString('zh-CN', { hour12: false }) : '--';
-      const dateStr = log.timestamp ? new Date(log.timestamp).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) : '';
+      const d = log.timestamp ? new Date(log.timestamp) : null;
+      const pad = n => String(n).padStart(2, '0');
+      const dateStr = d && !isNaN(d.getTime()) ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` : '--';
+      const timeStr = d && !isNaN(d.getTime()) ? `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` : '--';
 
       let badgeClass = 'as-tag-timeout';
       let tagText = '首字超时';
@@ -5678,8 +5993,8 @@ async function loadAutoSwitchLogs() {
       return `
         <tr>
           <td style="font-size: 0.73rem; color: #64748b; white-space: nowrap;">
-            <div>${escapeHtml(dateStr)}</div>
-            <div style="font-weight: 700; color: #1e293b;">${escapeHtml(timeStr)}</div>
+            <div style="font-family: var(--font-mono); font-size: 0.7rem; color: #64748b;">📅 ${escapeHtml(dateStr)}</div>
+            <div style="font-family: var(--font-mono); font-weight: 700; color: #1e293b;">${escapeHtml(timeStr)}</div>
           </td>
           <td>
             <div style="display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.2rem; flex-wrap: wrap;">
@@ -5960,14 +6275,14 @@ function updateQuickFinanceBar(summary) {
   const barYesterdayProfit = document.getElementById('barYesterdayProfit');
   const barPaying = document.getElementById('barPayingUsers');
 
-  if (barRecharge) barRecharge.textContent = `¥${Number(summary.totalRechargedAll || 0).toFixed(2)}`;
+  if (barRecharge) barRecharge.textContent = Number(summary.totalRechargedAll || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   if (barSpent) barSpent.textContent = `¥${Number(summary.totalSpentCustomers || 0).toFixed(2)}`;
   
   const totalProfit = Number(summary.totalProfitCustomers || 0);
   const profitMargin = Number(summary.profitMarginPercent || 0);
   if (barProfit) {
     barProfit.textContent = `${totalProfit >= 0 ? '+' : ''}¥${totalProfit.toFixed(2)}`;
-    barProfit.style.color = totalProfit >= 0 ? '#ffffff' : '#fca5a5';
+    barProfit.style.color = totalProfit >= 0 ? '#10b981' : '#f87171';
   }
   if (barProfitMargin) {
     barProfitMargin.textContent = `${profitMargin >= 0 ? '+' : ''}${profitMargin.toFixed(1)}%`;
@@ -6828,13 +7143,17 @@ async function fetchUpstreamScannerStatus() {
 
 function updateScannerPendingBadge(pendingActions) {
   const badge = document.getElementById('scanPendingBadge');
-  if (!badge) return;
+  const dot = document.getElementById('navDropdownPendingDot');
   const count = Array.isArray(pendingActions) ? pendingActions.length : 0;
   if (count > 0) {
-    badge.textContent = count;
-    badge.style.display = 'inline-block';
+    if (badge) {
+      badge.textContent = count;
+      badge.style.display = 'inline-block';
+    }
+    if (dot) dot.style.display = 'inline-block';
   } else {
-    badge.style.display = 'none';
+    if (badge) badge.style.display = 'none';
+    if (dot) dot.style.display = 'none';
   }
 }
 
