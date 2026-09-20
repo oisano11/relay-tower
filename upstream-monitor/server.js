@@ -54,6 +54,16 @@ function ensurePrivateRuntimeStorage(filePath) {
   }
 }
 
+function normalizeUrlKey(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  let s = rawUrl.trim().toLowerCase();
+  s = s.replace(/^https?:\/\//i, '');
+  s = s.replace(/\/+$/, '');
+  s = s.replace(/\/(v1|api)(\/.*)?$/i, '');
+  s = s.replace(/:(80|443)$/, '');
+  return s.replace(/\/+$/, '');
+}
+
 // 兼容读取与多上游管理池加载
 function loadUpstreamPanels() {
   let list = readJSON(UPSTREAM_PANELS_FILE, null);
@@ -679,14 +689,27 @@ async function refreshAllBalances() {
   return state.channels;
 }
 
-// 脱敏上游供应商配置
+// 脱敏上游供应商配置并附加关联与墓碑状态
 function maskPanel(p) {
   if (!p) return p;
+  const pKey = normalizeUrlKey(p.backendUrl);
+  const channels = (state && Array.isArray(state.channels)) ? state.channels : [];
+  const channelCount = channels.filter(c => 
+    c.upstreamPanelId === p.id ||
+    (pKey && normalizeUrlKey(c.baseUrl) === pKey)
+  ).length;
+  const isTombstoned = typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function'
+    ? upstreamScanner.isTombstoned(p.backendUrl, p.name)
+    : false;
+
   return {
     ...p,
     password: p.password ? '******' : '',
     userToken: p.userToken ? (p.userToken.length > 8 ? p.userToken.slice(0, 6) + '****' : '****') : '',
-    cookie: p.cookie ? '******' : ''
+    cookie: p.cookie ? '******' : '',
+    channelCount,
+    isOrphan: channelCount === 0,
+    isTombstoned
   };
 }
 
@@ -698,6 +721,11 @@ async function syncSingleUpstreamPanel(params = {}) {
     throw new Error('缺少上游后台 URL 地址');
   }
   const name = (params.name || '').trim() || (new URL(backendUrl).hostname || '上游后台');
+  if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function') {
+    if (upstreamScanner.isTombstoned(backendUrl, name)) {
+      throw new Error(`上游供应商 [${name}] 已被墓碑标记为已删除/已欠费下线，拒绝发起探测连接`);
+    }
+  }
   let cookie = params.cookie || '';
   let token = params.userToken || '';
   const username = (params.username || '').trim();
@@ -912,7 +940,45 @@ async function syncSingleUpstreamPanel(params = {}) {
       } catch (e) {}
     }
 
-    // 尝试 3: /v1/usage 协议 (适用于 Token/API Key 模式)
+    // 尝试 3: New-API / One-API 订阅与余额接口 (/v1/dashboard/billing/subscription)
+    if ((token || cookie) && !userInfo) {
+      for (const bPath of ['/v1/dashboard/billing/subscription', '/dashboard/billing/subscription']) {
+        try {
+          const subRes = await fetch(`${backendUrl}${bPath}`, {
+            headers: reqHeaders,
+            signal: AbortSignal.timeout(5000)
+          });
+          if (subRes.ok) {
+            const subData = await subRes.json();
+            const hardLimit = subData.hard_limit_usd !== undefined ? Number(subData.hard_limit_usd) : (subData.total_granted !== undefined ? Number(subData.total_granted) : null);
+            if (hardLimit !== null && !isNaN(hardLimit)) {
+              let totalUsageUSD = 0;
+              try {
+                const uPath = bPath.replace('subscription', 'usage');
+                const uRes = await fetch(`${backendUrl}${uPath}`, { headers: reqHeaders, signal: AbortSignal.timeout(4000) });
+                if (uRes.ok) {
+                  const uData = await uRes.json();
+                  if (uData.total_usage !== undefined) totalUsageUSD = Number((uData.total_usage / 100).toFixed(2));
+                }
+              } catch (_) {}
+              const remUSD = Math.max(0, Number((hardLimit - totalUsageUSD).toFixed(2)));
+              userInfo = {
+                id: 'api_key_user',
+                username: username || 'API Key User',
+                role: 'user',
+                quota: Math.round(remUSD * 500000),
+                balanceUSD: remUSD,
+                usedQuota: Math.round(totalUsageUSD * 500000)
+              };
+              loginOk = true;
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    // 尝试 4: /v1/usage 协议 (适用于 Token/API Key 模式)
     if ((token || cookie) && !userInfo) {
       try {
         const usageRes = await fetch(`${backendUrl}/v1/usage`, {
@@ -936,15 +1002,7 @@ async function syncSingleUpstreamPanel(params = {}) {
       } catch (e) {}
     }
 
-    if (!userInfo) {
-      if (params.userInfo && params.userInfo.balanceUSD !== undefined) {
-        userInfo = params.userInfo;
-      } else {
-        throw new Error(`未能从上游后台 [${name}] 获取到账户余额，请检查账号密码或授权状态`);
-      }
-    }
-
-    // 请求模型列表：优先 New-API /api/user/models，若无则尝试 Sub2API /v1/models
+    // 请求模型列表：优先 New-API /api/user/models，若无则尝试 Sub2API /v1/models 或纯 API Key 的 /v1/models
     try {
       const modelRes = await fetch(`${backendUrl}/api/user/models`, {
         headers: reqHeaders,
@@ -997,6 +1055,58 @@ async function syncSingleUpstreamPanel(params = {}) {
       models = params.models;
     }
 
+    // 检查并归一化用户信息：即使查额端点未开放，只要模型可用亦判定连通成功
+    if (!userInfo) {
+      if (params.userInfo && params.userInfo.balanceUSD !== undefined) {
+        userInfo = params.userInfo;
+      } else if (models && models.length > 0) {
+        userInfo = {
+          id: 'api_key_user',
+          username: username || (token ? (token.startsWith('sk-') ? 'API Key 接入' : 'Token 接入') : '上游平台'),
+          role: 'user',
+          quota: 0,
+          balanceUSD: 0,
+          usedQuota: 0
+        };
+      } else {
+        throw new Error(`未能从上游后台 [${name}] 获取到账户余额或模型列表，请核对地址与授权凭据`);
+      }
+    }
+
+    // 自动抓取该上游的分组目录
+    let panelGroups = [];
+    try {
+      if (upstreamScanner && typeof upstreamScanner.discoverUpstreamGroups === 'function') {
+        const scanRes = await upstreamScanner.discoverUpstreamGroups(state.channels, {
+          id,
+          name,
+          backendUrl,
+          userToken: token,
+          cookie,
+          enabled
+        });
+        panelGroups = scanRes.panelGroups || [];
+      }
+    } catch (err) {
+      console.warn(`[UpstreamPanel] [${name}] 自动抓取分组时提示:`, err.message);
+    }
+
+    // 自动抓取该上游的定价与倍率 (/api/pricing)
+    let pricing = [];
+    for (const pSuffix of ['/api/pricing', '/pricing']) {
+      try {
+        const pRes = await fetch(`${backendUrl}${pSuffix}`, { headers: reqHeaders, signal: AbortSignal.timeout(5000) });
+        if (pRes.ok) {
+          const pData = await pRes.json();
+          const pList = pData?.data || (Array.isArray(pData) ? pData : null);
+          if (Array.isArray(pList) && pList.length > 0) {
+            pricing = pList;
+            break;
+          }
+        }
+      } catch (_) {}
+    }
+
     const resultPanel = {
       id,
       name,
@@ -1011,6 +1121,9 @@ async function syncSingleUpstreamPanel(params = {}) {
       lastSyncTime: new Date().toISOString(),
       userInfo,
       models,
+      groups: panelGroups,
+      groupCount: panelGroups.length,
+      pricing,
       lastError: null,
       enabled
     };
@@ -1086,6 +1199,11 @@ async function syncAllUpstreamPanels() {
   const results = [];
   for (const p of upstreamPanels) {
     if (p.enabled === false) continue;
+    if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function') {
+      if (upstreamScanner.isTombstoned(p.backendUrl, p.name)) {
+        continue;
+      }
+    }
     try {
       const res = await syncSingleUpstreamPanel(p);
       results.push({ id: p.id, name: p.name, success: true, balanceUSD: res.balanceUSD });
@@ -1300,6 +1418,8 @@ SELECT json_agg(t) FROM (
     const allGroups = fetchAllSub2APIGroups();
     if (!snapshotOnly) state.allGroups = allGroups;
 
+    const remoteIdSet = new Set(realAccounts.map(acc => String(acc.id)));
+    const prunedChannels = sourceChannels.filter(c => !remoteIdSet.has(String(c.id)));
     const existingMap = new Map(sourceChannels.map(c => [String(c.id), c]));
     const ratioChanges = [];
     const updatedChannels = realAccounts.map(acc => {
@@ -1478,7 +1598,7 @@ SELECT json_agg(t) FROM (
     // process and prevents worker-local state from becoming a second writer.
     const safetyPlan = buildSub2APISyncSafetyPlan(updatedChannels);
     if (snapshotOnly) {
-      return { channels: updatedChannels, allGroups, ratioChanges, safetyPlan };
+      return { channels: updatedChannels, allGroups, ratioChanges, safetyPlan, prunedChannels };
     }
     // All automatic remote safety writes go through the serialised worker
     // below. Before it returns, a newly observed all-group loss is locally
@@ -1498,13 +1618,118 @@ SELECT json_agg(t) FROM (
       safetyReconciliationPending = false;
     }
 
+    if (prunedChannels.length > 0) {
+      console.log(`🧹 [同步清理] 检测到 Sub2API 后台已删除 ${prunedChannels.length} 个上游渠道: ${prunedChannels.map(c => `${c.name || c.id}(${c.id})`).join(', ')}`);
+      
+      // 1. 清理活动渠道与锁定渠道死指针
+      if (prunedChannels.some(c => String(c.id) === String(state.activeChannelId))) {
+        state.activeChannelId = '';
+      }
+      if (prunedChannels.some(c => String(c.id) === String(state.manualLockedChannelId))) {
+        state.manualLockedChannelId = null;
+      }
+
+      // 2. 清理调度器缓存
+      const prunedIds = prunedChannels.map(c => Number(c.id)).filter(n => !isNaN(n));
+      if (prunedIds.length > 0 && typeof invalidateSub2APIScheduler === 'function') {
+        invalidateSub2APIScheduler(prunedIds);
+      }
+
+      // 3. 清理 upstreamModelsCache 并在文件持久化
+      let cacheChanged = false;
+      prunedChannels.forEach(c => {
+        if (typeof upstreamModelsCache !== 'undefined' && upstreamModelsCache && upstreamModelsCache[String(c.id)]) {
+          delete upstreamModelsCache[String(c.id)];
+          cacheChanged = true;
+        }
+      });
+      if (cacheChanged && typeof writeJSON === 'function' && typeof UPSTREAM_MODELS_CACHE_FILE !== 'undefined') {
+        writeJSON(UPSTREAM_MODELS_CACHE_FILE, upstreamModelsCache);
+      }
+
+      // 4. 清理 customChannelModels 与 failoverRuntime
+      if (state.customChannelModels) {
+        prunedChannels.forEach(c => delete state.customChannelModels[String(c.id)]);
+      }
+      if (state.failoverRuntime) {
+        prunedChannels.forEach(c => delete state.failoverRuntime[String(c.id)]);
+      }
+
+      // 5. 清理其余通道中引用被删除通道 URL 的备选线路
+      const prunedUrls = new Set(prunedChannels.map(c => (c.baseUrl || '').replace(/\/+$/, '')).filter(Boolean));
+      if (prunedUrls.size > 0) {
+        updatedChannels.forEach(ch => {
+          if (Array.isArray(ch.backupLines)) {
+            ch.backupLines = ch.backupLines.filter(line => !prunedUrls.has((line.url || '').replace(/\/+$/, '')));
+          }
+        });
+      }
+
+      // 6. 为删除渠道建立墓碑阻断记录，防止自动巡检引擎自动复活
+      if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+        prunedChannels.forEach(c => {
+          if (c.baseUrl || c.name) upstreamScanner.tombstoneChannel(c.baseUrl, c.id, c.name);
+        });
+      }
+
+      // 7. 联动清理孤儿上游供应商后台面板 (upstreamPanels)
+      // 若某个上游面板所关联的渠道在后台已全部删除且在存活渠道中无任何有效引用，自动将其从上游管理池移除并建立墓碑
+      if (typeof upstreamPanels !== 'undefined' && Array.isArray(upstreamPanels) && upstreamPanels.length > 0) {
+        const getNormKey = (typeof normalizeUrlKey === 'function') ? normalizeUrlKey : (u => (u || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''));
+        const panelsToRemove = [];
+        upstreamPanels.forEach(p => {
+          if (!p) return;
+          const pKey = getNormKey(p.backendUrl);
+          const matchedPruned = prunedChannels.some(c => 
+            c.upstreamPanelId === p.id ||
+            (pKey && getNormKey(c.baseUrl) === pKey) ||
+            (p.name && c.name && (c.name.toLowerCase().includes(p.name.toLowerCase()) || p.name.toLowerCase().includes(c.name.toLowerCase())))
+          );
+          if (!matchedPruned) return;
+
+          const hasRemaining = updatedChannels.some(c => 
+            c.upstreamPanelId === p.id ||
+            (pKey && getNormKey(c.baseUrl) === pKey)
+          );
+
+          if (!hasRemaining) {
+            panelsToRemove.push(p);
+          }
+        });
+
+        if (panelsToRemove.length > 0) {
+          const removeIds = new Set(panelsToRemove.map(p => p.id));
+          upstreamPanels = upstreamPanels.filter(p => !removeIds.has(p.id));
+          if (typeof writeJSON === 'function' && typeof UPSTREAM_PANELS_FILE !== 'undefined') {
+            writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+          }
+          if (typeof syncUpstreamPanelConfigCompat === 'function') {
+            syncUpstreamPanelConfigCompat();
+          }
+          panelsToRemove.forEach(p => {
+            console.log(`🧹 [上游面板同步清理] 检测到后台关联渠道已全部删除，自动清理失效上游供应商面板: ${p.name || p.id} (${p.backendUrl})`);
+            if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+              upstreamScanner.tombstoneChannel(p.backendUrl, null, p.name);
+            }
+          });
+          state.prunedPanels = panelsToRemove.map(p => ({ id: p.id, name: p.name, backendUrl: p.backendUrl }));
+        }
+      }
+    }
+
+    state.prunedChannels = prunedChannels;
     state.channels = updatedChannels;
 
-    if (!state.activeChannelId && state.channels.length > 0) {
+    // 重新确认 activeChannelId 的有效性（若失效或未设置，自动优雅顺延至下一个可用可调度通道）
+    const currentActiveId = String(state.activeChannelId || '');
+    if (!currentActiveId || !state.channels.some(c => String(c.id) === currentActiveId)) {
       const schedulableOne = state.channels.find(c => c.schedulable) || state.channels[0];
-      state.activeChannelId = String(schedulableOne.id);
-      schedulableOne.isActive = true;
+      state.activeChannelId = schedulableOne ? String(schedulableOne.id) : '';
     }
+    state.channels.forEach(c => {
+      c.isActive = String(c.id) === String(state.activeChannelId);
+    });
+
     writeJSON(CHANNELS_FILE, state);
     triggerBackgroundModelDiscovery();
     if (hasSub2APISyncSafetyWork(safetyPlan) && directSnapshotSignature &&
@@ -4756,7 +4981,84 @@ function mergeControlPlaneSyncSnapshot(snapshot, baseline) {
   // confirms a remote deletion.
   for (const currentChannel of currentChannels) {
     const id = String(currentChannel.id);
-    if (!remoteIds.has(id) && !baselineById.has(id)) mergedChannels.push(currentChannel);
+    const confirmedDeletedBySnapshot = Array.isArray(snapshot.prunedChannels) &&
+      snapshot.prunedChannels.some(p => String(p.id) === id);
+    if (!remoteIds.has(id) && !baselineById.has(id) && !confirmedDeletedBySnapshot) {
+      mergedChannels.push(currentChannel);
+    }
+  }
+
+  const mergedIds = new Set(mergedChannels.map(c => String(c.id)));
+  const removedChannels = currentChannels.filter(c => !mergedIds.has(String(c.id)));
+  if (removedChannels.length > 0) {
+    console.log(`🧹 [后台控制面同步] 已自动移除后台删除的渠道: ${removedChannels.map(c => `${c.name || c.id}(${c.id})`).join(', ')}`);
+    const removedIds = removedChannels.map(c => Number(c.id)).filter(n => !isNaN(n));
+    if (removedIds.length > 0 && typeof invalidateSub2APIScheduler === 'function') {
+      invalidateSub2APIScheduler(removedIds);
+    }
+    let cacheChanged = false;
+    removedChannels.forEach(c => {
+      if (typeof upstreamModelsCache !== 'undefined' && upstreamModelsCache && upstreamModelsCache[String(c.id)]) {
+        delete upstreamModelsCache[String(c.id)];
+        cacheChanged = true;
+      }
+    });
+    if (cacheChanged && typeof writeJSON === 'function' && typeof UPSTREAM_MODELS_CACHE_FILE !== 'undefined') {
+      writeJSON(UPSTREAM_MODELS_CACHE_FILE, upstreamModelsCache);
+    }
+    if (state.customChannelModels) {
+      removedChannels.forEach(c => delete state.customChannelModels[String(c.id)]);
+    }
+    if (state.failoverRuntime) {
+      removedChannels.forEach(c => delete state.failoverRuntime[String(c.id)]);
+    }
+    if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+      removedChannels.forEach(c => {
+        if (c.baseUrl || c.name) upstreamScanner.tombstoneChannel(c.baseUrl, c.id, c.name);
+      });
+    }
+
+    // 联动清理孤儿上游供应商后台面板 (upstreamPanels)
+    if (typeof upstreamPanels !== 'undefined' && Array.isArray(upstreamPanels) && upstreamPanels.length > 0) {
+      const getNormKey = (typeof normalizeUrlKey === 'function') ? normalizeUrlKey : (u => (u || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''));
+      const panelsToRemove = [];
+      upstreamPanels.forEach(p => {
+        if (!p) return;
+        const pKey = getNormKey(p.backendUrl);
+        const matchedPruned = removedChannels.some(c => 
+          c.upstreamPanelId === p.id ||
+          (pKey && getNormKey(c.baseUrl) === pKey) ||
+          (p.name && c.name && (c.name.toLowerCase().includes(p.name.toLowerCase()) || p.name.toLowerCase().includes(c.name.toLowerCase())))
+        );
+        if (!matchedPruned) return;
+
+        const hasRemaining = mergedChannels.some(c => 
+          c.upstreamPanelId === p.id ||
+          (pKey && getNormKey(c.baseUrl) === pKey)
+        );
+
+        if (!hasRemaining) {
+          panelsToRemove.push(p);
+        }
+      });
+
+      if (panelsToRemove.length > 0) {
+        const removeIds = new Set(panelsToRemove.map(p => p.id));
+        upstreamPanels = upstreamPanels.filter(p => !removeIds.has(p.id));
+        if (typeof writeJSON === 'function' && typeof UPSTREAM_PANELS_FILE !== 'undefined') {
+          writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+        }
+        if (typeof syncUpstreamPanelConfigCompat === 'function') {
+          syncUpstreamPanelConfigCompat();
+        }
+        panelsToRemove.forEach(p => {
+          console.log(`🧹 [快照合并] 检测到后台渠道已删除，自动同步清理上游面板: ${p.name || p.id} (${p.backendUrl})`);
+          if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+            upstreamScanner.tombstoneChannel(p.backendUrl, null, p.name);
+          }
+        });
+      }
+    }
   }
 
   state.channels = mergedChannels;
@@ -6789,6 +7091,7 @@ async function handleRequest(req, res) {
     const safePanels = upstreamPanels.map(maskPanel);
     const totalBalance = Number(upstreamPanels.reduce((sum, p) => sum + (Number(p.balanceUSD) || 0), 0).toFixed(2));
     const connectedCount = upstreamPanels.filter(p => p.status === 'connected').length;
+    const orphanCount = safePanels.filter(p => p.isOrphan || p.isTombstoned).length;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       success: true,
@@ -6796,7 +7099,8 @@ async function handleRequest(req, res) {
       summary: {
         total: upstreamPanels.length,
         connected: connectedCount,
-        totalBalanceUSD: totalBalance
+        totalBalanceUSD: totalBalance,
+        orphanCount
       }
     }));
     return;
@@ -6823,12 +7127,26 @@ async function handleRequest(req, res) {
 
     try {
       const resultPanel = await syncSingleUpstreamPanel(body);
+      const mCount = Array.isArray(resultPanel.models) ? resultPanel.models.length : 0;
+      const gCount = Number(resultPanel.groupCount) || (Array.isArray(resultPanel.groups) ? resultPanel.groups.length : 0);
+      const balStr = (resultPanel.balanceUSD !== null && resultPanel.balanceUSD !== undefined) ? `，余额: $${resultPanel.balanceUSD}` : '';
+
+      // 只要添加或更新了 API，系统立即自动触发差分扫描与低价同步
+      if (upstreamScanner && typeof upstreamScanner.runScan === 'function') {
+        upstreamScanner.runScan(`添加/更新上游API [${resultPanel.name}] 自动抓取巡检`).catch(e => console.error('[自动抓取差分扫描异常]:', e.message));
+      }
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
-        message: `成功保存并连接上游后台 [${resultPanel.name}]`,
+        message: `成功保存并自动抓取上游 [${resultPanel.name}]：已抓取 ${mCount} 个模型、${gCount} 个分组${balStr}！`,
         panel: maskPanel(resultPanel),
-        panels: upstreamPanels.map(maskPanel)
+        panels: upstreamPanels.map(maskPanel),
+        scraped: {
+          modelsCount: mCount,
+          groupsCount: gCount,
+          balanceUSD: resultPanel.balanceUSD
+        }
       }));
     } catch (err) {
       // 即使连通测试报错，也保存以防用户重复输入，并返回错误说明
@@ -6843,6 +7161,55 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // 一键清理孤儿/失效上游供应商后台面板（已欠费下线、后台已删除渠道且无有效引用的面板）
+  if (pathname === '/api/upstream/panels/clean-orphans' && req.method === 'POST') {
+    const activeChannels = state.channels || [];
+    const removedPanels = [];
+    const prevCount = upstreamPanels.length;
+
+    upstreamPanels = upstreamPanels.filter(p => {
+      if (!p) return false;
+      const pKey = normalizeUrlKey(p.backendUrl);
+      const isDeadTombstone = typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function' && upstreamScanner.isTombstoned(p.backendUrl, p.name);
+      
+      const hasChannel = activeChannels.some(c => 
+        c.upstreamPanelId === p.id ||
+        (pKey && normalizeUrlKey(c.baseUrl) === pKey)
+      );
+
+      // 如果有存活渠道且未被墓碑标记阻断，则保留
+      if (hasChannel && !isDeadTombstone) {
+        return true;
+      }
+
+      // 无存活渠道，或已被墓碑阻断，判定为孤儿/失效上游，移除
+      removedPanels.push(p);
+      return false;
+    });
+
+    if (removedPanels.length > 0) {
+      writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+      syncUpstreamPanelConfigCompat();
+      removedPanels.forEach(p => {
+        if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+          upstreamScanner.tombstoneChannel(p.backendUrl, null, p.name);
+        }
+      });
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      count: removedPanels.length,
+      cleanedPanels: removedPanels.map(p => ({ id: p.id, name: p.name, backendUrl: p.backendUrl })),
+      panels: upstreamPanels.map(maskPanel),
+      message: removedPanels.length > 0
+        ? `成功清理 ${removedPanels.length} 个失效/欠费删除的上游供应商：${removedPanels.map(p => p.name || p.backendUrl).join(', ')}`
+        : '当前所有上游供应商均有活跃渠道，无需清理'
+    }));
+    return;
+  }
+
   // 删除指定的上游后台
   if ((pathname.startsWith('/api/upstream/panels/') && req.method === 'DELETE') ||
       (pathname === '/api/upstream/panels/delete' && req.method === 'POST')) {
@@ -6852,10 +7219,25 @@ async function handleRequest(req, res) {
       targetId = body.id || targetId;
     }
 
+    const targetPanel = upstreamPanels.find(p => p.id === targetId);
     const prevCount = upstreamPanels.length;
     upstreamPanels = upstreamPanels.filter(p => p.id !== targetId);
     writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
     syncUpstreamPanelConfigCompat();
+
+    // 解除本地渠道与该面板的绑定
+    if (state.channels) {
+      state.channels.forEach(c => {
+        if (c.upstreamPanelId === targetId) {
+          delete c.upstreamPanelId;
+        }
+      });
+      writeJSON(CHANNELS_FILE, state);
+    }
+
+    if (targetPanel && typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+      upstreamScanner.tombstoneChannel(targetPanel.backendUrl, null, targetPanel.name);
+    }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -6885,12 +7267,25 @@ async function handleRequest(req, res) {
 
     try {
       const updated = await syncSingleUpstreamPanel(panel);
+      const mCount = Array.isArray(updated.models) ? updated.models.length : 0;
+      const gCount = Number(updated.groupCount) || (Array.isArray(updated.groups) ? updated.groups.length : 0);
+      const balStr = (updated.balanceUSD !== null && updated.balanceUSD !== undefined) ? `，余额: $${updated.balanceUSD}` : '';
+
+      if (upstreamScanner && typeof upstreamScanner.runScan === 'function') {
+        upstreamScanner.runScan(`同步上游API [${updated.name}] 自动抓取巡检`).catch(e => console.error('[自动抓取差分扫描异常]:', e.message));
+      }
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
-        message: `上游 [${updated.name}] 同步成功！余额: $${updated.balanceUSD}`,
+        message: `上游 [${updated.name}] 自动抓取完成！已同步 ${mCount} 个模型、${gCount} 个分组${balStr}`,
         panel: maskPanel(updated),
-        panels: upstreamPanels.map(maskPanel)
+        panels: upstreamPanels.map(maskPanel),
+        scraped: {
+          modelsCount: mCount,
+          groupsCount: gCount,
+          balanceUSD: updated.balanceUSD
+        }
       }));
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -6902,10 +7297,13 @@ async function handleRequest(req, res) {
   // 批量全量同步所有上游后台
   if (pathname === '/api/upstream/panels/sync-all' && req.method === 'POST') {
     const results = await syncAllUpstreamPanels();
+    if (upstreamScanner && typeof upstreamScanner.runScan === 'function') {
+      upstreamScanner.runScan('批量同步全部上游API自动抓取巡检').catch(e => console.error('[批量自动抓取差分扫描异常]:', e.message));
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       success: true,
-      message: `已完成 ${results.length} 个上游平台的批量同步`,
+      message: `已完成 ${results.length} 个上游平台的批量自动抓取与差分巡检`,
       results,
       panels: upstreamPanels.map(maskPanel)
     }));
@@ -7089,7 +7487,7 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // 审批决策处理 (同意 / 拒绝 - 支持单项或 actionIds 批量)
+  // 审批决策处理 (同意 / 拒绝 / 删除 - 支持单项或 actionIds 批量)
   if (pathname === '/api/upstream/scanner/resolve-action' && req.method === 'POST') {
     const body = await getBody();
     const target = body.actionIds || body.actionId || body.id;
@@ -7101,6 +7499,28 @@ async function handleRequest(req, res) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: err.message }));
     });
+    return;
+  }
+
+  // 批量清理失效或指定关键字的待办事项
+  if (pathname === '/api/upstream/scanner/purge-actions' && req.method === 'POST') {
+    const body = await getBody();
+    const keyword = body.keyword || body.channelName || '';
+    let purged = 0;
+    if (keyword) {
+      purged = upstreamScanner.purgeActionsByKeyword(keyword);
+    } else {
+      const before = (upstreamScanner.pendingActions || []).length;
+      const remaining = upstreamScanner.getPendingActions();
+      purged = Math.max(0, before - remaining.length);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      success: true,
+      message: `已成功清理 ${purged} 项失效待办事项！`,
+      purgedCount: purged,
+      pendingActions: upstreamScanner.getPendingActions()
+    }));
     return;
   }
 
@@ -7190,12 +7610,159 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // 刷新检测
+  // 刷新检测 (同步 Sub2API 后台真实渠道，清理已删除上游)
   if (pathname === '/api/probe-all' && req.method === 'POST') {
+    const prevCount = (state.channels || []).length;
     syncRealSub2APIAccounts();
+    const prunedCount = state.prunedChannels ? state.prunedChannels.length : Math.max(0, prevCount - (state.channels || []).length);
     broadcastSSE('CHANNELS_UPDATED', state);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, count: state.channels.length }));
+    res.end(JSON.stringify({
+      success: true,
+      count: state.channels.length,
+      prunedCount,
+      prunedChannels: state.prunedChannels || []
+    }));
+    return;
+  }
+
+  // 【核心功能】强制从 Sub2API 后台数据库全量同步上游渠道与销售分组（自动清理已在后台删除的上游）
+  if (pathname === '/api/channels/sync-backend' && req.method === 'POST') {
+    try {
+      const prevChannels = state.channels || [];
+      const updated = syncRealSub2APIAccounts();
+      if (!updated) {
+        throw new Error('未能连接至 Sub2API 数据库获取渠道列表');
+      }
+      const remoteIdSet = new Set((updated || []).map(c => String(c.id)));
+      const pruned = prevChannels.filter(c => !remoteIdSet.has(String(c.id)));
+      
+      broadcastSSE('CHANNELS_UPDATED', state);
+      writeJSON(CHANNELS_FILE, state);
+
+      const prunedPanels = state.prunedPanels || [];
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        count: state.channels.length,
+        prunedCount: pruned.length,
+        prunedChannels: pruned.map(c => ({ id: c.id, name: c.name, vendor: c.vendor })),
+        prunedPanels: prunedPanels.map(p => ({ id: p.id, name: p.name, backendUrl: p.backendUrl })),
+        message: (pruned.length > 0 || prunedPanels.length > 0)
+          ? `已成功与后台同步！检测到后台已删除 ${pruned.length} 个渠道${prunedPanels.length > 0 ? `、${prunedPanels.length} 个失效上游面板` : ''}，已在塔台完成清理。`
+          : `已成功与后台同步！当前所有 ${state.channels.length} 个渠道与后台一致。`
+      }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 【核心功能】彻底删除指定上游渠道（同步在 Sub2API 数据库执行软/硬删除并清理塔台）
+  if ((pathname.match(/^\/api\/channels\/([^/]+)$/) && req.method === 'DELETE') ||
+      (pathname.match(/^\/api\/channels\/([^/]+)\/delete$/) && req.method === 'POST') ||
+      (pathname === '/api/channels/delete' && req.method === 'POST')) {
+    let targetId = '';
+    const matchDel = pathname.match(/^\/api\/channels\/([^/]+)$/);
+    const matchPostDel = pathname.match(/^\/api\/channels\/([^/]+)\/delete$/);
+    if (matchDel && req.method === 'DELETE') targetId = matchDel[1];
+    else if (matchPostDel && req.method === 'POST') targetId = matchPostDel[1];
+    else if (pathname === '/api/channels/delete' && req.method === 'POST') {
+      const body = await getBody();
+      targetId = body.id || body.channelId || '';
+    }
+
+    const channel = state.channels.find(c => String(c.id) === String(targetId));
+    if (!channel) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: '未找到指定上游渠道' }));
+      return;
+    }
+
+    const idNum = parseInt(targetId, 10);
+    if (isNaN(idNum) || idNum <= 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: '无效的渠道 ID' }));
+      return;
+    }
+
+    try {
+      // 1. 同步在 Sub2API 数据库中进行原子删除
+      const sql = `BEGIN;
+UPDATE accounts SET deleted_at = NOW(), updated_at = NOW() WHERE id = ${idNum} AND deleted_at IS NULL;
+DELETE FROM account_groups WHERE account_id = ${idNum};
+DELETE FROM scheduled_test_plans WHERE account_id = ${idNum};
+COMMIT;`;
+      execPsql(sql, false);
+      invalidateSub2APIScheduler(idNum);
+
+      // 2. 墓碑标记，防自动化巡检引擎死灰复燃
+      if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+        upstreamScanner.tombstoneChannel(channel.baseUrl, channel.id, channel.name);
+      }
+
+      // 3. 从本地 state.channels 中彻底清理
+      state.channels = state.channels.filter(c => String(c.id) !== String(targetId));
+      if (String(state.activeChannelId) === String(targetId)) {
+        const next = state.channels.find(c => c.schedulable) || state.channels[0];
+        state.activeChannelId = next ? String(next.id) : '';
+      }
+      if (String(state.manualLockedChannelId) === String(targetId)) {
+        state.manualLockedChannelId = null;
+      }
+      delete upstreamModelsCache[String(targetId)];
+      writeJSON(UPSTREAM_MODELS_CACHE_FILE, upstreamModelsCache);
+      if (state.customChannelModels) delete state.customChannelModels[String(targetId)];
+      if (state.failoverRuntime) delete state.failoverRuntime[String(targetId)];
+
+      // 4. 联动清理孤儿上游面板 (upstreamPanels)
+      if (typeof upstreamPanels !== 'undefined' && Array.isArray(upstreamPanels) && upstreamPanels.length > 0) {
+        const getNormKey = (typeof normalizeUrlKey === 'function') ? normalizeUrlKey : (u => (u || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''));
+        const pKey = getNormKey(channel.baseUrl);
+        const orphanPanels = upstreamPanels.filter(p => {
+          if (!p) return false;
+          const isMatch = (channel.upstreamPanelId && p.id === channel.upstreamPanelId) ||
+            (pKey && getNormKey(p.backendUrl) === pKey) ||
+            (p.name && channel.name && (channel.name.toLowerCase().includes(p.name.toLowerCase()) || p.name.toLowerCase().includes(channel.name.toLowerCase())));
+          if (!isMatch) return false;
+          const hasRemaining = state.channels.some(c => 
+            c.upstreamPanelId === p.id ||
+            (getNormKey(c.baseUrl) === getNormKey(p.backendUrl))
+          );
+          return !hasRemaining;
+        });
+        if (orphanPanels.length > 0) {
+          const orphanIds = new Set(orphanPanels.map(p => p.id));
+          upstreamPanels = upstreamPanels.filter(p => !orphanIds.has(p.id));
+          if (typeof writeJSON === 'function' && typeof UPSTREAM_PANELS_FILE !== 'undefined') {
+            writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+          }
+          if (typeof syncUpstreamPanelConfigCompat === 'function') {
+            syncUpstreamPanelConfigCompat();
+          }
+          orphanPanels.forEach(p => {
+            console.log(`🧹 [渠道删除联动] 渠道 [${channel.name}] 已删除且该上游无其他渠道，自动清理上游供应商面板: ${p.name || p.id}`);
+            if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.tombstoneChannel === 'function') {
+              upstreamScanner.tombstoneChannel(p.backendUrl, null, p.name);
+            }
+          });
+        }
+      }
+
+      writeJSON(CHANNELS_FILE, state);
+
+      broadcastSSE('CHANNELS_UPDATED', state);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        channelId: targetId,
+        message: `渠道 [${channel.name}] 已成功从 Sub2API 数据库和塔台中彻底删除！`
+      }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: '删除上游渠道失败: ' + err.message }));
+    }
     return;
   }
 
