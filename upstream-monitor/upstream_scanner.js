@@ -52,7 +52,8 @@ const DEFAULT_CONFIG = {
   markupPercent: 20, // (a) 自动同步定价上浮 20%
   notifyTelegram: true,
   lastScanTime: null,
-  nextScanTime: null
+  nextScanTime: null,
+  tombstonedUrls: [] // 记录已在后台或塔台明确删除的上游渠道 URL 墓碑，杜绝自动复活
 };
 
 function readJSON(filePath, defaultValue) {
@@ -94,6 +95,16 @@ function writeJSON(filePath, data) {
     console.error(`[UpstreamScanner] 写入 ${filePath} 失败:`, err.message);
     return false;
   }
+}
+
+function normalizeUrlKey(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  let s = rawUrl.trim().toLowerCase();
+  s = s.replace(/^https?:\/\//i, '');
+  s = s.replace(/\/+$/, '');
+  s = s.replace(/\/(v1|api)(\/.*)?$/i, '');
+  s = s.replace(/:(80|443)$/, '');
+  return s.replace(/\/+$/, '');
 }
 
 class UpstreamScanner {
@@ -157,6 +168,117 @@ class UpstreamScanner {
     }
   }
 
+  // 墓碑管理：已删除渠道记录，避免差分扫描时自动重新添加上线
+  tombstoneChannel(url, id = null, name = null) {
+    if (!url && !name) return;
+    const cleanUrl = (url || '').trim().replace(/\/+$/, '');
+    if (!Array.isArray(this.config.tombstonedUrls)) {
+      this.config.tombstonedUrls = [];
+    }
+    let added = false;
+    if (cleanUrl && !this.config.tombstonedUrls.includes(cleanUrl)) {
+      this.config.tombstonedUrls.push(cleanUrl);
+      added = true;
+    }
+    const cleanKey = normalizeUrlKey(cleanUrl);
+    if (cleanKey && !this.config.tombstonedUrls.includes(cleanKey)) {
+      this.config.tombstonedUrls.push(cleanKey);
+      added = true;
+    }
+    if (name && typeof name === 'string' && name.trim()) {
+      const cleanName = name.trim();
+      const nameKey = `name:${cleanName}`;
+      if (!this.config.tombstonedUrls.includes(nameKey)) {
+        this.config.tombstonedUrls.push(nameKey);
+        added = true;
+      }
+    }
+    if (added) {
+      this.saveConfig();
+      console.log(`🪦 [UpstreamScanner] 已为删除上游建立墓碑阻断记录: ${cleanUrl || name}`);
+    }
+    this.dismissActionsForChannel(id, cleanUrl, name);
+  }
+
+  isTombstoned(url, name = null) {
+    if (!Array.isArray(this.config.tombstonedUrls)) return false;
+    const targetKey = normalizeUrlKey(url);
+    const targetName = (name || '').trim().toLowerCase();
+    if (!targetKey && !targetName) return false;
+
+    for (const raw of this.config.tombstonedUrls) {
+      if (!raw) continue;
+      if (typeof raw === 'string' && raw.startsWith('name:')) {
+        const tName = raw.slice(5).trim().toLowerCase();
+        if (targetName && (targetName === tName || targetName.includes(tName) || tName.includes(targetName))) {
+          return true;
+        }
+        continue;
+      }
+      const tKey = normalizeUrlKey(raw);
+      if (targetKey && tKey && (targetKey === tKey || targetKey.includes(tKey) || tKey.includes(targetKey))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  removeTombstone(url) {
+    if (!url || typeof url !== 'string' || !Array.isArray(this.config.tombstonedUrls)) return;
+    const cleanUrl = url.trim().replace(/\/+$/, '');
+    const cleanKey = normalizeUrlKey(cleanUrl);
+    this.config.tombstonedUrls = this.config.tombstonedUrls.filter(u => u !== cleanUrl && u !== cleanKey);
+    this.saveConfig();
+  }
+
+  dismissActionsForChannel(channelId, url = null, name = null) {
+    this.pendingActions = readJSON(PENDING_FILE, []);
+    const cleanUrlKey = normalizeUrlKey(url);
+    const cleanName = (name || '').trim().toLowerCase();
+    const strId = channelId ? String(channelId) : '';
+
+    let changed = false;
+    this.pendingActions = (this.pendingActions || []).filter(item => {
+      const matchId = strId && String(item.channelId) === strId;
+      const itemUrlKey = normalizeUrlKey(item.upstreamUrl || item.baseUrl || '');
+      const matchUrl = cleanUrlKey && itemUrlKey && (cleanUrlKey === itemUrlKey || itemUrlKey.includes(cleanUrlKey) || cleanUrlKey.includes(itemUrlKey));
+      const itemName = (item.channelName || item.name || item.provider || '').trim().toLowerCase();
+      const matchName = cleanName && itemName && (itemName === cleanName || itemName.includes(cleanName) || cleanName.includes(itemName));
+
+      if (matchId || matchUrl || matchName) {
+        changed = true;
+        return false;
+      }
+      return true;
+    });
+    if (changed) {
+      writeJSON(PENDING_FILE, this.pendingActions);
+      console.log(`🧹 [UpstreamScanner] 已清理与 ${url || name || channelId} 关联的审批待办事项`);
+    }
+  }
+
+  // 批量清除指定关键字或已删除孤儿待办事项
+  purgeActionsByKeyword(keyword) {
+    if (!keyword || typeof keyword !== 'string') return 0;
+    const clean = keyword.trim().toLowerCase();
+    this.pendingActions = readJSON(PENDING_FILE, []);
+    const beforeCount = this.pendingActions.length;
+    this.pendingActions = this.pendingActions.filter(a => {
+      const url = (a.upstreamUrl || a.baseUrl || '').toLowerCase();
+      const name = (a.channelName || a.name || a.provider || '').toLowerCase();
+      const model = (a.modelName || '').toLowerCase();
+      const match = url.includes(clean) || name.includes(clean) || model.includes(clean);
+      return !match;
+    });
+    const purged = beforeCount - this.pendingActions.length;
+    if (purged > 0) {
+      writeJSON(PENDING_FILE, this.pendingActions);
+      this.tombstoneChannel(keyword, null, keyword);
+      console.log(`🧹 [UpstreamScanner] 已彻底清除匹配关键字 "${clean}" 的待办 ${purged} 项并建立墓碑`);
+    }
+    return purged;
+  }
+
   // 计算加价 20% 后的售价
   calculateSaleMultiplier(costMultiplier, customMarkup = null) {
     const markup = (customMarkup !== null && !isNaN(customMarkup)) ? customMarkup : (this.config.markupPercent || 20);
@@ -197,6 +319,13 @@ class UpstreamScanner {
     };
 
     try {
+      if (typeof this.context.syncRealSub2APIAccounts === 'function') {
+        try {
+          this.context.syncRealSub2APIAccounts();
+        } catch (syncErr) {
+          console.warn('[UpstreamScanner] 扫描前同步后台数据异常:', syncErr.message);
+        }
+      }
       const state = this.context.getState();
       const channels = state.channels || [];
       const upstreamCache = this.context.getUpstreamModelsCache() || {};
@@ -232,6 +361,11 @@ class UpstreamScanner {
 
       // 3. 差分比对：新增通道与新模型
       for (const offering of upstreamOfferings) {
+        if (offering.baseUrl && this.isTombstoned(offering.baseUrl)) {
+          // 已在后台或塔台明确删除的上游渠道，坚决不自动重新创建、重复提审或开启模型
+          continue;
+        }
+
         // (c) 新模型检测：上游有，我们没有的模型
         if (offering.type === 'model') {
           const modelName = offering.modelName;
@@ -263,6 +397,10 @@ class UpstreamScanner {
 
         // 通道维度对比：以价格与同名/同接口比对
         if (offering.type === 'channel') {
+          if (this.isTombstoned(offering.baseUrl)) {
+            // 已在后台或塔台明确删除的上游渠道，坚决不自动重新创建或重复提审
+            continue;
+          }
           const existingCh = channels.find(c => 
             c.baseUrl && offering.baseUrl && c.baseUrl.replace(/\/+$/, '') === offering.baseUrl.replace(/\/+$/, '')
           );
@@ -620,8 +758,14 @@ class UpstreamScanner {
 
   // 只读抓取上游后台分组目录；不会创建本站账号、业务分组或修改售价。
   async discoverUpstreamGroups(channels = [], upstreamPanel = {}) {
-    let panels = this.context.getUpstreamPanels ? (this.context.getUpstreamPanels() || []) : [];
-    if (!panels.length && upstreamPanel && upstreamPanel.backendUrl) panels = [upstreamPanel];
+    let panels = [];
+    if (upstreamPanel && upstreamPanel.backendUrl) {
+      panels = [upstreamPanel];
+    } else if (this.context.getUpstreamPanels && typeof this.context.getUpstreamPanels === 'function') {
+      panels = this.context.getUpstreamPanels() || [];
+    } else if (upstreamPanel && upstreamPanel.backendUrl) {
+      panels = [upstreamPanel];
+    }
     const previous = this.context.getUpstreamGroupCatalog ? this.context.getUpstreamGroupCatalog() : readJSON(GROUP_CATALOG_FILE, []);
     const previousMap = new Map((Array.isArray(previous) ? previous : []).map(item => [item.key, item]));
     const nextMap = new Map(previousMap), newGroups = [], changedGroups = [], errors = [];
@@ -637,8 +781,19 @@ class UpstreamScanner {
           const response = await fetch(`${baseUrl}${suffix}`, { headers, signal: AbortSignal.timeout(5000) });
           if (!response.ok) continue;
           const body = await response.json();
-          const candidate = body?.data?.items || body?.data?.groups || body?.data?.list || body?.items || body?.groups || body?.list || (Array.isArray(body?.data) ? body.data : null);
-          if (Array.isArray(candidate)) { list = candidate; endpoint = suffix; break; }
+          let candidate = body?.data?.items || body?.data?.groups || body?.data?.list || body?.items || body?.groups || body?.list;
+          if (!candidate && Array.isArray(body?.data)) {
+            candidate = body.data;
+          } else if (!candidate && Array.isArray(body)) {
+            candidate = body;
+          } else if (!candidate && body?.data && typeof body.data === 'object' && !Array.isArray(body.data)) {
+            candidate = Object.entries(body.data).map(([k, v]) => {
+              if (typeof v === 'number') return { id: k, name: k, cost_multiplier: v };
+              if (v && typeof v === 'object') return { id: k, name: k, ...v };
+              return { id: k, name: k };
+            });
+          }
+          if (Array.isArray(candidate) && candidate.length > 0) { list = candidate; endpoint = suffix; break; }
         } catch (_) {}
       }
       if (!list) {
@@ -650,8 +805,13 @@ class UpstreamScanner {
         continue;
       }
       const seen = new Set();
-      for (const raw of list) {
-        if (!raw || typeof raw !== 'object') continue;
+      for (let raw of list) {
+        if (!raw) continue;
+        if (typeof raw === 'string') {
+          raw = { id: raw, name: raw };
+        } else if (typeof raw !== 'object') {
+          continue;
+        }
         const id = raw.id ?? raw.group_id ?? raw.groupId ?? raw.value;
         const name = raw.name ?? raw.group_name ?? raw.groupName ?? raw.label;
         if ((id === undefined || id === null || id === '') && !name) continue;
@@ -676,7 +836,8 @@ class UpstreamScanner {
     }
     const catalog = [...nextMap.values()];
     if (this.context.setUpstreamGroupCatalog) this.context.setUpstreamGroupCatalog(catalog); else writeJSON(GROUP_CATALOG_FILE, catalog);
-    return { catalog, newGroups, changedGroups, errors };
+    const panelGroups = catalog.filter(g => panels.some(p => String(p.id || p.backendUrl) === g.panelId));
+    return { catalog, panelGroups, newGroups, changedGroups, errors };
   }
 
   firstFinite(...values) {
@@ -827,21 +988,65 @@ class UpstreamScanner {
     return newChannel;
   }
 
-  // 待审批项管理
+  // 待审批项管理 (具备对已删除/已阻断上游的自动感知与孤儿清除机制)
   getPendingActions() {
     this.pendingActions = readJSON(PENDING_FILE, []);
     const state = this.context.getState ? this.context.getState() : { channels: [] };
-    const channels = state.channels || [];
+    const channels = Array.isArray(state.channels) ? state.channels : [];
     let panels = [];
     if (this.context.getUpstreamPanels && typeof this.context.getUpstreamPanels === 'function') {
       panels = this.context.getUpstreamPanels() || [];
     }
 
+    const activeChannelIds = new Set(channels.map(c => String(c.id)));
+    const activeUrlKeys = new Set([
+      ...channels.map(c => normalizeUrlKey(c.baseUrl)).filter(Boolean),
+      ...panels.map(p => normalizeUrlKey(p.backendUrl)).filter(Boolean)
+    ]);
+    const activeNames = new Set([
+      ...channels.map(c => (c.name || '').trim().toLowerCase()).filter(Boolean),
+      ...panels.map(p => (p.name || '').trim().toLowerCase()).filter(Boolean)
+    ]);
+
     let modified = false;
-    this.pendingActions.forEach(a => {
+    const remainingPending = [];
+
+    for (const a of this.pendingActions) {
+      if (a.status !== 'pending') {
+        remainingPending.push(a);
+        continue;
+      }
+
+      const itemUrl = a.upstreamUrl || a.baseUrl || '';
+      const itemUrlKey = normalizeUrlKey(itemUrl);
+      const itemName = (a.channelName || a.name || a.provider || '').trim().toLowerCase();
+      const itemChannelId = a.channelId ? String(a.channelId) : '';
+
+      // 1. 若该渠道/URL/名称已在墓碑阻断名单中，彻底清理
+      if (this.isTombstoned(itemUrl, itemName)) {
+        console.log(`🧹 [UpstreamScanner] 自动清理已删除墓碑渠道的待办: ${a.channelName || itemUrl} (${a.type})`);
+        modified = true;
+        continue;
+      }
+
+      // 2. 对于“开启新模型”动作 (enable_new_model)，若所属渠道在 Sub2API 和 Panels 均已被物理删除，自动销毁孤儿待办
+      if (a.type === 'enable_new_model') {
+        const channelAlive = (itemChannelId && activeChannelIds.has(itemChannelId)) ||
+          (itemUrlKey && activeUrlKeys.has(itemUrlKey)) ||
+          (itemName && activeNames.has(itemName));
+        if (!channelAlive) {
+          console.log(`🧹 [UpstreamScanner] 自动清理已删除渠道的孤儿新模型待办: ${a.channelName || itemUrl} (${a.modelName || ''})`);
+          if (itemUrl) {
+            this.tombstoneChannel(itemUrl, itemChannelId, a.channelName);
+          }
+          modified = true;
+          continue;
+        }
+      }
+
+      // 3. 补充元数据映射 (名称、供应商、倍率)
       if (a.type === 'enable_new_model' && (!a.channelName || a.channelName === '默认通道' || a.channelName === 'Upstream')) {
         const url = (a.upstreamUrl || '').replace(/\/+$/, '');
-        // 匹配规则：优先同时匹配 baseUrl 与倍率，或匹配 baseUrl
         let matched = channels.find(c => {
           const cUrl = (c.baseUrl || '').replace(/\/+$/, '');
           return cUrl === url && a.suggestedMultiplier && Math.abs(c.multiplier - a.suggestedMultiplier) < 0.01;
@@ -867,9 +1072,12 @@ class UpstreamScanner {
           modified = true;
         }
       }
-    });
+
+      remainingPending.push(a);
+    }
 
     if (modified) {
+      this.pendingActions = remainingPending;
       writeJSON(PENDING_FILE, this.pendingActions);
     }
 
@@ -894,10 +1102,24 @@ class UpstreamScanner {
   // Resolve only the source channel; commit remote changes before publishing local state.
   async resolveAction(actionId, decision = 'approve', operator = '管理员') {
     if (Array.isArray(actionId)) return this.resolveActions(actionId, decision, operator);
-    if (!['approve', 'reject'].includes(decision)) return { success: false, message: '无效审批决定' };
+    if (!['approve', 'reject', 'delete', 'dismiss'].includes(decision)) return { success: false, message: '无效审批决定' };
     this.pendingActions = readJSON(PENDING_FILE, []);
     const action = this.pendingActions.find(a => String(a.id) === String(actionId));
-    if (!action || action.status !== 'pending') return { success: false, message: '审批项不存在或已处理' };
+    if (!action) return { success: false, message: '审批项不存在或已清理' };
+
+    // 显式删除待办并建立防复活墓碑
+    if (decision === 'delete' || decision === 'dismiss') {
+      this.pendingActions = this.pendingActions.filter(a => String(a.id) !== String(actionId));
+      writeJSON(PENDING_FILE, this.pendingActions);
+      if (action.upstreamUrl || action.baseUrl) {
+        this.tombstoneChannel(action.upstreamUrl || action.baseUrl, action.channelId, action.channelName);
+      }
+      this.context.broadcastSSE('UPSTREAM_ACTION_RESOLVED', { actionId, action, resultMessage: '已彻底删除待办项', pendingActions: this.getPendingActions() });
+      return { success: true, message: '已彻底删除该待办事项并建立阻断墓碑', action };
+    }
+
+    if (action.status !== 'pending') return { success: false, message: '审批项已处理' };
+
     try {
       const state = this.context.getState();
       if (decision === 'approve') {
@@ -938,6 +1160,22 @@ class UpstreamScanner {
 
   async resolveActions(actionIds, decision = 'approve', operator = '管理员') {
     if (!Array.isArray(actionIds) || !actionIds.length) return { success: false, message: '请提供待审批项 ID 列表' };
+
+    if (decision === 'delete' || decision === 'dismiss') {
+      const idSet = new Set(actionIds.map(String));
+      this.pendingActions = readJSON(PENDING_FILE, []);
+      const deletedActions = this.pendingActions.filter(a => idSet.has(String(a.id)));
+      this.pendingActions = this.pendingActions.filter(a => !idSet.has(String(a.id)));
+      writeJSON(PENDING_FILE, this.pendingActions);
+      deletedActions.forEach(a => {
+        if (a.upstreamUrl || a.baseUrl) {
+          this.tombstoneChannel(a.upstreamUrl || a.baseUrl, a.channelId, a.channelName);
+        }
+      });
+      this.context.broadcastSSE('UPSTREAM_ACTION_RESOLVED', { actionIds, resultMessage: '已批量删除待办项', pendingActions: this.getPendingActions() });
+      return { success: true, message: `已彻底清理 ${deletedActions.length} 项待办事项并建立阻断墓碑`, count: deletedActions.length };
+    }
+
     const results = [];
     for (const id of [...new Set(actionIds)]) results.push(await this.resolveAction(id, decision, operator));
     const count = results.filter(r => r.success).length;
@@ -950,4 +1188,7 @@ class UpstreamScanner {
   }
 }
 
-module.exports = new UpstreamScanner();
+const scannerInstance = new UpstreamScanner();
+scannerInstance.UpstreamScanner = UpstreamScanner;
+scannerInstance.normalizeUrlKey = normalizeUrlKey;
+module.exports = scannerInstance;

@@ -1413,3 +1413,205 @@ test('GPT general channels and exempt channels cannot be automatically switched'
     /属于用户手动调优例外通道，禁止自动切换/
   );
 });
+
+test('syncRealSub2APIAccounts prunes deleted accounts, shifts active channel, cleans caches, and tombstones URL', () => {
+  const remoteWrites = [];
+  const invalidations = [];
+  const tombstoned = [];
+  const state = {
+    activeChannelId: '99',
+    manualLockedChannelId: '99',
+    channels: [
+      { id: '99', name: 'deleted-upstream', baseUrl: 'https://deleted.upstream.com/v1', schedulable: true, multiplier: 0.5 },
+      { id: '100', name: 'remaining-upstream', baseUrl: 'https://remaining.upstream.com/v1', schedulable: true, multiplier: 0.6,
+        backupLines: [{ url: 'https://deleted.upstream.com/v1', label: 'backup line' }] }
+    ],
+    allGroups: [],
+    customChannelModels: { '99': ['model-x'], '100': ['model-y'] },
+    failoverRuntime: { '99': { failures: 5 }, '100': { failures: 0 } }
+  };
+  const upstreamModelsCache = { '99': ['gpt-4o'], '100': ['claude-3-5'] };
+
+  const context = vm.createContext({
+    state,
+    ...require('../routing-policy'),
+    // 远端数据库仅返回 100（99 已在后台删除）
+    execPsql() { return JSON.stringify([remoteAccount({ id: '100', name: 'remaining-upstream', base_url: 'https://remaining.upstream.com/v1' })]); },
+    fetchAllSub2APIGroups() { return [{ id: 1, name: 'business', sale_rate: 1 }]; },
+    selectPrimaryGroup(items) { return items[0] || { id: 0, name: '默认分组', sale_rate: 1 }; },
+    detectVendor() { return 'test'; },
+    detectProvider() { return 'test'; },
+    getDefaultBackupLines() { return []; },
+    getVendorCandidateModels() { return []; },
+    upstreamPanels: [],
+    upstreamModelsCache,
+    UPSTREAM_MODELS_CACHE_FILE: '/cache.json',
+    handleRatioChange() {},
+    triggerBackgroundModelDiscovery() {},
+    writeJSON() {},
+    CHANNELS_FILE: '',
+    getSub2APISignature() { return 'sig'; },
+    lastSub2APISignature: 'sig',
+    safetyReconciliationPending: false,
+    requestBackgroundSub2APISafetyPlan() {},
+    executeRemoteSQL(s) { remoteWrites.push(s); return true; },
+    invalidateSub2APIScheduler(ids) { invalidations.push(ids); },
+    upstreamScanner: {
+      tombstoneChannel(url, id) { tombstoned.push({ url, id }); }
+    },
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('function syncRealSub2APIAccounts('), source.indexOf('// 远端执行 SQL')), context);
+
+  context.syncRealSub2APIAccounts();
+
+  // 1. 渠道 99 应被物理移出 state.channels
+  assert.equal(state.channels.length, 1);
+  assert.equal(state.channels[0].id, '100');
+
+  // 2. 指针顺延与死锁解除
+  assert.equal(state.activeChannelId, '100');
+  assert.equal(state.manualLockedChannelId, null);
+
+  // 3. 调度器缓存失效
+  assert.deepEqual(invalidations, [[99]]);
+
+  // 4. 局部缓存与跨渠道备选线路清理
+  assert.equal(upstreamModelsCache['99'], undefined);
+  assert.deepEqual(upstreamModelsCache['100'], ['claude-3-5']);
+  assert.equal(state.customChannelModels['99'], undefined);
+  assert.equal(state.failoverRuntime['99'], undefined);
+  assert.deepEqual(state.customChannelModels['100'], ['model-y']);
+  // 5. 其余通道对已删除通道 URL 的 backupLines 引用被清除，仅保留自身主线
+  assert.equal(state.channels[0].backupLines.length, 1);
+  assert.equal(state.channels[0].backupLines[0].url, 'https://remaining.upstream.com/v1');
+  assert.equal(state.channels[0].backupLines.some(l => l.url.includes('deleted')), false);
+
+  // 6. 墓碑标记建立防复活
+  assert.equal(tombstoned.length, 1);
+  assert.equal(tombstoned[0].url, 'https://deleted.upstream.com/v1');
+  assert.equal(tombstoned[0].id, '99');
+});
+
+test('mergeControlPlaneSyncSnapshot removes channels confirmed deleted by snapshot and shifts active pointer', () => {
+  const baseline = {
+    activeChannelId: '99',
+    manualLockedChannelId: '99',
+    channels: [
+      { id: '99', name: 'deleted-ch', baseUrl: 'https://deleted.example/v1', multiplier: 0.5, schedulable: true },
+      { id: '100', name: 'surviving-ch', baseUrl: 'https://surviving.example/v1', multiplier: 0.6, schedulable: true }
+    ],
+    allGroups: []
+  };
+  const state = JSON.parse(JSON.stringify(baseline));
+  state.customChannelModels = { '99': ['m1'], '100': ['m2'] };
+  state.failoverRuntime = { '99': { failures: 1 }, '100': { failures: 0 } };
+
+  const invalidated = [];
+  const tombstoned = [];
+  const upstreamModelsCache = { '99': ['m1'], '100': ['m2'] };
+
+  const { context } = controlPlaneMergeHarness(state);
+  context.invalidateSub2APIScheduler = ids => invalidated.push(ids);
+  context.upstreamModelsCache = upstreamModelsCache;
+  context.upstreamScanner = {
+    tombstoneChannel(url, id) { tombstoned.push({ url, id }); }
+  };
+
+  context.mergeControlPlaneSyncSnapshot({
+    channels: [{ id: '100', name: 'surviving-ch', baseUrl: 'https://surviving.example/v1', multiplier: 0.6, schedulable: true }],
+    prunedChannels: [{ id: '99', baseUrl: 'https://deleted.example/v1' }],
+    allGroups: []
+  }, baseline);
+
+  // 1. 渠道 99 被移除
+  assert.equal(state.channels.length, 1);
+  assert.equal(state.channels[0].id, '100');
+
+  // 2. 指针顺延
+  assert.equal(state.activeChannelId, '100');
+  assert.equal(state.manualLockedChannelId, null);
+
+  // 3. 调度器缓存失效与墓碑
+  assert.deepEqual(invalidated, [[99]]);
+  assert.equal(tombstoned.length, 1);
+  assert.equal(tombstoned[0].url, 'https://deleted.example/v1');
+
+  // 4. 局部缓存清理
+  assert.equal(state.customChannelModels['99'], undefined);
+  assert.equal(state.failoverRuntime['99'], undefined);
+  assert.equal(upstreamModelsCache['99'], undefined);
+});
+
+test('syncRealSub2APIAccounts and control plane snapshot prune orphan upstream panels when accounts are deleted in Sub2API', () => {
+  const tombstoned = [];
+  const panelsWritten = [];
+  const state = {
+    activeChannelId: '99',
+    channels: [
+      { id: '99', name: 'zitong-channel', baseUrl: 'https://api-us.zitongwl.cn/v1', upstreamPanelId: 'panel_zitong', schedulable: true, multiplier: 0.1 },
+      { id: '100', name: 'jinlong-channel', baseUrl: 'https://jlaudeapi.com/v1', upstreamPanelId: 'panel_jinlong', schedulable: true, multiplier: 0.1 }
+    ],
+    allGroups: []
+  };
+
+  let upstreamPanels = [
+    { id: 'panel_zitong', name: '子桐网络', backendUrl: 'https://api-us.zitongwl.cn', status: 'connected' },
+    { id: 'panel_jinlong', name: '金龙', backendUrl: 'https://jlaudeapi.com', status: 'connected' }
+  ];
+
+  const context = vm.createContext({
+    state,
+    ...require('../routing-policy'),
+    execPsql() { return JSON.stringify([remoteAccount({ id: '100', name: 'jinlong-channel', base_url: 'https://jlaudeapi.com/v1' })]); },
+    fetchAllSub2APIGroups() { return [{ id: 1, name: 'business', sale_rate: 1 }]; },
+    selectPrimaryGroup(items) { return items[0] || { id: 0, name: '默认分组', sale_rate: 1 }; },
+    detectVendor() { return 'test'; },
+    detectProvider() { return 'test'; },
+    getDefaultBackupLines() { return []; },
+    getVendorCandidateModels() { return []; },
+    get upstreamPanels() { return upstreamPanels; },
+    set upstreamPanels(v) { upstreamPanels = v; },
+    upstreamModelsCache: {},
+    UPSTREAM_MODELS_CACHE_FILE: '/cache.json',
+    handleRatioChange() {},
+    writeJSON(file, data) { if (file.includes('panels')) panelsWritten.push(data); },
+    UPSTREAM_PANELS_FILE: '/panels.json',
+    syncUpstreamPanelConfigCompat() {},
+    triggerBackgroundModelDiscovery() {},
+    CHANNELS_FILE: '',
+    getSub2APISignature() { return 'sig'; },
+    lastSub2APISignature: 'sig',
+    safetyReconciliationPending: false,
+    requestBackgroundSub2APISafetyPlan() {},
+    executeRemoteSQL() { return true; },
+    invalidateSub2APIScheduler() {},
+    normalizeUrlKey(u) {
+      if (!u) return '';
+      return u.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/(v1|api)(\/.*)?$/, '');
+    },
+    upstreamScanner: {
+      tombstoneChannel(url, id, name) { tombstoned.push({ url, id, name }); }
+    },
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('function syncRealSub2APIAccounts('), source.indexOf('// 远端执行 SQL')), context);
+
+  context.syncRealSub2APIAccounts();
+
+  // 1. 渠道 99 被移除，仅剩 100
+  assert.equal(state.channels.length, 1);
+  assert.equal(state.channels[0].id, '100');
+
+  // 2. 关联的 panel_zitong 自动从 upstreamPanels 中清理，仅剩 panel_jinlong
+  assert.equal(upstreamPanels.length, 1);
+  assert.equal(upstreamPanels[0].id, 'panel_jinlong');
+
+  // 3. 子桐网络被建立墓碑阻断
+  assert.ok(tombstoned.some(t => t.name === '子桐网络' || (t.url && t.url.includes('zitongwl'))));
+});
+

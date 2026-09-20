@@ -55,6 +55,9 @@
         <button id="btnRefreshAll" class="btn btn-glass" title="立刻检查全部上游状态、首字测速与倍率">
           <span>⟳</span> 立即检测
         </button>
+        <button id="btnSyncBackend" class="btn btn-glass" title="强制从 Sub2API 后台全量对齐渠道列表，同步清理已在后台删除的上游">
+          <span>🔄</span> 同步后台
+        </button>
         <button id="btnOpenAlertsDrawer" class="btn btn-glass btn-alerts-box" title="打开报错与告警信息盒 (查看全部上游调价、自动切线熔断与报错流水)">
           <span class="bell-icon" id="alertsBellIcon">🔔</span> 报错信息盒 <span id="alertsBadgeCount" class="alerts-badge-count" style="display: none;">0</span>
         </button>
@@ -589,6 +592,12 @@
               <button id="btnSyncAllUpstreams" class="btn btn-sm btn-secondary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;">
                 ⟳ 刷新全部
               </button>
+              <button id="btnSyncBackendInPanel" class="btn btn-sm btn-secondary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;" title="强制从 Sub2API 数据库全量对齐渠道与分组，清理后台已删除上游">
+                🔄 同步后台
+              </button>
+              <button id="btnCleanOrphanPanels" class="btn btn-sm" style="display: none; font-size: 0.76rem; padding: 0.25rem 0.6rem; background: #fff1f2; border: 1px solid #fecdd3; color: #e11d48; font-weight: 600;" title="一键清理后台已删除/已欠费的失效上游供应商">
+                🧹 清理失效 (<span id="orphanPanelsCount">0</span>)
+              </button>
             </div>
           </div>
           <p style="font-size: 0.78rem; color: #64748b; margin-top: 2px;">
@@ -633,7 +642,7 @@
             <!-- 模式切换 -->
             <div style="display: flex; gap: 0.4rem; margin-bottom: 0.5rem;">
               <button id="btnUpstreamTabCreds" class="dim-tab active" style="flex: 1; text-align: center; padding: 0.25rem; font-size: 0.75rem;">方式一：账号密码登录</button>
-              <button id="btnUpstreamTabCookie" class="dim-tab" style="flex: 1; text-align: center; padding: 0.25rem; font-size: 0.75rem;">方式二：Cookie / Token</button>
+              <button id="btnUpstreamTabCookie" class="dim-tab" style="flex: 1; text-align: center; padding: 0.25rem; font-size: 0.75rem;">方式二：API Key / Token / Cookie</button>
             </div>
 
             <!-- 方式一：账号密码表单 -->
@@ -652,8 +661,11 @@
 
             <!-- 方式二：Cookie / Token 表单 -->
             <div id="upstreamFormCookieBox" style="display: none; margin-bottom: 0.4rem;">
-              <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">浏览器会话 Cookie 或 Access Token:</label>
-              <textarea id="upstreamFormCookieOrToken" placeholder="例如: session=ey... 或 eyJhbGci..." class="form-input" style="width: 100%; height: 50px; font-family: var(--font-mono); font-size: 0.75rem;"></textarea>
+              <label style="font-size: 0.75rem; font-weight: 600; color: #334155; display: block; margin-bottom: 0.2rem;">API Key (sk-...) 或 Access Token / 浏览器 Cookie:</label>
+              <textarea id="upstreamFormCookieOrToken" placeholder="例如: sk-xxxxxxxx 或 session=ey... 或 eyJhbGci..." class="form-input" style="width: 100%; height: 50px; font-family: var(--font-mono); font-size: 0.75rem;"></textarea>
+              <div style="font-size: 0.72rem; color: #64748b; margin-top: 0.25rem;">
+                💡 <b>自动抓取机制:</b> 只要添加或保存 API，系统将立即自动秒级抓取该平台的钱包余额、全部模型、分组目录及定价倍率，并自动触发全量差分巡检！
+              </div>
             </div>
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem;">
@@ -661,7 +673,7 @@
                 <input type="checkbox" id="upstreamFormEnabled" checked /> 启用此供应商（参与 3 小时定时巡检与查额）
               </label>
               <button id="btnSaveUpstreamPanel" class="btn btn-primary" style="font-size: 0.78rem; padding: 0.35rem 0.85rem;">
-                💾 保存并测试连接
+                💾 保存并自动抓取
               </button>
             </div>
             
@@ -1825,7 +1837,12 @@
                 <strong style="color: #92400e; font-size: 0.88rem; display: flex; align-items: center; gap: 0.4rem;">
                   🔔 待管理员决策请示事项 (<span id="scanPendingCountText">0</span> 项)
                 </strong>
-                <span style="font-size: 0.72rem; color: #b45309;">规则 2b 同价通道 & 规则 2c 新模型需人工把关确认</span>
+                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                  <button type="button" class="btn btn-secondary" onclick="purgeOrphanPendingActions()" title="一键清理所有已在后台删除上游的残留待办事项" style="font-size: 0.72rem; padding: 2px 8px; color: #92400e; border-color: #fcd34d; background: #fef3c7; border-radius: 4px; cursor: pointer; font-weight: 600;">
+                    🧹 清理失效待办
+                  </button>
+                  <span style="font-size: 0.72rem; color: #b45309;">规则 2b 同价通道 & 规则 2c 新模型需人工把关确认</span>
+                </div>
               </div>
               <div id="scanPendingList" style="display: flex; flex-direction: column; gap: 0.5rem;">
                 <!-- 动态填充待审批卡片 -->

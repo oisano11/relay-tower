@@ -36,7 +36,7 @@ let activeChannelId = '';
 let alertsData = [];
 let activeLinesModalChannelId = null;
 let jinlongConfig = null;
-let autoSwitchConfig = null;
+let autoSwitchConfig = { singleActiveExclusive: true, enabled: true };
 
 function formatLineHost(u) {
   if (!u) return '--';
@@ -1109,7 +1109,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
       ? `<span class="status-indicator online" title="在线可用"><span class="pulse-dot"></span></span>`
       : `<span class="status-indicator offline" title="连接异常/离线"></span>`;
 
-    const singleActiveMode = autoSwitchConfig.singleActiveExclusive !== false;
+    const singleActiveMode = !autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false;
 
     // 格式化上游账户余额展示
     let balanceHtml = '';
@@ -1292,6 +1292,9 @@ function renderStripsView(enabledChannels, standbyChannels) {
           </div>
           <button class="btn-strip-icon" title="测速并拉取最新状态" onclick="probeSingleChannel('${ch.id}')">
             ⟳
+          </button>
+          <button class="btn-strip-icon btn-strip-delete" title="在 Sub2API 数据库与塔台中彻底删除该渠道" onclick="deleteChannel('${ch.id}', '${escapeHtml(ch.name)}')">
+            🗑️
           </button>
           ${(currentDimension === 'group' && currentFilterPill !== 'all' && effectiveGroupId) ? `
             <button class="btn-strip-icon btn-strip-remove" title="从业务分组【${escapeHtml(effectiveGroupName)}】中移除解绑" onclick="removeChannelFromGroup('${ch.id}', '${effectiveGroupId}', '${escapeHtml(effectiveGroupName)}')">
@@ -2621,6 +2624,16 @@ async function checkJinlongStatus() {
   } catch (e) {}
 }
 
+function normalizeUrlKey(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  let s = rawUrl.trim().toLowerCase();
+  s = s.replace(/^https?:\/\//i, '');
+  s = s.replace(/\/+$/, '');
+  s = s.replace(/\/(v1|api)(\/.*)?$/i, '');
+  s = s.replace(/:(80|443)$/, '');
+  return s.replace(/\/+$/, '');
+}
+
 async function loadUpstreamPanelsList() {
   const container = document.getElementById('upstreamsListContainer');
   if (!container) return;
@@ -2635,6 +2648,30 @@ async function loadUpstreamPanelsList() {
 
     upstreamPanelsList = data.panels || [];
     const summary = data.summary || { total: 0, connected: 0, totalBalanceUSD: 0 };
+
+    // 计算孤儿/失效上游（后台 Sub2API 已无任何关联渠道，或已进入墓碑）
+    const orphanCount = summary.orphanCount !== undefined
+      ? summary.orphanCount
+      : upstreamPanelsList.filter(p => {
+          if (p.isOrphan || p.isTombstoned) return true;
+          const pKey = normalizeUrlKey(p.backendUrl);
+          return !channelsData || !channelsData.some(c => 
+            c.upstreamPanelId === p.id ||
+            (pKey && normalizeUrlKey(c.baseUrl) === pKey)
+          );
+        }).length;
+
+    // 控制弹窗头部“清理失效”按钮显隐与数量
+    const btnClean = document.getElementById('btnCleanOrphanPanels');
+    const elOrphanCount = document.getElementById('orphanPanelsCount');
+    if (btnClean) {
+      if (orphanCount > 0) {
+        btnClean.style.display = 'inline-flex';
+        if (elOrphanCount) elOrphanCount.textContent = orphanCount;
+      } else {
+        btnClean.style.display = 'none';
+      }
+    }
 
     // 更新总览统计
     const elTotal = document.getElementById('upstreamSummaryTotal');
@@ -2671,26 +2708,62 @@ async function loadUpstreamPanelsList() {
     }
 
     container.innerHTML = upstreamPanelsList.map(p => {
-      const isConnected = p.status === 'connected';
-      const isError = p.status === 'error';
+      const pKey = normalizeUrlKey(p.backendUrl);
+      const isOrphan = p.isOrphan !== undefined
+        ? p.isOrphan
+        : (!Array.isArray(channelsData) || !channelsData.some(c => 
+            c.upstreamPanelId === p.id ||
+            (pKey && normalizeUrlKey(c.baseUrl) === pKey)
+          ));
+      const isTombstoned = Boolean(p.isTombstoned);
+      const isDead = isOrphan || isTombstoned;
+
+      const isConnected = !isDead && p.status === 'connected';
+      const isError = !isDead && p.status === 'error';
       const isEnabled = p.enabled !== false;
-      const statusText = !isEnabled ? '已停用' : (isConnected ? '正常连通' : (isError ? `异常: ${p.lastError || '无法连接'}` : '未连接'));
-      const statusClass = !isEnabled ? 'disabled' : (isConnected ? 'connected' : (isError ? 'error' : 'disabled'));
+      const modelsCount = p.models && Array.isArray(p.models) ? p.models.length : 0;
+      const groupsCount = Number(p.groupCount) || (Array.isArray(p.groups) ? p.groups.length : 0);
+      const statusDetail = isConnected ? ` (已抓取 ${modelsCount}模型 / ${groupsCount}分组)` : '';
+      
+      let statusText = '';
+      let statusClass = '';
+      if (isDead) {
+        statusText = '后台已无对应渠道 (已欠费/已删除)';
+        statusClass = 'error';
+      } else if (!isEnabled) {
+        statusText = '已停用';
+        statusClass = 'disabled';
+      } else if (isConnected) {
+        statusText = `正常连通${statusDetail}`;
+        statusClass = 'connected';
+      } else if (isError) {
+        statusText = `异常: ${p.lastError || '无法连接'}`;
+        statusClass = 'error';
+      } else {
+        statusText = '未连接';
+        statusClass = 'disabled';
+      }
+
+      const isApiKey = p.userToken && p.userToken.startsWith('sk-');
       const authDesc = p.authMode === 'credentials'
         ? `账号: ${escapeHtml(p.username || '未填')}`
-        : 'Token / Cookie';
-      const modelsCount = p.models && Array.isArray(p.models) ? p.models.length : 0;
+        : (isApiKey ? 'API Key 接入' : 'Token / Cookie');
       const syncTimeStr = p.lastSyncTime ? formatTimeAgo(p.lastSyncTime) : '从未同步';
+      const balDisplay = (p.balanceUSD !== null && p.balanceUSD !== undefined)
+        ? `$${Number(p.balanceUSD || 0).toFixed(2)} USD`
+        : '<span style="color:#64748b;font-size:0.75rem;">未开放查额</span>';
+
+      const cardStyle = isDead ? 'border-color: #fca5a5; background: #fffaf0;' : '';
 
       return `
-        <div class="upstream-panel-card ${!isEnabled ? 'disabled' : ''}" data-panel-id="${escapeHtml(p.id)}">
+        <div class="upstream-panel-card ${!isEnabled ? 'disabled' : ''}" style="${cardStyle}" data-panel-id="${escapeHtml(p.id)}">
           <div class="upstream-card-header">
             <div class="upstream-card-title">
-              <span>🌐</span>
+              <span>${isDead ? '⚠️' : '🌐'}</span>
               <span>${escapeHtml(p.name || '未命名平台')}</span>
               <span style="font-size: 0.72rem; font-weight: normal; color: #64748b; font-family: var(--font-mono);">${escapeHtml(p.backendUrl)}</span>
             </div>
-            <div class="upstream-status-badge ${statusClass}">
+            <div class="upstream-status-badge ${statusClass}" ${isDead ? 'style="background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;font-weight:600;"' : ''}>
               <span>●</span> ${escapeHtml(statusText)}
             </div>
           </div>
@@ -2699,13 +2772,19 @@ async function loadUpstreamPanelsList() {
             <div>
               <div class="upstream-metric-label">钱包余额</div>
               <div class="upstream-metric-val" style="color: #059669; font-size: 0.85rem;">
-                $${Number(p.balanceUSD || 0).toFixed(2)} USD
+                ${balDisplay}
               </div>
             </div>
             <div>
               <div class="upstream-metric-label">支持模型</div>
               <div class="upstream-metric-val">
                 ${modelsCount} 个模型
+              </div>
+            </div>
+            <div>
+              <div class="upstream-metric-label">抓取分组</div>
+              <div class="upstream-metric-val" style="color: #2563eb;">
+                ${groupsCount} 个分组
               </div>
             </div>
             <div>
@@ -2721,9 +2800,13 @@ async function loadUpstreamPanelsList() {
               <span>上次同步: ${syncTimeStr}</span>
             </div>
             <div class="upstream-card-actions">
-              <button class="upstream-btn-sm" onclick="syncSingleUpstream('${escapeHtml(p.id)}')">⟳ 同步</button>
-              <button class="upstream-btn-sm" onclick="openEditUpstreamForm('${escapeHtml(p.id)}')">✏️ 编辑</button>
-              <button class="upstream-btn-sm danger" onclick="deleteUpstreamPanel('${escapeHtml(p.id)}', '${escapeHtml(p.name || '')}')">🗑️ 删除</button>
+              ${isDead ? `
+                <button class="upstream-btn-sm danger" style="background:#dc2626;color:#fff;border-color:#b91c1c;font-weight:600;" onclick="deleteUpstreamPanel('${escapeHtml(p.id)}', '${escapeHtml(p.name || '')}')">🗑️ 立即清理</button>
+              ` : `
+                <button class="upstream-btn-sm" onclick="syncSingleUpstream('${escapeHtml(p.id)}')">⟳ 自动抓取</button>
+                <button class="upstream-btn-sm" onclick="openEditUpstreamForm('${escapeHtml(p.id)}')">✏️ 编辑</button>
+                <button class="upstream-btn-sm danger" onclick="deleteUpstreamPanel('${escapeHtml(p.id)}', '${escapeHtml(p.name || '')}')">🗑️ 删除</button>
+              `}
             </div>
           </div>
         </div>
@@ -2841,17 +2924,17 @@ async function saveUpstreamPanel() {
     payload.authMode = 'token_cookie';
     const ct = document.getElementById('upstreamFormCookieOrToken')?.value.trim();
     if (ct) {
-      if (ct.includes('session=') || ct.includes('=')) {
-        payload.cookie = ct;
-      } else {
+      if (ct.startsWith('sk-') || (!ct.includes('session=') && !ct.includes('='))) {
         payload.userToken = ct;
+      } else {
+        payload.cookie = ct;
       }
     }
   }
 
   const btn = document.getElementById('btnSaveUpstreamPanel');
   const statusBox = document.getElementById('upstreamFormStatusBox');
-  if (btn) btn.textContent = '⏳ 正在验证连接...';
+  if (btn) btn.textContent = '⏳ 正在自动抓取数据...';
 
   try {
     const res = await fetch('/api/upstream/panels', {
@@ -2861,10 +2944,11 @@ async function saveUpstreamPanel() {
     });
     const data = await res.json();
     if (data.success) {
-      showToast(data.message || '上游配置保存成功！', 'success');
+      showToast(data.message || '上游配置保存并自动抓取成功！', 'success');
       cancelUpstreamForm();
       await loadUpstreamPanelsList();
       await loadChannels();
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
     } else {
       if (statusBox) {
         statusBox.style.display = 'block';
@@ -2873,13 +2957,13 @@ async function saveUpstreamPanel() {
         statusBox.style.color = '#991b1b';
         statusBox.innerHTML = `⚠️ ${data.message || data.error}`;
       }
-      showToast(data.message || '连接测试未通过', 'warning');
+      showToast(data.message || '自动抓取连接未通过', 'warning');
       await loadUpstreamPanelsList();
     }
   } catch (err) {
     showToast('保存异常: ' + err.message, 'error');
   } finally {
-    if (btn) btn.textContent = '💾 保存并测试连接';
+    if (btn) btn.textContent = '💾 保存并自动抓取';
   }
 }
 
@@ -2898,6 +2982,7 @@ async function deleteUpstreamPanel(panelId, panelName) {
       showToast(data.message || '上游已删除', 'info');
       await loadUpstreamPanelsList();
       await loadChannels();
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
     } else {
       showToast('删除失败: ' + data.error, 'error');
     }
@@ -2906,8 +2991,72 @@ async function deleteUpstreamPanel(panelId, panelName) {
   }
 }
 
+async function cleanOrphanPanels() {
+  if (!confirm('确定要一键清理所有在 Sub2API 后台已无关联渠道（已欠费/已删除）的失效上游平台吗？\n\n清理后塔台将彻底停止轮询这些已下线的平台，并建立阻断墓碑。')) {
+    return;
+  }
+  showToast('正在清理失效与已删除的上游供应商...', 'info');
+  try {
+    const res = await fetch('/api/upstream/panels/clean-orphans', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      showToast(data.message || `已成功清理 ${data.count} 个失效上游平台！`, 'success');
+      await loadUpstreamPanelsList();
+      await loadChannels();
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
+    } else {
+      showToast('清理失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (err) {
+    showToast('清理请求异常: ' + err.message, 'error');
+  }
+}
+
+async function syncBackendChannels() {
+  showToast('正在向 Sub2API 数据库全量对齐渠道与分组...', 'warning');
+  try {
+    const res = await fetch('/api/channels/sync-backend', { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      await loadChannels();
+      await loadUpstreamPanelsList();
+      if (data.prunedCount > 0 || (data.prunedPanels && data.prunedPanels.length > 0)) {
+        showToast(data.message || `已同步后台！已自动清理已删除的渠道与失效面板`, 'info');
+      } else {
+        showToast(data.message || '已成功与后台同步，所有渠道状态已最新', 'success');
+      }
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
+    } else {
+      showToast('同步失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (err) {
+    showToast('同步请求失败: ' + err.message, 'error');
+  }
+}
+
+async function deleteChannel(channelId, channelName) {
+  const name = channelName || `ID: ${channelId}`;
+  if (!confirm(`确定要在 Sub2API 数据库与塔台中彻底删除上游渠道 [${name}] 吗？\n\n⚠️ 注意：删除后该渠道将立即从系统与销售分组中下线，不可逆恢复。`)) {
+    return;
+  }
+  showToast(`正在从 Sub2API 数据库彻底删除渠道 [${name}]...`, 'warning');
+  try {
+    const res = await fetch(`/api/channels/${channelId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.success) {
+      showToast(data.message || `渠道 [${name}] 已彻底删除！`, 'success');
+      await loadChannels();
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
+    } else {
+      showToast('删除渠道失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (err) {
+    showToast('删除请求失败: ' + err.message, 'error');
+  }
+}
+
 async function syncSingleUpstream(panelId) {
-  showToast('正在同步上游资产...', 'info');
+  showToast('正在自动抓取上游资产与差分巡检...', 'info');
   try {
     const res = await fetch('/api/upstream/panels/sync', {
       method: 'POST',
@@ -2916,9 +3065,10 @@ async function syncSingleUpstream(panelId) {
     });
     const data = await res.json();
     if (data.success) {
-      showToast(data.message || '同步完成', 'success');
+      showToast(data.message || '自动抓取同步完成', 'success');
       await loadUpstreamPanelsList();
       await loadChannels();
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
     } else {
       showToast('同步失败: ' + data.error, 'error');
       await loadUpstreamPanelsList();
@@ -2930,14 +3080,15 @@ async function syncSingleUpstream(panelId) {
 
 async function syncAllUpstreams() {
   const btn = document.getElementById('btnSyncAllUpstreams');
-  if (btn) btn.textContent = '⏳ 刷新中...';
+  if (btn) btn.textContent = '⏳ 正在抓取全部...';
   try {
     const res = await fetch('/api/upstream/panels/sync-all', { method: 'POST' });
     const data = await res.json();
     if (data.success) {
-      showToast(data.message || '全部上游已刷新完成', 'success');
+      showToast(data.message || '全部上游已自动抓取完成', 'success');
       await loadUpstreamPanelsList();
       await loadChannels();
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
     } else {
       showToast('刷新失败: ' + data.error, 'error');
     }
@@ -2996,6 +3147,7 @@ function initApp() {
   document.getElementById('btnUpstreamTabCookie')?.addEventListener('click', () => switchUpstreamTab('cookie'));
   document.getElementById('btnSaveUpstreamPanel')?.addEventListener('click', saveUpstreamPanel);
   document.getElementById('btnSyncAllUpstreams')?.addEventListener('click', syncAllUpstreams);
+  document.getElementById('btnCleanOrphanPanels')?.addEventListener('click', cleanOrphanPanels);
 
   // 线路管理弹窗控制
   document.getElementById('btnCloseLinesModal')?.addEventListener('click', closeLinesModal);
@@ -3114,9 +3266,28 @@ function initApp() {
   // 刷新全部
   document.getElementById('btnRefreshAll')?.addEventListener('click', async () => {
     showToast('正在向 Sub2API 同步并测速...', 'warning');
-    await fetch('/api/probe-all', { method: 'POST' });
-    await loadChannels();
-    showToast('全部 10 家上游状态已同步完毕', 'success');
+    try {
+      const res = await fetch('/api/probe-all', { method: 'POST' });
+      const data = await res.json();
+      await loadChannels();
+      const count = (data && data.count !== undefined) ? data.count : channelsData.length;
+      if (data && data.prunedCount > 0) {
+        showToast(`全部 ${count} 家上游状态已同步！已自动清理 ${data.prunedCount} 个后台已删除渠道`, 'info');
+      } else {
+        showToast(`全部 ${count} 家上游状态已同步完毕`, 'success');
+      }
+    } catch (e) {
+      await loadChannels();
+      showToast(`全部 ${channelsData.length} 家上游状态已同步完毕`, 'success');
+    }
+  });
+
+  // 强制全量同步后台已删除渠道
+  document.getElementById('btnSyncBackend')?.addEventListener('click', () => {
+    syncBackendChannels();
+  });
+  document.getElementById('btnSyncBackendInPanel')?.addEventListener('click', () => {
+    syncBackendChannels();
   });
 
   // 模拟调价
@@ -7212,6 +7383,10 @@ function renderUpstreamScanModal(data) {
       const channelGroups = {};
       newModelItems.forEach(item => {
         const info = resolvePendingChannelInfo(item);
+        // 若该通道既不在当前存活渠道列表，也不在已绑定上游平台中，属于已在后台被删除的孤儿残留，前端直接忽略不展示
+        if (!info.matchedChannel && !info.matchedPanel) {
+          return;
+        }
         const key = `${info.channelName}__${info.apiUrl}`;
         if (!channelGroups[key]) {
           channelGroups[key] = {
@@ -7259,6 +7434,9 @@ function renderUpstreamScanModal(data) {
               <button type="button" class="btn btn-secondary" onclick="resolvePendingAction('${item.id}', 'reject')" style="font-size: 0.78rem; padding: 0.4rem 0.65rem;">
                 ❌ 忽略
               </button>
+              <button type="button" class="btn btn-secondary" onclick="resolvePendingAction('${item.id}', 'delete')" title="彻底删除此待办事项" style="font-size: 0.78rem; padding: 0.4rem 0.65rem; color: #dc2626; border-color: #fecaca; background: #fff5f5;">
+                🗑️ 删除
+              </button>
             </div>
           </div>
         `;
@@ -7305,6 +7483,9 @@ function renderUpstreamScanModal(data) {
                 </button>
                 <button type="button" class="btn btn-secondary" onclick="resolvePendingActionsBatch(${actionIdsJson}, 'reject', '${safeChName}')" style="font-size: 0.78rem; padding: 0.42rem 0.65rem;">
                   ⏸️ 暂缓
+                </button>
+                <button type="button" class="btn btn-secondary" onclick="resolvePendingActionsBatch(${actionIdsJson}, 'delete', '${safeChName}')" title="彻底删除此通道的待办新模型" style="font-size: 0.78rem; padding: 0.42rem 0.65rem; color: #dc2626; border-color: #fecaca; background: #fff5f5;">
+                  🗑️ 删除
                 </button>
               </div>
             </div>
@@ -7497,7 +7678,7 @@ window.toggleModelPills = function(key) {
 async function resolvePendingActionsBatch(actionIds, decision, channelName = '') {
   if (!Array.isArray(actionIds) || actionIds.length === 0) return;
   try {
-    const actionText = decision === 'approve' ? '开启对外服务' : '暂缓';
+    const actionText = decision === 'approve' ? '开启对外服务' : (decision === 'delete' ? '删除待办' : '暂缓');
     const res = await fetch('/api/upstream/scanner/resolve-action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -7505,7 +7686,7 @@ async function resolvePendingActionsBatch(actionIds, decision, channelName = '')
     });
     const result = await res.json();
     if (result.success) {
-      showToast(result.message || `已成功${actionText}通道 [${channelName}] 的新模型！`, 'success');
+      showToast(result.message || `已成功${actionText}通道 [${channelName}] 的待办事项！`, 'success');
       fetchUpstreamScannerStatus().then(renderUpstreamScanModal);
       loadChannels();
     } else {
@@ -7518,6 +7699,7 @@ async function resolvePendingActionsBatch(actionIds, decision, channelName = '')
 
 async function resolvePendingAction(actionId, decision) {
   try {
+    const actionText = decision === 'approve' ? '确认' : (decision === 'delete' ? '删除' : '忽略');
     const res = await fetch('/api/upstream/scanner/resolve-action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -7525,7 +7707,7 @@ async function resolvePendingAction(actionId, decision) {
     });
     const result = await res.json();
     if (result.success) {
-      showToast(result.message, 'success');
+      showToast(result.message || `已成功${actionText}待办！`, 'success');
       fetchUpstreamScannerStatus().then(renderUpstreamScanModal);
       loadChannels();
     } else {
@@ -7533,6 +7715,25 @@ async function resolvePendingAction(actionId, decision) {
     }
   } catch (err) {
     showToast(`操作异常: ${err.message}`, 'error');
+  }
+}
+
+async function purgeOrphanPendingActions() {
+  try {
+    const res = await fetch('/api/upstream/scanner/purge-actions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orphanOnly: true })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast(data.message || '已成功清理失效待办事项！', 'success');
+      fetchUpstreamScannerStatus().then(renderUpstreamScanModal);
+    } else {
+      showToast(data.message || '清理失败', 'error');
+    }
+  } catch (err) {
+    showToast(`清理异常: ${err.message}`, 'error');
   }
 }
 

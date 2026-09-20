@@ -481,6 +481,179 @@ async function main() {
     } finally { global.fetch = originalFetch; }
   });
 
+  await runAsyncTest('添加新上游自动抓取：兼容字符串数组分组与倍率字典对象，并准确返回 panelGroups', async () => {
+    const ctx = createMockContext();
+    let catalog = [];
+    ctx.getUpstreamPanels = () => [];
+    ctx.getUpstreamGroupCatalog = () => catalog;
+    ctx.setUpstreamGroupCatalog = next => { catalog = next; };
+    const originalFetch = global.fetch;
+    global.fetch = async url => {
+      // 模拟 New-API /api/group 返回纯字符串数组
+      if (url === 'https://panel.string-groups.com/api/group') {
+        return { ok: true, json: async () => ({ success: true, data: ['default', 'vip', 'svip'] }) };
+      }
+      // 模拟 One-API /api/groups 返回倍率字典对象
+      if (url === 'https://panel.dict-groups.com/api/groups') {
+        return { ok: true, json: async () => ({ success: true, data: { 'default': 1.0, 'developer': 0.85 } }) };
+      }
+      return { ok: false, json: async () => ({}) };
+    };
+
+    try {
+      scanner.init(ctx);
+      // 1. 抓取字符串数组形式的上游
+      const res1 = await scanner.discoverUpstreamGroups([], {
+        id: 'p_str',
+        name: '字符串分组上游',
+        backendUrl: 'https://panel.string-groups.com',
+        userToken: 'sk-test'
+      });
+      assert.strictEqual(res1.panelGroups.length, 3);
+      assert.strictEqual(res1.panelGroups[0].name, 'default');
+      assert.strictEqual(res1.panelGroups[1].name, 'vip');
+
+      // 2. 抓取字典对象形式的上游
+      const res2 = await scanner.discoverUpstreamGroups([], {
+        id: 'p_dict',
+        name: '字典分组上游',
+        backendUrl: 'https://panel.dict-groups.com',
+        userToken: 'sk-test'
+      });
+      assert.strictEqual(res2.panelGroups.length, 2);
+      const devGroup = res2.panelGroups.find(g => g.name === 'developer');
+      assert.ok(devGroup);
+      assert.strictEqual(devGroup.costMultiplier, 0.85);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  await runAsyncTest('墓碑机制防复活：后台已删除的上游 URL 被 tombstone 后，巡检全量扫描跳过且绝不重新建号建组或提审新模型', async () => {
+    const ctx = createMockContext();
+    scanner.init(ctx);
+
+    const deletedUrl = 'https://api.deleted-supplier.com/v1';
+    assert.strictEqual(scanner.isTombstoned(deletedUrl), false);
+
+    // 1. 测试建立墓碑
+    scanner.tombstoneChannel(deletedUrl, '999');
+    assert.strictEqual(scanner.isTombstoned(deletedUrl), true);
+    assert.strictEqual(scanner.isTombstoned('https://api.deleted-supplier.com/v1/'), true, '尾部斜杠应归一化兼容');
+
+    // 2. 模拟巡检上游面板发现了该已删除供应商的极低价通道和新模型
+    let autoCreatedCount = 0;
+    const origCreate = scanner.autoCreateChannelAndGroup;
+    const origDiscover = scanner.discoverUpstreamOfferings;
+    scanner.autoCreateChannelAndGroup = async (offering, cost, sale) => {
+      autoCreatedCount++;
+      return { id: 'created-' + autoCreatedCount, name: offering.name, ...offering };
+    };
+
+    scanner.discoverUpstreamOfferings = async () => [
+      {
+        type: 'channel',
+        name: '已被删除但面板仍存在的超低价通道',
+        vendor: 'OpenAI',
+        baseUrl: 'https://api.deleted-supplier.com/v1',
+        costMultiplier: 0.01 // 极低进价
+      },
+      {
+        type: 'model',
+        modelName: 'deleted-vendor-exclusive-model',
+        baseUrl: 'https://api.deleted-supplier.com/v1',
+        channelId: '999',
+        multiplier: 0.01
+      },
+      {
+        type: 'channel',
+        name: '全新正常未删除的低价通道',
+        vendor: 'OpenAI',
+        baseUrl: 'https://api.active-normal-supplier.com/v1',
+        costMultiplier: 0.05
+      }
+    ];
+
+    try {
+      const res = await scanner.runScan('测试墓碑防复活');
+      assert.strictEqual(res.success, true);
+      // 已删除的上游绝不能被自动创建
+      assert.strictEqual(autoCreatedCount, 1, '只有全新未删除的通道才允许被自动同步，墓碑通道必须被阻断');
+      assert.strictEqual(res.report.autoSyncedChannels.length, 1);
+      assert.strictEqual(res.report.autoSyncedChannels[0].name, '全新正常未删除的低价通道');
+
+      // 墓碑通道的新模型也绝不能进入 pendingNewModels 提审
+      const pendingDeleted = (res.report.pendingNewModels || []).filter(m => m.upstreamUrl.includes('deleted-supplier'));
+      assert.strictEqual(pendingDeleted.length, 0, '墓碑通道的新模型不得进入提审队列');
+    } finally {
+      scanner.autoCreateChannelAndGroup = origCreate;
+      scanner.discoverUpstreamOfferings = origDiscover;
+      // 3. 测试解除墓碑
+      scanner.removeTombstone(deletedUrl);
+      assert.strictEqual(scanner.isTombstoned(deletedUrl), false);
+    }
+  });
+
+  await runAsyncTest('待办请示自动清理：已删除上游（如 stain dspo）的孤儿新模型待办在 getPendingActions 时自动销毁，支持关键字 purge 与 delete', async () => {
+    const ctx = createMockContext();
+    scanner.init(ctx);
+
+    // 1. 模拟历史遗留的待审批项（包含一个正常通道的待办，以及已在后台删除的 stain dspo 待办）
+    scanner.upsertPendingAction({
+      id: 'act_stain_1',
+      type: 'enable_new_model',
+      title: '发现上游全新模型: gemini-3.5-flash-lite',
+      modelName: 'gemini-3.5-flash-lite',
+      channelName: 'stain dspo',
+      upstreamUrl: 'https://cdn.sta1n.cn',
+      channelId: '',
+      status: 'pending'
+    });
+    scanner.upsertPendingAction({
+      id: 'act_normal_1',
+      type: 'enable_new_model',
+      title: '发现上游全新模型: gpt-4o-new',
+      modelName: 'gpt-4o-new',
+      channelName: '测试通道-主用',
+      channelId: '101',
+      upstreamUrl: 'https://api.test-online.com',
+      status: 'pending'
+    });
+
+    // 2. 调用 getPendingActions()：已删除的 stain dspo 必须被自动物理销毁并建立墓碑阻断
+    const activeActions = scanner.getPendingActions();
+    assert.strictEqual(activeActions.length, 1, '已删除的 stain dspo 必须被自动移出待办列表');
+    assert.strictEqual(activeActions[0].id, 'act_normal_1', '正常渠道的待办应保留');
+    assert.strictEqual(scanner.isTombstoned('https://cdn.sta1n.cn/v1'), true, 'stain 的 URL 必须被自动登记为墓碑');
+
+    // 3. 测试关键字 purgeActionsByKeyword
+    scanner.upsertPendingAction({
+      id: 'act_stain_2',
+      type: 'enable_new_model',
+      title: 'm2',
+      modelName: 'm2',
+      channelName: 'stain v2',
+      upstreamUrl: 'https://cdn.sta1n.cn',
+      status: 'pending'
+    });
+    const purged = scanner.purgeActionsByKeyword('stain');
+    assert.strictEqual(purged >= 1, true);
+    assert.strictEqual(scanner.getPendingActions().some(a => (a.channelName || '').includes('stain')), false);
+
+    // 4. 测试 resolveAction 直接 delete
+    scanner.upsertPendingAction({
+      id: 'act_del_test',
+      type: 'same_price_channel',
+      name: 'del-test',
+      baseUrl: 'https://del-test.example.com',
+      status: 'pending'
+    });
+    const delRes = await scanner.resolveAction('act_del_test', 'delete');
+    assert.strictEqual(delRes.success, true);
+    assert.strictEqual(scanner.getPendingActions().some(a => a.id === 'act_del_test'), false);
+    assert.strictEqual(scanner.isTombstoned('https://del-test.example.com'), true);
+  });
+
   console.log(`\n========================================`);
   console.log(`🎉 巡检引擎全部测试完成：通过 ${testsPassed} 项，失败 ${testsFailed} 项`);
   console.log(`========================================`);
