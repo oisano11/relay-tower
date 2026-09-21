@@ -3,10 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=relay-tower-2026">
   <link rel="shortcut icon" href="favicon.ico?v=relay-tower-2026">
-  <link rel="stylesheet" href="style.css?v=20260906_users">
+  <link rel="stylesheet" href="style.css?v=20260921_sub2api_v2">
 </head>
 <body>
   <div class="app-layout">
@@ -26,7 +29,7 @@
         <div class="quick-switcher-badge">
           <span class="dot-live"></span>
           <span class="label">当前主调:</span>
-          <select id="headerChannelSelect" class="channel-dropdown" title="一键将选中的上游设为最高优先主调">
+          <select id="headerChannelSelect" class="channel-dropdown" title="一键将选中的上游设为最高优先主调 (已自动过滤后台停用与无余额通道)">
             <!-- 动态填充 -->
           </select>
           <span id="headerMultiplierBadge" class="ratio-pill">--x</span>
@@ -156,7 +159,7 @@
                 <span class="kpi-tag-1to1" title="美金与人民币严格 1:1 结算，无汇率折算">1:1 等额</span>
               </div>
               <button id="btnRefreshBalances" class="btn-kpi-action" title="一键抓取并刷新所有上游钱包余额">
-                <span>🔄</span> 查余额
+                <span>💰</span> 刷新余额
               </button>
             </div>
             <div class="kpi-card-body">
@@ -585,8 +588,11 @@
           </div>
           <div style="display: flex; justify-content: space-between; align-items: baseline;">
             <h3 style="color: #0f172a; font-size: 1.15rem; margin-top: 2px;">上游供应商后台管理中心</h3>
-            <div style="display: flex; gap: 0.4rem;">
-              <button id="btnOpenAddUpstreamForm" class="btn btn-sm btn-primary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;">
+            <div style="display: flex; gap: 0.4rem; flex-wrap: wrap;">
+              <button id="btnAutoDiscoverUpstreams" class="btn btn-sm btn-primary" style="font-size: 0.76rem; padding: 0.25rem 0.65rem; background: #0284c7; border-color: #0369a1; font-weight: 600;" title="先查看中转站后台新增的上游，并根据其 API 自动抓取该供应商的模型、定价与余额">
+                ⚡ 自动抓取
+              </button>
+              <button id="btnOpenAddUpstreamForm" class="btn btn-sm btn-secondary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;">
                 ➕ 添加新上游
               </button>
               <button id="btnSyncAllUpstreams" class="btn btn-sm btn-secondary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;">
@@ -2162,6 +2168,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260907_finances"></script>
+  <script src="app.js?v=20260921_sub2api_v2"></script>
 </body>
 </html>

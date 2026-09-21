@@ -718,7 +718,20 @@ class TelegramBotManager {
     const keyboard = [];
     let row = [];
 
-    state.channels.forEach((c) => {
+    const eligibleChannels = (state.channels || []).filter((c) => {
+      if (String(c.id) === activeId) return true;
+      if (c.schedulable === false) return false;
+      if (c.status === 'offline') return false;
+      const isUnlimited = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+      if (!isUnlimited) {
+        if (c.balanceStatus === 'empty') return false;
+        if (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001) return false;
+      }
+      return true;
+    });
+    const channelsToDisplay = eligibleChannels.length > 0 ? eligibleChannels : state.channels;
+
+    channelsToDisplay.forEach((c) => {
       const isCurrent = String(c.id) === activeId;
       const p = Number(c.priority);
       const roleTag = isCurrent ? '🌟' : (p <= 1 ? '🟢' : (p >= 100 ? '🟡' : '🔵'));

@@ -1615,3 +1615,307 @@ test('syncRealSub2APIAccounts and control plane snapshot prune orphan upstream p
   assert.ok(tombstoned.some(t => t.name === '子桐网络' || (t.url && t.url.includes('zitongwl'))));
 });
 
+test('autoDiscoverAndSyncUpstreamPanelsFromBackend automatically discovers new upstreams from channels and crawls them into upstreamPanels', async () => {
+  const syncedPanels = [];
+  const state = {
+    channels: [
+      { id: '1', name: '智云 0.045GPT', baseUrl: 'https://modnex.cc', apiKey: 'sk-modnex-token-123', provider: '智云' },
+      { id: '2', name: '熊二 Gemini 0.15', baseUrl: 'https://us.xcmapi.com', apiKey: 'sk-xcmapi-token-456', provider: '熊二' },
+      { id: '3', name: '已存在供应商渠道', baseUrl: 'https://jlaudeapi.com', apiKey: 'sk-jinlong-key', provider: '金龙' }
+    ]
+  };
+  let upstreamPanels = [
+    { id: 'panel_jinlong', name: '金龙', backendUrl: 'https://jlaudeapi.com', userToken: 'sk-jinlong-key', enabled: true }
+  ];
+
+  const context = vm.createContext({
+    state,
+    upstreamPanels,
+    maskPanel: p => p,
+    syncSingleUpstreamPanel: async (p) => {
+      syncedPanels.push(p);
+      return {
+        ...p,
+        status: 'connected',
+        balanceUSD: 15.5,
+        models: ['gpt-5.5', 'claude-3-7-sonnet']
+      };
+    },
+    writeJSON: () => {},
+    syncUpstreamPanelConfigCompat: () => {},
+    UPSTREAM_PANELS_FILE: '/panels.json',
+    normalizeUrlKey: u => (u || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/(v1|api)(\/.*)?$/, ''),
+    upstreamScanner: {
+      isTombstoned: (url, name) => false
+    },
+    isKnownNonSub2APIUrl: () => false,
+    checkIsSub2APIUpstream: async () => true,
+    URL: globalThis.URL,
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('async function autoDiscoverAndSyncUpstreamPanelsFromBackend('), source.indexOf('// 切换 Sub2API 上游真实 base_url')), context);
+
+  const res = await context.autoDiscoverAndSyncUpstreamPanelsFromBackend();
+
+  // 1. 成功自动发现并抓取了 2 个新上游 (modnex.cc 与 us.xcmapi.com)，已有上游 jlaudeapi.com 不会重复添加
+  assert.equal(res.success, true);
+  assert.equal(res.addedCount, 2);
+  assert.equal(syncedPanels.length, 2);
+  assert.ok(syncedPanels.some(p => p.backendUrl === 'https://modnex.cc' && p.userToken === 'sk-modnex-token-123'));
+  assert.ok(syncedPanels.some(p => p.backendUrl === 'https://us.xcmapi.com' && p.userToken === 'sk-xcmapi-token-456'));
+});
+
+test('autoDiscoverAndSyncUpstreamPanelsFromBackend strictly skips non-Sub2API upstreams', async () => {
+  const syncedPanels = [];
+  const state = {
+    channels: [
+      { id: '1', name: 'OpenAI 官方直连', baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-official', provider: 'OpenAI' },
+      { id: '2', name: '第三方 New-API 渠道', baseUrl: 'https://newapi-test.example.com', apiKey: 'sk-newapi', provider: 'New-API' },
+      { id: '3', name: '合规 Sub2API 渠道', baseUrl: 'https://sub2api.example.com', apiKey: 'sk-sub2api', provider: 'Sub2API' }
+    ]
+  };
+  let upstreamPanels = [];
+
+  const context = vm.createContext({
+    state,
+    upstreamPanels,
+    maskPanel: p => p,
+    syncSingleUpstreamPanel: async (p) => {
+      syncedPanels.push(p);
+      return {
+        ...p,
+        status: 'connected',
+        balanceUSD: 20.0,
+        models: ['claude-3-7-sonnet']
+      };
+    },
+    writeJSON: () => {},
+    syncUpstreamPanelConfigCompat: () => {},
+    UPSTREAM_PANELS_FILE: '/panels.json',
+    normalizeUrlKey: u => (u || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/(v1|api)(\/.*)?$/, ''),
+    upstreamScanner: {
+      isTombstoned: () => false
+    },
+    isKnownNonSub2APIUrl: u => u.includes('openai.com'),
+    checkIsSub2APIUpstream: async (url, key, params) => {
+      if (url.includes('openai.com') || url.includes('newapi') || (params && params.name && params.name.includes('New-API'))) {
+        return false;
+      }
+      return url.includes('sub2api');
+    },
+    URL: globalThis.URL,
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('async function autoDiscoverAndSyncUpstreamPanelsFromBackend('), source.indexOf('// 切换 Sub2API 上游真实 base_url')), context);
+
+  const res = await context.autoDiscoverAndSyncUpstreamPanelsFromBackend();
+
+  // 验证：官方渠道 (openai.com) 与 New-API 渠道坚决不被自动抓取或同步，只有 sub2api 渠道被同步
+  assert.equal(res.success, true);
+  assert.equal(res.addedCount, 1);
+  assert.equal(syncedPanels.length, 1);
+  assert.equal(syncedPanels[0].backendUrl, 'https://sub2api.example.com');
+  assert.ok(res.failed.some(f => f.skippedNonSub2API === true));
+});
+
+test('checkIsSub2APIUpstream accurately distinguishes Sub2API vs New-API and official endpoints', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const helperCode = source.slice(
+    source.indexOf('function isKnownNonSub2APIUrl('),
+    source.indexOf('// 单个上游 Sub2API 后台同步核心逻辑')
+  );
+
+  const context = vm.createContext({
+    Buffer,
+    AbortSignal,
+    fetch: async (url) => {
+      if (url.includes('/api/v1/auth/me')) {
+        return { ok: true, status: 200, json: async () => ({ code: 0, data: { user: { id: 1 } } }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }
+  });
+  vm.runInContext(helperCode, context);
+
+  // 1. 官方 API 域名直接判定为非 Sub2API
+  assert.equal(await context.checkIsSub2APIUpstream('https://api.openai.com/v1', 'sk-test'), false);
+  assert.equal(await context.checkIsSub2APIUpstream('https://api.anthropic.com', 'sk-test'), false);
+
+  // 2. 名称带 New-API 直接判定为非 Sub2API
+  assert.equal(await context.checkIsSub2APIUpstream('https://some-proxy.com', 'sk-test', { name: '金龙 New-API' }), false);
+
+  // 3. New-API JWT 直接判定为非 Sub2API
+  const newApiJwtHeader = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64');
+  const newApiPayload = Buffer.from(JSON.stringify({ iss: 'new-api', aud: ['new-api-dashboard'] })).toString('base64');
+  const newApiToken = `eyJ${newApiJwtHeader.slice(3)}.${newApiPayload}.sig`;
+  assert.equal(await context.checkIsSub2APIUpstream('https://some-proxy.com', newApiToken), false);
+
+  // 4. Sub2API JWT 正确识别
+  const sub2Payload = Buffer.from(JSON.stringify({ user_id: 99, token_version: 12345, sid: 'abc' })).toString('base64');
+  const sub2Token = `eyJ${newApiJwtHeader.slice(3)}.${sub2Payload}.sig`;
+  assert.equal(await context.checkIsSub2APIUpstream('https://some-proxy.com', sub2Token), true);
+
+  // 5. 探活 Sub2API 核心 /api/v1/auth/me 成功判定为 Sub2API
+  assert.equal(await context.checkIsSub2APIUpstream('https://my-sub2api.example.com', 'sk-sub2api-key'), true);
+});
+
+test('reserve pool and low balance alert correctly deduplicates shared channels and excludes 100M unlimited quota', async () => {
+  const fetchMock = async (url) => {
+    if (url.includes('/v1/usage')) {
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({ balance: 100000000, unit: 'USD' }) // 模拟 1 亿无限额度
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const context = vm.createContext({
+    fetch: fetchMock,
+    AbortSignal: { timeout: () => {} },
+    upstreamPanels: [
+      { id: 'panel_unlimited', backendUrl: 'https://unl.api.com', isUnlimited: true, balanceUSD: null, userInfo: { isUnlimited: true } },
+      { id: 'panel_lao', backendUrl: 'https://fast.ohlao.cfd', isUnlimited: false, balanceUSD: 8.78 },
+      { id: 'panel_like', backendUrl: 'https://api.likeai520.cc', isUnlimited: false, balanceUSD: 14.77 }
+    ],
+    state: {
+      channels: [
+        // 老欧平台 6 条通道共享同一个 8.78 钱包
+        { id: '186', name: 'Lao 1', baseUrl: 'https://fast.ohlao.cfd', upstreamPanelId: 'panel_lao', balance: 8.78 },
+        { id: '187', name: 'Lao 2', baseUrl: 'https://fast.ohlao.cfd', upstreamPanelId: 'panel_lao', balance: 8.78 },
+        { id: '191', name: 'Lao 3', baseUrl: 'https://fast.ohlao.cfd', upstreamPanelId: 'panel_lao', balance: 8.78 },
+        { id: '207', name: 'Lao 4', baseUrl: 'https://fast.ohlao.cfd', upstreamPanelId: 'panel_lao', balance: 8.78 },
+        { id: '208', name: 'Lao 5', baseUrl: 'https://fast.ohlao.cfd', upstreamPanelId: 'panel_lao', balance: 8.78 },
+        { id: '215', name: 'Lao 6', baseUrl: 'https://fast.ohlao.cfd', upstreamPanelId: 'panel_lao', balance: 8.78 },
+        // Like 2 条通道共享 14.77 钱包
+        { id: '183', name: 'Like 1', baseUrl: 'https://api.likeai520.cc', upstreamPanelId: 'panel_like', balance: 14.77 },
+        { id: '199', name: 'Like 2', baseUrl: 'https://api.likeai520.cc', upstreamPanelId: 'panel_like', balance: 14.77 },
+        // 无限额度通道 (哨兵值 1 亿)
+        { id: '999', name: 'Unl 1', baseUrl: 'https://unl.api.com', upstreamPanelId: 'panel_unlimited', isUnlimited: true, balance: null, balanceStatus: 'unlimited' },
+        // 未探测渠道 (balance === null)
+        { id: '206', name: 'Pending 1', baseUrl: 'https://unknown.com', balance: null, balanceStatus: 'pending' }
+      ]
+    },
+    normalizeUrlKey: u => (u || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '').replace(/\/(v1|api)(\/.*)?$/, ''),
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('// 获取单上游钱包余额'), source.indexOf('// 脱敏上游供应商配置并附加关联与墓碑状态')), context);
+
+  // 1. 验证 fetchChannelBalance 自动识别 1 亿为 isUnlimited 并排除污染
+  const balRes = await context.fetchChannelBalance({ baseUrl: 'https://test.com', apiKey: 'sk-test' });
+  assert.equal(balRes.isUnlimited, true);
+  assert.equal(balRes.status, 'unlimited');
+  assert.equal(balRes.balance, null);
+
+  // 2. 模拟前端资金池计算：去重求和且排除 1 亿
+  let totalUSD = 0;
+  let hasUnlimited = false;
+  const countedAccountKeys = new Set();
+  context.upstreamPanels.forEach(p => {
+    const isUnl = !!(p.isUnlimited || Number(p.balanceUSD) >= 1000000);
+    if (isUnl) hasUnlimited = true;
+    else if (p.balanceUSD > 0) totalUSD += Number(p.balanceUSD);
+    if (p.id) countedAccountKeys.add(p.id);
+  });
+
+  // 验证资金池总额只计算了老欧 (8.78) 和 Like (14.77)，未发生 6 倍虚增，更没有被 1 亿污染
+  assert.equal(totalUSD.toFixed(2), '23.55');
+  assert.equal(hasUnlimited, true);
+
+  // 3. 验证未探测渠道 (null) 不会误触发断粮/低余额
+  const emptyAccounts = new Set();
+  const lowAccounts = new Set();
+  let emptyChannels = 0;
+  let lowChannels = 0;
+
+  context.state.channels.forEach(c => {
+    if (c.isUnlimited) return;
+    if (c.balance === null || c.balance === undefined) return;
+    const b = Number(c.balance);
+    const isOut = (c.balanceStatus === 'empty') || (b <= 0.001);
+    const isLow = !isOut && ((c.balanceStatus === 'low') || (b < 5.0));
+    const accId = c.upstreamPanelId || c.id;
+    if (isOut) { emptyAccounts.add(accId); emptyChannels++; }
+    else if (isLow) { lowAccounts.add(accId); lowChannels++; }
+  });
+
+  assert.equal(emptyAccounts.size, 0);
+  assert.equal(lowAccounts.size, 0);
+  assert.equal(emptyChannels, 0);
+  assert.equal(lowChannels, 0);
+});
+
+test('user configured rate_multiplier takes precedence over stale probe and New-API panels sync successfully', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+
+  // 1. 验证 SQL 查询中的 CASE WHEN 优先级逻辑
+  assert.match(source, /WHEN \(extra->'upstream_billing_rate_sync_enabled'\)::boolean = true THEN/);
+  assert.match(source, /WHEN rate_multiplier IS NOT NULL AND rate_multiplier != 1\.0 THEN\s+rate_multiplier/);
+
+  // 2. 验证 remoteEffectiveCostSql 也具备正确的 CASE WHEN 逻辑
+  assert.match(source, /WHEN \(\$\{accountAlias\}\.extra->'upstream_billing_rate_sync_enabled'\)::boolean = true THEN/);
+
+  // 3. 验证 New-API 面板在 syncSingleUpstreamPanel 与 syncAllUpstreamPanels 中不会被强制置为 unsupported
+  const mockFetch = async (url) => {
+    if (url.includes('/api/user/self')) {
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: { id: 2093, username: 'tinwung', quota: 25000000, used_quota: 500 }
+        })
+      };
+    }
+    if (url.includes('/api/user/models')) {
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({ success: true, data: ['gpt-5.4', 'claude-sonnet-5'] })
+      };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+
+  const context = vm.createContext({
+    fetch: mockFetch,
+    AbortSignal: { timeout: () => {} },
+    isKnownNonSub2APIUrl: u => u.includes('openai.com'),
+    checkIsSub2APIUpstream: async () => false,
+    upstreamPanels: [],
+    writeJSON() {},
+    UPSTREAM_PANELS_FILE: '',
+    IS_CONTROL_PLANE_WORKER: false,
+    state: { channels: [] },
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const helperCode = source.slice(
+    source.indexOf('async function syncSingleUpstreamPanel('),
+    source.indexOf('// 批量同步所有已启用的上游后台')
+  );
+  vm.runInContext(helperCode, context);
+
+  // 模拟已配置账号密码的 New-API 面板（非 autoDiscovered）
+  const jinlongPanel = {
+    id: 'panel_jinlong',
+    name: '金龙 New-API (jlaudeapi.com)',
+    backendUrl: 'https://jlaudeapi.com',
+    authMode: 'token_cookie',
+    userToken: 'sk-test-token',
+    enabled: true
+  };
+
+  const syncRes = await context.syncSingleUpstreamPanel(jinlongPanel);
+  // 必须正常连通，绝不被判定为 unsupported，并准确获取 50 USD 余额与模型
+  assert.equal(syncRes.status, 'connected');
+  assert.equal(syncRes.balanceUSD, 50);
+  assert.deepEqual(syncRes.models, ['gpt-5.4', 'claude-sonnet-5']);
+});

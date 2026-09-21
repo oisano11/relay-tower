@@ -97,6 +97,22 @@ function loadUpstreamPanels() {
       if (!IS_CONTROL_PLANE_WORKER) writeJSON(UPSTREAM_PANELS_FILE, list);
     }
   }
+  if (Array.isArray(list) && list.length > 0) {
+    let changed = false;
+    for (const p of list) {
+      if (isKnownNonSub2APIUrl(p.backendUrl || '')) {
+        if (!p.isOfficialDirect) {
+          p.isOfficialDirect = true;
+          p.isUnlimited = true;
+          p.balanceUSD = null;
+          changed = true;
+        }
+      }
+    }
+    if (changed && !IS_CONTROL_PLANE_WORKER) {
+      writeJSON(UPSTREAM_PANELS_FILE, list);
+    }
+  }
   return list;
 }
 
@@ -304,6 +320,15 @@ if (!state.pendingFailoverProposals) {
 if (!state.manualFailoverRejections) {
   state.manualFailoverRejections = {};
 }
+if (Array.isArray(state.channels)) {
+  for (const ch of state.channels) {
+    if (typeof ch.balance === 'number' && (ch.balance >= 1000000 || ch.balance < 0)) {
+      ch.balance = null;
+      ch.isUnlimited = true;
+      ch.balanceStatus = 'unlimited';
+    }
+  }
+}
 
 let alerts = readJSON(ALERTS_FILE, []);
 let ratioHistory = readJSON(HISTORY_FILE, []);
@@ -311,7 +336,7 @@ let ratioHistory = readJSON(HISTORY_FILE, []);
 const AUTO_SWITCH_CONFIG_FILE = path.join(DATA_DIR, 'auto_switch_config.json');
 const AUTO_SWITCH_LOGS_FILE = path.join(DATA_DIR, 'auto_switch_logs.json');
 
-let autoSwitchConfig = readJSON(AUTO_SWITCH_CONFIG_FILE, {
+const defaultAutoSwitchConfig = {
   enabled: true,
   mode: 'cache_first', // 'cache_first' (Prompt Cache保护·推荐) | 'high_availability' (高可用敏感) | 'custom' (自定义)
   promptCacheLock: true, // 核心：Prompt Cache 优先保护锁 (杜绝偶发报错误切主线)
@@ -328,7 +353,12 @@ let autoSwitchConfig = readJSON(AUTO_SWITCH_CONFIG_FILE, {
   originalGroupSaleRates: {},
   lastSwitchTime: null,
   lastSwitchReason: null
-});
+};
+
+let rawLoadedAutoSwitchConfig = readJSON(AUTO_SWITCH_CONFIG_FILE, null);
+let autoSwitchConfig = (rawLoadedAutoSwitchConfig && typeof rawLoadedAutoSwitchConfig === 'object')
+  ? { ...defaultAutoSwitchConfig, ...rawLoadedAutoSwitchConfig }
+  : { ...defaultAutoSwitchConfig };
 
 autoSwitchConfig.manualLockPolicy = 'failover_allowed';
 autoSwitchConfig.singleActiveExclusive = true;
@@ -613,24 +643,38 @@ async function fetchChannelBalance(channel) {
       const data = await res.json();
       const bal = data.balance !== undefined ? data.balance : (data.remaining !== undefined ? data.remaining : null);
       if (bal !== null && !isNaN(Number(bal))) {
+        const numBal = Number(bal);
+        // 识别无限额度哨兵值 (如 >= 1000000 或 < 0 表示不限额)
+        if (numBal >= 1000000 || numBal < 0 || data.unlimited === true) {
+          return {
+            balance: null,
+            isUnlimited: true,
+            unit: data.unit || 'USD',
+            status: 'unlimited',
+            lastUpdated: new Date().toISOString()
+          };
+        }
         return {
-          balance: Number(Number(bal).toFixed(2)),
+          balance: Number(numBal.toFixed(2)),
+          isUnlimited: false,
           unit: data.unit || 'USD',
-          status: Number(bal) < 5 ? (Number(bal) <= 0 ? 'empty' : 'low') : 'ok',
+          status: numBal < 5 ? (numBal <= 0.001 ? 'empty' : 'low') : 'ok',
           lastUpdated: new Date().toISOString()
         };
       }
     }
   } catch (e) {}
 
-  // 2. 上游 New API / One API 后台管理池数据注入与自动查额
+  // 2. 上游 Sub2API / New-API 后台管理池数据注入与自动查额
   const matchedPanel = upstreamPanels.find(p => 
-    (channel.upstreamPanelId && p.id === channel.upstreamPanelId) ||
-    (channel.panelSync && p.id === 'panel_jinlong') ||
-    (p.backendUrl && channel.baseUrl && (
-      channel.baseUrl.replace(/\/+$/, '').includes(p.backendUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')) ||
-      p.backendUrl.replace(/\/+$/, '').includes(channel.baseUrl.replace(/^https?:\/\//, '').replace(/\/+$/, ''))
-    ))
+    p.enabled !== false && !p.isOfficialDirect && !(typeof isKnownNonSub2APIUrl === 'function' && isKnownNonSub2APIUrl(p.backendUrl || '')) && (
+      (channel.upstreamPanelId && p.id === channel.upstreamPanelId) ||
+      (channel.panelSync && p.id === 'panel_jinlong') ||
+      (p.backendUrl && channel.baseUrl && (
+        channel.baseUrl.replace(/\/+$/, '').includes(p.backendUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')) ||
+        p.backendUrl.replace(/\/+$/, '').includes(channel.baseUrl.replace(/^https?:\/\//, '').replace(/\/+$/, ''))
+      ))
+    )
   );
 
   if (matchedPanel) {
@@ -639,10 +683,22 @@ async function fetchChannelBalance(channel) {
         await syncSingleUpstreamPanel(matchedPanel);
       }
       if (matchedPanel.userInfo) {
+        const isUnlimited = !!(matchedPanel.isUnlimited || (matchedPanel.userInfo && matchedPanel.userInfo.isUnlimited) || Number(matchedPanel.userInfo.balanceUSD) >= 1000000);
+        if (isUnlimited) {
+          return {
+            balance: null,
+            isUnlimited: true,
+            unit: 'USD',
+            status: 'unlimited',
+            lastUpdated: matchedPanel.lastSyncTime || new Date().toISOString()
+          };
+        }
+        const b = matchedPanel.userInfo.balanceUSD;
         return {
-          balance: matchedPanel.userInfo.balanceUSD,
+          balance: (b !== null && b !== undefined) ? Number(Number(b).toFixed(2)) : null,
+          isUnlimited: false,
           unit: 'USD',
-          status: matchedPanel.userInfo.balanceUSD < 5 ? (matchedPanel.userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok',
+          status: (b === null || b === undefined) ? 'unknown' : (Number(b) < 5 ? (Number(b) <= 0.001 ? 'empty' : 'low') : 'ok'),
           lastUpdated: matchedPanel.lastSyncTime || new Date().toISOString()
         };
       }
@@ -653,6 +709,7 @@ async function fetchChannelBalance(channel) {
 
   return {
     balance: null,
+    isUnlimited: false,
     unit: 'USD',
     status: 'unknown',
     lastUpdated: new Date().toISOString()
@@ -669,11 +726,25 @@ async function refreshAllBalances() {
 
   const promises = state.channels.map(async (ch) => {
     const balInfo = await fetchChannelBalance(ch);
-    if (balInfo && balInfo.balance !== null) {
-      ch.balance = balInfo.balance;
-      ch.balanceUnit = balInfo.unit;
-      ch.balanceStatus = balInfo.status;
-      ch.balanceUpdated = balInfo.lastUpdated;
+    if (balInfo) {
+      if (balInfo.isUnlimited) {
+        ch.balance = null;
+        ch.isUnlimited = true;
+        ch.balanceUnit = balInfo.unit || 'USD';
+        ch.balanceStatus = 'unlimited';
+        ch.balanceUpdated = balInfo.lastUpdated;
+      } else if (balInfo.balance !== null && !isNaN(balInfo.balance)) {
+        ch.balance = balInfo.balance;
+        ch.isUnlimited = false;
+        ch.balanceUnit = balInfo.unit;
+        ch.balanceStatus = balInfo.status;
+        ch.balanceUpdated = balInfo.lastUpdated;
+      } else {
+        ch.balance = null;
+        ch.isUnlimited = false;
+        ch.balanceStatus = balInfo.status || 'unknown';
+        ch.balanceUpdated = balInfo.lastUpdated;
+      }
     }
   });
   await Promise.allSettled(promises);
@@ -702,6 +773,8 @@ function maskPanel(p) {
     ? upstreamScanner.isTombstoned(p.backendUrl, p.name)
     : false;
 
+  const isSub2API = p.isSub2API !== false && !(p.name && p.name.toLowerCase().includes('new-api'));
+
   return {
     ...p,
     password: p.password ? '******' : '',
@@ -709,11 +782,145 @@ function maskPanel(p) {
     cookie: p.cookie ? '******' : '',
     channelCount,
     isOrphan: channelCount === 0,
-    isTombstoned
+    isTombstoned,
+    isSub2API
   };
 }
 
-// 单个上游 New API / One API 后台同步核心逻辑
+// 判定是否为已知的官方或非 Sub2API 第三方域名 (黑名单拦截)
+function isKnownNonSub2APIUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  const u = rawUrl.toLowerCase().trim();
+  const nonSub2ApiHosts = [
+    'api.openai.com',
+    'api.anthropic.com',
+    'generativelanguage.googleapis.com',
+    'api.groq.com',
+    'openrouter.ai',
+    'api.deepseek.com',
+    'api.moonshot.cn',
+    'dashscope.aliyuncs.com',
+    'api.minimax.chat',
+    'ark.cn-beijing.volces.com',
+    'api.x.ai'
+  ];
+  return nonSub2ApiHosts.some(h => u.includes(h));
+}
+
+// 判定并校验上游供应商是否为 Sub2API 系统（严格准则：不要同步非 Sub2API 的上游）
+async function checkIsSub2APIUpstream(rawUrl, tokenOrKey = '', extraParams = {}) {
+  if (extraParams && extraParams.isSub2API === false) return false;
+  if (extraParams && extraParams.isSub2API === true) return true;
+
+  const cleanUrl = (rawUrl || '').trim().replace(/\/+$/, '').replace(/\/(v1|api)$/i, '');
+  if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) return false;
+
+  // 1. 已知非 Sub2API 官方/三方域名黑名单
+  if (isKnownNonSub2APIUrl(cleanUrl)) return false;
+
+  // 2. 名称特征识别：明确标注 New-API / One-API 者直接判定为非 Sub2API
+  const name = ((extraParams && extraParams.name) || '').toLowerCase();
+  if (name.includes('new-api') || name.includes('one-api') || name.includes('newapi') || name.includes('oneapi')) {
+    return false;
+  }
+
+  const token = (tokenOrKey || (extraParams && extraParams.userToken) || '').replace(/^Bearer\s+/i, '').trim();
+
+  // 3. 解析 JWT 载荷特征（若为 JWT）
+  if (token && token.startsWith('eyJ') && token.includes('.')) {
+    try {
+      const parts = token.split('.');
+      if (parts.length >= 2) {
+        const payloadStr = Buffer.from(parts[1], 'base64').toString('utf8');
+        const payload = JSON.parse(payloadStr);
+        // New-API 明显标识特征: iss === 'new-api' 或 aud 包含 'new-api-dashboard'
+        if (payload.iss === 'new-api' || (Array.isArray(payload.aud) && payload.aud.includes('new-api-dashboard'))) {
+          return false;
+        }
+        // Sub2API 专有标识特征: user_id 伴随 token_version, sid 或 bnd
+        if (payload.user_id !== undefined && (payload.token_version !== undefined || payload.sid !== undefined || payload.bnd !== undefined)) {
+          return true;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 4. 主动探活 Sub2API 专有认证与个人信息接口: /api/v1/auth/me
+  if (token) {
+    try {
+      const probeRes = await fetch(`${cleanUrl}/api/v1/auth/me`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'User-Agent': 'Mozilla/5.0 RelayTowerSub2APIProbe'
+        },
+        signal: AbortSignal.timeout(4000)
+      });
+      if (probeRes.ok) {
+        const pData = await probeRes.json();
+        // Sub2API 标准响应规范: { code: 0, data: ... }
+        if (pData && pData.code === 0 && pData.data) {
+          return true;
+        }
+      } else if (probeRes.status === 401 || probeRes.status === 403) {
+        try {
+          const errData = await probeRes.json();
+          if (errData && typeof errData.code === 'number' && errData.message && errData.success === undefined) {
+            return true;
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+
+    // 5. 主动探活 Sub2API 专有余额查询接口: /v1/usage
+    try {
+      const usageRes = await fetch(`${cleanUrl}/v1/usage`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'User-Agent': 'Mozilla/5.0 RelayTowerSub2APIProbe'
+        },
+        signal: AbortSignal.timeout(3500)
+      });
+      if (usageRes.ok) {
+        const uData = await usageRes.json();
+        // Sub2API /v1/usage 标准字段: balance 或 remaining，且不含 New-API 的 hard_limit_usd
+        if (uData && (uData.balance !== undefined || uData.remaining !== undefined) && uData.hard_limit_usd === undefined) {
+          return true;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 6. 探活 Sub2API 专有登录接口: /api/v1/auth/login (提供账密时)
+  const username = (extraParams && extraParams.username ? String(extraParams.username).trim() : '');
+  const password = extraParams && extraParams.password ? String(extraParams.password) : '';
+  if (username && password) {
+    try {
+      const loginRes = await fetch(`${cleanUrl}/api/v1/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 RelayTowerSub2APIProbe'
+        },
+        body: JSON.stringify({ email: username, password }),
+        signal: AbortSignal.timeout(4500)
+      });
+      if (loginRes.status !== 404 && loginRes.status !== 405 && loginRes.status !== 502) {
+        try {
+          const lData = await loginRes.json();
+          if (lData && typeof lData.code === 'number' && lData.success === undefined) {
+            return true;
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  return false;
+}
+
+// 单个上游 Sub2API 后台同步核心逻辑（准则：不要同步非 Sub2API 的上游）
 async function syncSingleUpstreamPanel(params = {}) {
   const id = params.id || `panel_${Date.now()}`;
   const backendUrl = (params.backendUrl || '').replace(/\/+$/, '');
@@ -732,6 +939,44 @@ async function syncSingleUpstreamPanel(params = {}) {
   const password = params.password || '';
   const authMode = params.authMode || (username && password ? 'credentials' : 'token_cookie');
   const enabled = params.enabled !== false;
+
+  // 官方直连 API (如 api.openai.com) 标记为直连，不进行面板后台登录
+  if (typeof isKnownNonSub2APIUrl === 'function' && isKnownNonSub2APIUrl(backendUrl)) {
+    return {
+      ...params,
+      id,
+      name,
+      backendUrl,
+      isOfficialDirect: true,
+      isUnlimited: true,
+      status: 'connected',
+      balanceUSD: null,
+      lastError: null,
+      lastSyncTime: new Date().toISOString()
+    };
+  }
+
+  // 自动发现渠道拦截：仅当来自后台自动发现时，严格限定只自动添加 Sub2API 渠道
+  if (params.autoDiscovered) {
+    const isSub2 = (typeof checkIsSub2APIUpstream === 'function')
+      ? await checkIsSub2APIUpstream(backendUrl, token, params)
+      : true;
+    if (!isSub2) {
+      console.warn(`[UpstreamPanel] [${name}] (${backendUrl}) 拒绝自动同步：检测到非 Sub2API 上游系统，已按照准则跳过`);
+      return {
+        ...params,
+        id,
+        name,
+        backendUrl,
+        isSub2API: false,
+        status: 'unsupported',
+        balanceUSD: null,
+        isUnlimited: false,
+        lastError: '非 Sub2API 上游（已按照准则跳过自动同步）',
+        lastSyncTime: new Date().toISOString()
+      };
+    }
+  }
 
   let userInfo = params.userInfo || null;
   let models = params.models || [];
@@ -758,12 +1003,14 @@ async function syncSingleUpstreamPanel(params = {}) {
             if (probeData.code === 0 && probeData.data) {
               const u = probeData.data.user || probeData.data;
               const rawBal = u.balance !== undefined ? u.balance : 0;
+              const isUnlimited = (Number(rawBal) >= 1000000 || Number(rawBal) < 0);
               userInfo = {
                 id: u.id,
                 username: u.email || u.username || username,
                 role: u.role,
-                quota: Math.round(Number(rawBal) * 500000),
-                balanceUSD: Number(Number(rawBal).toFixed(2)),
+                quota: isUnlimited ? -1 : Math.round(Number(rawBal) * 500000),
+                balanceUSD: isUnlimited ? null : Number(Number(rawBal).toFixed(2)),
+                isUnlimited,
                 usedQuota: 0
               };
               loginOk = true;
@@ -788,12 +1035,14 @@ async function syncSingleUpstreamPanel(params = {}) {
             if (probeData.success && probeData.data) {
               const u = probeData.data;
               const quota = u.quota || 0;
+              const isUnlimited = (quota < 0 || quota >= 50000000000);
               userInfo = {
                 id: u.id,
                 username: u.username || username,
                 role: u.role,
-                quota,
-                balanceUSD: Number((quota / 500000).toFixed(2)),
+                quota: isUnlimited ? -1 : quota,
+                balanceUSD: isUnlimited ? null : Number((quota / 500000).toFixed(2)),
+                isUnlimited,
                 usedQuota: u.used_quota || 0
               };
               loginOk = true;
@@ -823,12 +1072,14 @@ async function syncSingleUpstreamPanel(params = {}) {
           if (sub2Data.data.user) {
             const u = sub2Data.data.user;
             const rawBal = u.balance !== undefined ? u.balance : 0;
+            const isUnlimited = (Number(rawBal) >= 1000000 || Number(rawBal) < 0);
             userInfo = {
               id: u.id,
               username: u.email || u.username || username,
               role: u.role,
-              quota: Math.round(Number(rawBal) * 500000),
-              balanceUSD: Number(Number(rawBal).toFixed(2)),
+              quota: isUnlimited ? -1 : Math.round(Number(rawBal) * 500000),
+              balanceUSD: isUnlimited ? null : Number(Number(rawBal).toFixed(2)),
+              isUnlimited,
               usedQuota: 0
             };
           }
@@ -857,13 +1108,14 @@ async function syncSingleUpstreamPanel(params = {}) {
             if (loginData.data && loginData.data.user) {
               const u = loginData.data.user;
               const quota = u.quota || 0;
-              const balanceUSD = Number((quota / 500000).toFixed(2));
+              const isUnlimited = (quota < 0 || quota >= 50000000000);
               userInfo = {
                 id: u.id,
                 username: u.username || username,
                 role: u.role,
-                quota,
-                balanceUSD,
+                quota: isUnlimited ? -1 : quota,
+                balanceUSD: isUnlimited ? null : Number((quota / 500000).toFixed(2)),
+                isUnlimited,
                 usedQuota: u.used_quota || 0
               };
             }
@@ -905,12 +1157,14 @@ async function syncSingleUpstreamPanel(params = {}) {
         const meData = await meRes.json();
         if (meData.code === 0 && meData.data) {
           const rawBal = meData.data.balance !== undefined ? meData.data.balance : 0;
+          const isUnlimited = (Number(rawBal) >= 1000000 || Number(rawBal) < 0);
           userInfo = {
             id: meData.data.id || meData.data.user_id,
             username: meData.data.email || meData.data.username || username,
             role: meData.data.role,
-            quota: Math.round(Number(rawBal) * 500000),
-            balanceUSD: Number(Number(rawBal).toFixed(2)),
+            quota: isUnlimited ? -1 : Math.round(Number(rawBal) * 500000),
+            balanceUSD: isUnlimited ? null : Number(Number(rawBal).toFixed(2)),
+            isUnlimited,
             usedQuota: 0
           };
         }
@@ -927,13 +1181,14 @@ async function syncSingleUpstreamPanel(params = {}) {
         const userData = await userRes.json();
         if (userData.success && userData.data) {
           const quota = userData.data.quota || 0;
-          const balanceUSD = Number((quota / 500000).toFixed(2));
+          const isUnlimited = (quota < 0 || quota >= 50000000000);
           userInfo = {
             id: userData.data.id,
             username: userData.data.username || username,
             role: userData.data.role,
-            quota,
-            balanceUSD,
+            quota: isUnlimited ? -1 : quota,
+            balanceUSD: isUnlimited ? null : Number((quota / 500000).toFixed(2)),
+            isUnlimited,
             usedQuota: userData.data.used_quota || 0
           };
         }
@@ -961,13 +1216,15 @@ async function syncSingleUpstreamPanel(params = {}) {
                   if (uData.total_usage !== undefined) totalUsageUSD = Number((uData.total_usage / 100).toFixed(2));
                 }
               } catch (_) {}
-              const remUSD = Math.max(0, Number((hardLimit - totalUsageUSD).toFixed(2)));
+              const isUnlimited = (hardLimit >= 1000000);
+              const remUSD = isUnlimited ? null : Math.max(0, Number((hardLimit - totalUsageUSD).toFixed(2)));
               userInfo = {
                 id: 'api_key_user',
                 username: username || 'API Key User',
                 role: 'user',
-                quota: Math.round(remUSD * 500000),
+                quota: isUnlimited ? -1 : Math.round((remUSD || 0) * 500000),
                 balanceUSD: remUSD,
+                isUnlimited,
                 usedQuota: Math.round(totalUsageUSD * 500000)
               };
               loginOk = true;
@@ -989,12 +1246,14 @@ async function syncSingleUpstreamPanel(params = {}) {
           const usageData = await usageRes.json();
           const bal = usageData.balance !== undefined ? usageData.balance : (usageData.remaining !== undefined ? usageData.remaining : null);
           if (bal !== null && !isNaN(Number(bal))) {
+            const isUnlimited = (Number(bal) >= 1000000 || Number(bal) < 0 || usageData.unlimited === true);
             userInfo = {
               id: 'api_key_user',
               username: username || 'API Key User',
               role: 'user',
-              quota: Math.round(Number(bal) * 500000),
-              balanceUSD: Number(Number(bal).toFixed(2)),
+              quota: isUnlimited ? -1 : Math.round(Number(bal) * 500000),
+              balanceUSD: isUnlimited ? null : Number(Number(bal).toFixed(2)),
+              isUnlimited,
               usedQuota: 0
             };
           }
@@ -1118,6 +1377,7 @@ async function syncSingleUpstreamPanel(params = {}) {
       userToken: token,
       status: 'connected',
       balanceUSD: userInfo.balanceUSD,
+      isUnlimited: !!userInfo.isUnlimited,
       lastSyncTime: new Date().toISOString(),
       userInfo,
       models,
@@ -1135,7 +1395,7 @@ async function syncSingleUpstreamPanel(params = {}) {
       upstreamPanels.push(resultPanel);
     }
     writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
-    syncUpstreamPanelConfigCompat();
+    if (typeof syncUpstreamPanelConfigCompat === 'function') syncUpstreamPanelConfigCompat();
 
     // 同步更新关联通道渠道数据中的余额信息
     let channelsUpdated = false;
@@ -1144,9 +1404,19 @@ async function syncSingleUpstreamPanel(params = {}) {
                       (c.panelSync === true && id === 'panel_jinlong') ||
                       (c.baseUrl && backendUrl && c.baseUrl.includes(backendUrl.replace(/^https?:\/\//, '')));
       if (isMatch) {
-        c.balance = userInfo.balanceUSD;
-        c.balanceUnit = 'USD';
-        c.balanceStatus = userInfo.balanceUSD < 5 ? (userInfo.balanceUSD <= 0 ? 'empty' : 'low') : 'ok';
+        if (userInfo.isUnlimited) {
+          c.balance = null;
+          c.isUnlimited = true;
+          c.balanceUnit = 'USD';
+          c.balanceStatus = 'unlimited';
+        } else {
+          c.balance = userInfo.balanceUSD;
+          c.isUnlimited = false;
+          c.balanceUnit = 'USD';
+          c.balanceStatus = (userInfo.balanceUSD === null || userInfo.balanceUSD === undefined)
+            ? 'unknown'
+            : (userInfo.balanceUSD < 5 ? (userInfo.balanceUSD <= 0.001 ? 'empty' : 'low') : 'ok');
+        }
         c.balanceUpdated = resultPanel.lastSyncTime;
         channelsUpdated = true;
       }
@@ -1187,18 +1457,22 @@ async function syncSingleUpstreamPanel(params = {}) {
     if (existingIdx >= 0) upstreamPanels[existingIdx] = updated;
     else upstreamPanels.push(updated);
     writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
-    syncUpstreamPanelConfigCompat();
+    if (typeof syncUpstreamPanelConfigCompat === 'function') syncUpstreamPanelConfigCompat();
     throw err;
   }
 }
 
 const syncUpstreamPanel = syncSingleUpstreamPanel;
 
-// 批量同步所有已启用的上游后台
+// 批量同步所有已启用的上游后台（准则：不要同步非 Sub2API 的上游）
 async function syncAllUpstreamPanels() {
   const results = [];
+  let changed = false;
   for (const p of upstreamPanels) {
     if (p.enabled === false) continue;
+    if (p.isOfficialDirect === true || (typeof isKnownNonSub2APIUrl === 'function' && isKnownNonSub2APIUrl(p.backendUrl))) {
+      continue;
+    }
     if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function') {
       if (upstreamScanner.isTombstoned(p.backendUrl, p.name)) {
         continue;
@@ -1206,12 +1480,181 @@ async function syncAllUpstreamPanels() {
     }
     try {
       const res = await syncSingleUpstreamPanel(p);
+      Object.assign(p, res);
+      changed = true;
       results.push({ id: p.id, name: p.name, success: true, balanceUSD: res.balanceUSD });
     } catch (err) {
+      p.lastError = err.message;
+      p.status = 'error';
+      changed = true;
       results.push({ id: p.id, name: p.name, success: false, error: err.message });
     }
   }
+  if (changed && !IS_CONTROL_PLANE_WORKER) {
+    writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
+  }
   return results;
+}
+
+/**
+ * ⚡ autoDiscoverAndSyncUpstreamPanelsFromBackend(options = {})
+ * 核心功能：先看中转站后台 (Sub2API) 增加了哪些新的上游渠道/API，
+ * 提取去重后的上游 Base URL 与 API 密钥，直接通过该上游的 API 自动抓取该供应商的模型列表、定价倍率与钱包余额，
+ * 自动将其注入或更新至上游供应商管理池 (upstreamPanels)，免去人工重复填写的繁琐。
+ * 核心准则：不要同步非 Sub2API 的上游（严格过滤官方直连及 New-API/One-API 等非 Sub2API 上游）。
+ */
+async function autoDiscoverAndSyncUpstreamPanelsFromBackend(options = {}) {
+  const silent = Boolean(options && options.silent);
+  const channels = (state.channels && state.channels.length > 0) ? state.channels : [];
+  if (channels.length === 0) {
+    return { success: true, count: 0, added: [], updated: [], message: '中转站后台当前无活跃渠道' };
+  }
+
+  const results = {
+    added: [],
+    updated: [],
+    failed: []
+  };
+
+  // 1. 聚类去重：按照规范化 host 提取后台所有有效且拥有 API Key 的上游
+  const upstreamsByHost = new Map();
+  channels.forEach(c => {
+    if (!c || !c.baseUrl || !c.apiKey) return;
+    const rawUrl = (c.baseUrl || '').trim();
+    if (!rawUrl.startsWith('http://') && !rawUrl.startsWith('https://')) return;
+    
+    // 检查墓碑标记：已在后台欠费/删除的上游绝对不自动抓取或复活
+    if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function') {
+      if (upstreamScanner.isTombstoned(rawUrl, c.name)) return;
+    }
+
+    // 准则：不要同步非 Sub2API 的上游 (已知官方/外部直连黑名单快速跳过)
+    if (typeof isKnownNonSub2APIUrl === 'function' && isKnownNonSub2APIUrl(rawUrl)) return;
+
+    const normKey = normalizeUrlKey(rawUrl);
+    if (!normKey) return;
+
+    if (!upstreamsByHost.has(normKey)) {
+      upstreamsByHost.set(normKey, []);
+    }
+    upstreamsByHost.get(normKey).push(c);
+  });
+
+  // 2. 对每一个上游供应商进行匹配与自动抓取
+  for (const [normKey, chList] of upstreamsByHost.entries()) {
+    try {
+      const primaryCh = chList[0];
+      const targetBaseUrl = primaryCh.baseUrl.replace(/\/+$/, '').replace(/\/(v1|api)$/i, '');
+      
+      const extractHost = (u) => {
+        try {
+          if (typeof URL !== 'undefined') return new URL(u).hostname;
+        } catch (_) {}
+        return (u || '').replace(/^https?:\/\//i, '').split('/')[0].split(':')[0];
+      };
+
+      // 🌟 核心准则：不要同步非 Sub2API 的上游
+      const isSub2 = (typeof checkIsSub2APIUpstream === 'function')
+        ? await checkIsSub2APIUpstream(targetBaseUrl, primaryCh.apiKey, { name: primaryCh.name })
+        : true;
+      if (!isSub2) {
+        if (!silent) {
+          console.log(`ℹ️ [自动抓取] 跳过非 Sub2API 上游: ${primaryCh.name || normKey} (${targetBaseUrl})，准则限定仅同步 Sub2API 上游。`);
+        }
+        results.failed.push({
+          backendUrl: targetBaseUrl,
+          name: primaryCh.name || normKey,
+          error: '非 Sub2API 上游（已根据准则跳过同步）',
+          skippedNonSub2API: true
+        });
+        continue;
+      }
+
+      // 提取友好的供应商名称
+      let friendlyName = primaryCh.name || '上游供应商';
+      friendlyName = friendlyName.replace(/\s*\(.*?\)\s*/g, '').replace(/[\d\.]+[xX倍]/g, '').trim();
+      if (!friendlyName || friendlyName.length > 30) {
+        friendlyName = extractHost(targetBaseUrl) || '上游 API';
+      }
+      if (primaryCh.provider && primaryCh.provider !== '三方' && primaryCh.provider !== '三方渠道') {
+        friendlyName = primaryCh.provider;
+      }
+
+      // 检查当前 upstreamPanels 中是否已存在
+      const existingPanel = upstreamPanels.find(p => {
+        if (!p) return false;
+        const pKey = normalizeUrlKey(p.backendUrl);
+        return pKey === normKey || (pKey && normKey.includes(pKey)) || (pKey && pKey.includes(normKey));
+      });
+
+      if (!existingPanel) {
+        // 🌟 发现后台新增的 Sub2API 上游供应商！自动生成配置并通过其 API 进行抓取
+        const cleanHost = normKey.replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 24);
+        const panelId = `panel_auto_${cleanHost}`;
+        const newPanelConfig = {
+          id: panelId,
+          name: `${friendlyName} (${extractHost(targetBaseUrl)})`,
+          backendUrl: targetBaseUrl,
+          authMode: 'token_cookie',
+          userToken: primaryCh.apiKey,
+          cookie: '',
+          username: '',
+          password: '',
+          autoDiscovered: true,
+          isSub2API: true,
+          enabled: true
+        };
+
+        if (!silent) {
+          console.log(`⚡ [自动抓取] 发现中转站后台新 Sub2API 上游: ${newPanelConfig.name} (${targetBaseUrl})，正在调用其 API 自动抓取供应商数据...`);
+        }
+
+        try {
+          const synced = await syncSingleUpstreamPanel(newPanelConfig);
+          results.added.push({
+            id: synced.id,
+            name: synced.name,
+            backendUrl: synced.backendUrl,
+            balanceUSD: synced.balanceUSD,
+            modelsCount: Array.isArray(synced.models) ? synced.models.length : 0
+          });
+        } catch (err) {
+          console.warn(`[自动抓取] 抓取新上游 ${targetBaseUrl} 失败:`, err.message);
+          results.failed.push({ backendUrl: targetBaseUrl, error: err.message });
+        }
+      } else {
+        // 现有供应商：仅在是 Sub2API 上游且当前缺少 userToken 或处于未连接状态时，使用渠道有效 API Key 进行增强补全
+        if (existingPanel.isSub2API !== false && !(existingPanel.name && existingPanel.name.toLowerCase().includes('new-api'))) {
+          if (!existingPanel.userToken && primaryCh.apiKey) {
+            existingPanel.userToken = primaryCh.apiKey;
+            existingPanel.authMode = 'token_cookie';
+            try {
+              const synced = await syncSingleUpstreamPanel(existingPanel);
+              results.updated.push({
+                id: synced.id,
+                name: synced.name,
+                backendUrl: synced.backendUrl,
+                balanceUSD: synced.balanceUSD
+              });
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[自动抓取] 处理上游 ${normKey} 出错:`, err.message);
+    }
+  }
+
+  return {
+    success: true,
+    addedCount: results.added.length,
+    updatedCount: results.updated.length,
+    added: results.added,
+    updated: results.updated,
+    failed: results.failed,
+    totalPanels: upstreamPanels.length,
+    panels: upstreamPanels.map(maskPanel)
+  };
 }
 
 // 切换 Sub2API 上游真实 base_url
@@ -1383,11 +1826,22 @@ SELECT json_agg(t) FROM (
     status,
     priority,
     schedulable,
-    COALESCE(
-      (extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier')::numeric,
-      (extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier')::numeric,
-      rate_multiplier
-    )::float as multiplier,
+    CASE 
+      WHEN (extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+        COALESCE(
+          (extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier')::numeric,
+          (extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier')::numeric,
+          rate_multiplier
+        )
+      WHEN rate_multiplier IS NOT NULL AND rate_multiplier != 1.0 THEN
+        rate_multiplier
+      ELSE
+        COALESCE(
+          (extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier')::numeric,
+          (extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier')::numeric,
+          rate_multiplier
+        )
+    END::float as multiplier,
     rate_multiplier::float as configured_multiplier,
     credentials->>'base_url' as base_url,
     credentials->>'api_key' as api_key,
@@ -1413,8 +1867,14 @@ SELECT json_agg(t) FROM (
     const output = execPsql(sql, true).trim();
     if (!output || !output.startsWith('[')) return null;
     const allAccountsRaw = JSON.parse(output);
-    // 保留所有未删除的真实上游账号（包含暂未分配分组的独立通道，便于在控制台统一查看与指派分组）
-    const realAccounts = allAccountsRaw;
+    // 过滤已在墓碑名单中的欠费/已删除渠道 (如子桐网络、stain)
+    const isChannelTombstoned = (acc) => {
+      if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function') {
+        return upstreamScanner.isTombstoned(acc.base_url, acc.name);
+      }
+      return false;
+    };
+    const realAccounts = allAccountsRaw.filter(acc => !isChannelTombstoned(acc));
     const allGroups = fetchAllSub2APIGroups();
     if (!snapshotOnly) state.allGroups = allGroups;
 
@@ -1499,15 +1959,24 @@ SELECT json_agg(t) FROM (
       let balanceStatus = (existing && existing.balanceStatus) ? existing.balanceStatus : (balance !== null ? 'ok' : 'pending');
 
       const matchedAccPanel = upstreamPanels.find(p => 
-        (existing && existing.upstreamPanelId && p.id === existing.upstreamPanelId) ||
-        (existing && existing.panelSync && p.id === 'panel_jinlong') ||
-        (p.backendUrl && acc.base_url && acc.base_url.includes(p.backendUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')))
+        p.enabled !== false && !p.isOfficialDirect && !(typeof isKnownNonSub2APIUrl === 'function' && isKnownNonSub2APIUrl(p.backendUrl || '')) && (
+          (existing && existing.upstreamPanelId && p.id === existing.upstreamPanelId) ||
+          (existing && existing.panelSync && p.id === 'panel_jinlong') ||
+          (p.backendUrl && acc.base_url && acc.base_url.includes(p.backendUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')))
+        )
       );
       if (matchedAccPanel && matchedAccPanel.userInfo) {
-        balance = matchedAccPanel.userInfo.balanceUSD;
-        balanceUnit = 'USD';
+        const isUnl = !!(matchedAccPanel.isUnlimited || (matchedAccPanel.userInfo && matchedAccPanel.userInfo.isUnlimited) || Number(matchedAccPanel.userInfo.balanceUSD) >= 1000000);
+        if (isUnl) {
+          balance = null;
+          balanceUnit = 'USD';
+          balanceStatus = 'unlimited';
+        } else {
+          balance = matchedAccPanel.userInfo.balanceUSD;
+          balanceUnit = 'USD';
+          balanceStatus = (balance === null || balance === undefined) ? 'unknown' : (balance < 5 ? (balance <= 0.001 ? 'empty' : 'low') : 'ok');
+        }
         balanceUpdated = matchedAccPanel.lastSyncTime || new Date().toISOString();
-        balanceStatus = balance < 5 ? (balance <= 0 ? 'empty' : 'low') : 'ok';
       }
 
       const channelObj = {
@@ -1732,6 +2201,13 @@ SELECT json_agg(t) FROM (
 
     writeJSON(CHANNELS_FILE, state);
     triggerBackgroundModelDiscovery();
+    if (!snapshotOnly && typeof autoDiscoverAndSyncUpstreamPanelsFromBackend === 'function') {
+      setImmediate(() => {
+        autoDiscoverAndSyncUpstreamPanelsFromBackend({ silent: true }).catch(err => {
+          console.warn('[AutoDiscover] 后台自动发现供应商异常:', err.message);
+        });
+      });
+    }
     if (hasSub2APISyncSafetyWork(safetyPlan) && directSnapshotSignature &&
         typeof requestBackgroundSub2APISafetyPlan === 'function') {
       requestBackgroundSub2APISafetyPlan(safetyPlan, updatedChannels, directSnapshotSignature);
@@ -1915,11 +2391,22 @@ function executeControlPlaneSafetyPlan(plan, expectedSignature) {
   const correctRateCase = calibrations.length > 0
     ? `CASE a.id ${calibrations.map(item => `WHEN ${item.id} THEN ${item.correctRate.toFixed(4)}`).join(' ')} ELSE NULL::numeric END`
     : 'NULL::numeric';
-  const currentCostSql = `COALESCE(
-    NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
-    NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
-    a.rate_multiplier
-  )`;
+  const currentCostSql = `CASE 
+    WHEN (a.extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+      COALESCE(
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        a.rate_multiplier
+      )
+    WHEN a.rate_multiplier IS NOT NULL AND a.rate_multiplier != 1.0 THEN
+      a.rate_multiplier
+    ELSE
+      COALESCE(
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        a.rate_multiplier
+      )
+  END`;
   const hasSafeAttachedGroupSql = `SELECT 1
     FROM account_groups ag
     JOIN groups g ON g.id = ag.group_id AND g.deleted_at IS NULL
@@ -1999,7 +2486,7 @@ function setRemoteAccountRole(accountId, role) {
   const target = state.channels.find(c => String(c.id) === String(accountId));
   const id = Number(accountId);
   if (!target || !Number.isSafeInteger(id) || id <= 0) throw new Error('无效通道 ID');
-  const exclusive = autoSwitchConfig.singleActiveExclusive !== false;
+  const exclusive = Boolean(autoSwitchConfig && autoSwitchConfig.singleActiveExclusive !== false);
   const scope = groupIds(target).filter(gid => !isExemptGroup(gid));
   const peers = state.channels.filter(c => String(c.id) !== String(id) && groupIds(c).some(gid => scope.includes(gid)));
   const priority = { main: 1, sub: 10, alt: 20, alternative: 20, fallback: 100, standby: 100 }[role];
@@ -2060,7 +2547,7 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
 
   const currentMeta = roleMeta[normalizedRole];
   const nonExemptGroupIds = groupIds(targetChannel).filter(gid => !isExemptGroup(gid));
-  const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
+  const isSingleActive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false);
   const safeToDisableIdSet = new Set(
     normalizedRole === 'main' && isSingleActive
       ? state.channels
@@ -2280,7 +2767,7 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
       return costA - costB;
     });
 
-    const isSingleActive = autoSwitchConfig.singleActiveExclusive !== false;
+    const isSingleActive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false);
 
     profitable.forEach((ch, index) => {
       let role = 'sub';
@@ -2558,11 +3045,22 @@ function confirmRemoteGroupMutation(accountIds = []) {
 }
 
 function remoteEffectiveCostSql(accountAlias = 'a') {
-  return `COALESCE(
-    NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
-    NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
-    ${accountAlias}.rate_multiplier
-  )`;
+  return `CASE 
+    WHEN (${accountAlias}.extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+      COALESCE(
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        ${accountAlias}.rate_multiplier
+      )
+    WHEN ${accountAlias}.rate_multiplier IS NOT NULL AND ${accountAlias}.rate_multiplier != 1.0 THEN
+      ${accountAlias}.rate_multiplier
+    ELSE
+      COALESCE(
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        ${accountAlias}.rate_multiplier
+      )
+  END`;
 }
 
 function remoteAccountExistenceGuardSql(accountIds) {
@@ -4448,7 +4946,7 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
   if (hasTargetGroup && groupIds(fromChannel).some(groupId => !scope.includes(groupId))) {
     throw new Error('安全拦截：共享来源通道不能通过组级自动切换改写全局调度状态，请先配置经验证的组级调度能力');
   }
-  const exclusive = autoSwitchConfig.singleActiveExclusive !== false && !scope.some(gid => isExemptGroup(gid));
+  const exclusive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false) && !scope.some(gid => isExemptGroup(gid));
   const peers = state.channels.filter(c => String(c.id) !== targetId && groupIds(c).some(gid => scope.includes(gid)));
   const safeToDisableIds = exclusive
     ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(peerId => Number.isSafeInteger(peerId) && peerId > 0)
@@ -5983,7 +6481,8 @@ async function handleRequest(req, res) {
         totalLossCount: lossChannels.length,
         activeLossCount: lossChannels.filter(c => c.schedulable).length,
         lossChannels
-      }
+      },
+      upstreamPanels: upstreamPanels.map(maskPanel)
     }));
     return;
   }
@@ -7089,7 +7588,10 @@ async function handleRequest(req, res) {
   // 获取全部上游后台配置列表与总体统计
   if (pathname === '/api/upstream/panels' && req.method === 'GET') {
     const safePanels = upstreamPanels.map(maskPanel);
-    const totalBalance = Number(upstreamPanels.reduce((sum, p) => sum + (Number(p.balanceUSD) || 0), 0).toFixed(2));
+    const totalBalance = Number(upstreamPanels.reduce((sum, p) => {
+      const isUnl = !!(p.isUnlimited || (p.userInfo && p.userInfo.isUnlimited) || Number(p.balanceUSD) >= 1000000);
+      return isUnl ? sum : sum + (Number(p.balanceUSD) || 0);
+    }, 0).toFixed(2));
     const connectedCount = upstreamPanels.filter(p => p.status === 'connected').length;
     const orphanCount = safePanels.filter(p => p.isOrphan || p.isTombstoned).length;
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -7210,6 +7712,19 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ⚡ 自动抓取中转站后台新增上游供应商
+  if (pathname === '/api/upstream/panels/auto-discover' && req.method === 'POST') {
+    try {
+      const result = await autoDiscoverAndSyncUpstreamPanelsFromBackend();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message, message: `自动抓取异常: ${err.message}` }));
+    }
+    return;
+  }
+
   // 删除指定的上游后台
   if ((pathname.startsWith('/api/upstream/panels/') && req.method === 'DELETE') ||
       (pathname === '/api/upstream/panels/delete' && req.method === 'POST')) {
@@ -7314,7 +7829,10 @@ async function handleRequest(req, res) {
   if (pathname === '/api/upstream-panel/status' && req.method === 'GET') {
     const primaryPanel = upstreamPanels[0] || upstreamPanelConfig;
     const safePanel = maskPanel(primaryPanel);
-    const totalBalance = Number(upstreamPanels.reduce((sum, p) => sum + (Number(p.balanceUSD) || 0), 0).toFixed(2));
+    const totalBalance = Number(upstreamPanels.reduce((sum, p) => {
+      const isUnl = !!(p.isUnlimited || (p.userInfo && p.userInfo.isUnlimited) || Number(p.balanceUSD) >= 1000000);
+      return isUnl ? sum : sum + (Number(p.balanceUSD) || 0);
+    }, 0).toFixed(2));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ...safePanel,
@@ -7380,7 +7898,7 @@ async function handleRequest(req, res) {
     autoSwitchConfig.manualLockPolicy = 'failover_allowed';
 
     // 🔒 若开启了单主独占，立即执行一次同步检测与清理，确保同组内无双开副调
-    if (autoSwitchConfig.singleActiveExclusive) {
+    if (autoSwitchConfig && autoSwitchConfig.singleActiveExclusive) {
       enforceSingleActiveState();
     }
 
@@ -7844,7 +8362,9 @@ COMMIT;`;
     const contentType = MIME_TYPES[ext] || 'application/octet-stream';
     res.writeHead(200, {
       'Content-Type': contentType,
-      'Cache-Control': 'no-cache, must-revalidate'
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
     });
     fs.createReadStream(filePath).pipe(res);
   });
@@ -8052,7 +8572,8 @@ function initializeMainProcess() {
       writeJSON(UPSTREAM_GROUP_CATALOG_FILE, upstreamGroupCatalog);
     },
     isExemptGroup: (g) => isExemptGroup(g),
-    isExemptChannel: (c) => isExemptChannel(c)
+    isExemptChannel: (c) => isExemptChannel(c),
+    autoDiscoverAndSyncUpstreamPanelsFromBackend: (opts) => autoDiscoverAndSyncUpstreamPanelsFromBackend(opts)
   });
 
   // 初始化 Telegram 机器人与移动调度引擎
