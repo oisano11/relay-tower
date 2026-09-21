@@ -254,6 +254,9 @@ async function loadChannels() {
     pollCountdownSeconds = data.autoPollIntervalSeconds || 300;
     profitSummary = data.profitSummary || {};
     allGroups = data.groups || [];
+    if (data.upstreamPanels && Array.isArray(data.upstreamPanels)) {
+      upstreamPanelsList = data.upstreamPanels;
+    }
 
     if (data.globalUserStats) {
       updateGlobalUserStatsHeader(data.globalUserStats);
@@ -428,16 +431,29 @@ function renderOverviewMetrics() {
     }
   }
 
-  // 3. 调度通道池与全场最低进货
-  const sortedByRate = [...channelsData].sort((a, b) => a.multiplier - b.multiplier);
+  // 3. 调度通道池与全场最低进货 (优先从调度中且有余额的有效通道中选最低)
+  const validLowestCandidates = channelsData.filter(c => {
+    const isStopped = c.schedulable === false || c.status === 'offline' || (c.configuredStatus && c.configuredStatus !== 'active');
+    const isUnlimited = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+    const isEmpty = !isUnlimited && (c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001));
+    return !isStopped && !isEmpty;
+  });
+  const poolForLowest = validLowestCandidates.length > 0 ? validLowestCandidates : channelsData;
+  const sortedByRate = [...poolForLowest].sort((a, b) => {
+    const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
+    const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
+    return costA - costB;
+  });
   currentLowestChannel = sortedByRate[0];
   const elLowest = document.getElementById('metricLowestMultiplier');
   if (elLowest && currentLowestChannel) {
-    elLowest.textContent = `最低 ${formatRate(currentLowestChannel.multiplier)}x`;
+    const lowestCost = currentLowestChannel.costMultiplier !== undefined ? currentLowestChannel.costMultiplier : currentLowestChannel.multiplier;
+    elLowest.textContent = `最低 ${formatRate(lowestCost)}x`;
   }
   const barLowestMultiplier = document.getElementById('barLowestMultiplier');
   if (barLowestMultiplier && currentLowestChannel) {
-    barLowestMultiplier.textContent = `${formatRate(currentLowestChannel.multiplier)}x`;
+    const lowestCost = currentLowestChannel.costMultiplier !== undefined ? currentLowestChannel.costMultiplier : currentLowestChannel.multiplier;
+    barLowestMultiplier.textContent = `${formatRate(lowestCost)}x`;
   }
   const enabledCount = channelsData.filter(c => c.schedulable).length;
   const elEnabledCount = document.getElementById('metricEnabledCount');
@@ -479,33 +495,114 @@ function renderOverviewMetrics() {
 
   const barUpstreamBalance = document.getElementById('barUpstreamBalance');
   if (barUpstreamBalance) {
+    // 1. 计算去重后的上游总备付金资金池 (1:1 等额结算，绝无汇率折损)
+    // 严禁按通道重复相加！同一上游平台绑定的多条通道共享同一钱包。
+    // 严禁计入 New-API / One-API 的无限额度哨兵值 (>= 1,000,000 或 isUnlimited)！
     let totalUSD = 0;
-    let emptyCount = 0;
-    let lowCount = 0;
+    let hasUnlimited = false;
+    const countedAccountKeys = new Set();
+
+    // 优先以 upstreamPanelsList（上游供应商后台管理池）为唯一钱包基准进行汇总
+    if (Array.isArray(upstreamPanelsList) && upstreamPanelsList.length > 0) {
+      upstreamPanelsList.forEach(p => {
+        // 官方直连 API 排除在备付金汇总外
+        if (p.isOfficialDirect) return;
+        const isUnlimited = !!(p.isUnlimited || (p.userInfo && p.userInfo.isUnlimited) || (p.balanceUSD !== null && Number(p.balanceUSD) >= 1000000));
+        if (isUnlimited) {
+          hasUnlimited = true;
+        } else {
+          const b = Number(p.balanceUSD);
+          if (p.balanceUSD !== null && p.balanceUSD !== undefined && !isNaN(b) && b > 0) {
+            totalUSD += b;
+          }
+        }
+        if (p.id) countedAccountKeys.add(p.id);
+        if (p.backendUrl) countedAccountKeys.add(normalizeUrlKey(p.backendUrl));
+      });
+    }
+
+    // 针对未纳入 upstreamPanelsList 的独立外部通道，按 (baseUrl + apiKey) 唯一平台账号去重补充
     channelsData.forEach(c => {
-      const b = Number(c.balance);
-      if (!isNaN(b) && b > 0) totalUSD += b;
-      if (c.balanceStatus === 'empty' || (!isNaN(b) && b <= 0.001)) {
-        emptyCount++;
-      } else if (c.balanceStatus === 'low' || (!isNaN(b) && b < 5.0)) {
-        lowCount++;
+      // 准则：不要同步非 Sub2API 的上游
+      if (c.isSub2API === false) return;
+      const panelKey = c.upstreamPanelId || (c.baseUrl ? normalizeUrlKey(c.baseUrl) : null);
+      if (panelKey && countedAccountKeys.has(panelKey)) return;
+
+      const accKey = `${normalizeUrlKey(c.baseUrl || '')}:${(c.apiKey || '').slice(-8)}`;
+      if (countedAccountKeys.has(accKey)) return;
+      countedAccountKeys.add(accKey);
+
+      const isUnlimited = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+      if (isUnlimited) {
+        hasUnlimited = true;
+      } else {
+        const b = Number(c.balance);
+        if (c.balance !== null && c.balance !== undefined && !isNaN(b) && b > 0) {
+          totalUSD += b;
+        }
       }
     });
-    // 严禁汇率换算！美金与人民币严格 1:1 结算
-    barUpstreamBalance.textContent = totalUSD.toFixed(2);
+
+    // 严禁汇率换算！美金与人民币严格 1:1 等额结算，千分位展示
+    const formattedBalance = totalUSD.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    barUpstreamBalance.innerHTML = hasUnlimited
+      ? `${formattedBalance} <span style="font-size:0.82rem; font-weight:600; color:#059669;" title="包含平台不限额 / 后付费通道">+ ♾️</span>`
+      : formattedBalance;
+
+    // 统计断粮与低余额：以平台供应商账号实体去重为主维度，同时统计受影响的通道数
+    const emptyAccounts = new Set();
+    const lowAccounts = new Set();
+    let emptyChannelsCount = 0;
+    let lowChannelsCount = 0;
+
+    channelsData.forEach(c => {
+      const isUnlimited = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+      if (isUnlimited) return; // 无限额度通道无断粮风险
+
+      // 未探测或未同步余额的通道，避免被 JS Number(null) === 0 陷阱误判为断粮
+      if (c.balance === null || c.balance === undefined) {
+        if (c.balanceStatus !== 'empty' && c.balanceStatus !== 'low') return;
+      }
+
+      const b = Number(c.balance);
+      const isOut = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && !isNaN(b) && b <= 0.001);
+      const isLow = !isOut && ((c.balanceStatus === 'low') || (c.balance !== null && c.balance !== undefined && !isNaN(b) && b < 5.0));
+
+      const accId = c.upstreamPanelId || c.vendor || c.provider || (c.baseUrl ? normalizeUrlKey(c.baseUrl) : c.id);
+
+      if (isOut) {
+        emptyAccounts.add(accId);
+        emptyChannelsCount++;
+      } else if (isLow) {
+        lowAccounts.add(accId);
+        lowChannelsCount++;
+      }
+    });
 
     const barBalanceAlert = document.getElementById('barBalanceAlert');
+    const quickOpenPoolBtn = document.getElementById('quickOpenPoolBtn');
     if (barBalanceAlert) {
-      if (emptyCount > 0) {
-        barBalanceAlert.textContent = `🚨 ${emptyCount} 家已断粮`;
+      if (emptyAccounts.size > 0) {
+        barBalanceAlert.textContent = `🚨 ${emptyAccounts.size} 家已断粮 (${emptyChannelsCount} 条)`;
         barBalanceAlert.className = 'mono danger';
-      } else if (lowCount > 0) {
-        barBalanceAlert.textContent = `⚠️ ${lowCount} 家低余额`;
+        if (quickOpenPoolBtn) quickOpenPoolBtn.title = `点击快速定位 ${emptyChannelsCount} 条已断粮通道 (涉及 ${emptyAccounts.size} 家平台)`;
+      } else if (lowAccounts.size > 0) {
+        barBalanceAlert.textContent = `⚠️ ${lowAccounts.size} 家低余额 (${lowChannelsCount} 条)`;
         barBalanceAlert.className = 'mono warning';
+        if (quickOpenPoolBtn) quickOpenPoolBtn.title = `点击快速定位 ${lowChannelsCount} 条低余额通道 (涉及 ${lowAccounts.size} 家平台)`;
       } else {
         barBalanceAlert.textContent = '🟢 储备充裕';
         barBalanceAlert.className = 'mono safe';
+        if (quickOpenPoolBtn) quickOpenPoolBtn.title = '各平台资金储备充裕，无断粮风险';
       }
+    }
+
+    const kpiPoolFooter = document.getElementById('kpiPoolFooter');
+    if (kpiPoolFooter) {
+      const platformCount = Math.max(1, countedAccountKeys.size);
+      kpiPoolFooter.textContent = hasUnlimited
+        ? `已接入 ${platformCount} 家平台账户可用资金总池 (含不限额通道，1 美金 = 1 人民币)`
+        : `已接入 ${platformCount} 家平台账户可用资金总池 (1 美金 = 1 人民币)`;
     }
   }
 
@@ -539,17 +636,75 @@ function renderOverviewMetrics() {
   }
 }
 
-// 顶部切换下拉
+// 顶部切换下拉 (自动过滤后台已停调/停用、离线、以及无余额已断粮的通道)
 function updateHeaderSwitcher() {
   const select = document.getElementById('headerChannelSelect');
   if (!select) return;
 
   select.innerHTML = '';
-  channelsData.forEach(ch => {
+
+  function isChannelStopped(ch) {
+    if (ch.schedulable === false) return true;
+    if (ch.status === 'offline') return true;
+    if (ch.configuredStatus && ch.configuredStatus !== 'active') return true;
+    return false;
+  }
+
+  function isChannelEmptyBalance(ch) {
+    if (ch.isUnlimited || ch.balanceStatus === 'unlimited') return false;
+    if (ch.balance !== null && Number(ch.balance) >= 1000000) return false;
+    if (ch.balanceStatus === 'empty') return true;
+    if (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) <= 0.001) return true;
+    return false;
+  }
+
+  // 仅保留在后台开启调度且有余额的健康通道
+  const eligibleChannels = (channelsData || []).filter(ch => {
+    return !isChannelStopped(ch) && !isChannelEmptyBalance(ch);
+  });
+
+  // 若当前正在主调的通道恰好处于停用或断粮状态，仍临时保留在下拉列表中置顶，并明确标注故障原因，便于管理员排查和切线
+  const currentActive = (channelsData || []).find(c => String(c.id) === String(activeChannelId));
+  if (currentActive && !eligibleChannels.some(c => String(c.id) === String(activeChannelId))) {
+    eligibleChannels.unshift(currentActive);
+  }
+
+  // 排序规则：当前主调置顶，其余按进货成本由低到高排列
+  eligibleChannels.sort((a, b) => {
+    const isActA = String(a.id) === String(activeChannelId);
+    const isActB = String(b.id) === String(activeChannelId);
+    if (isActA && !isActB) return -1;
+    if (!isActA && isActB) return 1;
+
+    const costA = a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier;
+    const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
+    return costA - costB;
+  });
+
+  if (eligibleChannels.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = '⚠️ 暂无可用在线调度通道 (全部已停用或断粮)';
+    select.appendChild(opt);
+    return;
+  }
+
+  eligibleChannels.forEach(ch => {
     const opt = document.createElement('option');
     opt.value = ch.id;
-    opt.textContent = `${ch.name} (进: ${formatRate(ch.multiplier)}x / 售: ${formatRate(ch.saleMultiplier || 1.0)}x)${ch.schedulable ? ' [调度中]' : ''}`;
-    if (String(ch.id) === String(activeChannelId)) opt.selected = true;
+    const isCurActive = String(ch.id) === String(activeChannelId);
+
+    let flag = '';
+    if (isChannelEmptyBalance(ch)) {
+      flag = ' 🚨[断粮无余额]';
+    } else if (isChannelStopped(ch)) {
+      flag = ' ⏸[后台已停调]';
+    }
+
+    const costVal = ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier;
+    const saleVal = ch.saleMultiplier !== undefined ? ch.saleMultiplier : 1.0;
+    opt.textContent = `${ch.name} (进: ${formatRate(costVal)}x / 售: ${formatRate(saleVal)}x)${flag}`;
+    if (isCurActive) opt.selected = true;
     select.appendChild(opt);
   });
 }
@@ -700,9 +855,19 @@ function renderFilterPills() {
     if (lossCount > 0) {
       activePills.push({ key: 'loss', label: `🚨 倒贴亏损 (${lossCount})`, badgeClass: 'pill-active-loss' });
     }
-    const emptyCount = channelsData.filter(c => c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001)).length;
+    const emptyCount = channelsData.filter(c => {
+      const isUnl = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+      return !isUnl && (c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001));
+    }).length;
     if (emptyCount > 0) {
-      activePills.push({ key: 'empty', label: `⚠️ 欠费断粮 (${emptyCount})`, badgeClass: 'pill-active-empty' });
+      activePills.push({ key: 'empty', label: `🚨 欠费断粮 (${emptyCount})`, badgeClass: 'pill-active-empty' });
+    }
+    const lowCount = channelsData.filter(c => {
+      const isUnl = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+      return !isUnl && (c.balanceStatus === 'low' || (c.balance !== null && c.balance !== undefined && Number(c.balance) > 0.001 && Number(c.balance) < 5.0));
+    }).length;
+    if (lowCount > 0) {
+      activePills.push({ key: 'low', label: `⚠️ 余额告急 (${lowCount})`, badgeClass: 'pill-active-low' });
     }
     activePills.push(
       { key: 'has_traffic', label: `🔥 活跃有调用 (${hasTrafficCount})`, badgeClass: 'pill-active-hot' },
@@ -839,7 +1004,14 @@ function renderChannels() {
         const isOnline = (ua.activeUsers15m > 0);
         const p = Number(c.priority);
         if (currentFilterPill === 'loss' && !(c.isLoss || ((c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier) > (c.saleMultiplier !== undefined ? c.saleMultiplier : 1.0)))) return false;
-        if (currentFilterPill === 'empty' && !(c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001))) return false;
+        if (currentFilterPill === 'empty') {
+          const isUnl = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+          if (isUnl || !(c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001))) return false;
+        }
+        if (currentFilterPill === 'low') {
+          const isUnl = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+          if (isUnl || !(c.balanceStatus === 'low' || (c.balance !== null && c.balance !== undefined && Number(c.balance) > 0.001 && Number(c.balance) < 5.0))) return false;
+        }
         if (currentFilterPill === 'has_traffic' && !hasTraffic) return false;
         if (currentFilterPill === 'online' && !isOnline) return false;
         if (currentFilterPill === 'schedulable' && !c.schedulable) return false;
@@ -1117,11 +1289,19 @@ function renderStripsView(enabledChannels, standbyChannels) {
     const balUnit = ch.balanceUnit || 'USD';
     const balUnitSymbol = balUnit === 'CNY' ? '¥' : '$';
     const balStatus = ch.balanceStatus || 'unknown';
-    const isZeroBalance = (balStatus === 'empty' || (balVal !== null && balVal !== undefined && Number(balVal) <= 0.001));
-    const isLowBalance = !isZeroBalance && (balStatus === 'low' || (balVal !== null && balVal !== undefined && Number(balVal) < 5.0));
+    const isUnlimited = !!(ch.isUnlimited || balStatus === 'unlimited' || (balVal !== null && balVal !== undefined && Number(balVal) >= 1000000));
+    const isZeroBalance = !isUnlimited && (balStatus === 'empty' || (balVal !== null && balVal !== undefined && Number(balVal) <= 0.001));
+    const isLowBalance = !isUnlimited && !isZeroBalance && (balStatus === 'low' || (balVal !== null && balVal !== undefined && Number(balVal) < 5.0));
 
-    if (balVal === null || balVal === undefined) {
-      balanceHtml = `<span class="strip-bal-badge bal-unknown" title="尚未抓取余额或无需余额">--</span>`;
+    if (isUnlimited) {
+      balanceHtml = `
+        <div class="strip-bal-wrap" title="平台无限额度 / 后付费通道，无充值余额限制">
+          <span class="strip-bal-badge bal-unlimited">♾️ 不限额</span>
+          <span class="strip-bal-tag tag-unlimited">无限</span>
+        </div>
+      `;
+    } else if (balVal === null || balVal === undefined) {
+      balanceHtml = `<span class="strip-bal-badge bal-unknown" title="尚未抓取余额或无需充值">--</span>`;
     } else if (isZeroBalance) {
       balanceHtml = `
         <div class="strip-bal-wrap" title="⚠️ 余额已耗尽 ($0.00)！将触发自动换通道保护">
@@ -2725,6 +2905,9 @@ async function loadUpstreamPanelsList() {
       const groupsCount = Number(p.groupCount) || (Array.isArray(p.groups) ? p.groups.length : 0);
       const statusDetail = isConnected ? ` (已抓取 ${modelsCount}模型 / ${groupsCount}分组)` : '';
       
+      const isSub2API = p.isSub2API !== false && !(p.name && p.name.toLowerCase().includes('new-api'));
+      const isOfficialDirect = !!p.isOfficialDirect;
+      
       let statusText = '';
       let statusClass = '';
       if (isDead) {
@@ -2733,6 +2916,9 @@ async function loadUpstreamPanelsList() {
       } else if (!isEnabled) {
         statusText = '已停用';
         statusClass = 'disabled';
+      } else if (isOfficialDirect) {
+        statusText = '官方直连渠道';
+        statusClass = 'connected';
       } else if (isConnected) {
         statusText = `正常连通${statusDetail}`;
         statusClass = 'connected';
@@ -2749,11 +2935,17 @@ async function loadUpstreamPanelsList() {
         ? `账号: ${escapeHtml(p.username || '未填')}`
         : (isApiKey ? 'API Key 接入' : 'Token / Cookie');
       const syncTimeStr = p.lastSyncTime ? formatTimeAgo(p.lastSyncTime) : '从未同步';
-      const balDisplay = (p.balanceUSD !== null && p.balanceUSD !== undefined)
-        ? `$${Number(p.balanceUSD || 0).toFixed(2)} USD`
-        : '<span style="color:#64748b;font-size:0.75rem;">未开放查额</span>';
+      const isUnlPanel = !!(p.isUnlimited || (p.userInfo && p.userInfo.isUnlimited) || (p.balanceUSD !== null && Number(p.balanceUSD) >= 1000000));
+      const balDisplay = isUnlPanel
+        ? '<span style="color:#059669;font-weight:700;">♾️ 无限额度</span>'
+        : ((p.balanceUSD !== null && p.balanceUSD !== undefined)
+          ? `$${Number(p.balanceUSD || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`
+          : '<span style="color:#64748b;font-size:0.75rem;">未开放查额</span>');
 
       const cardStyle = isDead ? 'border-color: #fca5a5; background: #fffaf0;' : '';
+      const sub2Badge = isSub2API
+        ? '<span style="font-size: 0.68rem; padding: 1px 5px; border-radius: 4px; background: rgba(16,185,129,0.12); color: #059669; font-weight: 600;">Sub2API</span>'
+        : '<span style="font-size: 0.68rem; padding: 1px 5px; border-radius: 4px; background: rgba(59,130,246,0.12); color: #2563eb; font-weight: 600;">New-API / One-API</span>';
 
       return `
         <div class="upstream-panel-card ${!isEnabled ? 'disabled' : ''}" style="${cardStyle}" data-panel-id="${escapeHtml(p.id)}">
@@ -2761,6 +2953,7 @@ async function loadUpstreamPanelsList() {
             <div class="upstream-card-title">
               <span>${isDead ? '⚠️' : '🌐'}</span>
               <span>${escapeHtml(p.name || '未命名平台')}</span>
+              ${sub2Badge}
               <span style="font-size: 0.72rem; font-weight: normal; color: #64748b; font-family: var(--font-mono);">${escapeHtml(p.backendUrl)}</span>
             </div>
             <div class="upstream-status-badge ${statusClass}" ${isDead ? 'style="background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;font-weight:600;"' : ''}>
@@ -2991,6 +3184,47 @@ async function deleteUpstreamPanel(panelId, panelName) {
   }
 }
 
+async function autoDiscoverUpstreams() {
+  const btn = document.getElementById('btnAutoDiscoverUpstreams');
+  const originalText = btn ? btn.innerHTML : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '⚡ 正在抓取...';
+  }
+  showToast('正在扫描中转站后台新增上游，并根据其 API 自动抓取供应商数据...', 'info');
+
+  try {
+    const res = await fetch('/api/upstream/panels/auto-discover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    const data = await res.json();
+    if (data.success) {
+      const addedNames = (data.added || []).map(p => p.name || p.backendUrl);
+      const skippedNonSub2 = (data.failed || []).filter(f => f.skippedNonSub2API);
+      if (data.addedCount > 0) {
+        showToast(`⚡ 成功自动抓取 ${data.addedCount} 家 Sub2API 供应商${skippedNonSub2.length > 0 ? `（已跳过 ${skippedNonSub2.length} 家非 Sub2API 上游）` : ''}：${addedNames.join(', ')}`, 'success');
+      } else if (skippedNonSub2.length > 0) {
+        showToast(`后台无新增 Sub2API 供应商（已自动跳过 ${skippedNonSub2.length} 家非 Sub2API 上游）`, 'info');
+      } else {
+        showToast('中转站后台所有 Sub2API 上游均已抓取就绪，无新增供应商', 'info');
+      }
+      await loadUpstreamPanelsList();
+      await loadChannels();
+      if (typeof loadUpstreamScanStatus === 'function') loadUpstreamScanStatus();
+    } else {
+      showToast('自动抓取失败: ' + (data.error || data.message || '未知错误'), 'error');
+    }
+  } catch (err) {
+    showToast('自动抓取请求异常: ' + err.message, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalText || '⚡ 自动抓取';
+    }
+  }
+}
+
 async function cleanOrphanPanels() {
   if (!confirm('确定要一键清理所有在 Sub2API 后台已无关联渠道（已欠费/已删除）的失效上游平台吗？\n\n清理后塔台将彻底停止轮询这些已下线的平台，并建立阻断墓碑。')) {
     return;
@@ -3146,6 +3380,7 @@ function initApp() {
   document.getElementById('btnUpstreamTabCreds')?.addEventListener('click', () => switchUpstreamTab('creds'));
   document.getElementById('btnUpstreamTabCookie')?.addEventListener('click', () => switchUpstreamTab('cookie'));
   document.getElementById('btnSaveUpstreamPanel')?.addEventListener('click', saveUpstreamPanel);
+  document.getElementById('btnAutoDiscoverUpstreams')?.addEventListener('click', autoDiscoverUpstreams);
   document.getElementById('btnSyncAllUpstreams')?.addEventListener('click', syncAllUpstreams);
   document.getElementById('btnCleanOrphanPanels')?.addEventListener('click', cleanOrphanPanels);
 
@@ -3439,18 +3674,27 @@ function initApp() {
     showToast('已定位至所有倒贴亏损通道', 'warning');
   });
 
-  // 2. 断粮风险下钻联动：点击后快速筛选所有已欠费断粮通道
+  // 2. 断粮风险下钻联动：点击后快速筛选所有已欠费断粮或低余额告急通道
   document.getElementById('quickOpenPoolBtn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     currentDimension = 'active';
-    currentFilterPill = 'empty';
+    const hasEmpty = channelsData.some(c => {
+      const isUnl = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+      return !isUnl && (c.balanceStatus === 'empty' || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001));
+    });
+    const hasLow = channelsData.some(c => {
+      const isUnl = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+      return !isUnl && (c.balanceStatus === 'low' || (c.balance !== null && c.balance !== undefined && Number(c.balance) > 0.001 && Number(c.balance) < 5.0));
+    });
+
+    currentFilterPill = hasEmpty ? 'empty' : (hasLow ? 'low' : 'all');
     document.querySelectorAll('.dim-tab').forEach(t => {
       t.classList.toggle('active', t.getAttribute('data-dim') === 'active');
     });
     renderFilterPills();
     renderChannels();
     document.getElementById('channelsStripsList')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    showToast('已筛选显示欠费与低余额通道', 'info');
+    showToast(hasEmpty ? '已定位至所有欠费断粮通道' : (hasLow ? '已定位至所有低余额告急通道' : '当前所有渠道余额储备充裕'), 'info');
   });
 
   // ====== 业务分组管理事件监听 ======
@@ -4031,11 +4275,12 @@ function renderNewGroupChannelSelector() {
 
   container.innerHTML = filteredList.map(c => {
     const cost = formatRate(c.costMultiplier !== undefined ? c.costMultiplier : c.multiplier);
-    const bal = c.balance !== null && c.balance !== undefined ? `$${Number(c.balance).toFixed(2)}` : '未同步';
-    const isOut = (c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001);
-    const isLow = !isOut && ((c.balanceStatus === 'low') || (c.balance !== null && c.balance !== undefined && Number(c.balance) < 5.0));
-    const balColor = isOut ? '#dc2626' : (isLow ? '#e11d48' : '#10b981');
-    const balText = isOut ? '欠费 ($0.00)' : (isLow ? `告急 (${bal})` : bal);
+    const isUnlimited = !!(c.isUnlimited || c.balanceStatus === 'unlimited' || (c.balance !== null && Number(c.balance) >= 1000000));
+    const bal = isUnlimited ? '♾️ 不限额' : (c.balance !== null && c.balance !== undefined ? `$${Number(c.balance).toFixed(2)}` : '未同步');
+    const isOut = !isUnlimited && ((c.balanceStatus === 'empty') || (c.balance !== null && c.balance !== undefined && Number(c.balance) <= 0.001));
+    const isLow = !isUnlimited && !isOut && ((c.balanceStatus === 'low') || (c.balance !== null && c.balance !== undefined && Number(c.balance) < 5.0));
+    const balColor = isUnlimited ? '#059669' : (isOut ? '#dc2626' : (isLow ? '#e11d48' : '#10b981'));
+    const balText = isUnlimited ? '♾️ 不限额' : (isOut ? '欠费 ($0.00)' : (isLow ? `告急 (${bal})` : bal));
     const balTag = isOut 
       ? `<span style="font-size: 0.62rem; color: #dc2626; background: #fee2e2; border: 1px solid #f87171; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 欠费</span>`
       : (isLow ? `<span style="font-size: 0.62rem; color: #e11d48; background: #ffe4e6; border: 1px solid #fda4af; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 告急</span>` : '');
@@ -4239,11 +4484,12 @@ function openAssignAccountsModal(groupId, groupName) {
   const accountRowsHtml = list.map(ch => {
     const isChecked = currentAccIds.has(String(ch.id));
     const cost = formatRate(ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier);
-    const bal = ch.balance !== null && ch.balance !== undefined ? `$${Number(ch.balance).toFixed(2)}` : '未同步';
-    const isOut = (ch.balanceStatus === 'empty') || (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) <= 0.001);
-    const isLow = !isOut && ((ch.balanceStatus === 'low') || (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) < 5.0));
-    const balColor = isOut ? '#dc2626' : (isLow ? '#e11d48' : '#10b981');
-    const balText = isOut ? '欠费 ($0.00)' : (isLow ? `告急 (${bal})` : bal);
+    const isUnlimited = !!(ch.isUnlimited || ch.balanceStatus === 'unlimited' || (ch.balance !== null && Number(ch.balance) >= 1000000));
+    const bal = isUnlimited ? '♾️ 不限额' : (ch.balance !== null && ch.balance !== undefined ? `$${Number(ch.balance).toFixed(2)}` : '未同步');
+    const isOut = !isUnlimited && ((ch.balanceStatus === 'empty') || (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) <= 0.001));
+    const isLow = !isUnlimited && !isOut && ((ch.balanceStatus === 'low') || (ch.balance !== null && ch.balance !== undefined && Number(ch.balance) < 5.0));
+    const balColor = isUnlimited ? '#059669' : (isOut ? '#dc2626' : (isLow ? '#e11d48' : '#10b981'));
+    const balText = isUnlimited ? '♾️ 不限额' : (isOut ? '欠费 ($0.00)' : (isLow ? `告急 (${bal})` : bal));
     const balTag = isOut
       ? `<span style="font-size: 0.62rem; color: #dc2626; background: #fee2e2; border: 1px solid #f87171; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 欠费</span>`
       : (isLow ? `<span style="font-size: 0.62rem; color: #e11d48; background: #ffe4e6; border: 1px solid #fda4af; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 告急</span>` : '');

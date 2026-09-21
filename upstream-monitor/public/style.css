@@ -2012,8 +2012,10 @@ body {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
-  backdrop-filter: blur(2px);
+  background: rgba(15, 23, 42, 0.42);
+  /* 严格禁用背景模糊：保持宿主界面清晰可读，绝不毛玻璃模糊背景 */
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
   display: none;
   align-items: center;
   justify-content: center;
@@ -2518,6 +2520,13 @@ body {
   border: 1px solid #a7f3d0;
 }
 
+.strip-bal-badge.bal-unlimited {
+  background: #ecfdf5;
+  color: #059669;
+  border: 1px solid #10b981;
+  font-weight: 700;
+}
+
 .strip-bal-badge.bal-unknown {
   background: #f1f5f9;
   color: #94a3b8;
@@ -2540,6 +2549,11 @@ body {
 
 .strip-bal-tag.tag-low {
   background: #e11d48;
+  color: #ffffff;
+}
+
+.strip-bal-tag.tag-unlimited {
+  background: #059669;
   color: #ffffff;
 }
 
@@ -4083,6 +4097,30 @@ body {
   background: #ef4444 !important;
   color: #ffffff !important;
   border-color: #dc2626 !important;
+}
+
+.filter-pill.pill-active-empty {
+  background: #fef2f2 !important;
+  color: #dc2626 !important;
+  border-color: #fca5a5 !important;
+  font-weight: 700;
+}
+.filter-pill.pill-active-empty.active {
+  background: #dc2626 !important;
+  color: #ffffff !important;
+  border-color: #b91c1c !important;
+}
+
+.filter-pill.pill-active-low {
+  background: #fffbeb !important;
+  color: #d97706 !important;
+  border-color: #fde68a !important;
+  font-weight: 700;
+}
+.filter-pill.pill-active-low.active {
+  background: #d97706 !important;
+  color: #ffffff !important;
+  border-color: #b45309 !important;
 }
 
 @keyframes pulse-danger {

@@ -326,6 +326,13 @@ class UpstreamScanner {
           console.warn('[UpstreamScanner] 扫描前同步后台数据异常:', syncErr.message);
         }
       }
+      if (typeof this.context.autoDiscoverAndSyncUpstreamPanelsFromBackend === 'function') {
+        try {
+          await this.context.autoDiscoverAndSyncUpstreamPanelsFromBackend({ silent: true });
+        } catch (discErr) {
+          console.warn('[UpstreamScanner] 扫描前自动发现上游异常:', discErr.message);
+        }
+      }
       const state = this.context.getState();
       const channels = state.channels || [];
       const upstreamCache = this.context.getUpstreamModelsCache() || {};
@@ -625,6 +632,10 @@ class UpstreamScanner {
 
     for (const panel of panels) {
       if (panel.enabled === false || !panel.backendUrl) continue;
+      // 官方直连 API 跳过抓取模型
+      if (panel.isOfficialDirect === true) {
+        continue;
+      }
       const panelUrl = panel.backendUrl.replace(/\/+$/, '');
       const panelName = panel.name || 'New-API 上游';
       const headers = { 'User-Agent': 'Mozilla/5.0 RelayTowerScanner' };
@@ -771,6 +782,9 @@ class UpstreamScanner {
     const nextMap = new Map(previousMap), newGroups = [], changedGroups = [], errors = [];
     for (const panel of panels) {
       if (panel.enabled === false || !panel.backendUrl) continue;
+      if (panel.isOfficialDirect === true) {
+        continue;
+      }
       const baseUrl = panel.backendUrl.replace(/\/+$/, ''), panelId = String(panel.id || baseUrl);
       const headers = { 'User-Agent': 'Mozilla/5.0 RelayTowerScanner' };
       if (panel.userToken) headers.Authorization = panel.userToken.startsWith('Bearer ') ? panel.userToken : `Bearer ${panel.userToken}`;
