@@ -1177,7 +1177,15 @@ function renderStripsView(enabledChannels, standbyChannels) {
   }
 
   function renderSingleStrip(ch) {
-    const role = getChannelRole(ch);
+    // 上下文感知：若当前正按某个具体业务分组筛选，卡片动态对应到该分组的角色、售价、毛利与主标签！
+    const currentSelectedGroup = (currentDimension === 'group' && currentFilterPill !== 'all') ? currentFilterPill : null;
+    const contextualGroupDetail = currentSelectedGroup && ch.groupsDetail 
+      ? ch.groupsDetail.find(g => g.name === currentSelectedGroup || String(g.id) === String(currentSelectedGroup))
+      : null;
+
+    const effectiveGroupName = contextualGroupDetail ? contextualGroupDetail.name : (ch.primaryGroupName || '默认');
+    const effectiveGroupId = contextualGroupDetail ? contextualGroupDetail.id : (ch.primaryGroupId || '');
+    const role = getChannelRole(ch, effectiveGroupId);
     const isActive = role === 'main';
     const isSchedulable = Boolean(ch.schedulable);
     const vTheme = getVendorTheme(ch.vendor);
@@ -1191,15 +1199,6 @@ function renderStripsView(enabledChannels, standbyChannels) {
     } else {
       trendHtml = `<span class="strip-rate-trend" style="color: var(--text-muted)">— 稳定</span>`;
     }
-
-    // 上下文感知：若当前正按某个具体业务分组筛选，卡片动态对应到该分组的售价、毛利与主标签！
-    const currentSelectedGroup = (currentDimension === 'group' && currentFilterPill !== 'all') ? currentFilterPill : null;
-    const contextualGroupDetail = currentSelectedGroup && ch.groupsDetail 
-      ? ch.groupsDetail.find(g => g.name === currentSelectedGroup)
-      : null;
-
-    const effectiveGroupName = contextualGroupDetail ? contextualGroupDetail.name : (ch.primaryGroupName || '默认');
-    const effectiveGroupId = contextualGroupDetail ? contextualGroupDetail.id : (ch.primaryGroupId || '');
     const effectiveSaleMultiplier = contextualGroupDetail 
       ? contextualGroupDetail.sale_rate 
       : (ch.saleMultiplier !== undefined ? ch.saleMultiplier : 1.0);
@@ -1458,16 +1457,16 @@ function renderStripsView(enabledChannels, standbyChannels) {
         <div class="strip-col-actions">
           <div class="role-segmented-control" data-channel-id="${ch.id}" title="为该通道指定调度角色：主调(1) / 副调(10) / 备选(20) / 备用(100)。SUB2 数字越小越优先">
             <button class="role-seg-btn role-main ${role === 'main' ? 'active' : ''}" 
-                    onclick="setChannelRole('${ch.id}', 'main')" 
+                    onclick="setChannelRole('${ch.id}', 'main', '${effectiveGroupId || ''}')" 
                     title="定性为主调 (优先级 1 · 使用中账号)">主调</button>
             <button class="role-seg-btn role-sub ${role === 'sub' ? 'active' : ''}" 
-                    onclick="setChannelRole('${ch.id}', 'sub')" 
+                    onclick="setChannelRole('${ch.id}', 'sub', '${effectiveGroupId || ''}')" 
                     title="定性为副调 (优先级 10 · 第一替补)">副调</button>
             <button class="role-seg-btn role-alt ${role === 'alt' ? 'active' : ''}" 
-                    onclick="setChannelRole('${ch.id}', 'alt')" 
+                    onclick="setChannelRole('${ch.id}', 'alt', '${effectiveGroupId || ''}')" 
                     title="定性为备选 (优先级 20 · 第二替补)">备选</button>
             <button class="role-seg-btn role-standby ${role === 'standby' ? 'active' : ''}" 
-                    onclick="setChannelRole('${ch.id}', 'standby')" 
+                    onclick="setChannelRole('${ch.id}', 'standby', '${effectiveGroupId || ''}')" 
                     title="定性为备用 (优先级 100 · 后备池)">备用</button>
           </div>
           <button class="btn-strip-icon" title="测速并拉取最新状态" onclick="probeSingleChannel('${ch.id}')">
@@ -1492,11 +1491,13 @@ function renderStripsView(enabledChannels, standbyChannels) {
 
   // 🌟【业务分组专属四层架构视图】：在选定具体业务分组时，清晰按主调、副调、备选、备用四层分块排列！
   if (currentDimension === 'group' && currentFilterPill !== 'all') {
+    const activeGroupObj = (allGroups || []).find(g => g.name === currentFilterPill || String(g.id) === String(currentFilterPill));
+    const activeGroupId = activeGroupObj ? activeGroupObj.id : currentFilterPill;
     const allGroupChannels = [...enabledChannels, ...standbyChannels];
-    const mains = allGroupChannels.filter(c => getChannelRole(c) === 'main');
-    const subs = allGroupChannels.filter(c => getChannelRole(c) === 'sub');
-    const alts = allGroupChannels.filter(c => getChannelRole(c) === 'alt');
-    const standbys = allGroupChannels.filter(c => getChannelRole(c) === 'standby');
+    const mains = allGroupChannels.filter(c => getChannelRole(c, activeGroupId) === 'main');
+    const subs = allGroupChannels.filter(c => getChannelRole(c, activeGroupId) === 'sub');
+    const alts = allGroupChannels.filter(c => getChannelRole(c, activeGroupId) === 'alt');
+    const standbys = allGroupChannels.filter(c => getChannelRole(c, activeGroupId) === 'standby');
 
     const sortByCost = (a, b) => ((a.costMultiplier !== undefined ? a.costMultiplier : a.multiplier) - (b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier));
     mains.sort(sortByCost);
@@ -2078,8 +2079,29 @@ function initCalculatorToggle() {
 }
 
 // 获取渠道当前的调度定性 (main: 🌟 主调 | sub: 🔵 副调 | alt: 🟡 备选 | standby: ⚪ 备用)
-function getChannelRole(ch) {
+function getChannelRole(ch, groupContext) {
   if (!ch) return 'standby';
+
+  // 1. 如果指定或处于具体业务分组视图下，按该业务分组的独立优先级判定（杜绝全局 activeChannelId 污染）
+  let targetGroup = groupContext;
+  if (!targetGroup && typeof currentDimension !== 'undefined' && currentDimension === 'group' && typeof currentFilterPill !== 'undefined' && currentFilterPill !== 'all') {
+    targetGroup = currentFilterPill;
+  }
+
+  if (targetGroup && ch.groupsDetail && Array.isArray(ch.groupsDetail)) {
+    const gd = ch.groupsDetail.find(g => 
+      String(g.id) === String(targetGroup) || (g.name && g.name === String(targetGroup))
+    );
+    if (gd && gd.priority !== undefined && gd.priority !== null && Number.isFinite(Number(gd.priority))) {
+      const gp = Number(gd.priority);
+      if (gp <= 1) return 'main';
+      if (gp <= 10) return 'sub';
+      if (gp <= 20) return 'alt';
+      return 'standby';
+    }
+  }
+
+  // 2. 无分组上下文时的全局兜底定性
   const p = Number(ch.priority);
   if (ch.schedulable && (ch.isActive || String(ch.id) === String(activeChannelId))) return 'main';
   if (Number.isFinite(p) && p <= 1) return 'main';
@@ -2089,10 +2111,18 @@ function getChannelRole(ch) {
 }
 
 // 调整渠道调度定性 (主调 main / 副调 sub / 备选 alt / 备用 standby)
-async function setChannelRole(channelId, role) {
+async function setChannelRole(channelId, role, groupId = null) {
   const target = channelsData.find(c => String(c.id) === String(channelId));
   if (!target) return;
-  const currentRole = getChannelRole(target);
+
+  // 自动补齐业务分组上下文
+  let targetGroupId = groupId;
+  if (!targetGroupId && typeof currentDimension !== 'undefined' && currentDimension === 'group' && typeof currentFilterPill !== 'undefined' && currentFilterPill !== 'all') {
+    const gObj = (allGroups || []).find(g => g.name === currentFilterPill || String(g.id) === String(currentFilterPill));
+    if (gObj) targetGroupId = String(gObj.id);
+  }
+
+  const currentRole = getChannelRole(target, targetGroupId);
   if (currentRole === role) return;
 
   const roleMeta = {
@@ -2105,37 +2135,62 @@ async function setChannelRole(channelId, role) {
   const targetMeta = roleMeta[role] || { label: role, priority: 100 };
 
   try {
-    showToast(`正在将 [${target.name}] 定性为【${targetMeta.label}】...`, 'warning');
+    const groupNameStr = targetGroupId ? `在业务分组中` : '';
+    showToast(`正在将 [${target.name}] ${groupNameStr}定性为【${targetMeta.label}】...`, 'warning');
     const res = await fetch(`/api/channels/${channelId}/set-role`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role })
+      body: JSON.stringify({ role, groupId: targetGroupId })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '定性设置失败');
 
-    // 本地即时响应状态与优先级 (单主独占模式下除主调外皆冷备停调)
-    if (role === 'main') {
-      activeChannelId = String(channelId);
-      target.isActive = true;
-      target.priority = 1;
-      target.schedulable = true;
-    } else if (role === 'sub') {
-      target.isActive = false;
-      target.priority = 10;
-      target.schedulable = false;
-    } else if (role === 'alt') {
-      target.isActive = false;
-      target.priority = 20;
-      target.schedulable = false;
-    } else if (role === 'standby' || role === 'fallback') {
-      target.isActive = false;
-      target.priority = 100;
-      target.schedulable = false;
-    }
+    // 本地即时响应状态与优先级 (支持业务组独立隔离)
+    if (targetGroupId) {
+      if (!Array.isArray(target.groupsDetail)) target.groupsDetail = [];
+      let gd = target.groupsDetail.find(g => String(g.id) === String(targetGroupId));
+      if (gd) {
+        gd.priority = targetMeta.priority;
+      } else {
+        target.groupsDetail.push({ id: Number(targetGroupId), priority: targetMeta.priority });
+      }
 
-    if (data.activeChannelId) {
-      activeChannelId = String(data.activeChannelId);
+      if (role === 'main') {
+        target.schedulable = true;
+        // 同组其他原主调降为副调
+        channelsData.forEach(c => {
+          if (String(c.id) !== String(channelId) && Array.isArray(c.groupsDetail)) {
+            const peerGd = c.groupsDetail.find(g => String(g.id) === String(targetGroupId));
+            if (peerGd && peerGd.priority === 1) {
+              peerGd.priority = 10;
+            }
+          }
+        });
+      }
+    } else {
+      // 全局定性回退
+      if (role === 'main') {
+        activeChannelId = String(channelId);
+        target.isActive = true;
+        target.priority = 1;
+        target.schedulable = true;
+      } else if (role === 'sub') {
+        target.isActive = false;
+        target.priority = 10;
+        target.schedulable = false;
+      } else if (role === 'alt') {
+        target.isActive = false;
+        target.priority = 20;
+        target.schedulable = false;
+      } else if (role === 'standby' || role === 'fallback') {
+        target.isActive = false;
+        target.priority = 100;
+        target.schedulable = false;
+      }
+
+      if (data.activeChannelId) {
+        activeChannelId = String(data.activeChannelId);
+      }
     }
 
     await loadChannels();
@@ -4622,10 +4677,10 @@ function renderGroupControlBanner(groupName) {
     return false;
   });
 
-  const mainCh = currentAssigned.find(c => getChannelRole(c) === 'main');
-  const subCh = currentAssigned.find(c => getChannelRole(c) === 'sub');
-  const altCh = currentAssigned.find(c => getChannelRole(c) === 'alt');
-  const standbyChs = currentAssigned.filter(c => getChannelRole(c) === 'standby');
+  const mainCh = currentAssigned.find(c => getChannelRole(c, group.id) === 'main');
+  const subCh = currentAssigned.find(c => getChannelRole(c, group.id) === 'sub');
+  const altCh = currentAssigned.find(c => getChannelRole(c, group.id) === 'alt');
+  const standbyChs = currentAssigned.filter(c => getChannelRole(c, group.id) === 'standby');
 
   const unassignedEligible = eligible.filter(c => !currentAssigned.some(a => String(a.id) === String(c.id)));
 
@@ -4803,9 +4858,9 @@ function renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned)
   const prevSubId = document.getElementById('selectOrchestrateSub')?.value;
   const prevAltId = document.getElementById('selectOrchestrateAlt')?.value;
 
-  const currentMain = currentAssigned.find(c => getChannelRole(c) === 'main');
-  const currentSub = currentAssigned.find(c => getChannelRole(c) === 'sub');
-  const currentAlt = currentAssigned.find(c => getChannelRole(c) === 'alt');
+  const currentMain = currentAssigned.find(c => getChannelRole(c, group.id) === 'main');
+  const currentSub = currentAssigned.find(c => getChannelRole(c, group.id) === 'sub');
+  const currentAlt = currentAssigned.find(c => getChannelRole(c, group.id) === 'alt');
 
   const mainId = prevMainId !== undefined && prevMainId !== ''
     ? prevMainId
@@ -5187,9 +5242,9 @@ async function quickIncludeAllEligibleChannels(groupId) {
     return false;
   });
 
-  const mainCh = currentAssigned.find(c => getChannelRole(c) === 'main');
-  const subCh = currentAssigned.find(c => getChannelRole(c) === 'sub');
-  const altCh = currentAssigned.find(c => getChannelRole(c) === 'alt');
+  const mainCh = currentAssigned.find(c => getChannelRole(c, group.id) === 'main');
+  const subCh = currentAssigned.find(c => getChannelRole(c, group.id) === 'sub');
+  const altCh = currentAssigned.find(c => getChannelRole(c, group.id) === 'alt');
 
   const mainId = mainCh ? String(mainCh.id) : (eligible[0] ? String(eligible[0].id) : null);
   const subId = subCh ? String(subCh.id) : (eligible[1] && String(eligible[1].id) !== mainId ? String(eligible[1].id) : null);

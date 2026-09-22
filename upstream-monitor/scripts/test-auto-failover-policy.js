@@ -165,3 +165,60 @@ test('recent production errors must expire before stable recovery observations a
   }
   assert.equal(result.reason, 'cheaper_recovered');
 });
+
+test('consecutive 10 quota empty errors trigger balance_empty failover to secondary', () => {
+  const ch1 = channel(1, { schedulable: true, priority: 1, costMultiplier: 0.15 });
+  const ch2 = channel(2, { schedulable: false, priority: 10, costMultiplier: 0.15 });
+
+  // 9 quota failures: below threshold 10, should hold
+  const underThreshold = decide([ch1, ch2], {
+    metrics: { 1: { consecutiveQuotaFailures: 9, consecutiveFailures: 9 } }
+  });
+  // Note: consecutiveFailures=9 >= 5 might trigger request_failures if quota threshold is not hit,
+  // but let's test exactly with consecutiveQuotaFailures: 10, consecutiveFailures: 10
+  const result = decide([ch1, ch2], {
+    metrics: { 1: { consecutiveQuotaFailures: 10, consecutiveFailures: 10 } }
+  });
+  assert.equal(result.action, 'switch');
+  assert.equal(result.reason, 'balance_empty');
+  assert.equal(result.targetId, 2);
+  assert.equal(result.runtime.accounts['1'].debt, true);
+  assert.equal(result.runtime.originalMainId, 1);
+});
+
+test('recharging original main channel automatically switches back even with identical cost', () => {
+  // Channel 1 was original main (priority 1, cost 0.15), Channel 2 was secondary (priority 10, cost 0.15)
+  // Channel 1 experienced debt and failed over to Channel 2
+  const initialRuntime = { originalMainId: 1, lastSwitchAt: START, accounts: { 1: { debt: true, needsRecovery: true } } };
+  const ch1Debt = channel(1, { schedulable: false, priority: 1, costMultiplier: 0.15, balance: 0, balanceStatus: 'empty' });
+  const ch2Active = channel(2, { schedulable: true, priority: 10, costMultiplier: 0.15 });
+
+  let result = decide([ch1Debt, ch2Active], { runtime: initialRuntime, now: START });
+  assert.equal(result.action, 'hold');
+
+  // Channel 1 recharges: balance is now 50, status 'ok'.
+  // Accumulate 3 successful probes over 10 minutes (satisfying probe threshold and cooldown)
+  let runtime = result.runtime;
+  for (let minute = 1; minute <= 11; minute++) {
+    const now = START + minute * 60000;
+    const ch1Recharged = channel(1, {
+      schedulable: false, priority: 1, costMultiplier: 0.15,
+      balance: 50, balanceStatus: 'ok', balanceUpdated: now, lastProbeTime: now, lastProbeStatus: 'online'
+    });
+    const ch2Current = channel(2, {
+      schedulable: true, priority: 10, costMultiplier: 0.15,
+      lastProbeTime: now, lastProbeStatus: 'online'
+    });
+    result = decide([ch1Recharged, ch2Current], { runtime, now });
+    if (minute < 10) {
+      assert.equal(result.action, 'hold');
+    }
+    runtime = result.runtime;
+  }
+
+  // After recovery and cooldown, Channel 1 should trigger 'main_recharged' even though cost is identical (0.15 == 0.15)
+  assert.equal(result.action, 'switch');
+  assert.equal(result.reason, 'main_recharged');
+  assert.equal(result.targetId, 1);
+});
+

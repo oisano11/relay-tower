@@ -55,11 +55,19 @@ class GatewayMetrics {
     const events = (this.byChannel.get(String(id)) || []).filter(e => Date.now() - e.at < 5 * 60 * 1000);
     let consecutiveFailures = 0;
     for (let i = events.length - 1; i >= 0 && events[i].providerFailure; i--) consecutiveFailures++;
+    let consecutiveQuotaFailures = 0;
+    for (let i = events.length - 1; i >= 0 && events[i].quotaExhausted; i--) consecutiveQuotaFailures++;
     const timed = events.filter(e => Number.isFinite(e.ttftMs));
     return { totalCalls: events.length, totalErr: events.filter(e => e.providerFailure).length,
-      consecutiveFailures, ttftTimeout: events.at(-1)?.ttftTimeout || false,
+      consecutiveFailures, consecutiveQuotaFailures, ttftTimeout: events.at(-1)?.ttftTimeout || false,
       avgTtftMs: timed.length ? timed.reduce((sum, e) => sum + e.ttftMs, 0) / timed.length : null };
   }
+}
+
+function isQuotaExhaustedError(body, statusCode) {
+  if (statusCode === 402) return true;
+  const str = typeof body === 'string' ? body : String(body || '');
+  return /(?:insufficient_quota|quota_exhausted|exceeded.*quota|balance|欠费|余额不足|额度不足|point_exhausted|out_of_credit)/i.test(str);
 }
 
 function inspectFrame(frame) {
@@ -123,10 +131,25 @@ function forward(req, res, channel, { timeoutMs = 30000, metrics, onEnd = () => 
       return;
     }
     let providerFailure = response.statusCode === 429 || response.statusCode >= 500;
-    if (response.statusCode >= 400) boundErrorResponse();
+    let quotaExhausted = response.statusCode === 402;
+    let errorBodySnippet = '';
+    if (response.statusCode >= 400) {
+      boundErrorResponse();
+      if (quotaExhausted) providerFailure = true;
+    }
     res.writeHead(response.statusCode, response.headers);
     response.on('data', chunk => {
-      if (ended || response.statusCode >= 400) return;
+      if (ended) return;
+      if (response.statusCode >= 400) {
+        if (errorBodySnippet.length < 4096) {
+          errorBodySnippet += decoder.write(chunk);
+          if (isQuotaExhaustedError(errorBodySnippet, response.statusCode)) {
+            quotaExhausted = true;
+            providerFailure = true;
+          }
+        }
+        return;
+      }
       if (streaming) {
         pending += decoder.write(chunk);
         const frames = pending.split(/\r?\n\r?\n/);
@@ -136,13 +159,19 @@ function forward(req, res, channel, { timeoutMs = 30000, metrics, onEnd = () => 
           providerFailure = true;
           boundErrorResponse();
         }
+        for (const frame of frames) {
+          if (isQuotaExhaustedError(frame, response.statusCode)) {
+            quotaExhausted = true;
+            providerFailure = true;
+          }
+        }
         if (!observations.some(event => event.token)) return;
       }
       if (ttftMs !== null) return;
       ttftMs = Date.now() - started;
       if (!errorPending) clearTimeout(timer);
     });
-    response.on('end', () => finish({ providerFailure }));
+    response.on('end', () => finish({ providerFailure, quotaExhausted }));
     response.on('aborted', () => fail(new Error('Upstream response aborted')));
     response.on('error', fail);
     response.pipe(res);
@@ -166,4 +195,4 @@ function forward(req, res, channel, { timeoutMs = 30000, metrics, onEnd = () => 
   return upstream;
 }
 
-module.exports = { upstreamUrl, isAvailable, selectChannel, requestHeaders, GatewayMetrics, forward, defaultHttpAgent, defaultHttpsAgent };
+module.exports = { upstreamUrl, isAvailable, selectChannel, requestHeaders, GatewayMetrics, forward, defaultHttpAgent, defaultHttpsAgent, isQuotaExhaustedError };

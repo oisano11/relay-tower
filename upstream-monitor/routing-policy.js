@@ -15,4 +15,17 @@ function groupCostIsSafe(channel, group) {
   return Number.isFinite(cost) && Number.isFinite(sale) && cost >= 0 && sale > 0 && cost <= sale;
 }
 
-module.exports = { groupIds, assertExclusiveScope, groupCostIsSafe };
+function channelGroupPriority(channel, groupIdOrName) {
+  if (!channel) return Number.MAX_SAFE_INTEGER;
+  if (groupIdOrName != null && channel.groupsDetail && Array.isArray(channel.groupsDetail)) {
+    const gd = channel.groupsDetail.find(g => 
+      String(g.id) === String(groupIdOrName) || (g.name && g.name === String(groupIdOrName))
+    );
+    if (gd && gd.priority != null && Number.isFinite(Number(gd.priority))) {
+      return Number(gd.priority);
+    }
+  }
+  return Number.isFinite(Number(channel.priority)) ? Number(channel.priority) : Number.MAX_SAFE_INTEGER;
+}
+
+module.exports = { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority };
