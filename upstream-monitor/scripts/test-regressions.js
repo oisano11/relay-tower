@@ -1919,3 +1919,206 @@ test('user configured rate_multiplier takes precedence over stale probe and New-
   assert.equal(syncRes.balanceUSD, 50);
   assert.deepEqual(syncRes.models, ['gpt-5.4', 'claude-sonnet-5']);
 });
+
+test('active accounts in Sub2API database are authoritative and never pruned by tombstone, and un-tombstone automatically', () => {
+  const untombstoned = [];
+  const state = {
+    channels: [
+      { id: '245', name: '灵犀 ds 0.2', baseUrl: 'https://api.xcodexs.com/v1', multiplier: 0.2 },
+      { id: '226', name: '智云 pro 0.16', baseUrl: 'https://modnex.cc', multiplier: 0.25 }
+    ]
+  };
+  const accountsFromPostgres = [
+    {
+      id: '245',
+      name: '灵犀 ds 0.2',
+      platform: 'openai',
+      provider_type: 'apikey',
+      status: 'active',
+      priority: 1,
+      schedulable: true,
+      multiplier: 0.2,
+      configured_multiplier: 0.2,
+      base_url: 'https://api.xcodexs.com/v1',
+      api_key: 'sk-xcodexs-key',
+      groups_detail: [{ id: 2, name: 'GPT 通用', sale_rate: 1.0 }],
+      groups: ['GPT 通用']
+    },
+    {
+      id: '226',
+      name: '智云 pro 0.16',
+      platform: 'openai',
+      provider_type: 'apikey',
+      status: 'active',
+      priority: 10,
+      schedulable: true,
+      multiplier: 0.25,
+      configured_multiplier: 0.25,
+      base_url: 'https://modnex.cc',
+      api_key: 'sk-modnex-key',
+      groups_detail: [{ id: 2, name: 'GPT 通用', sale_rate: 1.0 }],
+      groups: ['GPT 通用']
+    }
+  ];
+
+  const context = vm.createContext({
+    state,
+    IS_CONTROL_PLANE_WORKER: false,
+    execPsql: () => JSON.stringify(accountsFromPostgres),
+    fetchAllSub2APIGroups: () => [{ id: 2, name: 'GPT 通用', sale_rate: 1.0 }],
+    groupCostIsSafe: () => true,
+    selectPrimaryGroup: (items) => items[0] || { id: 2, name: 'GPT 通用', sale_rate: 1.0 },
+    detectVendor: () => '国模专区',
+    detectProvider: () => '通用上游',
+    getDefaultBackupLines: () => [],
+    getVendorCandidateModels: () => [],
+    upstreamPanels: [],
+    upstreamModelsCache: {},
+    UPSTREAM_MODELS_CACHE_FILE: '/cache.json',
+    handleRatioChange: () => {},
+    writeJSON: () => {},
+    UPSTREAM_PANELS_FILE: '/panels.json',
+    syncUpstreamPanelConfigCompat: () => {},
+    triggerBackgroundModelDiscovery: () => {},
+    CHANNELS_FILE: '',
+    getSub2APISignature: () => 'sig',
+    lastSub2APISignature: 'sig',
+    safetyReconciliationPending: false,
+    requestBackgroundSub2APISafetyPlan: () => {},
+    executeRemoteSQL: () => true,
+    invalidateSub2APIScheduler: () => {},
+    buildSub2APISyncSafetyPlan: () => ({ quarantineIds: [], calibrations: [] }),
+    hasSub2APISyncSafetyWork: () => false,
+    broadcastSSE: () => {},
+    upstreamScanner: {
+      isTombstoned: (url, name) => name === '灵犀 ds 0.2',
+      removeTombstone: (url, name) => untombstoned.push({ url, name })
+    },
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('function syncRealSub2APIAccounts('), source.indexOf('// 远端执行 SQL')), context);
+
+  context.syncRealSub2APIAccounts();
+
+  // 1. 灵犀 ds 0.2 绝不因墓碑名单而被误杀，两个渠道都在
+  assert.equal(state.channels.length, 2);
+  assert.ok(state.channels.some(c => c.id === '245' && c.name === '灵犀 ds 0.2'));
+  assert.ok(state.channels.some(c => c.id === '226' && c.name === '智云 pro 0.16'));
+
+  // 2. 真实存活账号自动解除了墓碑阻断
+  assert.equal(untombstoned.length, 1);
+  assert.equal(untombstoned[0].name, '灵犀 ds 0.2');
+});
+
+test('setting channel as main in Group A isolates priority and preserves backup status in Group B', () => {
+  const chX = {
+    id: '101',
+    name: '多组渠道-X',
+    priority: 20,
+    schedulable: false,
+    costMultiplier: 0.1,
+    multiplier: 0.1,
+    groupsDetail: [
+      { id: 1, name: '分组-A', sale_rate: 1.0, priority: 20 },
+      { id: 2, name: '分组-B', sale_rate: 1.0, priority: 20 }
+    ]
+  };
+  const chY = {
+    id: '102',
+    name: 'B组原主调-Y',
+    priority: 1,
+    schedulable: true,
+    costMultiplier: 0.2,
+    multiplier: 0.2,
+    groupsDetail: [
+      { id: 2, name: '分组-B', sale_rate: 1.0, priority: 1 }
+    ]
+  };
+  const state = {
+    activeChannelId: '102',
+    allGroups: [
+      { id: 1, name: '分组-A', sale_rate: 1.0 },
+      { id: 2, name: '分组-B', sale_rate: 1.0 }
+    ],
+    channels: [chX, chY]
+  };
+
+  const executedSql = [];
+  const context = vm.createContext({
+    state,
+    autoSwitchConfig: { singleActiveExclusive: true },
+    isExemptGroup: () => false,
+    assertChannelPricingIsSafe: () => true,
+    executeRemoteSQL: (sql) => { executedSql.push(sql); return true; },
+    invalidateSub2APIScheduler: () => {},
+    refreshSub2APISignatureAfterDirectMutation: () => {},
+    writeJSON: () => {},
+    broadcastSSE: () => {},
+    alerts: [],
+    ALERTS_FILE: '/alerts.json',
+    AUTO_SWITCH_CONFIG_FILE: '/auto_switch_config.json',
+    CHANNELS_FILE: '/channels.json',
+    console: { log() {}, warn() {}, error() {} }
+  });
+
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const roleCode = source.slice(source.indexOf('function setChannelRole('), source.indexOf('\n// 通用激活/切换主用渠道逻辑'));
+  vm.runInContext(roleCode, context);
+
+  // 1. 在分组 A (id: 1) 中将 通道 X 设为主调
+  const resA = context.setChannelRole('101', 'main', '单元测试', 1);
+  assert.equal(resA.success, true);
+  assert.equal(resA.role, 'main');
+  assert.equal(resA.priority, 1);
+
+  // 验证 SQL：只更新 account_groups 中 group_id = 1 的记录
+  assert.ok(executedSql[0].includes('account_groups (account_id, group_id, priority) VALUES (101, 1, 1)'));
+  assert.ok(executedSql[0].includes('WHERE group_id = 1'));
+  assert.ok(!executedSql[0].includes('group_id = 2'));
+
+  // 验证内存状态隔离：
+  const gdA = chX.groupsDetail.find(g => g.id === 1);
+  const gdB = chX.groupsDetail.find(g => g.id === 2);
+  assert.equal(gdA.priority, 1, '通道 X 在分组 A 中必须变为主调 (priority=1)');
+  assert.equal(gdB.priority, 20, '通道 X 在分组 B 中必须严格保留备选 (priority=20)，绝不能变为主调！');
+  assert.equal(chX.schedulable, true);
+
+  // 验证分组 B 里的原主调通道 Y 没有被误伤
+  const chY_gdB = chY.groupsDetail.find(g => g.id === 2);
+  assert.equal(chY_gdB.priority, 1, '分组 B 的主调通道 Y 必须依然是优先级 1');
+
+  // 2. 模拟前端 getChannelRole 判定隔离
+  const appSource = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const frontContext = vm.createContext({
+    activeChannelId: '101', // 即使全局 activeChannelId 是 101
+    currentDimension: 'group',
+    currentFilterPill: '分组-B'
+  });
+  vm.runInContext(appSource.slice(appSource.indexOf('function getChannelRole('), appSource.indexOf('// 调整渠道调度定性')), frontContext);
+
+  // 在分组 A 视角下：通道 X 是主调
+  assert.equal(frontContext.getChannelRole(chX, 1), 'main', '分组 A 视角下通道 X 为 main');
+  // 在分组 B 视角下：通道 X 是备选，绝不是主调！
+  assert.equal(frontContext.getChannelRole(chX, 2), 'alt', '分组 B 视角下通道 X 必须为 alt (备选)');
+  // 分组 B 原主调通道 Y 依然是主调
+  assert.equal(frontContext.getChannelRole(chY, 2), 'main', '分组 B 视角下通道 Y 依然为 main');
+
+  // 3. 反向操作验证：在分组 B 中将 通道 X 调整为副调 (sub, priority=10)
+  const resB = context.setChannelRole('101', 'sub', '单元测试', 2);
+  assert.equal(resB.success, true);
+  assert.equal(resB.role, 'sub');
+  assert.equal(resB.priority, 10);
+
+  // 验证 SQL：只更新 account_groups 中 group_id = 2 的记录，绝不破坏 group_id = 1
+  assert.ok(executedSql[executedSql.length - 1].includes('account_groups (account_id, group_id, priority) VALUES (101, 2, 10)'));
+
+  // 验证内存状态：
+  assert.equal(chX.groupsDetail.find(g => g.id === 1).priority, 1, '通道 X 在分组 A 的主调状态丝毫不受分组 B 调整影响！');
+  assert.equal(chX.groupsDetail.find(g => g.id === 2).priority, 10, '通道 X 在分组 B 中成功更新为副调 (priority=10)');
+  assert.equal(frontContext.getChannelRole(chX, 1), 'main', '分组 A 视角下通道 X 依然是主调');
+  assert.equal(frontContext.getChannelRole(chX, 2), 'sub', '分组 B 视角下通道 X 变为副调');
+});
+
+

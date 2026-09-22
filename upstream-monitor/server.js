@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const { execSync, execFileSync, fork } = require('child_process');
 const gateway = require('./gateway');
 const gatewayMetrics = new gateway.GatewayMetrics();
-const { groupIds, assertExclusiveScope, groupCostIsSafe } = require('./routing-policy');
+const { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority } = require('./routing-policy');
 const { evaluateGroup } = require('./auto-failover-policy');
 const { EventEmitter } = require('events');
 // A worker is deliberately read-only with respect to local runtime JSON.  It
@@ -347,6 +347,7 @@ const defaultAutoSwitchConfig = {
   failRateThreshold: 50, // 失败率达到 50% 以上才切线，保护全站 Prompt Cache
   minSampleSize: 10,     // 最小有效样本量，拒绝 1~2 次偶发报错即切线
   consecutiveFailuresThreshold: 5, // 连续硬故障阈值
+  consecutiveQuotaThreshold: 10,   // 连续欠费断粮切线阈值
   strategy: 'cost_first', // 'cost_first' | 'speed_first'
   cooldownMinutes: 10,
   autoRecoverLowestCost: true,
@@ -1848,7 +1849,7 @@ SELECT json_agg(t) FROM (
     credentials->'model_mapping' as model_mapping,
     notes,
     COALESCE(
-      (SELECT json_agg(json_build_object('id', g.id, 'name', g.name, 'sale_rate', g.rate_multiplier::float))
+      (SELECT json_agg(json_build_object('id', g.id, 'name', g.name, 'sale_rate', g.rate_multiplier::float, 'priority', ag.priority))
        FROM account_groups ag JOIN groups g ON ag.group_id = g.id 
        WHERE ag.account_id = accounts.id AND g.deleted_at IS NULL),
       '[]'::json
@@ -1867,14 +1868,15 @@ SELECT json_agg(t) FROM (
     const output = execPsql(sql, true).trim();
     if (!output || !output.startsWith('[')) return null;
     const allAccountsRaw = JSON.parse(output);
-    // 过滤已在墓碑名单中的欠费/已删除渠道 (如子桐网络、stain)
-    const isChannelTombstoned = (acc) => {
-      if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.isTombstoned === 'function') {
-        return upstreamScanner.isTombstoned(acc.base_url, acc.name);
+    // 权威真实存活上游：Sub2API 数据库中 deleted_at IS NULL 的账号是绝对权威来源，绝不可被墓碑名单误杀
+    const realAccounts = allAccountsRaw;
+    if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.removeTombstone === 'function') {
+      for (const acc of realAccounts) {
+        if (upstreamScanner.isTombstoned(acc.base_url, acc.name)) {
+          upstreamScanner.removeTombstone(acc.base_url, acc.name);
+        }
       }
-      return false;
-    };
-    const realAccounts = allAccountsRaw.filter(acc => !isChannelTombstoned(acc));
+    }
     const allGroups = fetchAllSub2APIGroups();
     if (!snapshotOnly) state.allGroups = allGroups;
 
@@ -1920,7 +1922,8 @@ SELECT json_agg(t) FROM (
           spread: sp,
           margin_percent: mp,
           is_loss: !pricingSafe,
-          is_primary: g.id === primaryGroup.id
+          is_primary: g.id === primaryGroup.id,
+          priority: Number.isFinite(Number(g.priority)) ? Number(g.priority) : 50
         };
       });
       const lossGroups = enrichedGroups.filter(g => g.is_loss);
@@ -2524,7 +2527,7 @@ function enforceSingleActiveState() {
 }
 
 // 通用渠道定性设置逻辑 (主调 main / 副调 sub / 保底 fallback)
-function setChannelRole(targetId, role, operator = 'Web 控制台') {
+function setChannelRole(targetId, role, operator = 'Web 控制台', groupId = null) {
   const targetChannel = state.channels.find(c => String(c.id) === String(targetId));
   if (!targetChannel) {
     return { success: false, error: '目标通道不存在' };
@@ -2546,6 +2549,116 @@ function setChannelRole(targetId, role, operator = 'Web 控制台') {
   };
 
   const currentMeta = roleMeta[normalizedRole];
+
+  // 🌟 核心升级：如果指定了具体的业务销售分组 (groupId)，实行组内独立定性隔离！
+  const gid = groupId !== null && groupId !== undefined && groupId !== '' ? Number(groupId) : null;
+  const isGroupScoped = Number.isSafeInteger(gid) && gid > 0;
+
+  if (isGroupScoped) {
+    const targetGroupObj = (state.allGroups || []).find(g => Number(g.id) === gid);
+    const targetPriority = currentMeta.priority;
+
+    // 若设为主调，验证该通道对本组的进货成本是否安全（杜绝倒贴赔钱）
+    if (normalizedRole === 'main' && targetGroupObj) {
+      assertChannelPricingIsSafe(targetChannel, [targetGroupObj]);
+    }
+
+    let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${targetId} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Account missing'; END IF; END $$;
+INSERT INTO account_groups (account_id, group_id, priority) VALUES (${targetId}, ${gid}, ${targetPriority})
+ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
+
+    if (normalizedRole === 'main') {
+      sql += `\nUPDATE account_groups SET priority = GREATEST(priority, 10) WHERE group_id = ${gid} AND account_id <> ${targetId} AND priority = 1;`;
+      sql += `\nUPDATE accounts SET schedulable = true WHERE id = ${targetId};`;
+    }
+
+    const remoteOk = executeRemoteSQL(sql);
+    if (remoteOk !== true) throw new Error('远端分组调度角色写入未确认，本地状态未改变');
+    invalidateSub2APIScheduler([Number(targetId)]);
+    refreshSub2APISignatureAfterDirectMutation('手动业务组调度角色更新');
+
+    targetChannel.autoSwitchDisabled = false;
+    if (!Array.isArray(targetChannel.groupsDetail)) targetChannel.groupsDetail = [];
+    let gd = targetChannel.groupsDetail.find(g => Number(g.id) === gid);
+    if (gd) {
+      gd.priority = targetPriority;
+    } else {
+      gd = {
+        id: gid,
+        name: targetGroupObj?.name || `分组#${gid}`,
+        sale_rate: targetGroupObj?.sale_rate ?? 1.0,
+        priority: targetPriority
+      };
+      targetChannel.groupsDetail.push(gd);
+    }
+
+    if (normalizedRole === 'main') {
+      targetChannel.schedulable = true;
+      targetChannel.manualLocked = true;
+      // 同组其他通道若曾为主调，在当前组的优先级降为副调 (10)
+      state.channels.forEach(c => {
+        if (String(c.id) !== String(targetId) && Array.isArray(c.groupsDetail)) {
+          const peerGd = c.groupsDetail.find(g => Number(g.id) === gid);
+          if (peerGd && peerGd.priority === 1) {
+            peerGd.priority = 10;
+          }
+        }
+      });
+      // 保持全局 priority 为该通道在各组中的最高优先级（数值最小）
+      if (!targetChannel.priority || targetChannel.priority > targetPriority) {
+        targetChannel.priority = targetPriority;
+      }
+      // 手工选主记录
+      autoSwitchConfig.lastSwitchTime = new Date().toISOString();
+      autoSwitchConfig.lastSwitchReason = `管理员在分组 [${targetGroupObj?.name || gid}] 手动指定 [${targetChannel.name}] 为主调 (操作人: ${operator})`;
+      writeJSON(AUTO_SWITCH_CONFIG_FILE, autoSwitchConfig);
+    } else {
+      const isMainInAnyGroup = targetChannel.groupsDetail.some(g => g.priority === 1);
+      if (!isMainInAnyGroup && String(state.manualLockedChannelId) === String(targetId)) {
+        state.manualLockedChannelId = null;
+        targetChannel.manualLocked = false;
+      }
+    }
+
+    writeJSON(CHANNELS_FILE, state);
+
+    const roleAlert = {
+      id: 'role_' + Date.now(),
+      channelId: targetChannel.id,
+      channelName: targetChannel.name,
+      type: 'role_change',
+      role: normalizedRole,
+      groupId: gid,
+      groupName: targetGroupObj?.name || '',
+      priority: targetPriority,
+      multiplier: targetChannel.multiplier,
+      timestamp: new Date().toISOString(),
+      note: `已将 [${targetChannel.name}] 在业务分组【${targetGroupObj?.name || gid}】中定性为【${currentMeta.label}】(优先级 ${targetPriority})`
+    };
+    alerts.unshift(roleAlert);
+    if (alerts.length > 200) alerts = alerts.slice(0, 200);
+    writeJSON(ALERTS_FILE, alerts);
+
+    broadcastSSE('CHANNEL_ROLE_CHANGED', {
+      channelId: targetId,
+      role: normalizedRole,
+      groupId: gid,
+      priority: targetPriority,
+      channel: targetChannel,
+      alert: roleAlert
+    });
+    broadcastSSE('CHANNELS_UPDATED', state);
+
+    return {
+      success: true,
+      channelId: targetId,
+      groupId: gid,
+      role: normalizedRole,
+      priority: targetPriority,
+      message: `已成功将 [${targetChannel.name}] 在业务分组【${targetGroupObj?.name || gid}】中定性为【${currentMeta.label}】(优先级 ${targetPriority})`
+    };
+  }
+
   const nonExemptGroupIds = groupIds(targetChannel).filter(gid => !isExemptGroup(gid));
   const isSingleActive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false);
   const safeToDisableIdSet = new Set(
@@ -3007,12 +3120,19 @@ function refreshCachedChannelPricing(channel) {
 
 function applyCachedChannelMembership(channel, plannedGroups) {
   const oldDetails = new Map((channel.groupsDetail || []).map(group => [Number(group.id), group]));
-  channel.groupsDetail = plannedGroups.map(group => ({
-    ...(oldDetails.get(Number(group.id)) || {}),
-    ...group,
-    id: Number(group.id),
-    sale_rate: Number(group.sale_rate)
-  }));
+  channel.groupsDetail = plannedGroups.map(group => {
+    const prev = oldDetails.get(Number(group.id)) || {};
+    const priority = group.priority !== undefined && group.priority !== null && Number.isFinite(Number(group.priority))
+      ? Number(group.priority)
+      : (prev.priority !== undefined && prev.priority !== null && Number.isFinite(Number(prev.priority)) ? Number(prev.priority) : 50);
+    return {
+      ...prev,
+      ...group,
+      id: Number(group.id),
+      sale_rate: Number(group.sale_rate),
+      priority
+    };
+  });
   channel.groups = channel.groupsDetail.map(group => group.name).filter(Boolean);
   refreshCachedChannelPricing(channel);
 }
@@ -3407,7 +3527,11 @@ function executeRemoteGroupOrchestrationPlan(plan) {
     const isShared = channel && currentCachedGroupIds(channel).some(gid => gid !== plan.group.id);
     const priority = id === plan.mainId ? 1 : id === plan.subId ? 10 : id === plan.altId ? 20 : 100;
     const keepSchedulable = id === plan.mainId || (isShared && channel.schedulable === true);
-    statements.push(`UPDATE accounts SET schedulable = ${keepSchedulable}, priority = ${priority} WHERE id = ${id};`);
+    if (isShared) {
+      statements.push(`UPDATE accounts SET schedulable = ${keepSchedulable}, priority = LEAST(priority, ${priority}) WHERE id = ${id};`);
+    } else {
+      statements.push(`UPDATE accounts SET schedulable = ${keepSchedulable}, priority = ${priority} WHERE id = ${id};`);
+    }
   }
   if (executeRemoteSQL(statements.join('\n')) !== true) {
     throw new Error('远端分组编排写入未确认，本地状态未改变');
@@ -3418,10 +3542,16 @@ function executeRemoteGroupOrchestrationPlan(plan) {
     const id = Number(channel.id);
     const isShared = currentCachedGroupIds(channel).some(gid => gid !== plan.group.id);
     const keepSchedulable = id === plan.mainId || (isShared && channel.schedulable === true);
+    const rolePriority = id === plan.mainId ? 1 : id === plan.subId ? 10 : id === plan.altId ? 20 : 100;
     channel.manualLocked = id === plan.mainId;
     channel.schedulable = keepSchedulable;
-    channel.priority = id === plan.mainId ? 1 : (isShared ? channel.priority : (id === plan.subId ? 10 : id === plan.altId ? 20 : 100));
+    channel.priority = id === plan.mainId ? 1 : (isShared ? channel.priority : rolePriority);
     channel.isActive = id === plan.mainId;
+
+    if (channel.groupsDetail && Array.isArray(channel.groupsDetail)) {
+      const gd = channel.groupsDetail.find(g => Number(g.id) === plan.group.id);
+      if (gd) gd.priority = rolePriority;
+    }
   }
   if (plan.mainId !== null) {
     state.activeChannelId = String(plan.mainId);
@@ -5126,22 +5256,28 @@ function fetchRecentFailoverMetrics() {
   if (Date.now() - recentFailoverMetrics.at < 30000) return recentFailoverMetrics.data;
   try {
     const rows = JSON.parse(execPsql(`WITH events AS (
-      SELECT account_id, created_at, false AS failed, first_token_ms AS ttft
+      SELECT account_id, created_at, false AS failed, false AS quota_empty, first_token_ms AS ttft
       FROM usage_logs WHERE created_at >= NOW() - INTERVAL '5 minutes'
       UNION ALL
-      SELECT account_id, created_at, true AS failed, NULL AS ttft
+      SELECT account_id, created_at, true AS failed,
+        (status_code = 402 OR upstream_error_message ~* '(insufficient_quota|quota_exhausted|quota|balance|欠费|余额不足|额度不足|point_exhausted|out_of_credit)') AS quota_empty,
+        NULL AS ttft
       FROM ops_error_logs WHERE created_at >= NOW() - INTERVAL '5 minutes'
-        AND (error_owner = 'provider' OR status_code IN (401, 402, 403, 429) OR status_code >= 500)
+        AND (error_owner = 'provider' OR status_code IN (401, 402, 403, 429) OR status_code >= 500 OR upstream_error_message ~* '(insufficient_quota|quota_exhausted|quota|balance|欠费|余额不足|额度不足|point_exhausted|out_of_credit)')
     ), ranked AS (
       SELECT *, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY created_at DESC) AS position FROM events
     ) SELECT COALESCE(json_agg(t), '[]'::json) FROM (
       SELECT account_id, COUNT(*) AS calls, COUNT(*) FILTER (WHERE failed) AS errors,
+        COUNT(*) FILTER (WHERE quota_empty) AS quota_errors,
         AVG(ttft) AS ttft,
-        COALESCE(MIN(position) FILTER (WHERE NOT failed) - 1, COUNT(*)) AS consecutive
+        COALESCE(MIN(position) FILTER (WHERE NOT failed) - 1, COUNT(*)) AS consecutive,
+        COALESCE(MIN(position) FILTER (WHERE NOT quota_empty) - 1, COUNT(*)) AS consecutive_quota
       FROM ranked WHERE account_id IS NOT NULL GROUP BY account_id
     ) t;`, true).trim() || '[]');
     recentFailoverMetrics = { at: Date.now(), data: Object.fromEntries(rows.map(row => [String(row.account_id), {
-      totalCalls: Number(row.calls), providerErrCount: Number(row.errors), consecutiveFailures: Number(row.consecutive), avgTtftMs: Number(row.ttft)
+      totalCalls: Number(row.calls), providerErrCount: Number(row.errors),
+      consecutiveFailures: Number(row.consecutive), consecutiveQuotaFailures: Number(row.consecutive_quota),
+      avgTtftMs: Number(row.ttft)
     }])) };
   } catch (error) {
     // Do not keep stale production errors alive when the database is unavailable.
@@ -5157,7 +5293,7 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
   const reports = [], details = [];
   // Isolated tests and degraded startup may not have the DB metric helper loaded.
   const productionMetrics = typeof fetchRecentFailoverMetrics === 'function' ? fetchRecentFailoverMetrics() : {};
-  const reasonNames = { disabled: '当前账号已停用', balance_empty: '余额不足', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复' };
+  const reasonNames = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', main_recharged: '原主调充值恢复上线' };
   state.failoverRuntime = state.failoverRuntime || {};
   for (const group of groups || []) {
     if (isExemptGroup(group)) continue;
@@ -5208,6 +5344,11 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
           continue;
         }
         decision.runtime.sharedHoldNotified = false;
+        if (decision.reason === 'balance_empty' && current) {
+          current.balanceStatus = 'empty';
+          current.balance = 0;
+          current.balanceUpdated = new Date(now).toISOString();
+        }
         const target = channels.find(c => String(c.id) === String(decision.targetId));
         const result = executeAutoSwitch(current || { id: 0, name: '无活动账号' }, target, group.name + '：' + (reasonNames[decision.reason] || decision.reason), { groupId: group.id, groupName: group.name, triggerType: decision.reason });
         decision.runtime.lastSwitchAt = now;
@@ -6898,7 +7039,7 @@ async function handleRequest(req, res) {
       else if (p >= 100) role = 'fallback';
       else role = 'sub';
     }
-    const result = setChannelRole(targetId, role, 'Web 控制台');
+    const result = setChannelRole(targetId, role, 'Web 控制台', body.groupId);
     if (!result.success) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: result.error }));

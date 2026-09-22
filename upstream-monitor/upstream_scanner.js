@@ -223,12 +223,39 @@ class UpstreamScanner {
     return false;
   }
 
-  removeTombstone(url) {
-    if (!url || typeof url !== 'string' || !Array.isArray(this.config.tombstonedUrls)) return;
-    const cleanUrl = url.trim().replace(/\/+$/, '');
+  removeTombstone(url, name = null) {
+    if (!Array.isArray(this.config.tombstonedUrls)) return;
+    const cleanUrl = (url || '').trim().replace(/\/+$/, '');
     const cleanKey = normalizeUrlKey(cleanUrl);
-    this.config.tombstonedUrls = this.config.tombstonedUrls.filter(u => u !== cleanUrl && u !== cleanKey);
-    this.saveConfig();
+    const cleanName = (name || '').trim().toLowerCase();
+    let changed = false;
+
+    this.config.tombstonedUrls = this.config.tombstonedUrls.filter(raw => {
+      if (!raw) return false;
+      if (typeof raw === 'string' && raw.startsWith('name:')) {
+        const tName = raw.slice(5).trim().toLowerCase();
+        if (cleanName && (cleanName === tName || cleanName.includes(tName) || tName.includes(cleanName))) {
+          changed = true;
+          return false;
+        }
+        return true;
+      }
+      const tKey = normalizeUrlKey(raw);
+      if (cleanKey && tKey && (cleanKey === tKey || cleanKey.includes(tKey) || tKey.includes(cleanKey))) {
+        changed = true;
+        return false;
+      }
+      if (cleanUrl && (raw === cleanUrl || raw.replace(/\/+$/, '') === cleanUrl)) {
+        changed = true;
+        return false;
+      }
+      return true;
+    });
+
+    if (changed) {
+      this.saveConfig();
+      console.log(`✨ [UpstreamScanner] 已为存活/新建上游移除墓碑阻断: ${cleanUrl || name}`);
+    }
   }
 
   dismissActionsForChannel(channelId, url = null, name = null) {
