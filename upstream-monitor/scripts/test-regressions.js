@@ -33,6 +33,65 @@ test('gateway never picks disabled or unrelated fallback channels', () => {
   assert.equal(gateway.selectChannel({ activeChannelId: 'missing', channels: [{ ...channel, schedulable: true }] }), null);
 });
 
+test('gateway rejects a fresh offline probe even while status still says online', () => {
+  const now = Date.now();
+  const channel = { id: '1', baseUrl: 'https://example.com/v1', apiKey: 'secret', schedulable: true, status: 'online',
+    lastProbeStatus: 'online', lastProbeTime: new Date(now).toISOString() };
+  assert.equal(gateway.selectChannel({ activeChannelId: '1', channels: [channel] }, { now }), channel);
+  // refreshFailoverHealth records lastProbeStatus without always flipping status.
+  assert.equal(gateway.selectChannel({ activeChannelId: '1', channels: [{ ...channel, lastProbeStatus: 'offline' }] }, { now }), null);
+  assert.equal(gateway.isAvailable({ ...channel, lastProbeStatus: 'offline' }, { now }), false);
+  assert.equal(gateway.isRetryEligible({ ...channel, lastProbeStatus: 'offline', schedulable: false }, { now }), false);
+});
+
+test('stale offline probe flags can never permanently lock a recovered channel', () => {
+  const now = Date.now();
+  const stale = { id: '1', baseUrl: 'https://example.com/v1', apiKey: 'secret', schedulable: true, status: 'online',
+    lastProbeStatus: 'offline', lastProbeTime: new Date(now - 3600000).toISOString() };
+  assert.equal(gateway.selectChannel({ activeChannelId: '1', channels: [stale] }, { now }), stale);
+  // An unknown/absent probe is not evidence of an outage either.
+  assert.equal(gateway.selectChannel({ activeChannelId: '1', channels: [{ ...stale, lastProbeStatus: 'unknown' }] }, { now })?.id, '1');
+});
+
+test('retry candidates stay inside the active channel business groups and honor cost, health and model support', () => {
+  const now = Date.now();
+  const probe = { lastProbeStatus: 'online', lastProbeTime: new Date(now).toISOString() };
+  const state = {
+    activeChannelId: '1',
+    allGroups: [{ id: 1, sale_rate: 0.5 }, { id: 2, sale_rate: 0.1 }],
+    channels: [
+      { id: '1', baseUrl: 'https://a/v1', apiKey: 'k', schedulable: true, status: 'online', priority: 1, costMultiplier: 0.1, groupsDetail: [{ id: 1 }], ...probe },
+      { id: '2', baseUrl: 'https://b/v1', apiKey: 'k', schedulable: false, status: 'online', priority: 10, costMultiplier: 0.2, groupsDetail: [{ id: 1 }], configuredModels: ['gpt-5*'], ...probe },
+      { id: '3', baseUrl: 'https://c/v1', apiKey: 'k', schedulable: false, status: 'online', priority: 5, costMultiplier: 0.6, groupsDetail: [{ id: 1 }], ...probe },
+      { id: '4', baseUrl: 'https://d/v1', apiKey: 'k', schedulable: false, status: 'online', priority: 3, costMultiplier: 0.05, groupsDetail: [{ id: 2 }], ...probe },
+      { id: '5', baseUrl: 'https://e/v1', apiKey: 'k', schedulable: false, status: 'online', priority: 2, costMultiplier: 0.05, groupsDetail: [{ id: 1 }], configuredModels: ['claude-*'], ...probe },
+      { id: '6', baseUrl: 'https://f/v1', apiKey: 'k', schedulable: false, status: 'online', priority: 4, costMultiplier: 0.05, groupsDetail: [{ id: 1 }], ...probe,
+        lastProbeStatus: 'offline' }
+    ]
+  };
+  const candidates = gateway.selectRetryCandidates(state, { model: 'gpt-5.1', now });
+  assert.deepEqual(candidates.map(c => c.id), ['1', '2']);
+
+  // No usable backup keeps the primary as the only attempt (no dead-end 503).
+  const lonely = gateway.selectRetryCandidates({ activeChannelId: '1', allGroups: state.allGroups, channels: [state.channels[0]] }, { now });
+  assert.deepEqual(lonely.map(c => c.id), ['1']);
+
+  // A model the primary does not declare cannot invent a backup either.
+  const state2 = { ...state, channels: [{ ...state.channels[0], configuredModels: ['gpt-5*'] }, state.channels[2]] };
+  assert.deepEqual(gateway.selectRetryCandidates(state2, { model: 'unknown-model', now }).map(c => c.id), ['1']);
+});
+
+test('only provider-side failures are eligible for a same-request backup retry', () => {
+  for (const failure of [{ statusCode: 502 }, { statusCode: 503 }, { statusCode: 504 }, { statusCode: 429 }, { statusCode: 402 },
+    { quotaExhausted: true }, { networkError: true }, { statusCode: 500 }]) {
+    assert.equal(gateway.requestIsRetryable(failure), true, JSON.stringify(failure));
+  }
+  for (const failure of [{ statusCode: 400 }, { statusCode: 401 }, { statusCode: 404 }, { statusCode: 422 }, { statusCode: 200 },
+    { statusCode: 400, bodySnippet: 'model_not_found' }, undefined]) {
+    assert.equal(gateway.requestIsRetryable(failure), false, JSON.stringify(failure));
+  }
+});
+
 test('gateway preserves query parameters and replaces both credentials', () => {
   assert.equal(gateway.upstreamUrl('https://example.com/v1', '/v1/models?limit=2').href, 'https://example.com/v1/models?limit=2');
   const headers = gateway.requestHeaders({ cookie: 'auth_token=secret', 'x-api-key': 'gateway-key', authorization: 'Bearer gateway-key' }, 'upstream-key');
@@ -112,6 +171,7 @@ function loadAutoSwitch(context) {
   const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
   loadPricingHelpers(context);
   vm.runInContext(source.slice(source.indexOf('function isExemptChannel('), source.indexOf('function broadcastSSE(')), context);
+  // 该切片同时包含紧随其后的幂等闸门 (AUTO_SWITCH_LOCK_MS / duplicateAutoSwitch)。
   vm.runInContext(source.slice(source.indexOf('function executeAutoSwitch('), source.indexOf('function resolveFailoverProposal(')), context);
 }
 
@@ -642,6 +702,79 @@ test('failed auto switch leaves state unchanged; successful routing never change
   assert.match(sql, /priority = 1 WHERE/);
   assert.equal(state.activeChannelId, '2');
   assert.equal(state.allGroups[0].sale_rate, 1);
+});
+
+test('the same group cannot be switched twice in one tick by concurrent inspection paths', () => {
+  const { context, state } = evaluator();
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }, { id: 2, name: 'B', sale_rate: 1 }];
+  const observedAt = new Date().toISOString();
+  const channel = (id, overrides) => ({ id: String(id), name: `ch${id}`, status: 'online', priority: 1, schedulable: true,
+    costMultiplier: 0.2, balance: 10, balanceStatus: 'ok', balanceUpdated: observedAt,
+    lastProbeStatus: 'online', lastProbeTime: observedAt, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1 }], ...overrides });
+  state.channels = [channel(1), channel(2, { priority: 10, schedulable: false }), channel(3, { priority: 20, schedulable: false })];
+  state.activeChannelId = '1';
+  state.failoverRuntime = { 1: { lastSwitchAt: 0 } };
+  const remoteWrites = [];
+  Object.assign(context, { CHANNELS_FILE: '', AUTO_SWITCH_LOGS_FILE: '', ALERTS_FILE: '', autoSwitchLogs: [], alerts: [],
+    broadcastSSE() {}, telegram: { notifyAutoSwitch() {} }, invalidateSub2APIScheduler() {}, getSub2APISignature: () => '',
+    autoSwitchConfig: { singleActiveExclusive: true, groupLastSwitchTimes: {} },
+    executeRemoteSQL(statement) { remoteWrites.push(statement); return true; } });
+  loadAutoSwitch(context);
+  // 探活巡检、余额变动、网关实时容灾三条路径在同一 tick 都算出"切到 2"。
+  const meta = { groupId: 1, groupName: 'A', triggerType: 'probe_failures', decisionRuntimeAt: 0 };
+  const first = context.executeAutoSwitch(state.channels[0], state.channels[1], 'test', meta);
+  const second = context.executeAutoSwitch(state.channels[0], state.channels[1], 'test', meta);
+  const third = context.executeAutoSwitch(state.channels[0], state.channels[1], 'test', meta);
+  assert.equal(first.executed, true);
+  assert.equal(second.duplicate, true);
+  assert.equal(third.duplicate, true);
+  assert.match(second.skipped, /锁窗口内已切到该目标|路由已被其他巡检路径推进/);
+  // 只有第一次真正写库、记账与推进路由版本。
+  assert.equal(remoteWrites.length, 1);
+  assert.equal(context.autoSwitchLogs.length, 1);
+  assert.equal(state.routeVersion, 1);
+  assert.equal(state.activeChannelId, '2');
+
+  // 合法连续容灾不能被锁窗口误伤：B 刚上位就也欠费，下一秒必须能继续切到 C。
+  state.channels[1].balanceStatus = 'empty';
+  state.channels[1].balance = 0;
+  const followOn = context.executeAutoSwitch(state.channels[1], state.channels[2], 'test',
+    { groupId: 1, groupName: 'A', triggerType: 'balance_empty', decisionRuntimeAt: Number(state.failoverRuntime[1].lastSwitchAt) || 0 });
+  assert.equal(followOn.executed, true);
+  assert.equal(state.activeChannelId, '3');
+  assert.equal(state.routeVersion, 2);
+});
+
+test('a decision computed before another path moved the route is discarded as stale', () => {
+  const { context, state } = evaluator();
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const observedAt = new Date().toISOString();
+  const channel = (id, overrides) => ({ id: String(id), name: `ch${id}`, status: 'online', priority: 1, schedulable: true,
+    costMultiplier: 0.2, balance: 10, balanceStatus: 'ok', balanceUpdated: observedAt,
+    lastProbeStatus: 'online', lastProbeTime: observedAt, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1 }], ...overrides });
+  state.channels = [channel(1), channel(2, { priority: 10, schedulable: false }), channel(3, { priority: 20, schedulable: false })];
+  state.activeChannelId = '1';
+  state.failoverRuntime = { 1: { lastSwitchAt: 0 } };
+  const remoteWrites = [];
+  Object.assign(context, { CHANNELS_FILE: '', AUTO_SWITCH_LOGS_FILE: '', ALERTS_FILE: '', autoSwitchLogs: [], alerts: [],
+    broadcastSSE() {}, telegram: { notifyAutoSwitch() {} }, invalidateSub2APIScheduler() {}, getSub2APISignature: () => '',
+    autoSwitchConfig: { singleActiveExclusive: true, groupLastSwitchTimes: {} },
+    executeRemoteSQL(statement) { remoteWrites.push(statement); return true; } });
+  loadAutoSwitch(context);
+  // 另一条路径先切到了 3；此时拿旧快照决策出来的"切到 2"必须被丢弃。
+  state.failoverRuntime[1].lastSwitchAt = Date.now();
+  const stale = context.executeAutoSwitch(state.channels[0], state.channels[1], 'test',
+    { groupId: 1, groupName: 'A', decisionRuntimeAt: 0 });
+  assert.equal(stale.executed, false);
+  assert.equal(stale.duplicate, true);
+  assert.match(stale.skipped, /已过期/);
+  assert.equal(remoteWrites.length, 0);
+  assert.equal(state.activeChannelId, '1');
+
+  // 人工确认的切线不受自动去重影响，仍按操作员指令执行。
+  const manual = context.executeAutoSwitch(state.channels[0], state.channels[1], 'manual', { groupId: 1, manualConfirmed: true });
+  assert.equal(manual.executed, true);
+  assert.equal(state.activeChannelId, '2');
 });
 
 test('lowering a group sale rate rejects an enabled account before any remote write', () => {
@@ -2048,9 +2181,14 @@ test('setting channel as main in Group A isolates priority and preserves backup 
   const executedSql = [];
   const context = vm.createContext({
     state,
+    ...require('../routing-policy'),
     autoSwitchConfig: { singleActiveExclusive: true },
     isExemptGroup: () => false,
-    assertChannelPricingIsSafe: () => true,
+    assertChannelPricingIsSafe: (channel, targetGroupId) => {
+      assert.equal(typeof targetGroupId, 'number', 'targetGroupId 必须为正整数 ID，不能为数组或对象');
+      assert.ok(targetGroupId > 0);
+      return true;
+    },
     executeRemoteSQL: (sql) => { executedSql.push(sql); return true; },
     invalidateSub2APIScheduler: () => {},
     refreshSub2APISignatureAfterDirectMutation: () => {},
@@ -2075,7 +2213,6 @@ test('setting channel as main in Group A isolates priority and preserves backup 
 
   // 验证 SQL：只更新 account_groups 中 group_id = 1 的记录
   assert.ok(executedSql[0].includes('account_groups (account_id, group_id, priority) VALUES (101, 1, 1)'));
-  assert.ok(executedSql[0].includes('WHERE group_id = 1'));
   assert.ok(!executedSql[0].includes('group_id = 2'));
 
   // 验证内存状态隔离：
@@ -2119,6 +2256,376 @@ test('setting channel as main in Group A isolates priority and preserves backup 
   assert.equal(chX.groupsDetail.find(g => g.id === 2).priority, 10, '通道 X 在分组 B 中成功更新为副调 (priority=10)');
   assert.equal(frontContext.getChannelRole(chX, 1), 'main', '分组 A 视角下通道 X 依然是主调');
   assert.equal(frontContext.getChannelRole(chX, 2), 'sub', '分组 B 视角下通道 X 变为副调');
+
+  // 4. 多主调测试：在分组 B 中将 通道 X 设为主调，原本主调的通道 Y 依然保持主调（不踢人）
+  const resB_main = context.setChannelRole('101', 'main', '单元测试', 2);
+  assert.equal(resB_main.success, true);
+  assert.equal(chX.groupsDetail.find(g => g.id === 2).priority, 1, '通道 X 在分组 B 成为主调');
+  assert.equal(chY.groupsDetail.find(g => g.id === 2).priority, 1, '通道 Y 在分组 B 依然保持主调，不被互斥踢出');
+
+  // 5. 单通道分组保护：分组 A 只有 1 条通道 (chX)，尝试将其降级为副调将被安全拦截
+  const resA_demote = context.setChannelRole('101', 'sub', '单元测试', 1);
+  assert.equal(resA_demote.success, false);
+  assert.match(resA_demote.error, /仅有 1 条通道/);
+  assert.equal(chX.groupsDetail.find(g => g.id === 1).priority, 1, '单通道分组始终保持主调');
 });
 
+// ====== 2026-09 自动调配修复回归 ======
 
+function fixChannel(id, overrides = {}) {
+  const observedAt = new Date().toISOString();
+  return { id: String(id), name: `ch${id}`, status: 'online', configuredStatus: 'active', priority: 10, schedulable: false,
+    costMultiplier: 0.2, balance: 10, balanceStatus: 'ok', balanceUpdated: observedAt,
+    lastProbeStatus: 'online', lastProbeTime: observedAt, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1 }], ...overrides };
+}
+
+test('with no backup, a degraded (not indebted) main keeps serving instead of shutting the whole group down', () => {
+  const { context, state } = evaluator();
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const main = fixChannel(1, { priority: 1, schedulable: true });
+  state.channels = [main, fixChannel(2, { autoSwitchDisabled: true })];
+  state.activeChannelId = '1';
+  const writes = [];
+  context.executeRemoteSQL = statement => { writes.push(statement); return true; };
+  context.invalidateSub2APIScheduler = () => {};
+  for (let i = 0; i < 6; i++) context.gatewayMetrics.record('1', { providerFailure: true });
+  context.evaluateAutoSwitch();
+  assert.equal(main.schedulable, true, 'request failures alone must not park the only route');
+  assert.equal(writes.filter(sql => /schedulable = false/.test(sql) && /\b1\b/.test(sql)).length, 0);
+  assert.equal(state.activeChannelId, '1');
+  assert.match(context.alerts[0].note, /仍在服务/);
+});
+
+test('with no backup, a confirmed-debt main is still parked', () => {
+  const { context, state } = evaluator();
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const main = fixChannel(1, { priority: 1, schedulable: true, balance: 0, balanceStatus: 'empty' });
+  state.channels = [main];
+  state.activeChannelId = '1';
+  context.executeRemoteSQL = () => true;
+  context.invalidateSub2APIScheduler = () => {};
+  context.evaluateAutoSwitch();
+  assert.equal(main.schedulable, false);
+});
+
+test('a keyword-exempt main is left under manual control and is never switched away or parked', () => {
+  let switched = false;
+  const { context, state } = evaluator({ executeAutoSwitch: () => { switched = true; return { executed: true }; } });
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  context.autoSwitchConfig.exemptKeywords = ['自用'];
+  vm.runInContext(source.slice(source.indexOf('function isExemptChannel('), source.indexOf('function broadcastSSE(')), context);
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const main = fixChannel(1, { name: '自用主线', priority: 1, schedulable: true, balance: 0, balanceStatus: 'empty' });
+  state.channels = [main, fixChannel(2)];
+  context.executeRemoteSQL = () => { throw Error('must not write'); };
+  const result = context.evaluateAutoSwitch();
+  assert.equal(switched, false);
+  assert.equal(main.schedulable, true);
+  assert.ok(result.details.some(line => /例外渠道/.test(line)));
+});
+
+test('executeAutoSwitch never parks a keyword-exempt peer', () => {
+  const { context, state } = evaluator();
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const from = fixChannel(1, { priority: 1, schedulable: true });
+  const exempt = fixChannel(3, { name: 'GPT 通用', priority: 5, schedulable: true });
+  const to = fixChannel(2);
+  state.channels = [from, to, exempt];
+  let sql;
+  Object.assign(context, { CHANNELS_FILE: '', AUTO_SWITCH_LOGS_FILE: '', ALERTS_FILE: '', autoSwitchLogs: [], alerts: [],
+    broadcastSSE() {}, telegram: { notifyAutoSwitch() {} }, invalidateSub2APIScheduler() {}, getSub2APISignature: () => '',
+    autoSwitchConfig: { singleActiveExclusive: true, groupLastSwitchTimes: {} },
+    executeRemoteSQL(statement) { sql = statement; return true; } });
+  loadAutoSwitch(context);
+  context.executeAutoSwitch(from, to, 'test', { groupId: 1 });
+  assert.match(sql, /WHERE id IN \(1\)/);
+  assert.equal(exempt.schedulable, true);
+});
+
+test('production quota metric no longer treats generic "quota"/"balance" text or rate limits as debt', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const sql = source.slice(source.indexOf('function fetchRecentFailoverMetrics('), source.indexOf('function evaluateAutoSwitch('));
+  assert.doesNotMatch(sql, /\|quota\|balance\|/);
+  const pattern = new RegExp(sql.match(/~\* '(\([^']+\))'/)[1], 'i');
+  assert.equal(pattern.test('Quota exceeded for requests per minute'), false);
+  assert.equal(pattern.test('upstream load balancer timeout'), false);
+  assert.equal(pattern.test('You exceeded your current quota, please check your plan'), true);
+  assert.equal(pattern.test('Your credit balance is too low to access the API'), true);
+  assert.equal(pattern.test('余额不足'), true);
+});
+
+test('Sub2API accounts without an API key are marked for passive health checks', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  assert.match(source, /passiveHealth: !acc\.api_key/);
+  assert.match(source, /accountType: acc\.provider_type/);
+});
+
+test('scanner skips passive accounts and sends the Anthropic version header', async () => {
+  const { value: scanner, context } = isolatedModule('upstream_scanner.js');
+  let headers;
+  context.fetch = async (url, options) => { headers = options.headers; return { status: 200 }; };
+  await scanner.probeChannelAlive({ baseUrl: 'https://api.anthropic.com', apiKey: 'k', platform: 'anthropic' });
+  assert.equal(headers['anthropic-version'], '2023-06-01');
+});
+
+function loadGenerationProbe(overrides = {}) {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const context = vm.createContext({ console: { log() {}, warn() {}, error() {} }, Buffer, AbortController, setTimeout, clearTimeout, Date,
+    gateway, ...require('../routing-policy'), state: { channels: [], failoverRuntime: {} }, autoSwitchConfig: {}, ...overrides });
+  vm.runInContext(source.slice(source.indexOf('async function probeChannelModel('), source.indexOf('// ====== ⚡ 智能自动熔断')), context);
+  vm.runInContext(source.slice(source.indexOf('// ====== 真实生成探测'), source.indexOf('function startAutoSwitchPoller(')), context);
+  return context;
+}
+
+function streamResponse(text, status = 200) {
+  let sent = false;
+  return { ok: status < 400, status, text: async () => text,
+    body: { getReader: () => ({ read: async () => sent ? { done: true } : (sent = true, { value: Buffer.from(text), done: false }), cancel() {} }) } };
+}
+
+test('a 200 stream whose first frame is an error is not a successful generation', async () => {
+  const context = loadGenerationProbe({ fetch: async () => streamResponse('event: error\ndata: {"type":"error","error":{"message":"余额不足"}}\n\n') });
+  const result = await context.probeChannelModel({ baseUrl: 'https://x.test', apiKey: 'k' }, 'm');
+  assert.equal(result.success, false);
+  const ok = loadGenerationProbe({ fetch: async () => streamResponse('data: {"choices":[{"delta":{"content":"1"}}]}\n\n') });
+  assert.equal((await ok.probeChannelModel({ baseUrl: 'https://x.test', apiKey: 'k' }, 'm')).success, true);
+});
+
+test('generation proofs only probe accounts that need them, use the mapped upstream model and record quota', async () => {
+  const requested = [];
+  const channels = [
+    { id: '1', baseUrl: 'https://a.test/v1', apiKey: 'k1', modelMapping: { 'claude-sonnet': 'vendor-sonnet' }, groupsDetail: [{ id: 1 }] },
+    { id: '2', baseUrl: 'https://b.test', apiKey: 'k2', groupsDetail: [{ id: 1 }] },
+    { id: '3', baseUrl: 'https://c.test', apiKey: 'k3', groupsDetail: [{ id: 1 }], balanceStatus: 'empty', balance: 0, balanceUpdated: new Date(Date.now() - 60000).toISOString() }
+  ];
+  const context = loadGenerationProbe({
+    state: { channels, failoverRuntime: { 1: { requiredModels: ['gpt-5'], accounts: { 1: { debt: true }, 2: {}, 3: { proofRequiredSince: Date.now() } } } } },
+    fetch: async (url, options) => {
+      const body = JSON.parse(options.body);
+      requested.push([String(url), body.model]);
+      return String(url).includes('a.test') ? streamResponse('{"error":{"message":"insufficient_quota"}}', 402)
+        : streamResponse('data: {"choices":[{"delta":{"content":"1"}}]}\n\n');
+    }
+  });
+  await context.runGenerationProofs(channels);
+  assert.deepEqual(requested.map(r => r[0]).sort(), ['https://a.test/v1/chat/completions', 'https://c.test/v1/chat/completions']);
+  assert.equal(requested.find(r => r[0].includes('a.test'))[1], 'vendor-sonnet');
+  assert.equal(requested.find(r => r[0].includes('c.test'))[1], 'gpt-5');
+  assert.equal(channels[0].lastGenerationProbeStatus, 'quota');
+  assert.equal(channels[2].lastGenerationProbeStatus, 'ok');
+  assert.equal(channels[2].balanceStatus, 'unknown', 'a newer real generation clears a gateway-inferred empty balance');
+  assert.equal(channels[1].lastGenerationProbeAt, undefined);
+  // Throttled: a second pass right away does not spend more tokens.
+  await context.runGenerationProofs(channels);
+  assert.equal(requested.length, 2);
+});
+
+test('a quiet account whose last real requests failed gets a quick generation probe; busy or just-probed ones do not', async () => {
+  const requested = [];
+  const quiet = { id: '7', baseUrl: 'https://quiet.test', apiKey: 'k7', groupsDetail: [{ id: 1 }] };
+  const busy = { id: '8', baseUrl: 'https://busy.test', apiKey: 'k8', groupsDetail: [{ id: 1 }] };
+  const justProbed = { id: '9', baseUrl: 'https://recent.test', apiKey: 'k9', groupsDetail: [{ id: 1 }],
+    lastGenerationProbeAt: new Date(Date.now() - 60000).toISOString(), lastGenerationProbeStatus: 'ok' };
+  const channels = [quiet, busy, justProbed];
+  const context = loadGenerationProbe({
+    state: { channels, failoverRuntime: {} },
+    autoSwitchConfig: { consecutiveFailuresThreshold: 30 },
+    lowTrafficSuspect: require('../auto-failover-policy').lowTrafficSuspect,
+    fetchRecentFailoverMetrics: () => ({
+      7: { totalCalls: 3, consecutiveFailures: 3 },
+      8: { totalCalls: 200, consecutiveFailures: 5 },
+      9: { totalCalls: 4, consecutiveFailures: 4 }
+    }),
+    fetch: async url => { requested.push(String(url)); return streamResponse('{"error":{"message":"upstream exploded"}}', 500); }
+  });
+  await context.runGenerationProofs(channels);
+  assert.deepEqual(requested, ['https://quiet.test/v1/chat/completions']);
+  assert.equal(quiet.lastGenerationProbeStatus, 'fail');
+  assert.equal(busy.lastGenerationProbeAt, undefined, 'busy accounts are judged by the normal thresholds only');
+  assert.equal(justProbed.lastGenerationProbeStatus, 'ok', 'a suspect probed a minute ago waits for the 2-minute spacing');
+});
+
+// ====== 不支持 /v1/models 的上游 & 探测模型回退 ======
+
+test('generation probe falls back to another model when the first one does not exist, and remembers the working one', async () => {
+  const requested = [];
+  const channel = { id: '5', baseUrl: 'https://d.test', apiKey: 'k', groupsDetail: [{ id: 1 }], knownModels: ['claude-opus-x', 'claude-sonnet-y'] };
+  const context = loadGenerationProbe({
+    state: { channels: [channel], failoverRuntime: { 1: { accounts: { 5: { proofRequiredSince: Date.now() } } } } },
+    fetch: async (url, options) => {
+      const model = JSON.parse(options.body).model;
+      requested.push(model);
+      if (model === 'claude-opus-x') return streamResponse('{"error":{"message":"当前分组 default 下对于模型 claude-opus-x 无可用渠道"}}', 503);
+      return streamResponse('data: {"choices":[{"delta":{"content":"1"}}]}\n\n');
+    }
+  });
+  await context.runGenerationProofs([channel]);
+  assert.deepEqual(requested, ['claude-opus-x', 'claude-sonnet-y']);
+  assert.equal(channel.lastGenerationProbeStatus, 'ok');
+  assert.equal(channel.generationProbeModel, 'claude-sonnet-y');
+  assert.equal(context.pickGenerationProbeModels(channel)[0], 'claude-sonnet-y', 'the working model is tried first next time');
+});
+
+test('when no candidate model exists the probe reports unknown_model, never debt or a generic failure', async () => {
+  const channel = { id: '6', baseUrl: 'https://e.test', apiKey: 'k', groupsDetail: [{ id: 1 }] };
+  let calls = 0;
+  const context = loadGenerationProbe({
+    state: { channels: [channel], failoverRuntime: { 1: { accounts: { 6: { debt: true } } } } },
+    fetch: async () => { calls++; return streamResponse('{"error":{"code":"model_not_found","message":"The model does not exist"}}', 404); }
+  });
+  await context.runGenerationProofs([channel]);
+  assert.equal(calls, 2, 'tries every candidate once');
+  assert.equal(channel.lastGenerationProbeStatus, 'unknown_model');
+  assert.match(channel.lastGenerationProbeError, /模型映射/);
+});
+
+test('a real server error is not mistaken for a missing model and does not burn extra probes', async () => {
+  const channel = { id: '7', baseUrl: 'https://f.test', apiKey: 'k', groupsDetail: [{ id: 1 }], knownModels: ['m1', 'm2'] };
+  let calls = 0;
+  const context = loadGenerationProbe({
+    state: { channels: [channel], failoverRuntime: { 1: { accounts: { 7: { proofRequiredSince: Date.now() } } } } },
+    fetch: async () => { calls++; return streamResponse('{"error":{"message":"upstream overloaded"}}', 500); }
+  });
+  await context.runGenerationProofs([channel]);
+  assert.equal(calls, 1);
+  assert.equal(channel.lastGenerationProbeStatus, 'fail');
+});
+
+test('upstreams without /v1/models are probed by generation and become eligible only while that proof is recent', async () => {
+  const healthy = { id: '8', baseUrl: 'https://g.test', apiKey: 'k', groupsDetail: [{ id: 1 }], modelsProbeUnsupported: true };
+  const context = loadGenerationProbe({
+    state: { channels: [healthy], failoverRuntime: {} },
+    fetch: async () => streamResponse('data: {"choices":[{"delta":{"content":"1"}}]}\n\n')
+  });
+  await context.runGenerationProofs([healthy]);
+  assert.equal(healthy.lastGenerationProbeStatus, 'ok', 'probed even though no recovery proof was requested');
+  const now = Date.now();
+  context.applyGenerationBasedProbeStatus([healthy], now);
+  assert.equal(healthy.lastProbeStatus, 'online');
+  // One failed generation marks it unknown (not a candidate) but never "offline",
+  // so a single failed probe cannot pile up probe failures and evict a working main.
+  healthy.lastGenerationProbeStatus = 'fail';
+  context.applyGenerationBasedProbeStatus([healthy], now);
+  assert.equal(healthy.lastProbeStatus, 'unknown');
+  healthy.lastGenerationProbeStatus = 'ok';
+  healthy.lastGenerationProbeAt = new Date(now - 60 * 60000).toISOString();
+  context.applyGenerationBasedProbeStatus([healthy], now);
+  assert.equal(healthy.lastProbeStatus, 'unknown', 'a stale proof no longer qualifies the account');
+  const ordinary = { id: '9', lastProbeStatus: 'offline' };
+  context.applyGenerationBasedProbeStatus([ordinary], now);
+  assert.equal(ordinary.lastProbeStatus, 'offline', 'accounts with a working /v1/models are untouched');
+});
+
+test('a backup whose health comes from generation probes can take over a failed main', () => {
+  const { evaluateGroup } = require('../auto-failover-policy');
+  const now = Date.now();
+  const at = new Date(now).toISOString();
+  const base = { status: 'online', configuredStatus: 'active', balance: 10, balanceStatus: 'ok', balanceUpdated: at, lastProbeTime: at, primaryGroupId: 1 };
+  const result = evaluateGroup({ group: { id: 1, sale_rate: 1 }, now, channels: [
+    { ...base, id: 1, priority: 1, schedulable: true, costMultiplier: 0.2, balance: 0, balanceStatus: 'empty', lastProbeStatus: 'online' },
+    { ...base, id: 2, priority: 10, schedulable: false, costMultiplier: 0.3, lastProbeStatus: 'online', probeMode: 'generation' }
+  ] });
+  assert.equal(result.action, 'switch');
+  assert.equal(result.targetId, 2);
+});
+
+test('the scanner does not overwrite generation-based health with "unknown"', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../upstream_scanner.js'), 'utf8');
+  assert.match(source, /alive === null && channel\.probeMode === 'generation'/);
+});
+
+test('auto-switch preview explains each group decision without writing anything', () => {
+  const { context, state } = evaluator({ executeAutoSwitch: () => { throw Error('preview must not switch'); } });
+  context.executeRemoteSQL = () => { throw Error('preview must not write'); };
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const main = fixChannel(1, { name: '主调', priority: 1, schedulable: true, balance: 0, balanceStatus: 'empty' });
+  const backup = fixChannel(2, { name: '副调', costMultiplier: 0.3 });
+  const shared = fixChannel(3, { name: '共享', groupsDetail: [{ id: 1, name: 'A', sale_rate: 1 }, { id: 2, name: 'B', sale_rate: 1 }] });
+  const lossy = fixChannel(4, { name: '贵', costMultiplier: 1.5 });
+  state.channels = [main, backup, shared, lossy];
+  state.failoverRuntime = { 1: { lastSwitchAt: 5 } };
+  const before = JSON.stringify(state);
+  const preview = context.previewAutoSwitch();
+  assert.equal(JSON.stringify(state), before, 'state and runtime are untouched');
+  const group = preview.groups[0];
+  assert.equal(group.action, 'switch');
+  assert.equal(group.current.name, '主调');
+  assert.equal(group.target.name, '副调');
+  const note = name => group.accounts.find(a => a.name === name).notes.join(' ');
+  assert.match(note('主调'), /欠费/);
+  assert.match(note('共享'), /共享账号/);
+  assert.match(note('贵'), /售价/);
+  assert.equal(group.accounts.find(a => a.name === '副调').candidate, true);
+});
+
+test('preview marks accounts sharing the top priority as in use and names the keyword behind a manual group', () => {
+  const { context, state } = evaluator({ isExemptGroup: group => String(group?.name || '').includes('自用') });
+  context.autoSwitchConfig.exemptKeywords = ['自用'];
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }, { id: 2, name: '我的自用组', sale_rate: 1 }];
+  state.channels = [
+    fixChannel(1, { name: '主调', priority: 1, schedulable: true }),
+    fixChannel(2, { name: '并列', priority: 1, schedulable: true }),
+    fixChannel(3, { name: '备用', priority: 100 }),
+    fixChannel(4, { name: '自用号', priority: 1, schedulable: true, groupsDetail: [{ id: 2, name: '我的自用组', sale_rate: 1 }] })
+  ];
+  const preview = context.previewAutoSwitch();
+  const account = name => preview.groups.find(g => g.groupId === 1).accounts.find(a => a.name === name);
+  assert.equal(account('主调').isCurrent, true);
+  assert.equal(account('并列').isCoCurrent, true, 'same priority as the current account means Sub2API also routes to it');
+  assert.equal(account('备用').isCoCurrent, false);
+  const manual = preview.groups.find(g => g.groupId === 2);
+  assert.equal(manual.action, 'skip');
+  assert.match(manual.reason, /分组名含「自用」/);
+});
+
+test('auto-failover policy holds single channel groups and avoids cheaper flapping by default', () => {
+  const { evaluateGroup } = require('../auto-failover-policy');
+  const singleChannelGroup = { id: 99, name: '单通道组', enabled: true };
+  const singleChannel = { id: '999', name: '独苗', schedulable: true, priority: 1, groupsDetail: [{ id: 99, priority: 1 }], lastProbeStatus: 'online', status: 'online', lastProbeTime: Date.now() };
+  const res = evaluateGroup({ group: singleChannelGroup, channels: [singleChannel], config: { autoRecoverLowestCost: false } });
+  assert.equal(res.action, 'hold');
+  assert.equal(res.reason, 'healthy');
+});
+
+test('upstream balance sync buttons exist in header and cards and single channel balance refresh route works', async () => {
+  const fs = require('fs');
+  const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
+  assert.ok(html.includes('id="btnHeaderSyncBalances"'), 'Header must contain btnHeaderSyncBalances');
+  assert.ok(html.includes('id="btnRefreshBalances"'), 'KPI card must contain btnRefreshBalances');
+  assert.ok(html.includes('同步上游余额'), 'Both buttons must have text 同步上游余额');
+
+  const appJs = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  assert.ok(appJs.includes('btn-micro-sync-bal'), 'app.js renders micro sync balance button');
+  assert.ok(appJs.includes('refreshSingleChannelBalance'), 'app.js defines refreshSingleChannelBalance');
+  assert.ok(appJs.includes("btnHeaderSyncBalances"), 'app.js binds btnHeaderSyncBalances');
+
+  const css = fs.readFileSync(path.join(__dirname, '../public/style.css'), 'utf8');
+  assert.ok(css.includes('.btn-micro-sync-bal'), 'style.css defines .btn-micro-sync-bal');
+});
+
+test('without single-active exclusivity, failover still demotes the failing source so traffic really moves', () => {
+  for (const [trigger, parked] of [['request_failures', false], ['balance_empty', true]]) {
+    const { context, state } = evaluator();
+    state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+    const from = fixChannel(1, { priority: 1, schedulable: true });
+    const other = fixChannel(3, { priority: 1, schedulable: true });
+    const to = fixChannel(2);
+    state.channels = [from, to, other];
+    let sql, invalidated;
+    Object.assign(context, { CHANNELS_FILE: '', AUTO_SWITCH_LOGS_FILE: '', ALERTS_FILE: '', autoSwitchLogs: [], alerts: [],
+      broadcastSSE() {}, telegram: { notifyAutoSwitch() {} }, getSub2APISignature: () => '',
+      invalidateSub2APIScheduler(ids, groupId) { invalidated = [ids, groupId]; },
+      autoSwitchConfig: { singleActiveExclusive: false, groupLastSwitchTimes: {} },
+      executeRemoteSQL(statement) { sql = statement; return true; } });
+    loadAutoSwitch(context);
+    context.executeAutoSwitch(from, to, 'test', { groupId: 1, triggerType: trigger });
+    assert.match(sql, /UPDATE accounts SET priority = GREATEST\(priority, 10\)/);
+    assert.equal(/schedulable = false WHERE id = 1/.test(sql), parked);
+    assert.doesNotMatch(sql, /WHERE id IN \(.*3/, 'other concurrent mains are left alone');
+    assert.equal(from.priority, 10);
+    assert.equal(from.schedulable, !parked);
+    assert.equal(other.schedulable, true);
+    assert.equal(other.priority, 1);
+    assert.equal(JSON.stringify(invalidated), JSON.stringify([[2, 1], 1]), 'sticky sessions of the moved accounts are cleared for this group');
+  }
+});

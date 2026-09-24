@@ -372,9 +372,14 @@ class UpstreamScanner {
       // Probe every candidate first so fallback decisions do not depend on array order.
       const probeResults = new Map();
       for (const channel of channels) {
+        // OAuth / Setup-Token 等无 API Key 账号无法直连探活，交由调度器按真实请求被动判断。
+        if (channel.passiveHealth === true) { probeResults.set(channel, null); continue; }
         const probeStarted = Date.now();
         const alive = await this.probeChannelAlive(channel);
         probeResults.set(channel, alive);
+        // 不支持 /v1/models 的账号由调度器按真实生成探测维护健康状态，这里不要覆盖成“未知”，
+        // 否则每轮扫描都会清零它的恢复计数。
+        if (alive === null && channel.probeMode === 'generation') { channel.lastCheckTime = new Date().toISOString(); continue; }
         channel.lastCheckTime = new Date().toISOString();
         channel.lastProbeTime = channel.lastCheckTime;
         channel.lastProbeStatus = alive === null ? 'unknown' : alive ? 'online' : 'offline';
@@ -584,6 +589,8 @@ class UpstreamScanner {
         headers['Authorization'] = `Bearer ${channel.apiKey}`;
         headers['x-api-key'] = channel.apiKey;
       }
+      // Anthropic 官方 /v1/models 缺少版本头会返回 400，被误判为离线。
+      if (String(channel.platform || '').toLowerCase() === 'anthropic') headers['anthropic-version'] = '2023-06-01';
       const res = await fetch(upstreamUrl(cleanUrl), {
         method: 'GET',
         headers,

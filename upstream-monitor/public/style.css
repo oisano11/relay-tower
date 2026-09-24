@@ -2577,6 +2577,51 @@ body {
   font-weight: 500;
 }
 
+/* 渠道条目内单独同步上游余额微型按钮 */
+.btn-micro-sync-bal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #64748b;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+  margin-left: 0.3rem;
+  padding: 0;
+  line-height: 1;
+  transition: all 0.15s ease;
+  opacity: 0.7;
+}
+
+.channel-strip:hover .btn-micro-sync-bal {
+  opacity: 1;
+}
+
+.btn-micro-sync-bal:hover {
+  background: #eff6ff;
+  border-color: #3b82f6;
+  color: #1d4ed8;
+  transform: scale(1.1);
+}
+
+.btn-micro-sync-bal.spinning {
+  animation: spin-sync-icon 0.8s linear infinite;
+  pointer-events: none;
+  color: #0284c7;
+  border-color: #0284c7;
+  background: #f0f9ff;
+}
+
+@keyframes spin-sync-icon {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* 顶部上游后台连接状态小胶囊 */
 .jinlong-status-mini {
   display: inline-block;

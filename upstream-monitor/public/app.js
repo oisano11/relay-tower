@@ -1184,7 +1184,9 @@ function renderStripsView(enabledChannels, standbyChannels) {
       : null;
 
     const effectiveGroupName = contextualGroupDetail ? contextualGroupDetail.name : (ch.primaryGroupName || '默认');
-    const effectiveGroupId = contextualGroupDetail ? contextualGroupDetail.id : (ch.primaryGroupId || '');
+    const effectiveGroupId = (currentDimension === 'group' && currentFilterPill !== 'all')
+      ? (contextualGroupDetail ? contextualGroupDetail.id : '')
+      : '';
     const role = getChannelRole(ch, effectiveGroupId);
     const isActive = role === 'main';
     const isSchedulable = Boolean(ch.schedulable);
@@ -1365,6 +1367,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
         <!-- 4. 上游账户余额 -->
         <div class="strip-col-balance">
           ${balanceHtml}
+          <button class="btn-micro-sync-bal" id="btnSyncBal_${ch.id}" onclick="refreshSingleChannelBalance('${ch.id}', event)" title="单独同步抓取此上游钱包余额">⟳</button>
         </div>
 
         <!-- 5. 进货采购成本 (Cost) -->
@@ -2088,17 +2091,32 @@ function getChannelRole(ch, groupContext) {
     targetGroup = currentFilterPill;
   }
 
-  if (targetGroup && ch.groupsDetail && Array.isArray(ch.groupsDetail)) {
-    const gd = ch.groupsDetail.find(g => 
-      String(g.id) === String(targetGroup) || (g.name && g.name === String(targetGroup))
-    );
-    if (gd && gd.priority !== undefined && gd.priority !== null && Number.isFinite(Number(gd.priority))) {
-      const gp = Number(gd.priority);
-      if (gp <= 1) return 'main';
-      if (gp <= 10) return 'sub';
-      if (gp <= 20) return 'alt';
-      return 'standby';
+  if (targetGroup) {
+    // 🌟 单通道分组硬性保障：若该分组总共只有 1 条通道，无论如何一律显示为主调，绝不归为副调/备用！
+    if (typeof channelsData !== 'undefined' && Array.isArray(channelsData)) {
+      const groupChannels = channelsData.filter(c => {
+        if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(targetGroup) || gd.name === String(targetGroup))) return true;
+        if (c.groups && c.groups.includes(String(targetGroup))) return true;
+        return false;
+      });
+      if (groupChannels.length === 1 && String(groupChannels[0].id) === String(ch.id)) {
+        return 'main';
+      }
     }
+
+    if (ch.groupsDetail && Array.isArray(ch.groupsDetail)) {
+      const gd = ch.groupsDetail.find(g => 
+        String(g.id) === String(targetGroup) || (g.name && g.name === String(targetGroup))
+      );
+      if (gd && gd.priority !== undefined && gd.priority !== null && Number.isFinite(Number(gd.priority))) {
+        const gp = Number(gd.priority);
+        if (gp <= 1) return 'main';
+        if (gp <= 10) return 'sub';
+        if (gp <= 20) return 'alt';
+        return 'standby';
+      }
+    }
+    return 'standby';
   }
 
   // 2. 无分组上下文时的全局兜底定性
@@ -2120,6 +2138,19 @@ async function setChannelRole(channelId, role, groupId = null) {
   if (!targetGroupId && typeof currentDimension !== 'undefined' && currentDimension === 'group' && typeof currentFilterPill !== 'undefined' && currentFilterPill !== 'all') {
     const gObj = (allGroups || []).find(g => g.name === currentFilterPill || String(g.id) === String(currentFilterPill));
     if (gObj) targetGroupId = String(gObj.id);
+  }
+
+  // 🌟 单通道分组硬性保障：若该分组仅有 1 条通道，拒绝降级为副调或备用
+  if (targetGroupId) {
+    const groupChannels = (channelsData || []).filter(c => {
+      if (c.groupsDetail && c.groupsDetail.some(gd => String(gd.id) === String(targetGroupId) || gd.name === String(targetGroupId))) return true;
+      if (c.groups && c.groups.includes(String(targetGroupId))) return true;
+      return false;
+    });
+    if (groupChannels.length <= 1 && role !== 'main') {
+      showToast('该分组仅有 1 条通道，必须保持为主调，无法降级为副调或备用！', 'warning');
+      return;
+    }
   }
 
   const currentRole = getChannelRole(target, targetGroupId);
@@ -2145,7 +2176,7 @@ async function setChannelRole(channelId, role, groupId = null) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '定性设置失败');
 
-    // 本地即时响应状态与优先级 (支持业务组独立隔离)
+    // 本地即时响应状态与优先级 (支持业务组独立隔离与多主并发)
     if (targetGroupId) {
       if (!Array.isArray(target.groupsDetail)) target.groupsDetail = [];
       let gd = target.groupsDetail.find(g => String(g.id) === String(targetGroupId));
@@ -2157,15 +2188,6 @@ async function setChannelRole(channelId, role, groupId = null) {
 
       if (role === 'main') {
         target.schedulable = true;
-        // 同组其他原主调降为副调
-        channelsData.forEach(c => {
-          if (String(c.id) !== String(channelId) && Array.isArray(c.groupsDetail)) {
-            const peerGd = c.groupsDetail.find(g => String(g.id) === String(targetGroupId));
-            if (peerGd && peerGd.priority === 1) {
-              peerGd.priority = 10;
-            }
-          }
-        });
       }
     } else {
       // 全局定性回退
@@ -2223,6 +2245,43 @@ async function probeSingleChannel(channelId) {
     showToast(err.message, 'error');
   }
 }
+
+// 单渠道单独查额与同步
+async function refreshSingleChannelBalance(channelId, event) {
+  if (event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+  const btn = document.getElementById(`btnSyncBal_${channelId}`);
+  if (btn) btn.classList.add('spinning');
+  try {
+    const res = await fetch(`/api/channels/${channelId}/refresh-balance`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || '获取余额失败');
+    }
+    const balInfo = data.balanceInfo || {};
+    const chName = (data.channel && data.channel.name) || '目标渠道';
+    if (balInfo.isUnlimited) {
+      showToast(`[${chName}] 余额已同步: ♾️ 不限额`, 'success');
+    } else if (balInfo.balance !== null && balInfo.balance !== undefined) {
+      const unitSym = (balInfo.unit === 'CNY') ? '¥' : '$';
+      showToast(`[${chName}] 余额已同步: ${unitSym}${Number(balInfo.balance).toFixed(2)}`, 'success');
+    } else {
+      showToast(`[${chName}] 暂未开放查额接口或尚未配置凭据`, 'warning');
+    }
+    if (typeof loadUpstreamPanelsList === 'function') {
+      await loadUpstreamPanelsList();
+    }
+    await loadChannels();
+    checkJinlongStatus();
+  } catch (err) {
+    showToast(`同步余额失败: ${err.message}`, 'error');
+  } finally {
+    if (btn) btn.classList.remove('spinning');
+  }
+}
+window.refreshSingleChannelBalance = refreshSingleChannelBalance;
 
 // 模拟调价
 async function simulateChannelChange(channelId) {
@@ -3323,6 +3382,209 @@ async function syncBackendChannels() {
   }
 }
 
+// ====== 切号预演（只读） ======
+const AUTO_SWITCH_PREVIEW_ACTIONS = { switch: ['⚡ 将切换', '#b45309'], exhausted: ['🚨 无可用备选', '#dc2626'], hold: ['✅ 保持', '#16a34a'], skip: ['⏸ 不参与', '#64748b'] };
+let lastAutoSwitchPreview = null;
+
+async function fetchAutoSwitchPreview() {
+  const res = await fetch('/api/auto-switch/preview');
+  const data = await res.json();
+  if (!data.success) throw new Error(data.error || '读取失败');
+  return data;
+}
+
+// 只取切号决策和账号能否当备选，不含余额、倍率数字：余额随用量一直在变，不能让它把每组都标成“有变化”。
+function autoSwitchPreviewSignature(group) {
+  return JSON.stringify([group.action, group.reason, group.current?.id, group.target?.id,
+    (group.accounts || []).map(acc => [acc.id, acc.isCurrent, acc.isCoCurrent, acc.isTarget, acc.candidate, acc.notes])]);
+}
+
+function autoSwitchPreviewMetaHtml(data) {
+  return `按当前数据推演下一轮自动切号会怎么做，不写入任何数据。${data.enabled ? '' : '<b style="color:#dc2626;">全局自动切号目前是关闭的。</b>'} 生成时间：${escapeHtml(new Date(data.generatedAt).toLocaleString())}`;
+}
+
+function autoSwitchPreviewGroupsHtml(data, changedIds = new Set()) {
+  return (data.groups || []).map(group => {
+    const [label, color] = AUTO_SWITCH_PREVIEW_ACTIONS[group.action] || [group.action, '#334155'];
+    const changed = changedIds.has(String(group.groupId));
+    const accounts = group.accounts.map(acc => {
+      const tag = acc.isCurrent ? '<span style="color:#2563eb;font-weight:700;">当前</span>' : acc.isTarget ? '<span style="color:#b45309;font-weight:700;">→ 目标</span>'
+        : acc.isCoCurrent ? '<span style="color:#2563eb;" title="和当前账号优先级相同，Sub2API 会一起给它分配流量">同时在用</span>'
+        : acc.candidate ? '<span style="color:#16a34a;">可做备选</span>' : '<span style="color:#94a3b8;">不可用</span>';
+      const balanceNames = { unknown: '查不到', unlimited: '不限额', empty: '0', pending: '待查询' };
+      const bal = acc.balance == null ? (balanceNames[acc.balanceStatus] || acc.balanceStatus || '-') : acc.balance;
+      return `<tr style="border-top:1px solid #f1f5f9;">
+        <td style="padding:3px 6px;">${tag}</td>
+        <td style="padding:3px 6px;">${escapeHtml(acc.name || '')} <span style="color:#94a3b8;">#${escapeHtml(acc.id)}</span></td>
+        <td style="padding:3px 6px;" class="mono">${acc.cost ?? '-'}x</td>
+        <td style="padding:3px 6px;" class="mono">${escapeHtml(String(bal))}</td>
+        <td style="padding:3px 6px;color:#64748b;">${escapeHtml(acc.notes.join('；') || '正常')}</td>
+      </tr>`;
+    }).join('');
+    return `<div style="background:${changed ? '#fffbeb' : '#fff'};border:1px solid ${changed ? '#f59e0b' : '#e2e8f0'};border-radius:6px;padding:0.5rem 0.6rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;font-size:0.8rem;">
+        <b>${escapeHtml(group.groupName || '')}${changed ? ' <span style="color:#b45309;font-size:0.7rem;">· 有变化</span>' : ''}</b>
+        <span style="color:${color};font-weight:700;">${label}</span>
+      </div>
+      <div style="font-size:0.72rem;color:#475569;margin:0.15rem 0 0.3rem;">原因：${escapeHtml(group.reason || '')}${group.target ? `；${escapeHtml(group.current?.name || '无')} → ${escapeHtml(group.target.name || '')}` : ''}</div>
+      <table style="width:100%;font-size:0.7rem;border-collapse:collapse;">
+        <tr style="color:#94a3b8;text-align:left;"><th style="padding:2px 6px;">状态</th><th style="padding:2px 6px;">账号</th><th style="padding:2px 6px;">进价</th><th style="padding:2px 6px;">余额</th><th style="padding:2px 6px;">说明</th></tr>
+        ${accounts}
+      </table>
+    </div>`;
+  }).join('') || '<div style="padding:1rem;text-align:center;color:#64748b;">没有需要评估的分组</div>';
+}
+
+async function openAutoSwitchPreviewModal() {
+  document.getElementById('autoSwitchPreviewBackdrop')?.remove();
+  let data;
+  try {
+    data = await fetchAutoSwitchPreview();
+  } catch (err) {
+    showToast('读取切号预演失败: ' + err.message, 'error');
+    return;
+  }
+  lastAutoSwitchPreview = data;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = `
+    <div id="autoSwitchPreviewBackdrop" class="modal-backdrop open" style="z-index: 1050;">
+      <div class="modal-dialog" style="max-width: 760px;">
+        <div class="dialog-content">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.2rem;">
+            <div style="font-size:1.05rem;font-weight:700;color:#0f172a;">🧭 切号预演（只读）</div>
+            <button type="button" onclick="document.getElementById('autoSwitchPreviewBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+          <p id="autoSwitchPreviewMeta" style="font-size:0.74rem;color:#64748b;margin:0 0 0.5rem;">${autoSwitchPreviewMetaHtml(data)}</p>
+          <div id="autoSwitchPreviewList" style="display:flex;flex-direction:column;gap:0.45rem;max-height:460px;overflow-y:auto;background:#f8fafc;padding:0.4rem;border:1px solid #e2e8f0;border-radius:6px;">${autoSwitchPreviewGroupsHtml(data)}</div>
+          <div id="autoSwitchPreviewStatus" style="font-size:0.74rem;margin-top:0.45rem;min-height:1.1em;"></div>
+          <div class="dialog-actions" style="margin-top:0.5rem;display:flex;gap:0.5rem;">
+            <button id="btnRefreshAutoSwitchPreview" class="btn btn-secondary" style="flex:1;justify-content:center;">重新推演</button>
+            <button onclick="document.getElementById('autoSwitchPreviewBackdrop').remove()" class="btn btn-primary" style="justify-content:center;">关闭</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(wrapper.firstElementChild);
+  document.getElementById('btnRefreshAutoSwitchPreview')?.addEventListener('click', refreshAutoSwitchPreview);
+}
+
+// 重新推演：窗口不关、滚动位置不动，只替换内容，并说明和上一次相比有没有变化。
+async function refreshAutoSwitchPreview() {
+  const btn = document.getElementById('btnRefreshAutoSwitchPreview');
+  const list = document.getElementById('autoSwitchPreviewList');
+  const status = document.getElementById('autoSwitchPreviewStatus');
+  if (!btn || !list || !status || btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = '推演中…';
+  status.style.color = '#64748b';
+  status.textContent = '正在按最新数据重新推演…';
+  try {
+    const data = await fetchAutoSwitchPreview();
+    if (!list.isConnected) return; // 请求期间窗口已被关闭
+    const groups = data.groups || [];
+    const before = lastAutoSwitchPreview?.groups || [];
+    const previous = new Map(before.map(g => [String(g.groupId), autoSwitchPreviewSignature(g)]));
+    const changedIds = new Set(groups.filter(g => previous.get(String(g.groupId)) !== autoSwitchPreviewSignature(g)).map(g => String(g.groupId)));
+    const removed = before.filter(g => !groups.some(n => String(n.groupId) === String(g.groupId))).length;
+    const identical = JSON.stringify(before) === JSON.stringify(groups);
+    lastAutoSwitchPreview = data;
+    const scrollTop = list.scrollTop;
+    list.innerHTML = autoSwitchPreviewGroupsHtml(data, changedIds);
+    list.scrollTop = scrollTop;
+    document.getElementById('autoSwitchPreviewMeta').innerHTML = autoSwitchPreviewMetaHtml(data);
+    const time = new Date(data.generatedAt).toLocaleTimeString();
+    if (changedIds.size || removed) {
+      status.style.color = '#b45309';
+      status.textContent = `${time} 已重新推演：${changedIds.size} 个分组的切号决策或账号状态有变化，已标黄${removed ? `；${removed} 个分组已不在列表中` : ''}`;
+    } else {
+      status.style.color = '#16a34a';
+      status.textContent = identical ? `${time} 已重新推演：与上次完全相同，各组状态稳定` : `${time} 已重新推演：切号决策没有变化，只有余额、倍率等数字有更新`;
+    }
+  } catch (err) {
+    status.style.color = '#dc2626';
+    status.textContent = `重新推演失败：${err.message}（下面仍是上一次的结果）`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '重新推演';
+  }
+}
+
+// ====== 共享账号拆分：一个分组一个账号 ======
+async function openSplitSharedModal() {
+  document.getElementById('splitSharedModalBackdrop')?.remove();
+  showToast('正在读取 Sub2API 最新账号与分组...', 'info');
+  let plan;
+  try {
+    const res = await fetch('/api/accounts/split-plan');
+    plan = await res.json();
+    if (!plan.success) throw new Error(plan.error || '读取失败');
+  } catch (err) {
+    showToast('读取拆分计划失败: ' + err.message, 'error');
+    return;
+  }
+  const items = plan.items || [];
+  const rows = items.length ? items.map(item => {
+    const copies = item.copies.map(copy => `<div style="padding-left: 1.4rem; color: #334155;">＋ 新建 <b>${escapeHtml(copy.name)}</b> → 只挂「${escapeHtml(copy.groupName)}」</div>`).join('');
+    const head = item.splittable
+      ? `<label style="display: flex; gap: 0.45rem; align-items: center; cursor: pointer;"><input type="checkbox" class="split-acc-checkbox" value="${escapeHtml(item.accountId)}" checked /> <b>${escapeHtml(item.name)}</b> <span style="color: #64748b;">#${escapeHtml(item.accountId)}</span></label>`
+      : `<div style="display: flex; gap: 0.45rem; align-items: center; color: #94a3b8;"><input type="checkbox" disabled /> <b>${escapeHtml(item.name)}</b> <span>#${escapeHtml(item.accountId)}</span></div>`;
+    const detail = item.splittable
+      ? `<div style="padding-left: 1.4rem; color: #334155;">原账号保留在「${escapeHtml(item.keepGroupName)}」</div>${copies}`
+      : `<div style="padding-left: 1.4rem; color: #b45309;">⚠️ ${escapeHtml(item.blockedReason)}</div>`;
+    return `<div style="padding: 0.45rem 0.55rem; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 0.2rem;">${head}${detail}</div>`;
+  }).join('') : '<div style="padding: 1rem; text-align: center; color: #16a34a; font-size: 0.8rem;">✅ 当前没有共享账号，每个账号都只属于一个分组。</div>';
+
+  const html = `
+    <div id="splitSharedModalBackdrop" class="modal-backdrop open" style="z-index: 1050;">
+      <div class="modal-dialog" style="max-width: 600px;">
+        <div class="dialog-content">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.2rem;">
+            <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a;">🧩 拆分共享账号（一个分组一个账号）</div>
+            <button type="button" onclick="document.getElementById('splitSharedModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+          <p style="font-size: 0.74rem; color: #64748b; margin: 0 0 0.5rem;">
+            共 ${plan.sharedCount || 0} 个共享账号，可拆 ${plan.splittableCount || 0} 个，将新建 ${plan.newAccountCount || 0} 个账号。
+            新账号完整复制原账号的 Key、模型映射、倍率、代理、<b>并发上限（照抄原值）</b>、优先级和调度开关，拆分瞬间各组路由不变；余额仍是同一个上游钱包。
+            ${plan.synced === false ? '<br><span style="color:#dc2626;">⚠️ 未能连接 Sub2API，以下为缓存数据，执行时会再次校验。</span>' : ''}
+          </p>
+          <div style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 340px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">${rows}</div>
+          <p style="font-size: 0.7rem; color: #94a3b8; margin: 0.4rem 0 0;">写入在单个事务内执行；若账号分组在预览后被改动，将整体中止、不做任何修改。</p>
+          <div class="dialog-actions" style="margin-top: 0.7rem; display: flex; gap: 0.5rem;">
+            <button id="btnConfirmSplitShared" class="btn btn-primary" style="flex: 1; justify-content: center; font-weight: 600;" ${plan.splittableCount ? '' : 'disabled'}>确认拆分选中账号</button>
+            <button onclick="document.getElementById('splitSharedModalBackdrop').remove()" class="btn btn-secondary">取消</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = html;
+  document.body.appendChild(wrapper.firstElementChild);
+
+  document.getElementById('btnConfirmSplitShared')?.addEventListener('click', async (event) => {
+    const accountIds = [...document.querySelectorAll('.split-acc-checkbox:checked')].map(cb => cb.value);
+    if (!accountIds.length) {
+      showToast('请至少勾选一个要拆分的账号', 'warning');
+      return;
+    }
+    if (!confirm(`确定拆分 ${accountIds.length} 个共享账号吗？\n\n将在 Sub2API 中新建分组专属账号，并把原账号移出这些分组。`)) return;
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = '正在拆分...';
+    try {
+      const res = await fetch('/api/accounts/split', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accountIds }) });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || '拆分失败');
+      document.getElementById('splitSharedModalBackdrop')?.remove();
+      showToast(`✅ 已拆分 ${data.splitCount} 个共享账号，新建 ${data.createdCount} 个分组专属账号`, 'success');
+      await loadChannels();
+    } catch (err) {
+      showToast('拆分失败（未做任何修改）: ' + err.message, 'error');
+      button.disabled = false;
+      button.textContent = '确认拆分选中账号';
+    }
+  });
+}
+
 async function deleteChannel(channelId, channelName) {
   const name = channelName || `ID: ${channelId}`;
   if (!confirm(`确定要在 Sub2API 数据库与塔台中彻底删除上游渠道 [${name}] 吗？\n\n⚠️ 注意：删除后该渠道将立即从系统与销售分组中下线，不可逆恢复。`)) {
@@ -3388,28 +3650,45 @@ async function syncAllUpstreams() {
   }
 }
 
-// ====== 【一键刷新全量余额】 ======
+// ====== 【一键同步/刷新全量余额】 ======
 async function refreshAllBalances() {
   const btn = document.getElementById('btnRefreshBalances');
+  const headerBtn = document.getElementById('btnHeaderSyncBalances');
   if (btn) {
-    btn.innerHTML = '<span>⏳</span> 刷新中...';
+    btn.innerHTML = '<span>⏳</span> 同步中...';
+    btn.disabled = true;
   }
+  if (headerBtn) {
+    headerBtn.innerHTML = '<span>⏳</span> 同步中...';
+    headerBtn.disabled = true;
+  }
+  showToast('正在从各上游抓取并同步最新钱包余额...', 'warning');
   try {
     const res = await fetch('/api/channels/refresh-balances', { method: 'POST' });
     const data = await res.json();
-    if (data.success) {
-      showToast('各上游钱包余额已全部刷新完成', 'success');
-      await loadChannels();
-      checkJinlongStatus();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || data.message || '服务端同步返回异常');
     }
+    showToast('各上游钱包余额已全部同步刷新完成', 'success');
+    if (typeof loadUpstreamPanelsList === 'function') {
+      await loadUpstreamPanelsList();
+    }
+    await loadChannels();
+    checkJinlongStatus();
   } catch (err) {
-    showToast('刷新余额失败: ' + err.message, 'error');
+    showToast('同步上游余额失败: ' + err.message, 'error');
   } finally {
     if (btn) {
-      btn.innerHTML = '<span>💰</span> 刷新余额';
+      btn.innerHTML = '<span>💰</span> 同步上游余额';
+      btn.disabled = false;
+    }
+    if (headerBtn) {
+      headerBtn.innerHTML = '<span>💰</span> 同步上游余额';
+      headerBtn.disabled = false;
     }
   }
 }
+window.refreshAllBalances = refreshAllBalances;
 
 function markModeAsCustom() {
   // 标记模式为自定义
@@ -3423,8 +3702,9 @@ function initApp() {
   loadChannels();
   loadAlerts();
   setupSSE();
-  // 刷新全量余额
+  // 刷新/同步全量余额
   document.getElementById('btnRefreshBalances')?.addEventListener('click', refreshAllBalances);
+  document.getElementById('btnHeaderSyncBalances')?.addEventListener('click', refreshAllBalances);
 
   // 上游供应商后台管理池弹窗控制
   document.getElementById('btnOpenJinlongModal')?.addEventListener('click', openJinlongModal);
@@ -3578,6 +3858,12 @@ function initApp() {
   });
   document.getElementById('btnSyncBackendInPanel')?.addEventListener('click', () => {
     syncBackendChannels();
+  });
+  document.getElementById('btnSplitShared')?.addEventListener('click', () => {
+    openSplitSharedModal();
+  });
+  document.getElementById('btnAutoSwitchPreview')?.addEventListener('click', () => {
+    openAutoSwitchPreviewModal();
   });
 
   // 模拟调价
@@ -5081,6 +5367,68 @@ async function submitGroupOrchestration() {
 }
 
 // 打开业务分组专属自动切线策略弹窗
+// 分组设置：面板显示「本组单独设置 + 其余跟随全站」后的实际生效值；这里记下全站值，用来对比和一键恢复。
+let groupAutoSwitchDefaults = null;
+let groupAutoSwitchGlobalEnabled = true;
+const GROUP_POLICY_LABELS = { enabled: '参与自动切号', failRateThreshold: '失败率', minSampleSize: '样本量',
+  consecutiveFailuresThreshold: '连续失败次数', cooldownMinutes: '切回间隔', autoRecoverLowestCost: '便宜账号自动换过去' };
+
+// 值不在下拉选项里时补一个选项，避免显示空白、保存时被悄悄换成别的数字。
+function setGroupPolicySelect(id, value, unit) {
+  const select = document.getElementById(id);
+  if (!select || value == null || !Number.isFinite(Number(value))) return;
+  const text = String(Number(value));
+  if (![...select.options].some(option => option.value === text)) select.add(new Option(`${text}${unit}`, text));
+  select.value = text;
+}
+
+function setGroupToggle(buttonId, textId, on) {
+  const btn = document.getElementById(buttonId);
+  const txt = document.getElementById(textId);
+  if (btn) btn.className = `toggle-switch-btn ${on ? 'is-on' : 'is-off'}`;
+  if (txt) txt.textContent = on ? '已开启' : '已停用';
+}
+
+function readGroupPolicyForm() {
+  const number = id => {
+    const value = document.getElementById(id)?.value;
+    return value === '' || value == null ? undefined : Number(value);
+  };
+  return {
+    enabled: document.getElementById('btnToggleGroupAutoSwitch')?.classList.contains('is-on'),
+    failRateThreshold: number('selectGroupFailRate'),
+    minSampleSize: number('selectGroupMinSampleSize'),
+    consecutiveFailuresThreshold: number('selectGroupConsecutiveFailures'),
+    cooldownMinutes: number('selectGroupCooldown'),
+    autoRecoverLowestCost: document.getElementById('btnToggleGroupAutoRecover')?.classList.contains('is-on')
+  };
+}
+
+// 按当前表单和全站设置的差别，告诉运营者保存后哪些项单独对本组生效。
+function updateGroupPolicyNote() {
+  const note = document.getElementById('groupAutoSwitchFollowNote');
+  if (!note || !groupAutoSwitchDefaults) return;
+  const form = readGroupPolicyForm();
+  const differs = Object.keys(GROUP_POLICY_LABELS).filter(key => form[key] !== undefined && form[key] !== groupAutoSwitchDefaults[key]);
+  const globalOff = groupAutoSwitchGlobalEnabled ? '' : '<div style="color:#dc2626;font-weight:700;">⚠️ 全站自动切号总开关目前是关闭的，本组的设置暂时不会生效。</div>';
+  note.innerHTML = globalOff + (differs.length
+    ? `🔧 本组单独设置：<b>${differs.map(key => GROUP_POLICY_LABELS[key]).join('、')}</b>；其余跟随全站。`
+    : '✅ 本组完全跟随全站设置。');
+}
+
+function resetGroupAutoSwitchToGlobal() {
+  const defaults = groupAutoSwitchDefaults;
+  if (!defaults) return;
+  setGroupToggle('btnToggleGroupAutoSwitch', 'textGroupAutoSwitchState', true);
+  setGroupPolicySelect('selectGroupFailRate', defaults.failRateThreshold, '%');
+  setGroupPolicySelect('selectGroupMinSampleSize', defaults.minSampleSize, ' 次');
+  setGroupPolicySelect('selectGroupConsecutiveFailures', defaults.consecutiveFailuresThreshold, ' 次');
+  setGroupPolicySelect('selectGroupCooldown', defaults.cooldownMinutes, ' 分钟');
+  setGroupToggle('btnToggleGroupAutoRecover', 'textGroupAutoRecoverState', defaults.autoRecoverLowestCost === true);
+  updateGroupPolicyNote();
+  showToast('已改回全站设置，点「保存本组设置」后生效', 'info');
+}
+
 async function openGroupAutoSwitchModal(groupId) {
   const group = (allGroups || []).find(g => String(g.id) === String(groupId));
   if (!group) {
@@ -5095,40 +5443,18 @@ async function openGroupAutoSwitchModal(groupId) {
     const res = await fetch(`/api/groups/${groupId}/auto-switch`);
     const data = await res.json();
     const policy = data.policy || {};
-
-    const isEnabled = policy.enabled !== false;
-    const btnSwitch = document.getElementById('btnToggleGroupAutoSwitch');
-    const txtSwitch = document.getElementById('textGroupAutoSwitchState');
-    if (btnSwitch && txtSwitch) {
-      btnSwitch.className = `toggle-switch-btn ${isEnabled ? 'is-on' : 'is-off'}`;
-      txtSwitch.textContent = isEnabled ? '已开启' : '已停用';
-    }
-
-    const selectFailRate = document.getElementById('selectGroupFailRate');
-    if (selectFailRate) selectFailRate.value = String(policy.failRateThreshold || 50);
-
-    const selectConsec = document.getElementById('selectGroupConsecutiveFailures');
-    if (selectConsec) selectConsec.value = String(policy.consecutiveFailuresThreshold || 5);
-
-    const selectCooldown = document.getElementById('selectGroupCooldown');
-    if (selectCooldown) selectCooldown.value = String(policy.cooldownMinutes || 10);
-
-    const isLowRate = Boolean(policy.isLowRateGroup);
+    groupAutoSwitchDefaults = policy.defaults || null;
+    groupAutoSwitchGlobalEnabled = policy.globalEnabled !== false;
+    setGroupToggle('btnToggleGroupAutoSwitch', 'textGroupAutoSwitchState', policy.enabled !== false);
+    setGroupPolicySelect('selectGroupFailRate', policy.failRateThreshold, '%');
+    setGroupPolicySelect('selectGroupMinSampleSize', policy.minSampleSize, ' 次');
+    setGroupPolicySelect('selectGroupConsecutiveFailures', policy.consecutiveFailuresThreshold, ' 次');
+    setGroupPolicySelect('selectGroupCooldown', policy.cooldownMinutes, ' 分钟');
+    // 以前读的是不存在的 autoRecover 字段，开关永远显示「已开启」，保存的却是关闭。
+    setGroupToggle('btnToggleGroupAutoRecover', 'textGroupAutoRecoverState', policy.autoRecoverLowestCost === true);
     const lowRateNotice = document.getElementById('groupLowRateNotice');
-    if (lowRateNotice) {
-      lowRateNotice.style.display = isLowRate ? 'block' : 'none';
-    }
-
-    const selectMinSample = document.getElementById('selectGroupMinSampleSize');
-    if (selectMinSample) selectMinSample.value = String(policy.minSampleSize || (isLowRate ? 10 : 5));
-
-    const isAutoRecover = policy.autoRecover !== false;
-    const btnRecover = document.getElementById('btnToggleGroupAutoRecover');
-    const txtRecover = document.getElementById('textGroupAutoRecoverState');
-    if (btnRecover && txtRecover) {
-      btnRecover.className = `toggle-switch-btn ${isAutoRecover ? 'is-on' : 'is-off'}`;
-      txtRecover.textContent = isAutoRecover ? '已开启' : '已停用';
-    }
+    if (lowRateNotice) lowRateNotice.style.display = policy.isLowRateGroup ? 'block' : 'none';
+    updateGroupPolicyNote();
 
     const modal = document.getElementById('groupAutoSwitchModal');
     if (modal) modal.style.display = 'flex';
@@ -5138,19 +5464,12 @@ async function openGroupAutoSwitchModal(groupId) {
 }
 
 function applyLowRatePreset() {
-  const selectFailRate = document.getElementById('selectGroupFailRate');
-  if (selectFailRate) selectFailRate.value = '60';
-
-  const selectMinSample = document.getElementById('selectGroupMinSampleSize');
-  if (selectMinSample) selectMinSample.value = '10';
-
-  const selectConsec = document.getElementById('selectGroupConsecutiveFailures');
-  if (selectConsec) selectConsec.value = '10';
-
-  const selectCooldown = document.getElementById('selectGroupCooldown');
-  if (selectCooldown) selectCooldown.value = '20';
-
-  showToast('⚡ 已一键填入低倍率专区防抖推荐配置（失败率60%·样本量10次·连续硬报错10次·冷静期20分），点击下方【保存本组切线策略】即可生效！', 'info');
+  setGroupPolicySelect('selectGroupFailRate', 60, '%');
+  setGroupPolicySelect('selectGroupMinSampleSize', 10, ' 次');
+  setGroupPolicySelect('selectGroupConsecutiveFailures', 10, ' 次');
+  setGroupPolicySelect('selectGroupCooldown', 20, ' 分钟');
+  updateGroupPolicyNote();
+  showToast('已填入：失败率 60%、样本 10 次、连续失败 10 次、切回间隔 20 分钟。点「保存本组设置」后生效', 'info');
 }
 
 function closeGroupAutoSwitchModal() {
@@ -5161,32 +5480,21 @@ function closeGroupAutoSwitchModal() {
 
 function toggleGroupAutoSwitchState() {
   const btn = document.getElementById('btnToggleGroupAutoSwitch');
-  const txt = document.getElementById('textGroupAutoSwitchState');
-  if (!btn || !txt) return;
-  const isOn = btn.classList.contains('is-on');
-  btn.className = `toggle-switch-btn ${!isOn ? 'is-on' : 'is-off'}`;
-  txt.textContent = !isOn ? '已开启' : '已停用';
+  if (!btn) return;
+  setGroupToggle('btnToggleGroupAutoSwitch', 'textGroupAutoSwitchState', !btn.classList.contains('is-on'));
+  updateGroupPolicyNote();
 }
 
 function toggleGroupAutoRecoverState() {
   const btn = document.getElementById('btnToggleGroupAutoRecover');
-  const txt = document.getElementById('textGroupAutoRecoverState');
-  if (!btn || !txt) return;
-  const isOn = btn.classList.contains('is-on');
-  btn.className = `toggle-switch-btn ${!isOn ? 'is-on' : 'is-off'}`;
-  txt.textContent = !isOn ? '已开启' : '已停用';
+  if (!btn) return;
+  setGroupToggle('btnToggleGroupAutoRecover', 'textGroupAutoRecoverState', !btn.classList.contains('is-on'));
+  updateGroupPolicyNote();
 }
 
 // 提交保存本组自动切线策略
 async function submitGroupAutoSwitchPolicy() {
   if (!currentAutoSwitchGroupId) return;
-
-  const enabled = document.getElementById('btnToggleGroupAutoSwitch')?.classList.contains('is-on');
-  const failRateThreshold = Number(document.getElementById('selectGroupFailRate')?.value || 50);
-  const minSampleSize = Number(document.getElementById('selectGroupMinSampleSize')?.value || 5);
-  const consecutiveFailuresThreshold = Number(document.getElementById('selectGroupConsecutiveFailures')?.value || 5);
-  const cooldownMinutes = Number(document.getElementById('selectGroupCooldown')?.value || 10);
-  const autoRecover = document.getElementById('btnToggleGroupAutoRecover')?.classList.contains('is-on');
 
   const btnSave = document.getElementById('btnSaveGroupAutoSwitchModal');
   if (btnSave) {
@@ -5195,17 +5503,11 @@ async function submitGroupAutoSwitchPolicy() {
   }
 
   try {
+    // 服务器只保存和全站不同的项，其余继续跟随全站。
     const res = await fetch(`/api/groups/${currentAutoSwitchGroupId}/auto-switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        enabled,
-        failRateThreshold,
-        minSampleSize,
-        consecutiveFailuresThreshold,
-        cooldownMinutes,
-        autoRecover
-      })
+      body: JSON.stringify(readGroupPolicyForm())
     });
     const result = await res.json();
     if (result.success) {
@@ -6312,6 +6614,70 @@ function syncAutoSwitchForm() {
     selectConsecutive.value = String(autoSwitchConfig.consecutiveFailuresThreshold);
   }
 
+  const selectProbe = document.getElementById('selectProbeFailures');
+  if (selectProbe && autoSwitchConfig.probeFailuresThreshold !== undefined) {
+    selectProbe.value = String(autoSwitchConfig.probeFailuresThreshold);
+  }
+
+}
+
+// 保护情况：借用切号预演的数据，告诉运营者哪些分组出问题时能自动切换、哪些不能、为什么。
+function summarizeAutoSwitchCoverage(data) {
+  const covered = [], exposed = [], manual = [], urgent = [];
+  for (const group of data.groups || []) {
+    if (group.action === 'skip') { manual.push(group); continue; }
+    if (group.action === 'exhausted') urgent.push(group);
+    const others = (group.accounts || []).filter(acc => !acc.isCurrent);
+    const backups = others.filter(acc => acc.candidate).length;
+    if (backups) { covered.push({ group, backups }); continue; }
+    const tally = {};
+    for (const acc of others) {
+      const notes = (acc.notes || []).join(' ');
+      const kind = /共享账号/.test(notes) ? '共享账号' : /售价|倍率未知/.test(notes) ? '进价高于售价' : /人工停用|例外渠道/.test(notes) ? '人工停用' : '暂时不可用';
+      tally[kind] = (tally[kind] || 0) + 1;
+    }
+    const why = others.length ? '其余 ' + Object.entries(tally).map(([kind, count]) => `${count} 个${kind}`).join('、') : '只有 1 个账号';
+    exposed.push({ group, why, shared: Boolean(tally['共享账号']) });
+  }
+  return { covered, exposed, manual, urgent };
+}
+
+function renderAutoSwitchCoverage(data) {
+  const box = document.getElementById('autoSwitchCoverage');
+  if (!box) return;
+  const name = group => escapeHtml(group.groupName || '');
+  const line = (icon, color, count, title, detail) => count ? `<div style="margin-top:0.3rem;">
+      <span style="color:${color};font-weight:700;">${icon} ${count} 个分组${title}</span>
+      <div style="color:#64748b;font-size:0.74rem;margin-left:1.35rem;">${detail}</div>
+    </div>` : '';
+  const { covered, exposed, manual, urgent } = summarizeAutoSwitchCoverage(data);
+  const hints = [];
+  if (exposed.length) hints.push('给没有备用的分组各加一个同类模型、进价不高于售价的备用账号，出问题时就能自动切换。');
+  if (exposed.some(item => item.shared)) hints.push('共享账号不能直接当备用，可以用顶栏【🧩 拆分共享账号】拆开。');
+  box.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;">
+      <strong style="color:#0f172a;">🛡️ 各分组的保护情况</strong>
+      <span style="font-size:0.7rem;color:#94a3b8;">${escapeHtml(new Date(data.generatedAt).toLocaleTimeString())} 检查</span>
+    </div>
+    ${data.enabled ? `
+      ${line('🚨', '#dc2626', urgent.length, '当前账号出了问题，而且没有备用可切，请尽快充值或补充账号', urgent.map(name).join('、'))}
+      ${line('✅', '#16a34a', covered.length, '有备用账号，出问题会自动切换', covered.map(item => `${name(item.group)}（${item.backups} 个备用）`).join('、'))}
+      ${line('⚠️', '#b45309', exposed.length, '没有可用的备用账号，出问题时无法自动切换', exposed.map(item => `${name(item.group)}（${escapeHtml(item.why)}）`).join('、'))}
+      ${line('⏸', '#64748b', manual.length, '由你人工管理，不自动切换', manual.map(group => `${name(group)}（${escapeHtml(String(group.reason || '').split('，')[0])}）`).join('、'))}
+      ${hints.length ? `<div style="margin-top:0.45rem;padding-top:0.4rem;border-top:1px dashed #cbd5e1;color:#475569;font-size:0.74rem;">💡 ${hints.join('')}</div>` : ''}`
+    : '<div style="color:#dc2626;font-weight:700;margin-top:0.3rem;">⏸ 自动切号总开关目前是关闭的，所有分组都不会自动切换。</div>'}
+    <div style="margin-top:0.5rem;"><button type="button" class="btn-micro-edit" onclick="openAutoSwitchPreviewModal()">🧭 查看每个分组的详情（切号预演）</button></div>`;
+}
+
+async function loadAutoSwitchCoverage() {
+  const box = document.getElementById('autoSwitchCoverage');
+  if (!box) return;
+  box.innerHTML = '<span style="color:#64748b;">正在检查各分组的保护情况…</span>';
+  try {
+    renderAutoSwitchCoverage(await fetchAutoSwitchPreview());
+  } catch (err) {
+    box.innerHTML = `<span style="color:#dc2626;">读取保护情况失败：${escapeHtml(err.message)}</span>`;
+  }
 }
 
 function openAutoSwitchModal() {
@@ -6323,6 +6689,7 @@ function openAutoSwitchModal() {
     } else {
       loadAutoSwitchConfig();
     }
+    loadAutoSwitchCoverage();
     loadAutoSwitchLogs();
   }
 }
@@ -6338,10 +6705,11 @@ async function saveAutoSwitchConfig() {
   const btnToggle = document.getElementById('btnToggleAutoSwitch');
   const enabled = btnToggle?.classList.contains('is-on');
   
-  const failRateThreshold = Number(document.getElementById('selectFailRateThreshold')?.value) || 50;
+  const failRateThreshold = Number(document.getElementById('selectFailRateThreshold')?.value) || 70;
   const cooldownMinutes = Number(document.getElementById('selectCooldownMinutes')?.value) || 10;
-  const minSampleSize = Number(document.getElementById('selectMinSampleSize')?.value) || 10;
-  const consecutiveFailuresThreshold = Number(document.getElementById('selectConsecutiveFailures')?.value) || 5;
+  const minSampleSize = Number(document.getElementById('selectMinSampleSize')?.value) || 50;
+  const consecutiveFailuresThreshold = Number(document.getElementById('selectConsecutiveFailures')?.value) || 30;
+  const probeFailuresThreshold = Number(document.getElementById('selectProbeFailures')?.value) || 20;
 
   const saveBtn = document.getElementById('btnSaveAutoSwitchConfig');
   if (saveBtn) {
@@ -6353,16 +6721,14 @@ async function saveAutoSwitchConfig() {
     const res = await fetch('/api/auto-switch/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      // 只提交面板上看得见的设置；首字超时、欠费确认次数等没有展示的项保持服务器上的现值，不再被写死的默认值覆盖。
       body: JSON.stringify({
         enabled,
-        mode: 'unified_cost_first',
-        ttftThresholdMs: 30000,
         failRateThreshold,
         minSampleSize,
         consecutiveFailuresThreshold,
-        cooldownMinutes,
-        autoRecoverLowestCost: true,
-        strategy: 'cost_first' // 严格唯一基准：谁便宜谁是主调，按照价格来是第一要素
+        probeFailuresThreshold,
+        cooldownMinutes
       })
     });
     const data = await res.json();
