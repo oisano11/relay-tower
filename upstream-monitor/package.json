@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/test-upstream-scanner.js && node --test scripts/test-regressions.js scripts/test-auth-telegram.js scripts/test-gateway-integration.js scripts/test-role-plans.js scripts/test-server-smoke.js scripts/test-auto-failover-policy.js"
+    "test": "node scripts/test-upstream-scanner.js && node --test scripts/test-regressions.js scripts/test-auth-telegram.js scripts/test-gateway-integration.js scripts/test-role-plans.js scripts/test-server-smoke.js scripts/test-auto-failover-policy.js scripts/test-account-split.js"
   },
   "keywords": ["ai", "relay", "upstream", "monitor", "pricing", "switcher"],
   "author": "Relay Tower Community",

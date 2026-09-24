@@ -156,7 +156,9 @@ test('recent production errors must expire before stable recovery observations a
   let result;
   for (let minute = 0; minute <= 8; minute++) {
     const now = START + minute * 60000;
-    result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }), channel(2, { costMultiplier: 0.1, lastProbeTime: now })], {
+    // A real 1-token generation succeeds after the errors stopped.
+    const proof = minute >= 5 ? { lastGenerationProbeAt: now, lastGenerationProbeStatus: 'ok' } : {};
+    result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }), channel(2, { costMultiplier: 0.1, lastProbeTime: now, ...proof })], {
       now, runtime, metrics: minute < 5 ? { 2: { totalCalls: 5, providerErrCount: 5, consecutiveFailures: 5 } } : {}
     });
     if (minute < 8) assert.equal(result.action, 'hold');
@@ -164,6 +166,105 @@ test('recent production errors must expire before stable recovery observations a
     runtime = result.runtime;
   }
   assert.equal(result.reason, 'cheaper_recovered');
+});
+
+test('request-level faults never recover on /v1/models alone: a real generation proof is required', () => {
+  let runtime = {};
+  let result;
+  for (let minute = 0; minute <= 30; minute++) {
+    const now = START + minute * 60000;
+    result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }), channel(2, { costMultiplier: 0.1, lastProbeTime: now })], {
+      now, runtime, metrics: minute < 5 ? { 2: { totalCalls: 5, providerErrCount: 5, consecutiveFailures: 5 } } : {}
+    });
+    assert.equal(result.action, 'hold', `minute ${minute}: must not flap back without proof`);
+    runtime = result.runtime;
+  }
+  // A proof older than the fault does not count either.
+  const now = START + 31 * 60000;
+  result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }),
+    channel(2, { costMultiplier: 0.1, lastProbeTime: now, lastGenerationProbeAt: START + 60000, lastGenerationProbeStatus: 'ok' })], { now, runtime });
+  assert.equal(result.action, 'hold');
+});
+
+test('debt on an account whose balance cannot be queried is cleared by a real generation after recharge', () => {
+  const unknown = { balance: null, balanceStatus: 'unknown' };
+  let result = decide([channel(1, { ...unknown, costMultiplier: 0.5 }), channel(2, { ...unknown, costMultiplier: 0.8, schedulable: false })],
+    { metrics: { 1: { totalCalls: 10, providerErrCount: 10, consecutiveFailures: 10, consecutiveQuotaFailures: 10 } } });
+  assert.equal(result.reason, 'balance_empty');
+  let runtime = { ...result.runtime, lastSwitchAt: START, lastTargetId: 2 };
+  // One hour of healthy /models probes without a generation proof: stays excluded.
+  for (let minute = 1; minute <= 60; minute++) {
+    const now = START + minute * 60000;
+    result = decide([channel(1, { ...unknown, costMultiplier: 0.5, schedulable: false, priority: 10, lastProbeTime: now }),
+      channel(2, { ...unknown, costMultiplier: 0.8, schedulable: true, priority: 1, lastProbeTime: now })], { now, runtime });
+    assert.equal(result.action, 'hold');
+    runtime = result.runtime;
+  }
+  assert.equal(runtime.accounts['1'].debt, true);
+  // After recharge the generation probe succeeds: debt clears and traffic returns.
+  for (let minute = 61; minute <= 66; minute++) {
+    const now = START + minute * 60000;
+    result = decide([channel(1, { ...unknown, costMultiplier: 0.5, schedulable: false, priority: 10, lastProbeTime: now, lastGenerationProbeAt: START + 61 * 60000, lastGenerationProbeStatus: 'ok' }),
+      channel(2, { ...unknown, costMultiplier: 0.8, schedulable: true, priority: 1, lastProbeTime: now })], { now, runtime });
+    runtime = result.runtime;
+    if (result.action === 'switch') break;
+  }
+  assert.equal(runtime.accounts['1'].debt, false);
+  assert.equal(result.action, 'switch');
+  assert.equal(result.targetId, 1);
+});
+
+test('a generation probe that still reports quota keeps the debt; unlimited balance clears only after the quota burst', () => {
+  const quota = decide([channel(1, { balance: null, balanceStatus: 'unknown', lastGenerationProbeAt: START, lastGenerationProbeStatus: 'quota' }), channel(2)]);
+  assert.equal(quota.runtime.accounts['1'].debt, true);
+  assert.equal(quota.reason, 'balance_empty');
+  // Unlimited account hit by a burst of quota-looking errors.
+  const burst = decide([channel(1, { balance: null, balanceStatus: 'unlimited', balanceUpdated: START - 60000 }), channel(2)],
+    { metrics: { 1: { consecutiveQuotaFailures: 10, consecutiveFailures: 10 } } });
+  assert.equal(burst.runtime.accounts['1'].debt, true);
+  // Same (older) unlimited observation cannot clear it...
+  const stillOld = decide([channel(1, { balance: null, balanceStatus: 'unlimited', balanceUpdated: START - 60000 }), channel(2)], { runtime: burst.runtime, now: START + 60000 });
+  assert.equal(stillOld.runtime.accounts['1'].debt, true);
+  // ...but a newer refresh does.
+  const refreshed = decide([channel(1, { balance: null, balanceStatus: 'unlimited', balanceUpdated: START + 120000, lastProbeTime: START + 120000 }), channel(2, { lastProbeTime: START + 120000 })],
+    { runtime: burst.runtime, now: START + 120000 });
+  assert.equal(refreshed.runtime.accounts['1'].debt, false);
+});
+
+test('passive (OAuth / no API key) accounts recover from request faults without a generation probe', () => {
+  let runtime = {};
+  let result;
+  for (let minute = 0; minute <= 12; minute++) {
+    const now = START + minute * 60000;
+    result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }), channel(2, { costMultiplier: 0.1, lastProbeTime: now, passiveHealth: true })], {
+      now, runtime, metrics: minute < 5 ? { 2: { totalCalls: 5, providerErrCount: 5, consecutiveFailures: 5 } } : {}
+    });
+    runtime = result.runtime;
+    if (result.action === 'switch') break;
+  }
+  assert.equal(result.reason, 'cheaper_recovered');
+});
+
+test('candidate order can prefer native role priority over cost', () => {
+  const channels = [channel(1, { balance: 0, balanceStatus: 'empty' }), channel(2, { priority: 100, costMultiplier: 0.2 }), channel(3, { priority: 10, costMultiplier: 0.3 })];
+  assert.equal(decide(channels).targetId, 2);
+  assert.equal(decide(channels, { config: { candidateOrder: 'role' } }).targetId, 3);
+});
+
+test('decisions expose per-account faults so callers only shut down confirmed debt', () => {
+  const result = decide([channel(1, { balance: 0, balanceStatus: 'empty' }), channel(2, { autoSwitchDisabled: true })]);
+  assert.equal(result.action, 'exhausted');
+  assert.equal(result.faults['1'], 'balance_empty');
+  assert.equal(result.faults['2'], 'disabled');
+  const slow = decide([channel(1), channel(2, { autoSwitchDisabled: true })], { metrics: { 1: { consecutiveFailures: 5 } } });
+  assert.equal(slow.action, 'exhausted');
+  assert.equal(slow.faults['1'], 'request_failures');
+});
+
+test('current account is chosen by account-wide priority, which is what SUB2API schedules on', () => {
+  const result = decide([channel(1, { schedulable: true, priority: 1, groupsDetail: [{ id: 1, priority: 90 }] }),
+    channel(2, { schedulable: true, priority: 10, groupsDetail: [{ id: 1, priority: 1 }] })]);
+  assert.equal(result.currentId, 1);
 });
 
 test('consecutive 10 quota empty errors trigger balance_empty failover to secondary', () => {
@@ -222,3 +323,126 @@ test('recharging original main channel automatically switches back even with ide
   assert.equal(result.targetId, 1);
 });
 
+test('promoting the backup to priority 1 after failover never rewrites the recorded origin', () => {
+  // Empty-limit main fails over, and executeAutoSwitch then marks account 2 as
+  // priority 1 / schedulable. Without the fix, the next evaluation would treat
+  // account 2 as the original main, permanently blocking main_recharged.
+  const initial = decide([channel(1, { balance: 0, balanceStatus: 'empty' }), channel(2, { schedulable: false, priority: 10 })]);
+  assert.equal(initial.action, 'switch');
+  assert.equal(initial.runtime.originalMainId, 1);
+
+  const afterSwitch = [channel(1, { schedulable: false, priority: 10, balance: 0, balanceStatus: 'empty' }), channel(2, { schedulable: true, priority: 1 })];
+  let result = decide(afterSwitch, { runtime: initial.runtime });
+  assert.equal(result.action, 'hold');
+  assert.equal(result.runtime.originalMainId, 1, 'promoted backup must not become the recorded origin');
+
+  // Once the real main is healthy and charged again, control returns to it.
+  let runtime = result.runtime;
+  for (let minute = 1; minute <= 11; minute++) {
+    const now = START + minute * 60000;
+    result = decide([
+      channel(1, { schedulable: false, priority: 10, balance: 50, balanceStatus: 'ok', balanceUpdated: now, lastProbeTime: now }),
+      channel(2, { schedulable: true, priority: 1, lastProbeTime: now })
+    ], { runtime, now });
+    runtime = result.runtime;
+  }
+  assert.equal(result.reason, 'main_recharged');
+  assert.equal(result.targetId, 1);
+});
+
+test('a manual main lock is the one promotion that may reset the recorded origin', () => {
+  const runtime = { originalMainId: 1, accounts: {} };
+  const result = decide([channel(1, { schedulable: false, costMultiplier: 0.1 }),
+    channel(2, { costMultiplier: 0.1, schedulable: true, priority: 1, manualLocked: true })], { runtime });
+  assert.equal(result.runtime.originalMainId, 2);
+});
+
+test('with cheaper-recovery turned off, a recharged original main still takes traffic back', () => {
+  let runtime = { originalMainId: 1, lastSwitchAt: START, accounts: { 1: { debt: true, needsRecovery: true } } };
+  let result;
+  for (let minute = 1; minute <= 12; minute++) {
+    const now = START + minute * 60000;
+    result = decide([
+      channel(1, { schedulable: false, priority: 10, costMultiplier: 0.5, balance: 50, balanceStatus: 'ok', balanceUpdated: now, lastProbeTime: now }),
+      channel(2, { schedulable: true, priority: 1, costMultiplier: 0.2, lastProbeTime: now })
+    ], { runtime, now, config: { autoRecoverLowestCost: false } });
+    runtime = result.runtime;
+    if (result.action === 'switch') break;
+  }
+  assert.equal(result.reason, 'main_recharged', 'returns to the operator-chosen main even though it is more expensive');
+  assert.equal(result.targetId, 1);
+});
+
+test('with cheaper-recovery turned off, a merely cheaper account never steals the route', () => {
+  let runtime = {};
+  let result;
+  for (let minute = 0; minute <= 15; minute++) {
+    const now = START + minute * 60000;
+    result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }), channel(2, { costMultiplier: 0.1, lastProbeTime: now })],
+      { runtime, now, config: { autoRecoverLowestCost: false } });
+    runtime = result.runtime;
+    assert.equal(result.action, 'hold');
+  }
+});
+
+test('a quiet main whose last requests failed is switched only after a real generation also fails', () => {
+  const config = { consecutiveFailuresThreshold: 30, suspectFailures: 3 };
+  const quiet = { 1: { totalCalls: 4, providerErrCount: 3, consecutiveFailures: 3 } };
+  const main = overrides => channel(1, overrides);
+  // Too few requests for the normal thresholds, and suspicion alone never moves traffic.
+  assert.equal(decide([main(), channel(2)], { config, metrics: quiet }).action, 'hold');
+  // A successful probe, or one that only found no usable model, clears the suspicion.
+  for (const status of ['ok', 'unknown_model']) {
+    assert.equal(decide([main({ lastGenerationProbeAt: START - 30000, lastGenerationProbeStatus: status }), channel(2)], { config, metrics: quiet }).action, 'hold');
+  }
+  // A failed probe from an earlier incident is too old to confirm this one.
+  assert.equal(decide([main({ lastGenerationProbeAt: START - 600000, lastGenerationProbeStatus: 'fail' }), channel(2)], { config, metrics: quiet }).action, 'hold');
+  const result = decide([main({ lastGenerationProbeAt: START - 30000, lastGenerationProbeStatus: 'fail' }), channel(2)], { config, metrics: quiet });
+  assert.equal(result.action, 'switch');
+  assert.equal(result.reason, 'request_failures');
+  assert.equal(result.targetId, 2);
+  assert.equal(result.runtime.accounts['1'].proofRequiredSince, START, 'coming back still needs a successful real generation');
+});
+
+test('busy accounts keep the original thresholds even when a generation probe fails', () => {
+  const config = { consecutiveFailuresThreshold: 30, suspectFailures: 3 };
+  const busy = { 1: { totalCalls: 120, providerErrCount: 5, consecutiveFailures: 5 } };
+  const result = decide([channel(1, { lastGenerationProbeAt: START - 30000, lastGenerationProbeStatus: 'fail' }), channel(2)], { config, metrics: busy });
+  assert.equal(result.action, 'hold');
+});
+
+test('an uncustomized group shows the current global settings, not stale hard-coded numbers', () => {
+  const { resolveGroupPolicy } = require('../auto-failover-policy');
+  const view = resolveGroupPolicy({ failRateThreshold: 70, minSampleSize: 20, consecutiveFailuresThreshold: 30, cooldownMinutes: 10, autoRecoverLowestCost: false }, {});
+  assert.deepEqual(view.customized, []);
+  assert.equal(view.minSampleSize, 20);
+  assert.equal(view.enabled, true);
+  assert.equal(view.autoRecoverLowestCost, false);
+});
+
+test('saving a group keeps only the settings that differ from the global ones', () => {
+  const { groupPolicyOverrides, resolveGroupPolicy } = require('../auto-failover-policy');
+  const global = { failRateThreshold: 70, minSampleSize: 20, consecutiveFailuresThreshold: 30, cooldownMinutes: 10, autoRecoverLowestCost: false };
+  const form = { enabled: true, failRateThreshold: 50, minSampleSize: 20, consecutiveFailuresThreshold: 30, cooldownMinutes: 10, autoRecoverLowestCost: true };
+  const overrides = groupPolicyOverrides(global, form);
+  assert.deepEqual(overrides, { failRateThreshold: 50, autoRecoverLowestCost: true });
+  // A later global change still reaches every setting the group did not override.
+  const view = resolveGroupPolicy({ ...global, minSampleSize: 50, cooldownMinutes: 15 }, overrides);
+  assert.equal(view.minSampleSize, 50);
+  assert.equal(view.cooldownMinutes, 15);
+  assert.equal(view.failRateThreshold, 50);
+  assert.deepEqual([...view.customized].sort(), ['autoRecoverLowestCost', 'failRateThreshold']);
+  // Turning the group off is the only way `enabled` gets stored; matching everything drops the policy.
+  assert.deepEqual(groupPolicyOverrides(global, { ...form, enabled: false, failRateThreshold: 70, autoRecoverLowestCost: false }), { enabled: false });
+  assert.deepEqual(groupPolicyOverrides(global, { ...form, failRateThreshold: 70, autoRecoverLowestCost: false }), {});
+  // Out-of-range values are clamped and empty ones ignored instead of being stored verbatim.
+  assert.deepEqual(groupPolicyOverrides(global, { failRateThreshold: 250, minSampleSize: '' }), { failRateThreshold: 100 });
+});
+
+test('a legacy group policy that copied every global value only reports the real differences', () => {
+  const { resolveGroupPolicy } = require('../auto-failover-policy');
+  const view = resolveGroupPolicy({ failRateThreshold: 70, minSampleSize: 50, consecutiveFailuresThreshold: 30, cooldownMinutes: 10 },
+    { enabled: true, failRateThreshold: 70, consecutiveFailuresThreshold: 30, cooldownMinutes: 15, autoRecoverLowestCost: false });
+  assert.deepEqual(view.customized, ['cooldownMinutes']);
+  assert.equal(view.cooldownMinutes, 15);
+});

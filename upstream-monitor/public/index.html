@@ -9,7 +9,7 @@
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=relay-tower-2026">
   <link rel="shortcut icon" href="favicon.ico?v=relay-tower-2026">
-  <link rel="stylesheet" href="style.css?v=20260921_sub2api_v2">
+  <link rel="stylesheet" href="style.css?v=20260923_balance_sync_v3">
 </head>
 <body>
   <div class="app-layout">
@@ -60,6 +60,15 @@
         </button>
         <button id="btnSyncBackend" class="btn btn-glass" title="强制从 Sub2API 后台全量对齐渠道列表，同步清理已在后台删除的上游">
           <span>🔄</span> 同步后台
+        </button>
+        <button id="btnAutoSwitchPreview" class="btn btn-glass" title="只读预演：按当前线上数据，查看每个分组现在会怎么切号、为什么（不写入任何数据）">
+          <span>🧭</span> 切号预演
+        </button>
+        <button id="btnSplitShared" class="btn btn-glass" title="把挂在多个业务分组下的共享账号，拆成每个分组一个独立账号，之后即可按组自动切换">
+          <span>🧩</span> 拆分共享账号
+        </button>
+        <button id="btnHeaderSyncBalances" class="btn btn-glass" onclick="refreshAllBalances()" title="一键抓取并全量同步所有上游钱包余额">
+          <span>💰</span> 同步上游余额
         </button>
         <button id="btnOpenAlertsDrawer" class="btn btn-glass btn-alerts-box" title="打开报错与告警信息盒 (查看全部上游调价、自动切线熔断与报错流水)">
           <span class="bell-icon" id="alertsBellIcon">🔔</span> 报错信息盒 <span id="alertsBadgeCount" class="alerts-badge-count" style="display: none;">0</span>
@@ -158,8 +167,8 @@
                 <span>上游总备付金</span>
                 <span class="kpi-tag-1to1" title="美金与人民币严格 1:1 结算，无汇率折算">1:1 等额</span>
               </div>
-              <button id="btnRefreshBalances" class="btn-kpi-action" title="一键抓取并刷新所有上游钱包余额">
-                <span>💰</span> 刷新余额
+              <button id="btnRefreshBalances" class="btn-kpi-action" onclick="refreshAllBalances()" title="一键抓取并全量同步所有上游钱包余额">
+                <span>💰</span> 同步上游余额
               </button>
             </div>
             <div class="kpi-card-body">
@@ -941,45 +950,41 @@
             </h3>
             <button id="btnCloseAutoSwitchModalHeader" class="btn btn-secondary" style="font-size: 0.85rem; padding: 0.2rem 0.5rem;">✕</button>
           </div>
-          <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 0.65rem 0.85rem; margin-top: 0.4rem; font-size: 0.78rem; color: #1e40af; line-height: 1.5;">
-            <strong>📌 日常只需关注充值：</strong><br/>
-            ① 短暂波动先观察；确认故障或余额耗尽后，自动切到同业务组可用账号，无需逐次批准。<br/>
-            ② 备用账号持续接受健康检查，充值并稳定恢复后重新参与调度。<br/>
-            ③ 低价回切受稳定观察和冷静期约束；当前账号再次故障时仍可及时切出。<br/>
-            ④ 仅选择成本不高于分组售价的候选；不自动修改对外售价，无可用候选时提醒处理。<br/>
-            ⑤ 渠道开关只管理是否参与自动调度；人工停用的账号不会被自动重新启用。分组页面可覆盖本组参数。
+          <!-- 1. 保护情况：打开面板时按切号预演实时统计（app.js loadAutoSwitchCoverage） -->
+          <div id="autoSwitchCoverage" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.65rem 0.85rem; margin-top: 0.4rem; font-size: 0.78rem; color: #334155; line-height: 1.55;">
+            <span style="color: #64748b;">正在检查各分组的保护情况…</span>
           </div>
 
-          <!-- 1. 核心规则四大铁律卡片 -->
+          <!-- 2. 规则说明：与 auto-failover-policy.js 的实际判断一致 -->
           <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; margin-top: 0.75rem;">
-            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
-              <div style="font-weight: 700; color: #166534; margin-bottom: 2px;">🟢 健康后再比价</div>
-              <div style="color: #15803d; line-height: 1.35;">在同组健康、未人工停用且成本合适的账号中择优</div>
-            </div>
             <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
-              <div style="font-weight: 700; color: #1e40af; margin-bottom: 2px;">🔵 故障自动接替</div>
-              <div style="color: #1d4ed8; line-height: 1.35;">按失败率、连续失败和余额判断；一次偶发失败不会立即切号</div>
+              <div style="font-weight: 700; color: #1e40af; margin-bottom: 2px;">🔍 什么时候换号</div>
+              <div style="color: #1d4ed8; line-height: 1.35;">确认出了故障才换：余额用完、连续失败、失败率过高或长时间连不上。偶尔失败不会换</div>
+            </div>
+            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
+              <div style="font-weight: 700; color: #166534; margin-bottom: 2px;">🔁 换到哪个号</div>
+              <div style="color: #15803d; line-height: 1.35;">同组里健康、支持同样模型、进价不高于售价的备用账号，优先选最便宜的</div>
             </div>
             <div style="background: #fefce8; border: 1px solid #fef08a; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
-              <div style="font-weight: 700; color: #854d0e; margin-bottom: 2px;">🟡 人工只需充值</div>
-              <div style="color: #a16207; line-height: 1.35;">余额刷新后自动验证恢复，故障号恢复不需要手动开关</div>
+              <div style="font-weight: 700; color: #854d0e; margin-bottom: 2px;">💰 你只需要充值</div>
+              <div style="color: #a16207; line-height: 1.35;">原来的账号充值或恢复后，观察几分钟、再用一次真实请求验证，就自动切回。不会为了省钱主动换号</div>
             </div>
             <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
-              <div style="font-weight: 700; color: #334155; margin-bottom: 2px;">🛡️ 单主独占·防横跳</div>
-              <div style="color: #475569; line-height: 1.35;">同组保留一个使用中账号；稳定后才低价回切，故障切出不受冷静期阻挡</div>
+              <div style="font-weight: 700; color: #334155; margin-bottom: 2px;">🛡️ 不会乱动</div>
+              <div style="color: #475569; line-height: 1.35;">不改对外售价；不启用你手动停用的账号；人工管理的分组不碰</div>
             </div>
           </div>
 
           <!-- 2. 核心调度与风控参数设定 -->
           <div style="margin-top: 0.85rem;">
             <div style="font-size: 0.8rem; font-weight: 700; color: #334155; margin-bottom: 0.45rem;">
-              ⚙️ 核心调度与风控参数设定
+              ⚙️ 切换灵敏度 <span style="font-weight: 400; color: #64748b;">（下面的数字越大，越不容易误切，但发现故障也越慢）</span>
             </div>
             <div class="as-config-card">
               <div class="as-config-row">
                 <div class="as-config-info">
-                  <span class="as-config-label">自动切线总开关</span>
-                  <span class="as-config-desc">持续检查纳管业务组，自动处理故障、欠费和恢复；关闭后暂停自动切号</span>
+                  <span class="as-config-label">自动切号总开关</span>
+                  <span class="as-config-desc">开启时每分钟检查一次各分组，自动处理故障、欠费和恢复；关闭后暂停所有自动换号</span>
                 </div>
                 <button id="btnToggleAutoSwitch" class="toggle-switch-btn is-on">
                   <span>●</span> <span>已启用</span>
@@ -990,14 +995,14 @@
 
               <div class="as-config-row">
                 <div class="as-config-info">
-                  <span class="as-config-label">📊 故障切线失败率门槛</span>
-                  <span class="as-config-desc">近期有效样本达到最低数量后，按此失败率判断故障</span>
+                  <span class="as-config-label">📊 失败率达到多少算故障</span>
+                  <span class="as-config-desc">最近 5 分钟的请求数达到下面的「样本量」后，失败率达到这个比例（或者平均要等 30 秒以上才开始回复）就换号</span>
                 </div>
-                <select id="selectFailRateThreshold" class="form-input mono" style="width: 185px; font-weight: 700;">
-                  <option value="50" selected>50% (失败过半才切·推荐)</option>
-                  <option value="40">40% (轻度严格)</option>
-                  <option value="30">30% (高敏响应)</option>
-                  <option value="20">20% (成功率&lt;80%切线)</option>
+                <select id="selectFailRateThreshold" class="form-input mono" style="width: 210px; font-weight: 700;">
+                  <option value="80">80%（最不容易误切）</option>
+                  <option value="70" selected>70%（推荐）</option>
+                  <option value="60">60%</option>
+                  <option value="50">50%（最灵敏）</option>
                 </select>
               </div>
 
@@ -1005,13 +1010,14 @@
 
               <div class="as-config-row">
                 <div class="as-config-info">
-                  <span class="as-config-label">🔢 有效统计最小样本量</span>
-                  <span class="as-config-desc">主通道累计调用量达到该样本数才计算失败率，杜绝 1~2 次偶发网络抖动误切</span>
+                  <span class="as-config-label">🔢 至少多少次请求才看失败率</span>
+                  <span class="as-config-desc">最近 5 分钟请求太少时不看失败率，免得偶尔几次失败就误切。请求少的分组可能达不到这个数，这时失败率这条规则不起作用</span>
                 </div>
-                <select id="selectMinSampleSize" class="form-input mono" style="width: 170px; font-weight: 700;">
-                  <option value="5">5 次 (较快响应)</option>
-                  <option value="10" selected>10 次 (推荐)</option>
-                  <option value="20">20 次 (超高防抖)</option>
+                <select id="selectMinSampleSize" class="form-input mono" style="width: 210px; font-weight: 700;">
+                  <option value="20">20 次（请求少的分组）</option>
+                  <option value="50" selected>50 次（推荐）</option>
+                  <option value="100">100 次</option>
+                  <option value="200">200 次（请求很多的分组）</option>
                 </select>
               </div>
 
@@ -1019,13 +1025,14 @@
 
               <div class="as-config-row">
                 <div class="as-config-info">
-                  <span class="as-config-label">💥 连续硬故障确诊熔断门槛</span>
-                  <span class="as-config-desc">上游连续爆出 502/503/429/401 达到此次数时，即便样本量未满也确诊宕机切线</span>
+                  <span class="as-config-label">💥 连续失败多少次算故障</span>
+                  <span class="as-config-desc">最近 5 分钟里，当前账号的请求连续失败达到这个次数就换号；中间只要成功一次就重新计数。请求少的分组凑不够这个数：连续失败 3 次后，塔台会主动发一次真实请求验证，验证也失败就换号</span>
                 </div>
-                <select id="selectConsecutiveFailures" class="form-input mono" style="width: 170px; font-weight: 700;">
-                  <option value="3">连续 3 次 (敏捷响应)</option>
-                  <option value="5" selected>连续 5 次 (推荐·确诊宕机)</option>
-                  <option value="8">连续 8 次 (高耐受)</option>
+                <select id="selectConsecutiveFailures" class="form-input mono" style="width: 210px; font-weight: 700;">
+                  <option value="15">15 次（更快）</option>
+                  <option value="30" selected>30 次（推荐）</option>
+                  <option value="50">50 次</option>
+                  <option value="80">80 次（最不容易误切）</option>
                 </select>
               </div>
 
@@ -1033,14 +1040,28 @@
 
               <div class="as-config-row">
                 <div class="as-config-info">
-                  <span class="as-config-label">🧊 防抖动冷静期时长</span>
-                  <span class="as-config-desc">限制健康账号之间的低价回切；当前账号故障时不必等冷静期结束</span>
+                  <span class="as-config-label">📡 连续连不上多少次算故障</span>
+                  <span class="as-config-desc">塔台每分钟检测一次上游；连续这么多次连不上，并且这段时间没有正常的真实请求，才换号</span>
+                </div>
+                <select id="selectProbeFailures" class="form-input mono" style="width: 210px; font-weight: 700;">
+                  <option value="10">10 次（约 10 分钟）</option>
+                  <option value="20" selected>20 次（约 20 分钟·推荐）</option>
+                  <option value="30">30 次（约 30 分钟）</option>
+                </select>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">🧊 换号后多久才允许切回</span>
+                  <span class="as-config-desc">避免来回切换；当前账号如果又出故障，不受这个限制，照样立即换走</span>
                 </div>
                 <select id="selectCooldownMinutes" class="form-input mono" style="width: 170px; font-weight: 700;">
                   <option value="5">5 分钟</option>
-                  <option value="10" selected>10 分钟 (核心推荐)</option>
+                  <option value="10" selected>10 分钟（推荐）</option>
                   <option value="15">15 分钟</option>
-                  <option value="30">30 分钟 (深度防抖)</option>
+                  <option value="30">30 分钟</option>
                 </select>
               </div>
 
@@ -1049,7 +1070,7 @@
 
           <!-- 3. 操作按钮与演练评估 -->
           <div class="dialog-actions" style="margin-top: 1rem; display: flex; justify-content: space-between; align-items: center;">
-            <button id="btnEvaluateAutoSwitchNow" class="btn btn-secondary" style="font-size: 0.8rem;">
+            <button id="btnEvaluateAutoSwitchNow" class="btn btn-secondary" style="font-size: 0.8rem;" title="按上面的规则马上检查一次；发现故障会真的切换。只想看看、不想切换，请用「切号预演」">
               ⚡ 立即检查并执行切号
             </button>
             <div style="display: flex; gap: 0.5rem;">
@@ -1063,7 +1084,7 @@
           <!-- 4. 自动切换决策历史记录流水 -->
           <div style="margin-top: 1rem; border-top: 1px solid #e2e8f0; padding-top: 0.75rem;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
-              <span style="font-size: 0.78rem; font-weight: 700; color: #334155;">📋 最近自动切线决策流水记录</span>
+              <span style="font-size: 0.78rem; font-weight: 700; color: #334155;">📋 最近的自动切号记录</span>
               <button id="btnRefreshAutoSwitchLogs" class="btn-micro-edit">⟳ 刷新流水</button>
             </div>
             <div class="as-logs-wrap">
@@ -2039,22 +2060,23 @@
             <button id="btnCloseGroupAutoSwitchModalHeader" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
 
-          <h3 style="color: #0f172a; font-size: 1.18rem; margin: 4px 0 2px 0;">⚡ 自动换通道与熔断容灾配置</h3>
-          <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem 0.75rem; font-size: 0.75rem; color: #1e40af; line-height: 1.45; margin-top: 0.4rem;">
-            <strong>📌 组内四层流转规则：</strong><br/>
-            🌟 <strong>主调故障 / 余额断流</strong> ➜ 自动接替为 🔵 <strong>副调</strong> ➜ 若副调不可用 ➜ 自动接替为 🟡 <strong>备选</strong> ➜ 依次动用 ⚪ <strong>备用待命池</strong> (严格按进货成本由低到高兜底)
+          <h3 style="color: #0f172a; font-size: 1.18rem; margin: 4px 0 2px 0;">⚡ 本组的自动切号设置</h3>
+          <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem 0.75rem; font-size: 0.75rem; color: #1e40af; line-height: 1.5; margin-top: 0.4rem;">
+            本组当前账号出故障时，会换到本组里健康、支持同样模型、进价不高于售价的备用账号，优先选最便宜的。<br/>
+            下面的设置<strong>默认跟随全站</strong>：只有你改过的项才单独对本组生效；没改的项，全站怎么调，本组就跟着变。
           </div>
+          <div id="groupAutoSwitchFollowNote" style="font-size: 0.75rem; color: #475569; margin-top: 0.45rem; line-height: 1.5;"></div>
 
           <div style="margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.6rem;">
             <!-- 低倍率/特惠专属防抖预设快捷栏 -->
             <div id="groupLowRateNotice" style="display: none; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
                 <div>
-                  <div style="font-size: 0.78rem; font-weight: 700; color: #b45309;">💡 系统识别：本组属于低倍率/特惠业务组</div>
-                  <div style="font-size: 0.71rem; color: #92400e;">低倍率渠道常有偶发轻微波动，推荐应用宽松阈值杜绝频繁误切与来回横跳</div>
+                  <div style="font-size: 0.78rem; font-weight: 700; color: #b45309;">💡 这是低价 / 特惠组</div>
+                  <div style="font-size: 0.71rem; color: #92400e;">便宜的账号偶尔不太稳。可以一键填入一组「切走更快、切回更慢」的设置：失败率 60%、样本 10 次、连续失败 10 次、切回间隔 20 分钟（点保存才生效）</div>
                 </div>
                 <button type="button" class="btn btn-secondary" onclick="applyLowRatePreset()" style="font-size: 0.74rem; padding: 0.35rem 0.65rem; background: #fef3c7; border-color: #f59e0b; color: #92400e; font-weight: 700; white-space: nowrap;">
-                  ⚡ 一键套用低倍率防抖配置
+                  ⚡ 一键填入
                 </button>
               </div>
             </div>
@@ -2062,8 +2084,8 @@
             <!-- 1. 本组自动切线开关 -->
             <div class="as-config-row" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
-                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">本组自动换通道总开关</span>
-                <span class="as-config-desc" style="font-size: 0.72rem;">开启后后端将对该业务分组的主调进行健康巡检，异常时自动流转切线</span>
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">本组参与自动切号</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">关闭后本组改为人工管理，塔台不会给本组自动换号</span>
               </div>
               <button id="btnToggleGroupAutoSwitch" class="toggle-switch-btn is-on" onclick="toggleGroupAutoSwitchState()">
                 <span>●</span> <span id="textGroupAutoSwitchState">已开启</span>
@@ -2073,81 +2095,85 @@
             <!-- 2. 失败率门槛 -->
             <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
-                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">📊 故障切线失败率门槛</span>
-                <span class="as-config-desc" style="font-size: 0.72rem;">主调错误率超过此比例切至副调 (保 Prompt Cache 缓存)</span>
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">📊 失败率达到多少算故障</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">最近 5 分钟的请求数达到下面的「样本量」后，失败率达到这个比例就换号</span>
               </div>
-              <select id="selectGroupFailRate" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
-                <option value="70">70% (低倍率专区·超高容忍)</option>
-                <option value="60">60% (低倍率防抖·推荐)</option>
-                <option value="50" selected>50% (失败过半才切·标准)</option>
-                <option value="40">40% (轻度严格)</option>
-                <option value="30">30% (高敏响应)</option>
-                <option value="20">20% (成功率&lt;80%切线)</option>
+              <select id="selectGroupFailRate" class="form-input mono" style="width: 200px; font-size: 0.8rem; font-weight: 700;" onchange="updateGroupPolicyNote()">
+                <option value="80">80%（最不容易误切）</option>
+                <option value="70" selected>70%</option>
+                <option value="60">60%</option>
+                <option value="50">50%（最灵敏）</option>
               </select>
             </div>
 
             <!-- 3. 统计最小有效样本量 -->
             <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
-                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">🔢 最小统计有效样本量</span>
-                <span class="as-config-desc" style="font-size: 0.72rem;">累计调用达到该样本数才核算失败率，杜绝 1~2 次偶发报错误切</span>
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">🔢 至少多少次请求才看失败率</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">请求太少时不看失败率，免得偶尔几次失败就误切</span>
               </div>
-              <select id="selectGroupMinSampleSize" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
-                <option value="5">5 次 (基准)</option>
-                <option value="10" selected>10 次 (低倍率推荐·防抖)</option>
-                <option value="15">15 次 (高稳健样本)</option>
-                <option value="20">20 次 (超高防抖样本)</option>
+              <select id="selectGroupMinSampleSize" class="form-input mono" style="width: 200px; font-size: 0.8rem; font-weight: 700;" onchange="updateGroupPolicyNote()">
+                <option value="10">10 次</option>
+                <option value="20">20 次</option>
+                <option value="50" selected>50 次</option>
+                <option value="100">100 次</option>
+                <option value="200">200 次</option>
               </select>
             </div>
 
             <!-- 4. 连续硬故障次数 -->
             <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
-                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">💥 连续硬故障确诊门槛</span>
-                <span class="as-config-desc" style="font-size: 0.72rem;">连续爆出 502/503/429/401 达到此次数确诊宕机，秒切副调</span>
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">💥 连续失败多少次算故障</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">最近 5 分钟里连续失败达到这个次数就换号；请求少凑不够时，连续失败 3 次后塔台会主动验证</span>
               </div>
-              <select id="selectGroupConsecutiveFailures" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
-                <option value="3">连续 3 次 (敏捷切线)</option>
-                <option value="5">连续 5 次 (常规确诊)</option>
-                <option value="8">连续 8 次 (高容忍度)</option>
-                <option value="10" selected>连续 10 次 (低倍率推荐)</option>
-                <option value="15">连续 15 次 (超高耐受)</option>
+              <select id="selectGroupConsecutiveFailures" class="form-input mono" style="width: 200px; font-size: 0.8rem; font-weight: 700;" onchange="updateGroupPolicyNote()">
+                <option value="10">10 次</option>
+                <option value="15">15 次</option>
+                <option value="30" selected>30 次</option>
+                <option value="50">50 次</option>
+                <option value="80">80 次（最不容易误切）</option>
               </select>
             </div>
 
             <!-- 5. 冷静期 -->
             <div class="as-config-row" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
-                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">🧊 防颠簸冷静期时长</span>
-                <span class="as-config-desc" style="font-size: 0.72rem;">限制健康账号的低价回切；故障切出不受此时间限制</span>
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700;">🧊 换号后多久才允许切回</span>
+                <span class="as-config-desc" style="font-size: 0.72rem;">避免来回切换；当前账号又出故障时不受限制，照样立即换走</span>
               </div>
-              <select id="selectGroupCooldown" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;">
+              <select id="selectGroupCooldown" class="form-input mono" style="width: 185px; font-size: 0.8rem; font-weight: 700;" onchange="updateGroupPolicyNote()">
                 <option value="5">5 分钟</option>
-                <option value="10">10 分钟 (常规推荐)</option>
+                <option value="10" selected>10 分钟</option>
                 <option value="15">15 分钟</option>
-                <option value="20" selected>20 分钟 (低倍率推荐·高防抖)</option>
-                <option value="30">30 分钟 (超高防颠簸)</option>
+                <option value="20">20 分钟</option>
+                <option value="30">30 分钟</option>
               </select>
             </div>
 
             <!-- 6. 自动恢复低成本主调 -->
             <div class="as-config-row" style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
-                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700; color: #166534;">📉 低成本优质通道充值恢复后自动回切</span>
-                <span class="as-config-desc" style="font-size: 0.72rem; color: #15803d;">低价账号充值并稳定恢复后，满足冷静期和降本条件时自动回切；对外售价不变</span>
+                <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700; color: #166534;">💸 更便宜的账号恢复后，自动换过去</span>
+                <span class="as-config-desc" style="font-size: 0.72rem; color: #15803d;">关闭时只会切回原来的主账号；开启后，本组有便宜 5% 以上的备用账号稳定恢复时，也会主动换过去（换号会让缓存失效）</span>
               </div>
-              <button id="btnToggleGroupAutoRecover" class="toggle-switch-btn is-on" onclick="toggleGroupAutoRecoverState()">
-                <span>●</span> <span id="textGroupAutoRecoverState">已开启</span>
+              <button id="btnToggleGroupAutoRecover" class="toggle-switch-btn is-off" onclick="toggleGroupAutoRecoverState()" style="flex-shrink: 0; white-space: nowrap;">
+                <span>●</span> <span id="textGroupAutoRecoverState">已停用</span>
               </button>
             </div>
           </div>
 
           <div class="dialog-actions" style="margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
-            <button type="button" id="btnCancelGroupAutoSwitchModal" class="btn btn-secondary" style="font-size: 0.8rem;">
-              取消
-            </button>
+            <div style="display: flex; gap: 0.5rem;">
+              <button type="button" id="btnCancelGroupAutoSwitchModal" class="btn btn-secondary" style="font-size: 0.8rem; white-space: nowrap;">
+                取消
+              </button>
+              <button type="button" id="btnResetGroupAutoSwitch" class="btn btn-secondary" onclick="resetGroupAutoSwitchToGlobal()" style="font-size: 0.8rem; white-space: nowrap;" title="把下面所有项改回全站当前的设置；点保存后本组完全跟随全站">
+                ↺ 全部跟随全站
+              </button>
+            </div>
             <button type="button" id="btnSaveGroupAutoSwitchModal" class="btn btn-primary" onclick="submitGroupAutoSwitchPolicy()" style="font-size: 0.82rem; padding: 0.4rem 1.25rem; font-weight: 700; background: #2563eb; border-color: #2563eb;">
-              💾 保存本组切线策略
+              💾 保存本组设置
             </button>
           </div>
         </div>
@@ -2168,6 +2194,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260921_sub2api_v2"></script>
+  <script src="app.js?v=20260923_balance_sync_v3"></script>
 </body>
 </html>
