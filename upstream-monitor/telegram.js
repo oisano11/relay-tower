@@ -406,7 +406,7 @@ class TelegramBotManager {
         `直接向本机器人发送中控台管理密码完成一键绑定：\n` +
         `<code>/bind &lt;中控台管理密码&gt;</code>\n\n` +
         `<b>方式二（Web 控制台添加）</b>：\n` +
-        `登录中控台网页，在顶栏点击【✈️ Telegram 设置】，将上方 ID 填入「管理员 Chat ID」列表保存。`
+        `登录中控台网页，在右上角【⚙️ 系统管理】菜单里点击【✈️ Telegram 机器人通知】，将上方 ID 填入「管理员 Chat ID」列表保存。`
       );
       return;
     }

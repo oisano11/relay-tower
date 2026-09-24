@@ -233,7 +233,7 @@ Navigate to `http://localhost:3300`. An initial admin password will be generated
 Point your client tools to `http://localhost:3300/v1` to use prompt cache route affinity and switch upstreams through a stable endpoint.
 
 > [!TIP]
-> **Gateway Key**: In the examples below, `sk-your-relay-key` represents the Gateway API Key. You can view, copy, or reset it anytime in the **Security Center** modal on the top bar. Requests made locally from `127.0.0.1` pass through without requiring a key by default.
+> **Gateway Key**: In the examples below, `sk-your-relay-key` represents the Gateway API Key. You can view, copy, or reset it anytime in the **Security Center** modal (top-right **⚙️ 系统管理** menu → **🛡️ 安全设置与改密**). Requests made locally from `127.0.0.1` pass through without requiring a key by default.
 
 ### 1. Claude Code CLI
 ```bash

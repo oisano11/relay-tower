@@ -129,7 +129,7 @@ for i in $(seq 1 20); do
   if "${SSH[@]}" "curl -fsS -m 5 http://127.0.0.1:$HEALTH_PORT/api/auth/status >/dev/null"; then ok=1; break; fi
 done
 if [[ "$ok" == 1 ]]; then
-  echo -e "\n\033[1;32m部署成功。\033[0m请打开控制台，先点【🧭 切号预演】核对各分组。"
+  echo -e "\n\033[1;32m部署成功。\033[0m请打开控制台，在右上角【⚙️ 系统管理 → 🧭 切号预演】核对各分组。"
   echo "如需手动回滚：${SSH[*]} \"$ROLLBACK\""
   exit 0
 fi

@@ -9,7 +9,7 @@
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=relay-tower-2026">
   <link rel="shortcut icon" href="favicon.ico?v=relay-tower-2026">
-  <link rel="stylesheet" href="style.css?v=20260923_balance_sync_v3">
+  <link rel="stylesheet" href="style.css?v=20260924_console_cleanup">
 </head>
 <body>
   <div class="app-layout">
@@ -25,17 +25,7 @@
       </div>
 
       <div class="header-center">
-        <!-- 快速单切换 -->
-        <div class="quick-switcher-badge">
-          <span class="dot-live"></span>
-          <span class="label">当前主调:</span>
-          <select id="headerChannelSelect" class="channel-dropdown" title="一键将选中的上游设为最高优先主调 (已自动过滤后台停用与无余额通道)">
-            <!-- 动态填充 -->
-          </select>
-          <span id="headerMultiplierBadge" class="ratio-pill">--x</span>
-        </div>
-
-        <!-- 实时服务精简胶囊 (合并状态，节省横向空间) -->
+        <!-- 实时服务精简胶囊 (合并状态，节省横向空间)；主调按分组设置，见渠道清单里的分组视图 -->
         <div class="nav-status-capsule">
           <div class="status-capsule-item" title="本地 /v1 智能反向代理网关服务正常">
             <span class="status-dot-pulse"></span>
@@ -54,21 +44,9 @@
       </div>
 
       <div class="header-actions">
-        <!-- 高频核心动作 -->
-        <button id="btnRefreshAll" class="btn btn-glass" title="立刻检查全部上游状态、首字测速与倍率">
-          <span>⟳</span> 立即检测
-        </button>
-        <button id="btnSyncBackend" class="btn btn-glass" title="强制从 Sub2API 后台全量对齐渠道列表，同步清理已在后台删除的上游">
-          <span>🔄</span> 同步后台
-        </button>
-        <button id="btnAutoSwitchPreview" class="btn btn-glass" title="只读预演：按当前线上数据，查看每个分组现在会怎么切号、为什么（不写入任何数据）">
-          <span>🧭</span> 切号预演
-        </button>
-        <button id="btnSplitShared" class="btn btn-glass" title="把挂在多个业务分组下的共享账号，拆成每个分组一个独立账号，之后即可按组自动切换">
-          <span>🧩</span> 拆分共享账号
-        </button>
-        <button id="btnHeaderSyncBalances" class="btn btn-glass" onclick="refreshAllBalances()" title="一键抓取并全量同步所有上游钱包余额">
-          <span>💰</span> 同步上游余额
+        <!-- 顶栏只放每天都用的；不常用的都在「系统管理」菜单里 -->
+        <button id="btnSyncBackend" class="btn btn-glass" title="马上从 Sub2API 重新读取全部渠道、分组和倍率，并清理后台已删除的渠道（平时会自动同步，一般不用点）">
+          <span>⟳</span> 刷新数据
         </button>
         <button id="btnOpenAlertsDrawer" class="btn btn-glass btn-alerts-box" title="打开报错与告警信息盒 (查看全部上游调价、自动切线熔断与报错流水)">
           <span class="bell-icon" id="alertsBellIcon">🔔</span> 报错信息盒 <span id="alertsBadgeCount" class="alerts-badge-count" style="display: none;">0</span>
@@ -79,27 +57,42 @@
 
         <!-- 统一收纳：系统管理与后台配置下拉菜单 -->
         <div class="nav-dropdown-wrap" id="navSettingsDropdownWrap">
-          <button id="btnNavDropdownToggle" class="btn btn-glass dropdown-toggle" type="button" title="系统设置与运维中枢">
+          <button id="btnNavDropdownToggle" class="btn btn-glass dropdown-toggle" type="button" title="自动切号、分组、上游供应商和系统设置">
             <span>⚙️</span> 系统管理 ▾
             <span id="navDropdownPendingDot" class="nav-dropdown-pending-dot" style="display: none;"></span>
           </button>
           <div class="nav-dropdown-menu" id="navDropdownMenu">
-            <div class="dropdown-header">系统策略与调度中枢</div>
+            <div class="dropdown-header">自动切号</div>
             <button id="btnOpenAutoSwitchModal" class="dropdown-item" title="统一设置故障切号、充值后恢复与低价回切">
               <span class="dropdown-item-icon">⚡</span>
-              <span class="dropdown-item-label">自动切号与容灾策略</span>
+              <span class="dropdown-item-label">自动切号设置</span>
               <span id="autoSwitchStatusPill" class="auto-switch-status-pill on">已启用</span>
             </button>
-            <button id="btnOpenJinlongModal" class="dropdown-item" title="配置上游 New API 后台账号获取余额与倍率">
+            <button id="btnAutoSwitchPreview" class="dropdown-item" title="按当前线上数据，看每个分组现在会怎么切号、为什么（只看不改，不写入任何数据）">
+              <span class="dropdown-item-icon">🧭</span>
+              <span class="dropdown-item-label">切号预演（只看不改）</span>
+            </button>
+            <div class="dropdown-header">分组与账号</div>
+            <button id="btnOpenAllGroupsModal" class="dropdown-item" title="新建或删除业务分组、修改对外售价、给分组分配账号">
+              <span class="dropdown-item-icon">🗂️</span>
+              <span class="dropdown-item-label">业务分组管理（新建 / 删除）</span>
+            </button>
+            <button id="btnSplitShared" class="dropdown-item" title="把挂在多个业务分组下的共享账号，拆成每个分组一个独立账号，之后即可按组自动切换">
+              <span class="dropdown-item-icon">🧩</span>
+              <span class="dropdown-item-label">拆分共享账号</span>
+            </button>
+            <div class="dropdown-header">上游供应商</div>
+            <button id="btnOpenJinlongModal" class="dropdown-item" title="登记上游供应商的后台账号，用来查余额、模型和倍率">
               <span class="dropdown-item-icon">🔑</span>
-              <span class="dropdown-item-label">上游 New-API 后台</span>
+              <span class="dropdown-item-label">上游供应商后台</span>
               <span id="jinlongStatusPill" class="jinlong-status-mini">待配置</span>
             </button>
             <button id="btnOpenUpstreamScanModal" class="dropdown-item" title="查看 3 小时上游通道巡检、差分同步、孤岛分组熔断与待办审批">
               <span class="dropdown-item-icon">🔄</span>
-              <span class="dropdown-item-label">上游巡检待办审批</span>
+              <span class="dropdown-item-label">上游巡检与待办审批</span>
               <span id="scanPendingBadge" class="auto-switch-status-pill on" style="display: none; background: #ef4444; color: #fff; padding: 1px 6px; border-radius: 999px; font-weight: 700;">0</span>
             </button>
+            <div class="dropdown-header">系统</div>
             <button id="btnOpenTelegramModal" class="dropdown-item" title="配置 Telegram 机器人推送与手机端一键切线">
               <span class="dropdown-item-icon">✈️</span>
               <span class="dropdown-item-label">Telegram 机器人通知</span>
@@ -110,10 +103,6 @@
               <span class="dropdown-item-label">安全设置与改密</span>
             </button>
             <div class="dropdown-divider"></div>
-            <button id="btnSimulate" class="dropdown-item dropdown-item-subtle" title="模拟上游变价，测试弹窗效果">
-              <span class="dropdown-item-icon">🧪</span>
-              <span class="dropdown-item-label">模拟变价演练 (开发测试)</span>
-            </button>
             <button id="btnLogout" class="dropdown-item dropdown-item-danger" title="安全退出登录并注销凭据">
               <span class="dropdown-item-icon">🚪</span>
               <span class="dropdown-item-label">退出登录</span>
@@ -167,7 +156,7 @@
                 <span>上游总备付金</span>
                 <span class="kpi-tag-1to1" title="美金与人民币严格 1:1 结算，无汇率折算">1:1 等额</span>
               </div>
-              <button id="btnRefreshBalances" class="btn-kpi-action" onclick="refreshAllBalances()" title="一键抓取并全量同步所有上游钱包余额">
+              <button id="btnRefreshBalances" class="btn-kpi-action" title="一键抓取并全量同步所有上游钱包余额">
                 <span>💰</span> 同步上游余额
               </button>
             </div>
@@ -199,7 +188,7 @@
                 <span class="kpi-icon-badge icon-dispatch">⚡</span>
                 <span>通道调度与风控</span>
               </div>
-              <span class="kpi-status-tag" id="kpiDispatchModeTag">180s 防抖保护</span>
+              <span class="kpi-status-tag" id="kpiDispatchModeTag">切回间隔 -- 分钟</span>
             </div>
             <div class="kpi-card-body">
               <div class="kpi-hero-num">
@@ -211,19 +200,19 @@
                   <span class="kpi-sub-label">倒贴预警</span>
                   <strong id="barLossCount" class="mono safe">0 条</strong>
                 </div>
-                <div class="kpi-sub-item">
-                  <span class="kpi-sub-label">当前主力</span>
-                  <span id="kpiCurrentMainName" class="kpi-main-name" title="当前主调">--</span>
+                <div class="kpi-sub-item" id="kpiAutoSwitchItem" style="cursor: pointer;" title="点击打开自动切号设置，查看各分组有没有备用账号">
+                  <span class="kpi-sub-label">自动切号</span>
+                  <strong id="kpiAutoSwitchState" class="mono">--</strong>
                 </div>
               </div>
             </div>
             <div class="kpi-card-footer">
-              <span>智能防抖抑制中，GPT 通用通道保持严格豁免</span>
+              <span>出故障时在同一分组内换号；人工管理的分组不自动切换</span>
             </div>
           </div>
 
           <!-- 卡片 4: 🛡️ 全网可用率与并发流量 -->
-          <div class="kpi-card card-traffic" id="quickConcurrencyItem" style="cursor: pointer;">
+          <div class="kpi-card card-traffic" id="quickConcurrencyItem">
             <div class="kpi-card-header">
               <div class="kpi-card-title">
                 <span class="kpi-icon-badge icon-traffic">🛡️</span>
@@ -341,7 +330,7 @@
               <button class="dim-tab active" data-dim="group">按业务分组</button>
               <button class="dim-tab" data-dim="vendor">按模型厂商</button>
               <button class="dim-tab" data-dim="provider">按上游供应商</button>
-              <button class="dim-tab" data-dim="active">活跃渠道</button>
+              <button class="dim-tab" data-dim="active" title="按状态筛选：倒贴、欠费、余额告急、有调用、在线、已停用等">按状态</button>
             </div>
           </div>
 
@@ -504,8 +493,11 @@
           </div>
 
           <div class="dialog-actions" style="margin-top: 1.25rem;">
-            <button id="modalBtnSwitchLowest" class="btn btn-success">
-              一键切换到同厂商最低上游 (<span id="modalLowestCandidateText">0.0600x</span>)
+            <button id="modalBtnSwitchLowest" class="btn btn-success" title="只在这个账号所在的分组里换主调，不影响别的分组">
+              切到本组更便宜的账号 (<span id="modalLowestCandidateText">0.0600x</span>)
+            </button>
+            <button id="modalBtnGoGroup" class="btn btn-secondary" title="打开这个账号所在的分组：可以改售价、换主调、调整本组设置">
+              📍 去这个分组看看
             </button>
             <button id="modalBtnDismiss" class="btn btn-secondary">
               知道了，暂不切换
@@ -606,9 +598,6 @@
               </button>
               <button id="btnSyncAllUpstreams" class="btn btn-sm btn-secondary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;">
                 ⟳ 刷新全部
-              </button>
-              <button id="btnSyncBackendInPanel" class="btn btn-sm btn-secondary" style="font-size: 0.76rem; padding: 0.25rem 0.6rem;" title="强制从 Sub2API 数据库全量对齐渠道与分组，清理后台已删除上游">
-                🔄 同步后台
               </button>
               <button id="btnCleanOrphanPanels" class="btn btn-sm" style="display: none; font-size: 0.76rem; padding: 0.25rem 0.6rem; background: #fff1f2; border: 1px solid #fecdd3; color: #e11d48; font-weight: 600;" title="一键清理后台已删除/已欠费的失效上游供应商">
                 🧹 清理失效 (<span id="orphanPanelsCount">0</span>)
@@ -2022,7 +2011,7 @@
                     <input type="checkbox" id="orchestrateShowAllToggle" onchange="toggleOrchestrateShowAll(this.checked)" style="cursor: pointer;" />
                     <span>显示全站所有渠道</span>
                   </label>
-                  <button type="button" class="btn btn-secondary" onclick="orchestrateSelectAllChannels(true)" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选合规</button>
+                  <button type="button" class="btn btn-secondary" onclick="orchestrateSelectAllChannels(true)" title="只勾选进价低于售价、且不在别的分组里的账号" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">全选合规</button>
                   <button type="button" class="btn btn-secondary" onclick="orchestrateSelectAllChannels(false)" style="font-size: 0.68rem; padding: 1px 6px; height: 22px;">清空非指定</button>
                 </div>
               </div>
@@ -2194,6 +2183,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260923_balance_sync_v3"></script>
+  <script src="app.js?v=20260924_console_cleanup"></script>
 </body>
 </html>
