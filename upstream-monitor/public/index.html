@@ -9,7 +9,7 @@
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=relay-tower-2026">
   <link rel="shortcut icon" href="favicon.ico?v=relay-tower-2026">
-  <link rel="stylesheet" href="style.css?v=20260924_console_cleanup">
+  <link rel="stylesheet" href="style.css?v=20260925_upstream_keys">
 </head>
 <body>
   <div class="app-layout">
@@ -82,6 +82,11 @@
               <span class="dropdown-item-label">拆分共享账号</span>
             </button>
             <div class="dropdown-header">上游供应商</div>
+            <button id="btnOpenUpstreamKeysModal" class="dropdown-item" title="你在上游网站新建的 Key 会出现在这里，选好本站分组就能一键接入">
+              <span class="dropdown-item-icon">🆕</span>
+              <span class="dropdown-item-label">接入上游新 Key</span>
+              <span id="upstreamKeysBadge" class="auto-switch-status-pill on" style="display: none; background: #2563eb; color: #fff; padding: 1px 6px; border-radius: 999px; font-weight: 700;">0</span>
+            </button>
             <button id="btnOpenJinlongModal" class="dropdown-item" title="登记上游供应商的后台账号，用来查余额、模型和倍率">
               <span class="dropdown-item-icon">🔑</span>
               <span class="dropdown-item-label">上游供应商后台</span>
@@ -2183,6 +2188,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260924_console_cleanup"></script>
+  <script src="app.js?v=20260925_upstream_keys"></script>
 </body>
 </html>
