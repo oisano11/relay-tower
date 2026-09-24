@@ -5507,7 +5507,7 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
       const current = channels.find(c => String(c.id) === String(decision.currentId)) || groupCurrent;
       if (decision.action === 'switch') {
         if (current && !isExclusiveToGroup(current)) {
-          const warnNote = `${group.name}：当前活跃通道 [${current.name}] 发生故障(${reasonNames[decision.reason] || decision.reason})，但由于该通道被多个业务组共享，系统已保守保持以避免跨组影响。可在控制台顶栏【拆分共享账号】一键拆成每组独立账号，之后即可按组自动切换`;
+          const warnNote = `${group.name}：当前活跃通道 [${current.name}] 发生故障(${reasonNames[decision.reason] || decision.reason})，但由于该通道被多个业务组共享，系统已保守保持以避免跨组影响。可在控制台【系统管理 → 拆分共享账号】一键拆成每组独立账号，之后即可按组自动切换`;
           details.push(warnNote);
           if (!decision.runtime.sharedHoldNotified) {
             alerts.unshift({ id: 'shared_hold_' + key + '_' + now, type: 'pool_exhausted', groupId: group.id, timestamp: new Date(now).toISOString(), note: warnNote });

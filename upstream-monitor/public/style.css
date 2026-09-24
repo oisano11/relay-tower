@@ -366,7 +366,7 @@ body {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  min-width: 250px;
+  min-width: 300px;
   background: #ffffff;
   border: 1px solid #cbd5e1;
   border-radius: 10px;

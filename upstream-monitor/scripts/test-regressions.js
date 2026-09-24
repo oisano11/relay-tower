@@ -2587,20 +2587,71 @@ test('auto-failover policy holds single channel groups and avoids cheaper flappi
   assert.equal(res.reason, 'healthy');
 });
 
-test('upstream balance sync buttons exist in header and cards and single channel balance refresh route works', async () => {
+test('upstream balance sync has one card button bound once, plus the per-channel refresh', async () => {
   const fs = require('fs');
   const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
-  assert.ok(html.includes('id="btnHeaderSyncBalances"'), 'Header must contain btnHeaderSyncBalances');
   assert.ok(html.includes('id="btnRefreshBalances"'), 'KPI card must contain btnRefreshBalances');
-  assert.ok(html.includes('同步上游余额'), 'Both buttons must have text 同步上游余额');
+  assert.equal((html.match(/同步上游余额/g) || []).length, 1, 'only the balance card offers 同步上游余额');
+  // 同时写 onclick 又 addEventListener 会让一次点击发两次全量同步
+  assert.doesNotMatch(html, /onclick="refreshAllBalances\(\)"/);
 
   const appJs = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  assert.equal((appJs.match(/getElementById\('btnRefreshBalances'\)\?\.addEventListener/g) || []).length, 1);
   assert.ok(appJs.includes('btn-micro-sync-bal'), 'app.js renders micro sync balance button');
   assert.ok(appJs.includes('refreshSingleChannelBalance'), 'app.js defines refreshSingleChannelBalance');
-  assert.ok(appJs.includes("btnHeaderSyncBalances"), 'app.js binds btnHeaderSyncBalances');
 
   const css = fs.readFileSync(path.join(__dirname, '../public/style.css'), 'utf8');
   assert.ok(css.includes('.btn-micro-sync-bal'), 'style.css defines .btn-micro-sync-bal');
+});
+
+test('console has no global main switch or test-only price simulation, and group tools stay reachable', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
+  const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  // 全站「当前主调」下拉会不经确认改线上路由；模拟改价会写入假的涨价记录并推送告警
+  assert.doesNotMatch(html, /headerChannelSelect|btnSimulate|btnRefreshAll"/);
+  assert.doesNotMatch(app, /simulate-change|quickIncludeAllEligibleChannels|activateChannel\(/);
+  for (const id of ['btnOpenAllGroupsModal', 'btnAutoSwitchPreview', 'btnSplitShared', 'btnSyncBackend']) {
+    assert.ok(html.includes(`id="${id}"`), `${id} must stay reachable`);
+  }
+  // 批量纳入/停用直接改线上，必须先确认
+  const batch = app.slice(app.indexOf('async function batchToggleVisible('), app.indexOf('// 【核心功能 3】免登后台直改倍率'));
+  assert.match(batch, /if \(!confirm\(/);
+});
+
+test('group editor opens with the group own roles and members, not the previously opened group', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const detail = (id, priority) => ({ id, name: `G${id}`, sale_rate: 0.12, priority });
+  const channel = (id, groupsDetail) => ({ id, name: `#${id}`, vendor: 'OpenAI / GPT', costMultiplier: 0.05, groupsDetail, groups: groupsDetail.map(g => g.name) });
+  const a = channel('101', [detail(1, 1)]);
+  const shared = channel('103', [detail(1, 10), detail(3, 10)]);
+  const b = channel('102', [detail(3, 1)]);
+  const selects = { selectOrchestrateMain: { value: '101' }, selectOrchestrateSub: { value: '' }, selectOrchestrateAlt: { value: '' } };
+  // 上一次打开分组 1 留下的勾选
+  const list = { innerHTML: '', querySelectorAll: () => [{ value: '101' }] };
+  const context = vm.createContext({
+    document: { getElementById: id => selects[id] || (id === 'orchestrateChannelsCheckboxList' ? list : null) },
+    channelsData: [a, shared, b], activeChannelId: '', currentDimension: 'group', currentFilterPill: 'all',
+    orchestrateShowAllChannels: false, orchestrateChannelSearch: '',
+    getVendorTheme: () => ({ pillClass: '', shortLabel: '' }), formatRate: n => Number(n).toFixed(4), escapeHtml: s => String(s),
+    updateOrchestrateRoleTags() {}, updateOrchestrateStandbySummary() {}
+  });
+  vm.runInContext(app.slice(app.indexOf('function getChannelRole('), app.indexOf('// 调整渠道调度定性')), context);
+  vm.runInContext(app.slice(app.indexOf('function renderOrchestrateSelectsAndCheckboxes('), app.indexOf('// 刷新编排弹窗内各条目的角色标签与锁定状态')), context);
+
+  const group3 = { id: 3, name: 'G3', sale_rate: 0.12 };
+  context.renderOrchestrateSelectsAndCheckboxes(group3, [a, shared, b], [shared, b], { initial: true });
+  assert.match(selects.selectOrchestrateMain.innerHTML, /value="102" selected/);
+  assert.doesNotMatch(selects.selectOrchestrateMain.innerHTML, /value="101" selected/);
+  assert.match(selects.selectOrchestrateSub.innerHTML, /value="103" selected/);
+  assert.match(list.innerHTML, /value="102" checked/);
+  assert.doesNotMatch(list.innerHTML, /value="101" checked/);
+  assert.match(list.innerHTML, /id="orchItem_103" data-other-groups="1"/, 'accounts already in another group are flagged');
+
+  // 同一次编辑里搜索或切换显示范围时，保留用户刚选的「暂不指定副调」
+  selects.selectOrchestrateMain.value = '102';
+  selects.selectOrchestrateSub.value = '';
+  context.renderOrchestrateSelectsAndCheckboxes(group3, [a, shared, b], [shared, b]);
+  assert.doesNotMatch(selects.selectOrchestrateSub.innerHTML, /selected/);
 });
 
 test('without single-active exclusivity, failover still demotes the failing source so traffic really moves', () => {
