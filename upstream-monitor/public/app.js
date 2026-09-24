@@ -2414,6 +2414,8 @@ function renderAlertsDrawer() {
     const isRole = a.type === 'role_change';
     const isPool = a.type === 'pool_exhausted';
     const isError = a.type === 'error';
+    const isNewKey = a.type === 'upstream_key';
+    const isConnect = a.type === 'account_connect';
     const itemTs = new Date(a.timestamp).getTime();
     const isUnread = !isNaN(itemTs) && itemTs > lastReadTs;
 
@@ -2438,6 +2440,12 @@ function renderAlertsDrawer() {
     } else if (isError) {
       cardClass = 'is-error';
       badgeHtml = `<span style="color: #dc2626; font-weight: 700;">❌ 上游故障报错</span>`;
+    } else if (isNewKey) {
+      cardClass = 'is-channel-switch';
+      badgeHtml = `<span style="color: #2563eb; font-weight: 700;">🆕 上游新 Key</span>`;
+    } else if (isConnect) {
+      cardClass = 'is-channel-switch';
+      badgeHtml = `<span style="color: #059669; font-weight: 700;">🔗 接入新账号</span>`;
     } else if (isRatio) {
       cardClass = isUp ? 'is-up' : 'is-down';
       badgeHtml = `<span style="color: ${isUp ? 'var(--color-red)' : 'var(--color-green)'}; font-weight: 700;">${isUp ? '↗ 进货倍率上涨' : '↘ 进货倍率下调'}</span>`;
@@ -2451,7 +2459,7 @@ function renderAlertsDrawer() {
     const alertTitle = a.channelName || (a.groupId ? '业务分组 #' + a.groupId : '中转塔台系统');
 
     return `
-      <div class="alert-item-card ${cardClass}" style="cursor: ${(isRatio || isAutoSwitch) ? 'pointer' : 'default'};" data-alert-idx="${idx}">
+      <div class="alert-item-card ${cardClass}" style="cursor: ${(isRatio || isAutoSwitch || isNewKey) ? 'pointer' : 'default'};" data-alert-idx="${idx}">
         <div class="alert-item-header">
           <div style="display: flex; align-items: center; gap: 0.35rem;">
             ${badgeHtml}
@@ -2463,6 +2471,7 @@ function renderAlertsDrawer() {
         <div class="alert-item-body">${escapeHtml(a.note || a.reason || '')}</div>
         ${isRatio ? '<div style="margin-top: 0.4rem; font-size: 0.74rem; color: var(--color-blue); text-align: right;">点击查看同品类比价详情 →</div>' : ''}
         ${isAutoSwitch ? '<div style="margin-top: 0.4rem; font-size: 0.74rem; color: #d97706; text-align: right;">点击查看自动切线流水 →</div>' : ''}
+        ${isNewKey ? '<div style="margin-top: 0.4rem; font-size: 0.74rem; color: #2563eb; text-align: right;">点击去接入 →</div>' : ''}
       </div>
     `;
   }).join('');
@@ -2479,6 +2488,9 @@ function renderAlertsDrawer() {
           if (typeof openAutoSwitchModal === 'function') {
             openAutoSwitchModal();
           }
+        } else if (a.type === 'upstream_key') {
+          document.getElementById('alertsDrawer')?.classList.remove('open');
+          openUpstreamKeysModal();
         }
       }
     });
@@ -2615,6 +2627,17 @@ function setupSSE() {
       handleUpstreamScanReportSSE(payload);
     } catch (e) {
       console.error('处理上游巡检报告出错:', e);
+    }
+  });
+
+  evtSource.addEventListener('UPSTREAM_KEYS_UPDATED', (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      updateUpstreamKeysBadge(payload.pending);
+      loadAlerts();
+      if (document.getElementById('upstreamKeysModalBackdrop')) refreshUpstreamKeysModal(false);
+    } catch (e) {
+      console.error('处理上游新 Key 更新出错:', e);
     }
   });
 
@@ -3516,6 +3539,193 @@ async function openSplitSharedModal() {
   });
 }
 
+// ====== 接入上游新 Key：上游新建的 Key → 选本站分组 → 一键建号 ======
+let upstreamKeysData = null;
+let upstreamKeysShowDismissed = false;
+
+function updateUpstreamKeysBadge(pending) {
+  const badge = document.getElementById('upstreamKeysBadge');
+  const count = Number(pending) || 0;
+  if (badge) {
+    badge.textContent = String(count);
+    badge.style.display = count > 0 ? 'inline-block' : 'none';
+  }
+  window._upstreamKeysPending = count;
+  refreshNavPendingDot();
+}
+
+async function loadUpstreamKeys(refresh = false) {
+  const res = await fetch(`/api/upstream/keys${refresh ? '?refresh=true' : ''}`);
+  const data = await res.json();
+  if (!data.success) throw new Error(data.error || '读取失败');
+  upstreamKeysData = data;
+  updateUpstreamKeysBadge((data.items || []).filter(item => !item.dismissed).length);
+  return data;
+}
+
+const UPSTREAM_KEY_PANEL_STATUS = {
+  ok: ['✅', '#16a34a'], token_invalid: ['⚠️', '#b45309'], unsupported: ['⏸', '#64748b'], error: ['❌', '#dc2626'], skipped: ['⏸', '#94a3b8']
+};
+
+function upstreamKeysPanelsHtml(data) {
+  return (data.panels || []).map(p => {
+    const [icon, color] = UPSTREAM_KEY_PANEL_STATUS[p.status] || ['•', '#334155'];
+    const detail = p.status === 'ok'
+      ? `上游共 ${p.total} 个 Key，已接入 ${p.connected} 个${p.pending ? `，<b style="color:#2563eb;">待接入 ${p.pending} 个</b>` : ''}`
+      : escapeHtml(p.message || '');
+    return `<div style="font-size:0.74rem;color:#334155;"><span style="color:${color};">${icon}</span> <b>${escapeHtml(p.name || p.host)}</b> <span style="color:#94a3b8;">${escapeHtml(p.host || '')}</span> · ${detail}</div>`;
+  }).join('') || '<div style="font-size:0.74rem;color:#64748b;">还没有登记上游供应商。</div>';
+}
+
+function upstreamKeyRowHtml(item) {
+  const g = item.upstreamGroup || {};
+  const options = (item.candidateGroups || []).map(cg => {
+    const members = cg.members ? `${cg.members} 个账号` : '空分组';
+    const label = `${cg.name}（售价 ${cg.saleRate ?? '?'}x · ${members}${cg.blocked ? ` · ${cg.blocked}` : ''}）`;
+    return `<option value="${cg.id}" ${cg.blocked ? 'disabled' : ''} ${String(cg.id) === String(item.suggestedGroupId) ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
+  const created = item.createdAt ? String(item.createdAt).slice(0, 10) : '';
+  const used = item.lastUsedAt ? `，最近使用 ${String(item.lastUsedAt).slice(0, 10)}` : '，还没用过';
+  const actions = item.dismissed
+    ? `<button type="button" class="btn btn-secondary" style="font-size:0.74rem;padding:0.25rem 0.6rem;" onclick="dismissUpstreamKeyItem('${escapeHtml(item.uid)}', true)">恢复</button>`
+    : `<button type="button" class="btn btn-primary" style="font-size:0.74rem;padding:0.25rem 0.7rem;" onclick="connectUpstreamKeyItem('${escapeHtml(item.uid)}', this)">接入</button>
+       <button type="button" class="btn btn-secondary" style="font-size:0.74rem;padding:0.25rem 0.6rem;color:#64748b;" title="不接这个 Key，以后不再提示（可以恢复）" onclick="dismissUpstreamKeyItem('${escapeHtml(item.uid)}', false)">删除</button>`;
+  return `<div class="upstream-key-row" data-uid="${escapeHtml(item.uid)}" style="background:${item.dismissed ? '#f8fafc' : '#fff'};border:1px solid #e2e8f0;border-radius:6px;padding:0.5rem 0.6rem;display:flex;flex-direction:column;gap:0.35rem;${item.dismissed ? 'opacity:0.7;' : ''}">
+    <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:baseline;flex-wrap:wrap;">
+      <div style="font-size:0.8rem;"><b>${escapeHtml(item.panelName || item.host)}</b> · ${escapeHtml(item.keyName || '(未命名)')} <span class="mono" style="color:#94a3b8;">${escapeHtml(item.keyTail || '')}</span></div>
+      <div style="font-size:0.72rem;color:#475569;">上游分组「${escapeHtml(g.name || '-')}」· ${escapeHtml(g.platform || '-')} · 进价 <b class="mono">${g.rate ?? '?'}x</b></div>
+    </div>
+    <div style="font-size:0.7rem;color:#94a3b8;">${created ? `${created} 创建` : ''}${used}</div>
+    ${item.dismissed ? '' : `<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;">
+      <select class="form-input upstream-key-group" style="flex:2;min-width:220px;font-size:0.76rem;">
+        <option value="">-- 选择放进本站哪个分组 --</option>${options}
+      </select>
+      <input type="text" class="form-input upstream-key-name" value="${escapeHtml(item.suggestedName || '')}" maxlength="100" title="在 Sub2API 里显示的账号名称" style="flex:1;min-width:150px;font-size:0.76rem;" />
+    </div>`}
+    <div style="display:flex;gap:0.35rem;justify-content:flex-end;">${actions}</div>
+  </div>`;
+}
+
+function renderUpstreamKeysModal() {
+  const box = document.getElementById('upstreamKeysList');
+  const panelsBox = document.getElementById('upstreamKeysPanels');
+  const meta = document.getElementById('upstreamKeysMeta');
+  if (!box || !upstreamKeysData) return;
+  const items = upstreamKeysData.items || [];
+  const active = items.filter(item => !item.dismissed);
+  const dismissed = items.filter(item => item.dismissed);
+  if (panelsBox) panelsBox.innerHTML = upstreamKeysPanelsHtml(upstreamKeysData);
+  if (meta) meta.textContent = upstreamKeysData.checkedAt ? `上次检查：${new Date(upstreamKeysData.checkedAt).toLocaleString()}` : '';
+  const shown = upstreamKeysShowDismissed ? [...active, ...dismissed] : active;
+  box.innerHTML = (shown.length ? shown.map(upstreamKeyRowHtml).join('') : '<div style="padding:1rem;text-align:center;color:#16a34a;font-size:0.8rem;">✅ 没有待接入的新 Key。</div>')
+    + (dismissed.length ? `<div style="text-align:center;font-size:0.72rem;color:#64748b;"><a href="#" onclick="toggleDismissedUpstreamKeys(event)">${upstreamKeysShowDismissed ? '收起已删除的' : `已删除 ${dismissed.length} 个 · 显示`}</a></div>` : '');
+}
+
+async function openUpstreamKeysModal() {
+  document.getElementById('upstreamKeysModalBackdrop')?.remove();
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = `
+    <div id="upstreamKeysModalBackdrop" class="modal-backdrop open" style="z-index: 1050;">
+      <div class="modal-dialog" style="max-width: 760px;">
+        <div class="dialog-content">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.2rem;">
+            <div style="font-size:1.05rem;font-weight:700;color:#0f172a;">🆕 接入上游新 Key</div>
+            <button type="button" onclick="document.getElementById('upstreamKeysModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+          <p style="font-size:0.74rem;color:#64748b;margin:0 0 0.5rem;line-height:1.55;">
+            你在上游网站（Sub2API 搭的站）新建的 Key 会自动出现在这里，塔台每 10 分钟检查一次。选好放进本站哪个分组，点「接入」：
+            塔台照着这家上游已有的账号，在 Sub2API 里新建一个账号，只换 Key、名称和进价。分组里已有账号时，新账号先当备用；空分组直接当主调。进价不低于分组售价的不能接。
+          </p>
+          <div id="upstreamKeysPanels" style="display:flex;flex-direction:column;gap:0.2rem;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:0.45rem 0.6rem;margin-bottom:0.5rem;">正在读取…</div>
+          <div id="upstreamKeysList" style="display:flex;flex-direction:column;gap:0.45rem;max-height:420px;overflow-y:auto;"></div>
+          <div style="margin-top:0.6rem;display:flex;justify-content:space-between;align-items:center;gap:0.5rem;">
+            <span id="upstreamKeysMeta" style="font-size:0.72rem;color:#94a3b8;"></span>
+            <div style="display:flex;gap:0.5rem;white-space:nowrap;">
+              <button id="btnRefreshUpstreamKeys" type="button" class="btn btn-secondary" title="马上去各家上游重新读取 Key 列表">⟳ 重新检查</button>
+              <button type="button" onclick="document.getElementById('upstreamKeysModalBackdrop').remove()" class="btn btn-primary">关闭</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(wrapper.firstElementChild);
+  document.getElementById('btnRefreshUpstreamKeys')?.addEventListener('click', () => refreshUpstreamKeysModal(true));
+  await refreshUpstreamKeysModal(false);
+}
+
+async function refreshUpstreamKeysModal(refresh) {
+  const btn = document.getElementById('btnRefreshUpstreamKeys');
+  if (btn) { btn.disabled = true; btn.textContent = refresh ? '检查中…' : '⟳ 重新检查'; }
+  try {
+    await loadUpstreamKeys(refresh);
+    renderUpstreamKeysModal();
+  } catch (err) {
+    const box = document.getElementById('upstreamKeysList');
+    if (box) box.innerHTML = `<div style="color:#dc2626;font-size:0.78rem;">读取失败：${escapeHtml(err.message)}</div>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⟳ 重新检查'; }
+  }
+}
+
+async function connectUpstreamKeyItem(uid, button) {
+  const row = button.closest('.upstream-key-row');
+  const item = (upstreamKeysData?.items || []).find(i => i.uid === uid);
+  const groupId = row?.querySelector('.upstream-key-group')?.value;
+  const name = (row?.querySelector('.upstream-key-name')?.value || '').trim();
+  if (!item) return;
+  if (!groupId) { showToast('请先选择要放进的本站分组', 'warning'); return; }
+  const group = (item.candidateGroups || []).find(g => String(g.id) === String(groupId));
+  const role = group && group.members ? `分组里已有 ${group.members} 个账号，新账号先当备用。` : '这个分组还没有账号，新账号会直接当主调。';
+  if (!confirm(`把「${item.panelName} · ${item.keyName || item.keyTail}」接入分组【${group ? group.name : groupId}】吗？\n\n会在 Sub2API 新建账号「${name || item.suggestedName}」，进价 ${item.upstreamGroup.rate}x（分组售价 ${group ? group.saleRate : '?'}x）。\n${role}`)) return;
+  button.disabled = true;
+  button.textContent = '接入中…';
+  try {
+    const res = await fetch('/api/upstream/keys/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, groupId: Number(groupId), name }) });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '接入失败');
+    showToast(`✅ ${data.message}`, 'success');
+    if (upstreamKeysData) {
+      upstreamKeysData.items = upstreamKeysData.items.filter(i => i.uid !== uid);
+      const panelSummary = (upstreamKeysData.panels || []).find(p => p.id === item.panelId);
+      if (panelSummary) {
+        panelSummary.connected += 1;
+        panelSummary.pending = Math.max(0, panelSummary.pending - 1);
+      }
+    }
+    renderUpstreamKeysModal();
+    updateUpstreamKeysBadge((upstreamKeysData?.items || []).filter(i => !i.dismissed).length);
+    await loadChannels();
+  } catch (err) {
+    showToast('接入失败（没有做任何修改）：' + err.message, 'error');
+    button.disabled = false;
+    button.textContent = '接入';
+  }
+}
+
+async function dismissUpstreamKeyItem(uid, restore) {
+  try {
+    const res = await fetch('/api/upstream/keys/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid, restore }) });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '操作失败');
+    const item = (upstreamKeysData?.items || []).find(i => i.uid === uid);
+    if (item) item.dismissed = !restore;
+    for (const panelSummary of upstreamKeysData?.panels || []) {
+      panelSummary.pending = upstreamKeysData.items.filter(i => i.panelId === panelSummary.id && !i.dismissed).length;
+    }
+    renderUpstreamKeysModal();
+    updateUpstreamKeysBadge(data.pending);
+    showToast(restore ? '已恢复显示这个 Key' : '已删除，这个 Key 以后不再提示（可在下方「已删除」里恢复）', 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+function toggleDismissedUpstreamKeys(event) {
+  event?.preventDefault();
+  upstreamKeysShowDismissed = !upstreamKeysShowDismissed;
+  renderUpstreamKeysModal();
+}
+
 async function deleteChannel(channelId, channelName) {
   const name = channelName || `ID: ${channelId}`;
   if (!confirm(`确定要在 Sub2API 数据库与塔台中彻底删除上游渠道 [${name}] 吗？\n\n⚠️ 注意：删除后该渠道将立即从系统与销售分组中下线，不可逆恢复。`)) {
@@ -3756,6 +3966,8 @@ function initApp() {
     openAutoSwitchPreviewModal();
   });
   document.getElementById('kpiAutoSwitchItem')?.addEventListener('click', openAutoSwitchModal);
+  document.getElementById('btnOpenUpstreamKeysModal')?.addEventListener('click', openUpstreamKeysModal);
+  loadUpstreamKeys(false).catch(err => console.warn('读取上游新 Key 失败:', err.message));
 
   // 搜索
   document.getElementById('channelSearchInput')?.addEventListener('input', () => {
@@ -3996,10 +4208,13 @@ if (document.readyState === 'loading') {
 }
 
 // ====== 全局弹窗安全关闭调度器 ======
+// 用 JS 临时生成的弹窗，关闭时直接移除
+const DYNAMIC_MODAL_IDS = ['upstreamKeysModalBackdrop', 'splitSharedModalBackdrop', 'autoSwitchPreviewBackdrop'];
+
 function closeActiveModal(targetBackdrop = null) {
   if (targetBackdrop && targetBackdrop.id) {
     const id = targetBackdrop.id;
-    if (id === 'assignAccountsModalBackdrop') {
+    if (id === 'assignAccountsModalBackdrop' || DYNAMIC_MODAL_IDS.includes(id)) {
       targetBackdrop.remove();
       return;
     }
@@ -4088,6 +4303,14 @@ function closeActiveModal(targetBackdrop = null) {
   if (assignModal) {
     assignModal.remove();
     return;
+  }
+
+  for (const dynamicId of DYNAMIC_MODAL_IDS) {
+    const dynamicModal = document.getElementById(dynamicId);
+    if (dynamicModal) {
+      dynamicModal.remove();
+      return;
+    }
   }
 
   const rechargeModal = document.getElementById('quickRechargeModal');
@@ -7814,18 +8037,19 @@ async function fetchUpstreamScannerStatus() {
 
 function updateScannerPendingBadge(pendingActions) {
   const badge = document.getElementById('scanPendingBadge');
-  const dot = document.getElementById('navDropdownPendingDot');
   const count = Array.isArray(pendingActions) ? pendingActions.length : 0;
-  if (count > 0) {
-    if (badge) {
-      badge.textContent = count;
-      badge.style.display = 'inline-block';
-    }
-    if (dot) dot.style.display = 'inline-block';
-  } else {
-    if (badge) badge.style.display = 'none';
-    if (dot) dot.style.display = 'none';
+  window._scannerPendingCount = count;
+  if (badge) {
+    badge.textContent = count;
+    badge.style.display = count > 0 ? 'inline-block' : 'none';
   }
+  refreshNavPendingDot();
+}
+
+// 「系统管理」按钮上的小红点：巡检待审批或上游新 Key 任一有内容就亮
+function refreshNavPendingDot() {
+  const dot = document.getElementById('navDropdownPendingDot');
+  if (dot) dot.style.display = (window._scannerPendingCount || 0) + (window._upstreamKeysPending || 0) > 0 ? 'inline-block' : 'none';
 }
 
 async function openUpstreamScanModal() {

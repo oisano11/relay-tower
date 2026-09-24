@@ -10,6 +10,7 @@ const gatewayMetrics = new gateway.GatewayMetrics();
 const { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority } = require('./routing-policy');
 const { evaluateGroup, lowTrafficSuspect, resolveGroupPolicy, groupPolicyOverrides } = require('./auto-failover-policy');
 const accountSplit = require('./account-split');
+const upstreamKeys = require('./upstream-keys');
 const { EventEmitter } = require('events');
 // A worker is deliberately read-only with respect to local runtime JSON.  It
 // can use the synchronous DB/SSH adapters without blocking the gateway, but
@@ -25,6 +26,7 @@ const UPSTREAM_PANEL_FILE = path.join(DATA_DIR, 'upstream_panel.json');
 const UPSTREAM_PANELS_FILE = path.join(DATA_DIR, 'upstream_panels.json');
 const UPSTREAM_MODELS_CACHE_FILE = path.join(DATA_DIR, 'upstream_models_cache.json');
 const UPSTREAM_GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
+const UPSTREAM_KEY_STATE_FILE = path.join(DATA_DIR, 'upstream_key_state.json');
 const DATA_DIR_MODE = 0o700;
 const RUNTIME_DATA_FILE_MODE = 0o600;
 
@@ -328,6 +330,9 @@ function writeJSON(filePath, data) {
 
 let upstreamModelsCache = readJSON(UPSTREAM_MODELS_CACHE_FILE, {});
 let upstreamGroupCatalog = readJSON(UPSTREAM_GROUP_CATALOG_FILE, []);
+// 上游新 Key：dismissed = 人工删除（不再提示），seen = 已经提醒过的 Key
+let upstreamKeyState = IS_CONTROL_PLANE_WORKER ? { dismissed: [], seen: [] } : readJSON(UPSTREAM_KEY_STATE_FILE, { dismissed: [], seen: [] });
+let upstreamKeyDiscovery = { items: [], panels: [], checkedAt: null };
 
 let state = readJSON(CHANNELS_FILE, {
   activeChannelId: '169',
@@ -838,7 +843,199 @@ async function refreshAllBalances() {
       console.error('[通道余额巡检切线异常]:', e.message);
     }
   }
+  // 同步余额时各家上游刚登录过，顺便检查有没有新建的 Key（不等待，失败只记日志）
+  discoverUpstreamKeys({ notify: true }).catch(err => console.error('[上游新 Key] 检查失败:', err.message));
   return state.channels;
+}
+
+// ====== 上游新 Key：发现 → 待接入 → 选分组一键建号 ======
+// 只处理 Sub2API 上游。完整 Key 只在服务端使用，列表里只给末 4 位；接入时重新向上游读取。
+function saveUpstreamKeyState() {
+  upstreamKeyState.dismissed = [...new Set(upstreamKeyState.dismissed || [])];
+  upstreamKeyState.seen = [...new Set(upstreamKeyState.seen || [])].slice(-2000);
+  writeJSON(UPSTREAM_KEY_STATE_FILE, upstreamKeyState);
+}
+
+async function upstreamPanelJson(panel, apiPath) {
+  const base = String(panel.backendUrl || '').replace(/\/+$/, '');
+  const token = String(panel.userToken || '');
+  try {
+    const res = await fetch(`${base}${apiPath}`, {
+      headers: { Authorization: token.startsWith('Bearer ') ? token : `Bearer ${token}`, 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(8000)
+    });
+    let body = null;
+    try { body = await res.json(); } catch (_) {}
+    return { status: res.status, body };
+  } catch (err) {
+    return { status: 0, body: null, error: err.message };
+  }
+}
+
+// 读取一家上游的全部 Key 和专属倍率；登录过期、又存了账号密码时，自动重新登录一次再读
+async function fetchUpstreamKeyInventory(panel, { allowRelogin = false } = {}) {
+  if (panel.enabled === false) return { panel, status: 'skipped', message: '已停用' };
+  if (panel.isSub2API === false || panel.status === 'unsupported') {
+    return { panel, status: 'unsupported', message: '不是 Sub2API 系统，暂不支持自动发现 Key' };
+  }
+  if (!panel.userToken) return { panel, status: 'token_invalid', message: '没有登录信息，请在「上游供应商后台」填写账号密码' };
+  const listPath = `/api/v1/keys?page=1&page_size=${upstreamKeys.KEY_PAGE_SIZE}`;
+  let listRes = await upstreamPanelJson(panel, listPath);
+  if (listRes.status === 401 && allowRelogin && panel.username && panel.password) {
+    try {
+      await syncSingleUpstreamPanel(panel);
+      panel = upstreamPanels.find(p => p.id === panel.id) || panel;
+      listRes = await upstreamPanelJson(panel, listPath);
+    } catch (err) {
+      return { panel, status: 'token_invalid', message: `重新登录失败：${err.message}` };
+    }
+  }
+  if (listRes.status === 401) {
+    return {
+      panel, status: 'token_invalid',
+      message: panel.username && panel.password ? '登录已过期，下次同步余额时会自动重新登录' : '登录已失效，请在「上游供应商后台」重新填写账号密码'
+    };
+  }
+  if (listRes.status === 404) return { panel, status: 'unsupported', message: '不是 Sub2API 系统（可能是 New-API），暂不支持自动发现 Key' };
+  const keys = upstreamKeys.parseKeyList(listRes.body);
+  if (!keys) return { panel, status: 'error', message: listRes.error || `读取 Key 列表失败（HTTP ${listRes.status}）` };
+  const ratesRes = await upstreamPanelJson(panel, '/api/v1/groups/rates');
+  const ratesBody = ratesRes.status === 200 && ratesRes.body && ratesRes.body.code === 0 ? ratesRes.body.data : null;
+  return { panel, status: 'ok', keys, rates: ratesBody && typeof ratesBody === 'object' ? ratesBody : {} };
+}
+
+function upstreamKeyDiscoverySummary() {
+  return { pending: upstreamKeyDiscovery.items.filter(item => !item.dismissed).length, checkedAt: upstreamKeyDiscovery.checkedAt };
+}
+
+function announceNewUpstreamKeys(fresh) {
+  const lines = fresh.slice(0, 10).map(item => `${item.panelName}：${item.keyName || item.keyTail}（上游分组 ${item.upstreamGroup.name || '-'}，进价 ${item.upstreamGroup.rate ?? '?'}x）`);
+  const more = fresh.length > 10 ? `\n……另外还有 ${fresh.length - 10} 个` : '';
+  const note = `发现 ${fresh.length} 个上游 Key 还没接入本站：\n${lines.join('\n')}${more}\n到控制台「系统管理 → 接入上游新 Key」选好分组就能接入。`;
+  alerts.unshift({ id: 'upkey_' + Date.now(), type: 'upstream_key', timestamp: new Date().toISOString(), note });
+  if (alerts.length > 200) alerts = alerts.slice(0, 200);
+  writeJSON(ALERTS_FILE, alerts);
+  try {
+    if (telegram && telegram.config && telegram.config.enabled) {
+      Promise.resolve(telegram.broadcastToAdmins(note.replace(/[&<>]/g, ''))).catch(error => console.error('[新 Key 通知]', error.message));
+    }
+  } catch (err) {
+    console.error('[新 Key 通知]', err.message);
+  }
+}
+
+let upstreamKeyDiscoveryRunning = null;
+async function discoverUpstreamKeys({ notify = false, allowRelogin = false } = {}) {
+  if (IS_CONTROL_PLANE_WORKER) return upstreamKeyDiscovery;
+  if (upstreamKeyDiscoveryRunning) return upstreamKeyDiscoveryRunning;
+  upstreamKeyDiscoveryRunning = (async () => {
+    const panelResults = [];
+    for (const panel of upstreamPanels) {
+      if (!panel || !panel.backendUrl || panel.isOfficialDirect) continue;
+      if (upstreamScanner && typeof upstreamScanner.isTombstoned === 'function' && upstreamScanner.isTombstoned(panel.backendUrl, panel.name)) continue;
+      panelResults.push(await fetchUpstreamKeyInventory(panel, { allowRelogin }));
+    }
+    const plan = upstreamKeys.planUpstreamKeys({
+      panelResults, channels: state.channels || [], groups: state.allGroups || [], dismissed: upstreamKeyState.dismissed || []
+    });
+    upstreamKeyDiscovery = { ...plan, checkedAt: new Date().toISOString() };
+    const seen = new Set(upstreamKeyState.seen || []);
+    const fresh = plan.items.filter(item => !item.dismissed && !seen.has(item.uid));
+    if (fresh.length) {
+      upstreamKeyState.seen = [...seen, ...fresh.map(item => item.uid)];
+      saveUpstreamKeyState();
+      if (notify) announceNewUpstreamKeys(fresh);
+    }
+    broadcastSSE('UPSTREAM_KEYS_UPDATED', upstreamKeyDiscoverySummary());
+    return upstreamKeyDiscovery;
+  })();
+  try {
+    return await upstreamKeyDiscoveryRunning;
+  } finally {
+    upstreamKeyDiscoveryRunning = null;
+  }
+}
+
+// 把一个上游 Key 接入本站分组：照着同一家上游、同平台的现有账号复制一份，只换 Key、名称、进价和分组
+async function connectUpstreamKey({ uid, groupId, name }) {
+  const text = String(uid || '');
+  const cut = text.lastIndexOf(':');
+  const panelId = cut > 0 ? text.slice(0, cut) : '';
+  const keyId = cut > 0 ? text.slice(cut + 1) : '';
+  const panel = upstreamPanels.find(p => p.id === panelId);
+  if (!panel || !keyId) throw new Error('找不到这个上游 Key，请点「重新检查」');
+  const inventory = await fetchUpstreamKeyInventory(panel, { allowRelogin: true });
+  if (inventory.status !== 'ok') throw new Error(`读取上游「${panel.name}」失败：${inventory.message}`);
+  const key = inventory.keys.find(k => String(k.id) === String(keyId));
+  if (!key || String(key.status || 'active') !== 'active') throw new Error('上游已经没有这个 Key，或者它被停用了');
+  if ((state.channels || []).some(c => String(c.apiKey || '') === String(key.key))) throw new Error('这个 Key 已经接入过本站了');
+
+  const gid = Number(groupId);
+  const group = (state.allGroups || []).find(g => Number(g.id) === gid);
+  if (!group) throw new Error('请先选择要放进的本站分组');
+  const platform = upstreamKeys.groupPlatform(group, state.channels);
+  const upstreamPlatform = key.group && key.group.platform;
+  if (!platform || !upstreamKeys.localPlatformsFor(upstreamPlatform).includes(platform)) {
+    throw new Error(`分组【${group.name}】的平台（${platform || '未知'}）和这个 Key 的上游平台（${upstreamPlatform || '未知'}）对不上`);
+  }
+  const rate = upstreamKeys.effectiveRate(key, inventory.rates);
+  if (rate === null) throw new Error('上游没有给出这个 Key 的倍率，无法核对进价');
+  if (!(Number(group.sale_rate) > rate)) {
+    throw new Error(`进价 ${rate}x 不低于分组【${group.name}】的售价 ${group.sale_rate}x，接入会倒贴。可以先调高这个分组的售价，或换一个分组`);
+  }
+  const keyGroupByApiKey = new Map(inventory.keys.map(k => [String(k.key), k.group_id]));
+  const template = upstreamKeys.pickTemplate(state.channels, upstreamKeys.hostKey(panel.backendUrl), platform, key.group_id, keyGroupByApiKey);
+  if (!template) throw new Error(`本站还没有这家上游的 ${platform} 账号可以参照。请先在 Sub2API 后台手动加一个，之后的新 Key 就能一键接入`);
+
+  // 空分组直接当主调；已有账号时先当备用（单主独占模式下备用不接流量，由自动切号按需启用）
+  const members = (state.channels || []).filter(c => groupIds(c).includes(gid));
+  const exclusive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false);
+  const role = members.length === 0 ? 'main' : 'standby';
+  const accountName = String(name || '').trim() || upstreamKeys.suggestAccountName(panel.name, key.name, rate);
+  const notes = `[中转塔台接入] 上游 ${panel.name} 的 Key #${key.id}「${key.name || ''}」，上游分组「${(key.group && key.group.name) || '-'}」（${upstreamPlatform || '-'} ${rate}x），参照账号 #${template.id}`;
+  const sql = upstreamKeys.buildConnectSql({
+    templateId: template.id, groupId: gid, apiKey: key.key, name: accountName, notes, rate,
+    priority: role === 'main' ? 1 : 100, schedulable: role === 'main' || !exclusive, keepModelMapping: template.keepModelMapping
+  });
+  const output = execPsql(`BEGIN;\n${sql}\nCOMMIT;`, true);
+  const ids = String(output || '').split(/\r?\n/).map(value => value.trim()).filter(value => /^\d+$/.test(value));
+  const newId = Number(ids[ids.length - 1]);
+  if (!Number.isSafeInteger(newId) || newId <= 0) throw new Error('Sub2API 没有返回新账号编号，请刷新后确认账号是否已建好');
+
+  invalidateSub2APIScheduler([newId], gid);
+  refreshSub2APISignatureAfterDirectMutation('接入上游新 Key');
+  syncRealSub2APIAccounts();
+  const message = `已接入：在分组【${group.name}】新建账号 #${newId}「${accountName}」，进价 ${rate}x，${role === 'main' ? '这个分组原来没有账号，已设为主调' : '先当备用'}`;
+  alerts.unshift({ id: 'upkey_connect_' + Date.now(), type: 'account_connect', channelId: String(newId), channelName: accountName, groupId: gid, timestamp: new Date().toISOString(), note: message });
+  if (alerts.length > 200) alerts = alerts.slice(0, 200);
+  writeJSON(ALERTS_FILE, alerts);
+  upstreamKeyDiscovery.items = upstreamKeyDiscovery.items.filter(item => item.uid !== text);
+  const summary = upstreamKeyDiscovery.panels.find(p => p.id === panelId);
+  if (summary) {
+    summary.connected += 1;
+    summary.pending = Math.max(0, summary.pending - 1);
+  }
+  broadcastSSE('CHANNELS_UPDATED', state);
+  broadcastSSE('UPSTREAM_KEYS_UPDATED', upstreamKeyDiscoverySummary());
+  return { accountId: String(newId), role, message };
+}
+
+// 删除 = 不再提示这个 Key（只改塔台自己的记录，不动上游）；restore 为 true 时恢复显示
+function dismissUpstreamKey(uid, restore = false) {
+  const text = String(uid || '');
+  if (!text.includes(':')) throw new Error('无效的上游 Key');
+  const dismissed = new Set(upstreamKeyState.dismissed || []);
+  if (restore) dismissed.delete(text); else dismissed.add(text);
+  upstreamKeyState.dismissed = [...dismissed];
+  saveUpstreamKeyState();
+  for (const item of upstreamKeyDiscovery.items) {
+    if (item.uid === text) item.dismissed = !restore;
+  }
+  for (const panel of upstreamKeyDiscovery.panels) {
+    panel.pending = upstreamKeyDiscovery.items.filter(item => item.panelId === panel.id && !item.dismissed).length;
+  }
+  broadcastSSE('UPSTREAM_KEYS_UPDATED', upstreamKeyDiscoverySummary());
+  return upstreamKeyDiscoverySummary();
 }
 
 // 脱敏上游供应商配置并附加关联与墓碑状态
@@ -1879,7 +2076,7 @@ function selectPrimaryGroup(groupsDetail) {
 // 获取 Sub2API 系统的所有分组与销售倍率
 function fetchAllSub2APIGroups() {
   try {
-    const sql = `SELECT json_agg(g) FROM (SELECT id, name, rate_multiplier::float as sale_rate FROM groups WHERE deleted_at IS NULL ORDER BY id ASC) g;`;
+    const sql = `SELECT json_agg(g) FROM (SELECT id, name, rate_multiplier::float as sale_rate, platform FROM groups WHERE deleted_at IS NULL ORDER BY id ASC) g;`;
     const output = execPsql(sql, true).trim();
     if (!output || !output.startsWith('[')) return [];
     return JSON.parse(output);
@@ -8633,6 +8830,49 @@ async function handleRequest(req, res) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: err.message }));
     });
+    return;
+  }
+
+  // 上游新 Key：待接入列表（refresh=true 时立即向各家上游重新读取）
+  if (pathname === '/api/upstream/keys' && req.method === 'GET') {
+    try {
+      if (parsedUrl.query.refresh === 'true' || !upstreamKeyDiscovery.checkedAt) {
+        await discoverUpstreamKeys({ allowRelogin: parsedUrl.query.refresh === 'true' });
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: true, ...upstreamKeyDiscovery }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/api/upstream/keys/connect' && req.method === 'POST') {
+    const body = await getBody();
+    try {
+      const result = await connectUpstreamKey({ uid: body.uid, groupId: body.groupId, name: body.name });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: true, ...result }));
+    } catch (err) {
+      // psql 报错时只取出守卫里的中文原因，不把整段命令输出给页面
+      const reason = String(err.message || err).split('\n').find(line => /中止|不能|请|无效|找不到|对不上|倒贴|失败|没有/.test(line)) || err.message;
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: String(reason).replace(/^.*?ERROR:\s*/, '') }));
+    }
+    return;
+  }
+
+  if (pathname === '/api/upstream/keys/dismiss' && req.method === 'POST') {
+    const body = await getBody();
+    try {
+      const summary = dismissUpstreamKey(body.uid, body.restore === true);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: true, ...summary }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
     return;
   }
 
