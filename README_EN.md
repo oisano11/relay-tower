@@ -17,7 +17,7 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot%20Integrated-0088cc.svg?logo=telegram)](https://telegram.org)
 
-[English](README_EN.md) · [简体中文](README.md) · [Why Relay Tower?](#-why-relay-tower-comparison) · [Key Features](#-key-features-matrix) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [Client Setup](#-client-integration-guide) · [FAQ](#-faq)
+[English](README_EN.md) · [简体中文](README.md) · [Why Relay Tower?](#-why-relay-tower-comparison) · [Key Features](#-key-features-matrix) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [Client Setup](#-client-integration-guide) · [FAQ](#-faq) · [Changelog (中文)](CHANGELOG.md)
 
 </div>
 
