@@ -4899,9 +4899,25 @@ async function saveGroupRateFromInput(groupId, btnEl) {
   }
 }
 
+function formatKeyLastUsed(value) {
+  if (!value) return '从没用过';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '从没用过';
+  const pad = n => String(n).padStart(2, '0');
+  return `最后使用 ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 function buildGroupDeleteConfirmText(preview) {
   const name = preview.groupName || `#${preview.groupId}`;
   const lines = [`确定删除分组「${name}」吗？`, ''];
+  const bindings = preview.bindings || {};
+  const keyOwners = bindings.keyOwners || [];
+  if (preview.keyWarning) {
+    lines.push(`⚠️ ${preview.keyWarning}`);
+    keyOwners.forEach(item => lines.push(`  · ${item.owner} 的「${item.keyName || '未命名'}」（${formatKeyLastUsed(item.lastUsedAt)}）`));
+    if ((bindings.keys || 0) > keyOwners.length) lines.push(`  · 还有 ${bindings.keys - keyOwners.length} 个没列出`);
+    lines.push('');
+  }
   const stopAccounts = preview.stopAccounts || [];
   const unlinkAccounts = preview.unlinkAccounts || [];
   if (stopAccounts.length > 0) {
@@ -4914,7 +4930,8 @@ function buildGroupDeleteConfirmText(preview) {
     unlinkAccounts.forEach(account => lines.push(`  · ${account.name}${account.schedulable ? '（在别的分组照常接单）' : '（已停用）'}`));
     lines.push('');
   }
-  lines.push('这个分组没有绑客户 Key。删除后不能在塔台里恢复。');
+  if (!preview.keyWarning) lines.push('这个分组没有绑客户 Key。');
+  lines.push('删除后不能在塔台里恢复。');
   return lines.join('\n');
 }
 
@@ -4949,7 +4966,10 @@ async function handleDeleteGroup(groupId, btnEl) {
     const res = await fetch(`/api/groups/${groupId}`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stopAccountIds: (preview.stopAccounts || []).map(account => account.id) })
+      body: JSON.stringify({
+        stopAccountIds: (preview.stopAccounts || []).map(account => account.id),
+        confirmKeyCount: (preview.bindings && preview.bindings.keys) || 0
+      })
     });
     const data = await res.json();
     if (!res.ok || !data.success) throw new Error(data.error || '删除分组失败');
