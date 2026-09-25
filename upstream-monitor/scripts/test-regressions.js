@@ -2420,9 +2420,8 @@ test('active accounts in Sub2API database are authoritative and never pruned by 
   assert.ok(state.channels.some(c => c.id === '245' && c.name === '灵犀 ds 0.2'));
   assert.ok(state.channels.some(c => c.id === '226' && c.name === '智云 pro 0.16'));
 
-  // 2. 真实存活账号自动解除了墓碑阻断
-  assert.equal(untombstoned.length, 1);
-  assert.equal(untombstoned[0].name, '灵犀 ds 0.2');
+  // 2. 真实存活账号自动解除了墓碑阻断（每个存活账号都会清一遍自己的地址和名字）
+  assert.deepEqual(untombstoned, accountsFromPostgres.map(acc => ({ url: acc.base_url, name: acc.name })));
 });
 
 test('setting channel as main in Group A isolates priority and preserves backup status in Group B', () => {

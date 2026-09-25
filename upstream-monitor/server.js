@@ -2169,14 +2169,12 @@ SELECT json_agg(t) FROM (
     const output = execPsql(sql, true).trim();
     if (!output || !output.startsWith('[')) return null;
     const allAccountsRaw = JSON.parse(output);
-    // 权威真实存活上游：Sub2API 数据库中 deleted_at IS NULL 的账号是绝对权威来源，绝不可被墓碑名单误杀
+    // 权威真实存活上游：Sub2API 数据库中 deleted_at IS NULL 的账号是绝对权威来源，绝不可被墓碑名单误杀。
+    // 每个存活账号都清一遍（没有可清的不会写盘），连同这个地址以前的供应商面板名，
+    // 否则账号删了又重建时，旧面板名会一直挡住自动发现。
     const realAccounts = allAccountsRaw;
     if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.removeTombstone === 'function') {
-      for (const acc of realAccounts) {
-        if (upstreamScanner.isTombstoned(acc.base_url, acc.name)) {
-          upstreamScanner.removeTombstone(acc.base_url, acc.name);
-        }
-      }
+      for (const acc of realAccounts) upstreamScanner.removeTombstone(acc.base_url, acc.name);
     }
     const allGroups = fetchAllSub2APIGroups();
     if (!snapshotOnly) state.allGroups = allGroups;
