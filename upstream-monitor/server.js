@@ -3732,17 +3732,41 @@ function prepareGroupAccountsPlan(groupId, requestedAccountIds, operation) {
   return { group, accountIds, selectedChannels, affectedChannels, changes };
 }
 
+// Deleting a group never needs the group's own sale price, and a stopped
+// account only needs its cached membership updated. An enabled account whose
+// only group is this one is stopped in the same transaction (the console shows
+// that list before the user confirms). An enabled account that keeps other
+// groups must stay profitable in every one of them.
 function prepareDeleteRemoteGroupPlan(groupId) {
   const operation = '删除分组';
-  const group = getCachedGroupForPlan(groupId, operation);
+  const id = normalizePositivePlanId(groupId, '分组 ID');
+  const cachedGroup = (Array.isArray(state.allGroups) ? state.allGroups : []).find(candidate => Number(candidate.id) === id);
+  if (!cachedGroup) throw new Error(`找不到分组 #${id}，它可能已经被删除了，请刷新页面后再试`);
+  const group = { ...cachedGroup, id };
+  const cachedById = new Map((state.allGroups || []).map(candidate => [Number(candidate.id), candidate]));
   const affectedChannels = (state.channels || []).filter(channel => currentCachedGroupIds(channel).includes(group.id));
+  const stopChannels = [];
   const changes = affectedChannels.map(channel => {
-    const groupIds = currentCachedGroupIds(channel).filter(id => id !== group.id);
-    const groups = resolveCachedGroupPlans(groupIds, operation);
-    assertPlannedChannelMembershipIsSafe(channel, groups, operation);
-    return { channel, groupIds, groups };
+    const groupIds = currentCachedGroupIds(channel).filter(gid => gid !== group.id);
+    if (channel.schedulable === true && groupIds.length === 0) {
+      stopChannels.push(channel);
+      return { channel, groupIds, groups: [], stop: true };
+    }
+    if (channel.schedulable !== true) {
+      const details = new Map((channel.groupsDetail || []).map(detail => [Number(detail.id), detail]));
+      const groups = groupIds.map(gid => ({ ...(details.get(gid) || {}), ...(cachedById.get(gid) || {}), id: gid }));
+      return { channel, groupIds, groups, stop: false };
+    }
+    try {
+      const groups = resolveCachedGroupPlans(groupIds, operation);
+      assertPlannedChannelMembershipIsSafe(channel, groups, operation);
+      return { channel, groupIds, groups, stop: false };
+    } catch (err) {
+      const remaining = groupIds.map(gid => `「${(cachedById.get(gid) || {}).name || `分组 ${gid}`}」`).join('、');
+      throw new Error(`账号「${channel.name || channel.id}」还在接单，删掉这个分组后它只剩 ${remaining}，在那边是亏本价或者售价核对不上，所以不能删。请先停用这个账号，或者调整它的分组。`);
+    }
   });
-  return { group, affectedChannels, changes };
+  return { group, affectedChannels, changes, stopChannels };
 }
 
 function prepareAddAccountsToGroupPlan(groupId, requestedAccountIds, operation) {
@@ -4056,21 +4080,182 @@ UPDATE groups SET ${sets.join(', ')} WHERE id = ${gid} AND deleted_at IS NULL;`;
   return true;
 }
 
-// 删除或停用分组
-function deleteRemoteGroup(groupId) {
+// Sub2API rejects a customer key whose group is deleted ("API Key 所属分组已删除"),
+// so anything still bound to the group blocks the delete. The preview and the
+// write transaction check the same things.
+function buildGroupDeleteBindingsSql(groupId) {
+  const gid = normalizePositivePlanId(groupId, '分组 ID');
+  return `SELECT json_build_object(
+  'keys', (SELECT count(*) FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL),
+  'keysUsed7d', (SELECT count(*) FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL AND last_used_at > NOW() - INTERVAL '7 days'),
+  'keyUsers', (SELECT count(DISTINCT user_id) FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL),
+  'subscriptions', (SELECT count(*) FROM user_subscriptions s WHERE s.group_id = ${gid} AND (to_jsonb(s)->>'deleted_at') IS NULL),
+  'fallbackFrom', COALESCE((SELECT json_agg(g.name ORDER BY g.id) FROM groups g WHERE ${remoteGroupFallsBackToSql('g', gid)}), '[]'::json)
+);`;
+}
+
+// Read through to_jsonb so a Sub2API version without these columns still works.
+function remoteGroupFallsBackToSql(alias, gid) {
+  return `${alias}.deleted_at IS NULL AND ${alias}.id <> ${gid} AND ${gid} IN ((to_jsonb(${alias})->>'fallback_group_id')::bigint, (to_jsonb(${alias})->>'fallback_group_id_on_invalid_request')::bigint)`;
+}
+
+function readGroupDeleteBindings(groupId) {
+  const output = String(execPsql(buildGroupDeleteBindingsSql(groupId), true) || '').trim();
+  const parsed = JSON.parse(output);
+  return {
+    keys: Number(parsed.keys) || 0,
+    keysUsed7d: Number(parsed.keysUsed7d) || 0,
+    keyUsers: Number(parsed.keyUsers) || 0,
+    subscriptions: Number(parsed.subscriptions) || 0,
+    fallbackFrom: Array.isArray(parsed.fallbackFrom) ? parsed.fallbackFrom.map(String) : []
+  };
+}
+
+function describeGroupDeleteBindings(bindings) {
+  if (bindings.keys > 0) {
+    const inUse = bindings.keysUsed7d > 0 ? `，最近 7 天有 ${bindings.keysUsed7d} 个在用` : '';
+    return `还有 ${bindings.keys} 个客户 Key（${bindings.keyUsers} 位客户）绑在这个分组上${inUse}。分组删掉后，这些 Key 会被 Sub2API 拒绝，提示「API Key 所属分组已删除」。请先在 Sub2API 后台把这些 Key 换到别的分组或者删掉，再来删分组。`;
+  }
+  if (bindings.subscriptions > 0) {
+    return `还有 ${bindings.subscriptions} 个客户订阅挂在这个分组上。请先在 Sub2API 后台处理这些订阅，再来删分组。`;
+  }
+  if (bindings.fallbackFrom.length > 0) {
+    return `分组 ${bindings.fallbackFrom.map(name => `「${name}」`).join('、')} 把它设成了备用分组。请先在 Sub2API 后台改掉这个设置，再来删分组。`;
+  }
+  return null;
+}
+
+function previewDeleteRemoteGroup(groupId) {
+  const id = normalizePositivePlanId(groupId, '分组 ID');
+  const cached = (state.allGroups || []).find(group => Number(group.id) === id);
+  let plan = null;
+  let blocked = null;
+  try {
+    plan = prepareDeleteRemoteGroupPlan(id);
+  } catch (err) {
+    blocked = err.message;
+  }
+  let bindings;
+  try {
+    bindings = readGroupDeleteBindings(id);
+  } catch (err) {
+    throw new Error(`查不到这个分组还绑着哪些客户 Key，为了安全先不删：${err.message}`);
+  }
+  if (!blocked) blocked = describeGroupDeleteBindings(bindings);
+  return {
+    groupId: id,
+    groupName: cached ? String(cached.name || '') : '',
+    stopAccounts: plan ? plan.stopChannels.map(channel => ({ id: Number(channel.id), name: channel.name || String(channel.id) })) : [],
+    unlinkAccounts: plan
+      ? plan.changes.filter(change => !change.stop).map(change => ({
+        id: Number(change.channel.id),
+        name: change.channel.name || String(change.channel.id),
+        schedulable: change.channel.schedulable === true
+      }))
+      : [],
+    bindings,
+    blocked
+  };
+}
+
+function assertConfirmedGroupDeleteStops(plan, confirmedStopIds) {
+  const expected = plan.stopChannels.map(channel => Number(channel.id)).sort((a, b) => a - b);
+  if (expected.length === 0) return;
+  const confirmed = Array.isArray(confirmedStopIds)
+    ? [...new Set(confirmedStopIds.map(Number))].sort((a, b) => a - b)
+    : null;
+  if (confirmed && confirmed.length === expected.length && confirmed.every((id, index) => id === expected[index])) return;
+  if (confirmed) throw new Error('分组里的账号刚刚有变化，这次没有删除。请刷新页面，再点一次删除，确认新的停用名单。');
+  const names = plan.stopChannels.map(channel => `「${channel.name || channel.id}」`).join('、');
+  throw new Error(`分组「${plan.group.name || plan.group.id}」里的账号 ${names} 还在接单，而且只在这个分组里。删除分组要一起停用它们，请在删除确认框里确认后再删。`);
+}
+
+function buildDeleteRemoteGroupSql(groupId, stopIds) {
+  const gid = normalizePositivePlanId(groupId, '分组 ID');
+  const stops = normalizePositivePlanIds(stopIds, '账号 ID');
+  const statements = [
+    remoteGroupExistenceGuardSql([gid]),
+    `DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL) THEN
+    RAISE EXCEPTION 'relay-tower: group has api keys';
+  END IF;
+  IF EXISTS (SELECT 1 FROM user_subscriptions s WHERE s.group_id = ${gid} AND (to_jsonb(s)->>'deleted_at') IS NULL) THEN
+    RAISE EXCEPTION 'relay-tower: group has subscriptions';
+  END IF;
+  IF EXISTS (SELECT 1 FROM groups g WHERE ${remoteGroupFallsBackToSql('g', gid)}) THEN
+    RAISE EXCEPTION 'relay-tower: group is a fallback target';
+  END IF;
+END $$;`
+  ];
+  if (stops.length > 0) {
+    const ids = stops.join(',');
+    // Stop only accounts that still serve no other group, so a membership
+    // change after the preview can never stop another group's account.
+    statements.push(`DO $$ BEGIN
+  PERFORM 1 FROM accounts WHERE id IN (${ids}) AND deleted_at IS NULL FOR UPDATE;
+  IF EXISTS (
+    SELECT 1
+    FROM account_groups other
+    JOIN groups other_group ON other_group.id = other.group_id AND other_group.deleted_at IS NULL
+    WHERE other.account_id IN (${ids}) AND other.group_id <> ${gid}
+  ) THEN
+    RAISE EXCEPTION 'relay-tower: stop list changed';
+  END IF;
+END $$;`, `UPDATE accounts SET schedulable = false WHERE id IN (${ids}) AND deleted_at IS NULL;`);
+  }
+  statements.push(
+    remoteGroupRemovalLeavesScheduledUngroupedGuardSql(gid, []),
+    remoteRemainingMembershipSafetyAfterGroupRemovalGuardSql(gid),
+    // The same cascade as Sub2API's own admin delete. Composite routes are
+    // soft-deleted only where this Sub2API version has that column.
+    `DELETE FROM user_allowed_groups WHERE group_id = ${gid};`,
+    `DELETE FROM account_groups WHERE group_id = ${gid};`,
+    `DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'composite_model_routes' AND column_name = 'deleted_at') THEN
+    EXECUTE 'UPDATE composite_model_routes SET deleted_at = NOW() WHERE group_id = ${gid} AND deleted_at IS NULL';
+  END IF;
+END $$;`,
+    `UPDATE groups SET deleted_at = NOW() WHERE id = ${gid} AND deleted_at IS NULL;`
+  );
+  return statements.join('\n');
+}
+
+function describeGroupDeleteFailure(err) {
+  const text = `${(err && err.stderr) || ''}\n${(err && err.message) || ''}`;
+  if (/relay-tower: group has api keys/.test(text)) return '还有客户 Key 绑在这个分组上，这次没有删除。请先在 Sub2API 后台把这些 Key 换到别的分组或者删掉。';
+  if (/relay-tower: group has subscriptions/.test(text)) return '还有客户订阅挂在这个分组上，这次没有删除。请先在 Sub2API 后台处理这些订阅。';
+  if (/relay-tower: group is a fallback target/.test(text)) return '有别的分组把它设成了备用分组，这次没有删除。请先在 Sub2API 后台改掉这个设置。';
+  if (/relay-tower: stop list changed|Scheduled account cannot be left without a priced group/.test(text)) return '分组里的账号刚刚有变化，这次没有删除。请刷新页面后再删一次。';
+  if (/Unsafe scheduled account pricing/.test(text)) return '删掉后，有在接单的账号会在别的分组亏本，这次没有删除。请先调整这些账号。';
+  if (/Group missing/.test(text)) return '这个分组已经不存在了，请刷新页面。';
+  const detail = text.split('\n').map(line => line.trim()).find(line => /^(ERROR|FATAL):/.test(line)) || String((err && err.message) || '未知错误').split('\n')[0];
+  return `删除没有完成：${detail.slice(0, 200)}。请刷新页面，看看分组是否还在。`;
+}
+
+// 删除业务分组：只在这个分组里的在用账号一起停用；客户 Key 还绑着时不删
+function deleteRemoteGroup(groupId, confirmedStopIds = null) {
   const plan = prepareDeleteRemoteGroupPlan(groupId);
-  const sql = [
-    remoteGroupExistenceGuardSql([plan.group.id]),
-    remoteGroupRemovalLeavesScheduledUngroupedGuardSql(plan.group.id, []),
-    remoteRemainingMembershipSafetyAfterGroupRemovalGuardSql(plan.group.id),
-    `UPDATE groups SET deleted_at = NOW() WHERE id = ${plan.group.id} AND deleted_at IS NULL;`,
-    `DELETE FROM account_groups WHERE group_id = ${plan.group.id};`
-  ].join('\n');
-  if (executeRemoteSQL(sql) !== true) throw new Error('远端删除分组写入未确认，本地状态未改变');
+  assertConfirmedGroupDeleteStops(plan, confirmedStopIds);
+  const stopIds = plan.stopChannels.map(channel => Number(channel.id)).sort((a, b) => a - b);
+  const sql = buildDeleteRemoteGroupSql(plan.group.id, stopIds);
+  try {
+    if (executeRemoteSQL(sql) !== true) throw new Error('远端删除分组写入未确认');
+  } catch (err) {
+    throw new Error(describeGroupDeleteFailure(err));
+  }
+  for (const channel of plan.stopChannels) channel.schedulable = false;
   for (const change of plan.changes) applyCachedChannelMembership(change.channel, change.groups);
   state.allGroups = (state.allGroups || []).filter(group => Number(group.id) !== plan.group.id);
-  confirmRemoteGroupMutation(plan.affectedChannels.map(channel => channel.id));
-  return true;
+  // The caller waits only for the database write above. Evicting Sub2API's
+  // scheduler cache and re-reading every account run in background workers,
+  // so the console is not frozen for several Docker round trips.
+  const affectedIds = plan.affectedChannels.map(channel => Number(channel.id)).filter(id => Number.isSafeInteger(id) && id > 0);
+  if (affectedIds.length > 0) {
+    if (typeof requestBackgroundSchedulerInvalidation === 'function') requestBackgroundSchedulerInvalidation(affectedIds);
+    else invalidateSub2APIScheduler(affectedIds);
+  }
+  refreshSub2APISignatureAfterDirectMutation('删除分组', true);
+  return { stoppedIds: stopIds, stoppedNames: plan.stopChannels.map(channel => channel.name || String(channel.id)) };
 }
 
 // 在分组维度批量分配上游渠道
@@ -7544,19 +7729,36 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // 【核心功能】删除或停用业务分组
+  // 删除分组前的检查：会停用哪些账号、还有没有客户 Key 绑着
+  if (pathname.match(/^\/api\/groups\/([^/]+)\/delete-preview$/) && req.method === 'GET') {
+    const match = pathname.match(/^\/api\/groups\/([^/]+)\/delete-preview$/);
+    try {
+      const preview = previewDeleteRemoteGroup(match[1]);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, ...preview }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 【核心功能】删除业务分组（只在这个分组里的在用账号一起停用）
   if (pathname.match(/^\/api\/groups\/([^/]+)$/) && req.method === 'DELETE') {
     const match = pathname.match(/^\/api\/groups\/([^/]+)$/);
     const groupId = match[1];
     try {
-      const remoteOk = deleteRemoteGroup(groupId);
-      syncRealSub2APIAccounts();
+      const body = await getBody();
+      const result = deleteRemoteGroup(groupId, Array.isArray(body.stopAccountIds) ? body.stopAccountIds : null);
       broadcastSSE('CHANNELS_UPDATED', state);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
-        remoteSynced: remoteOk,
-        message: `业务分组已成功删除并解绑关联！`
+        remoteSynced: true,
+        stoppedAccounts: result.stoppedNames,
+        message: result.stoppedNames.length > 0
+          ? `分组已删除，并停用了只在这个分组里的 ${result.stoppedNames.length} 个账号：${result.stoppedNames.join('、')}`
+          : '分组已删除'
       }));
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
