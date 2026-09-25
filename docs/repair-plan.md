@@ -189,3 +189,18 @@
 ## 部署脚本中文环境修复（2026-09-25）
 
 macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变量` 后面的中文当成变量名的一部分，脚本在 `set -u` 下报「unbound variable」后停止。`deploy/deploy.sh` 里紧跟中文的变量都改成了 `${变量}` 写法。
+
+## 上游改价跟价与改价提醒（2026-09-25）
+
+用户反馈：上游改价后，塔台的进价没有变，也没有收到改价提醒。查到两个原因。
+
+- **提醒丢失**：从 d322e1d（09-20）起，`handleRatioChange` 在写倍率历史时引用了不存在的变量 `direction`，每次检测到倍率变化都会抛出 `ReferenceError`。后台同步在合并完新倍率之后才调用它，所以抛错后本轮同步被记为失败：`channels.json` 没有写入，没有广播，也没有 `RATIO_ALERT` 和 Telegram 推送。5 秒后的下一轮同步把新数字补上，但提醒和倍率历史已经丢了。直接同步（启动、手动刷新）遇到倍率变化时，整次同步都会返回失败。已改为 `direction: alert.direction`。之前的测试都把 `handleRatioChange` 换成了空函数，所以没有测到这个问题。新增 2 个用例直接运行真实的处理函数，改动前会报同样的 `ReferenceError`。
+- **不跟价**：6f3a8b8（09-21）为了不让过期的上游数据盖过手填的倍率，把进价规则改成：没开 `upstream_billing_rate_sync_enabled` 且 `rate_multiplier ≠ 1` 时一律用 `rate_multiplier`。但 Sub2API 的上游计费探测（`/v1/sub2api/billing`，默认 30 分钟一次）对没开同步的账号也照常更新 `upstream_billing_probe`，只是不改写 `rate_multiplier`。所以对这类账号，塔台就看不到上游改价了。
+- **新规则**（`syncRealSub2APIAccounts` 的查询、`executeControlPlaneSafetyPlan` 的 `currentCostSql`、`remoteEffectiveCostSql` 三处保持一致）：
+  1. 开了自动同步：用上游价。
+  2. 没开，但 `upstream_billing_probe.status = 'ok'` 且 `fresh_until` 还没到（Sub2API 写入的是收到时间加两个探测周期）：仍用上游价。
+  3. 否则用 `rate_multiplier`。
+  4. 它还是默认值 1 时，退回上游最后一次报的价。
+
+  `fresh_until` 要先用正则确认是时间格式，再在 `CASE` 里转成 `timestamptz`。PostgreSQL 不保证 `AND` 两边的求值顺序，这样写可以保证坏数据不会让整条查询报错。
+- **验收**：`npm test` 179/179。把三处的真实 SQL 放到按 Sub2API 表结构手写的本地 PostgreSQL 18 上，跑了 12 种探测状态：开或没开同步、上游价有效或已过期、查询失败、不支持、探测已关闭、时间带 9 位小数、不带小数、带 `+08:00` 时区、格式错误、缺少 `fresh_until`、倍率为默认 1。三处算出的进价都一致，安全动作 SQL 复核时也没有判为过期。上线前在生产库只读核对过：规则改变后进价会变的账号，新进价都不高于所在分组的售价，不会触发自动停用。

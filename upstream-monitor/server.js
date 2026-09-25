@@ -2039,7 +2039,7 @@ function handleRatioChange(channel, oldMultiplier, newMultiplier, reason = '上�
     channelId: String(channel.id),
     channelName: channel.name,
     multiplier: newMultiplier,
-    direction
+    direction: alert.direction
   });
   if (ratioHistory.length > 500) ratioHistory = ratioHistory.slice(0, 500);
 
@@ -2103,6 +2103,11 @@ function syncRealSub2APIAccounts(options = {}) {
     : '';
   const sourceChannels = Array.isArray(sourceState.channels) ? sourceState.channels : [];
   try {
+    // 进价取值顺序（与 executeControlPlaneSafetyPlan、remoteEffectiveCostSql 保持一致）：
+    // 1. Sub2API 开了「自动同步倍率」→ 上游价；
+    // 2. 没开，但 Sub2API 最近一次查上游成功且没过有效期（fresh_until）→ 仍用上游价，上游改价塔台自动跟上；
+    // 3. 上游查不到、查询失败或已过期 → 用账号里填的倍率，过期的旧上游价不能盖过手填的值；
+    // 4. 填的是默认值 1 → 退回上游最后一次报的价。
     const sql = `
 SELECT json_agg(t) FROM (
   SELECT 
@@ -2115,6 +2120,16 @@ SELECT json_agg(t) FROM (
     schedulable,
     CASE 
       WHEN (extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+        COALESCE(
+          (extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier')::numeric,
+          (extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier')::numeric,
+          rate_multiplier
+        )
+      WHEN extra->'upstream_billing_probe'->>'status' = 'ok' AND CASE
+          WHEN extra->'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+          THEN (extra->'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()
+          ELSE false
+        END THEN
         COALESCE(
           (extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier')::numeric,
           (extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier')::numeric,
@@ -2696,6 +2711,16 @@ function executeControlPlaneSafetyPlan(plan, expectedSignature) {
     : 'NULL::numeric';
   const currentCostSql = `CASE 
     WHEN (a.extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+      COALESCE(
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        a.rate_multiplier
+      )
+    WHEN a.extra->'upstream_billing_probe'->>'status' = 'ok' AND CASE
+        WHEN a.extra->'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+        THEN (a.extra->'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()
+        ELSE false
+      END THEN
       COALESCE(
         NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
         NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
@@ -3473,6 +3498,16 @@ function confirmRemoteGroupMutation(accountIds = []) {
 function remoteEffectiveCostSql(accountAlias = 'a') {
   return `CASE 
     WHEN (${accountAlias}.extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+      COALESCE(
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        ${accountAlias}.rate_multiplier
+      )
+    WHEN ${accountAlias}.extra->'upstream_billing_probe'->>'status' = 'ok' AND CASE
+        WHEN ${accountAlias}.extra->'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+        THEN (${accountAlias}.extra->'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()
+        ELSE false
+      END THEN
       COALESCE(
         NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
         NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
