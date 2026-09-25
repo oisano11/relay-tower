@@ -2039,7 +2039,7 @@ function handleRatioChange(channel, oldMultiplier, newMultiplier, reason = '上�
     channelId: String(channel.id),
     channelName: channel.name,
     multiplier: newMultiplier,
-    direction
+    direction: alert.direction
   });
   if (ratioHistory.length > 500) ratioHistory = ratioHistory.slice(0, 500);
 
@@ -2103,6 +2103,11 @@ function syncRealSub2APIAccounts(options = {}) {
     : '';
   const sourceChannels = Array.isArray(sourceState.channels) ? sourceState.channels : [];
   try {
+    // 进价取值顺序（与 executeControlPlaneSafetyPlan、remoteEffectiveCostSql 保持一致）：
+    // 1. Sub2API 开了「自动同步倍率」→ 上游价；
+    // 2. 没开，但 Sub2API 最近一次查上游成功且没过有效期（fresh_until）→ 仍用上游价，上游改价塔台自动跟上；
+    // 3. 上游查不到、查询失败或已过期 → 用账号里填的倍率，过期的旧上游价不能盖过手填的值；
+    // 4. 填的是默认值 1 → 退回上游最后一次报的价。
     const sql = `
 SELECT json_agg(t) FROM (
   SELECT 
@@ -2115,6 +2120,16 @@ SELECT json_agg(t) FROM (
     schedulable,
     CASE 
       WHEN (extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+        COALESCE(
+          (extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier')::numeric,
+          (extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier')::numeric,
+          rate_multiplier
+        )
+      WHEN extra->'upstream_billing_probe'->>'status' = 'ok' AND CASE
+          WHEN extra->'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+          THEN (extra->'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()
+          ELSE false
+        END THEN
         COALESCE(
           (extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier')::numeric,
           (extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier')::numeric,
@@ -2154,14 +2169,12 @@ SELECT json_agg(t) FROM (
     const output = execPsql(sql, true).trim();
     if (!output || !output.startsWith('[')) return null;
     const allAccountsRaw = JSON.parse(output);
-    // 权威真实存活上游：Sub2API 数据库中 deleted_at IS NULL 的账号是绝对权威来源，绝不可被墓碑名单误杀
+    // 权威真实存活上游：Sub2API 数据库中 deleted_at IS NULL 的账号是绝对权威来源，绝不可被墓碑名单误杀。
+    // 每个存活账号都清一遍（没有可清的不会写盘），连同这个地址以前的供应商面板名，
+    // 否则账号删了又重建时，旧面板名会一直挡住自动发现。
     const realAccounts = allAccountsRaw;
     if (typeof upstreamScanner !== 'undefined' && upstreamScanner && typeof upstreamScanner.removeTombstone === 'function') {
-      for (const acc of realAccounts) {
-        if (upstreamScanner.isTombstoned(acc.base_url, acc.name)) {
-          upstreamScanner.removeTombstone(acc.base_url, acc.name);
-        }
-      }
+      for (const acc of realAccounts) upstreamScanner.removeTombstone(acc.base_url, acc.name);
     }
     const allGroups = fetchAllSub2APIGroups();
     if (!snapshotOnly) state.allGroups = allGroups;
@@ -2696,6 +2709,16 @@ function executeControlPlaneSafetyPlan(plan, expectedSignature) {
     : 'NULL::numeric';
   const currentCostSql = `CASE 
     WHEN (a.extra->'upstream_billing_rate_sync_enabled')::boolean = true THEN
+      COALESCE(
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        a.rate_multiplier
+      )
+    WHEN a.extra->'upstream_billing_probe'->>'status' = 'ok' AND CASE
+        WHEN a.extra->'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+        THEN (a.extra->'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()
+        ELSE false
+      END THEN
       COALESCE(
         NULLIF(a.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
         NULLIF(a.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
@@ -3478,6 +3501,16 @@ function remoteEffectiveCostSql(accountAlias = 'a') {
         NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
         ${accountAlias}.rate_multiplier
       )
+    WHEN ${accountAlias}.extra->'upstream_billing_probe'->>'status' = 'ok' AND CASE
+        WHEN ${accountAlias}.extra->'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+        THEN (${accountAlias}.extra->'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()
+        ELSE false
+      END THEN
+      COALESCE(
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'effective_rate_multiplier', '')::numeric,
+        NULLIF(${accountAlias}.extra->'upstream_billing_probe'->'data'->>'resolved_rate_multiplier', '')::numeric,
+        ${accountAlias}.rate_multiplier
+      )
     WHEN ${accountAlias}.rate_multiplier IS NOT NULL AND ${accountAlias}.rate_multiplier != 1.0 THEN
       ${accountAlias}.rate_multiplier
     ELSE
@@ -4080,15 +4113,26 @@ UPDATE groups SET ${sets.join(', ')} WHERE id = ${gid} AND deleted_at IS NULL;`;
   return true;
 }
 
-// Sub2API rejects a customer key whose group is deleted ("API Key 所属分组已删除"),
-// so anything still bound to the group blocks the delete. The preview and the
-// write transaction check the same things.
+// Sub2API rejects a customer key whose group is deleted ("API Key 所属分组已删除").
+// Like Sub2API's own delete, bound keys only need the user's confirmation, so
+// the preview names them. Subscriptions and fallback references still block.
+// The preview and the write transaction check the same things.
+const GROUP_DELETE_KEY_OWNER_LIMIT = 20;
+
 function buildGroupDeleteBindingsSql(groupId) {
   const gid = normalizePositivePlanId(groupId, '分组 ID');
   return `SELECT json_build_object(
   'keys', (SELECT count(*) FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL),
   'keysUsed7d', (SELECT count(*) FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL AND last_used_at > NOW() - INTERVAL '7 days'),
   'keyUsers', (SELECT count(DISTINCT user_id) FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL),
+  'keyOwners', COALESCE((SELECT json_agg(o) FROM (
+    SELECT k.name AS "keyName", k.status, k.last_used_at AS "lastUsedAt",
+      COALESCE(NULLIF(to_jsonb(u)->>'email', ''), NULLIF(to_jsonb(u)->>'username', ''), '用户 #' || k.user_id) AS owner
+    FROM api_keys k LEFT JOIN users u ON u.id = k.user_id
+    WHERE k.group_id = ${gid} AND k.deleted_at IS NULL
+    ORDER BY k.last_used_at DESC NULLS LAST, k.id
+    LIMIT ${GROUP_DELETE_KEY_OWNER_LIMIT}
+  ) o), '[]'::json),
   'subscriptions', (SELECT count(*) FROM user_subscriptions s WHERE s.group_id = ${gid} AND (to_jsonb(s)->>'deleted_at') IS NULL),
   'fallbackFrom', COALESCE((SELECT json_agg(g.name ORDER BY g.id) FROM groups g WHERE ${remoteGroupFallsBackToSql('g', gid)}), '[]'::json)
 );`;
@@ -4106,16 +4150,26 @@ function readGroupDeleteBindings(groupId) {
     keys: Number(parsed.keys) || 0,
     keysUsed7d: Number(parsed.keysUsed7d) || 0,
     keyUsers: Number(parsed.keyUsers) || 0,
+    keyOwners: Array.isArray(parsed.keyOwners)
+      ? parsed.keyOwners.map(item => ({
+        owner: String((item && item.owner) || ''),
+        keyName: String((item && item.keyName) || ''),
+        status: String((item && item.status) || ''),
+        lastUsedAt: item && item.lastUsedAt ? String(item.lastUsedAt) : null
+      }))
+      : [],
     subscriptions: Number(parsed.subscriptions) || 0,
     fallbackFrom: Array.isArray(parsed.fallbackFrom) ? parsed.fallbackFrom.map(String) : []
   };
 }
 
+function describeGroupDeleteKeyWarning(bindings) {
+  if (bindings.keys === 0) return null;
+  const inUse = bindings.keysUsed7d > 0 ? `最近 7 天有 ${bindings.keysUsed7d} 个在用` : '最近 7 天没人用';
+  return `还有 ${bindings.keys} 个客户 Key（${bindings.keyUsers} 位客户）绑在这个分组上，${inUse}。删掉分组后，这些 Key 就用不了了（Sub2API 会提示「API Key 所属分组已删除」），要在 Sub2API 后台把它们换到别的分组才能继续用。`;
+}
+
 function describeGroupDeleteBindings(bindings) {
-  if (bindings.keys > 0) {
-    const inUse = bindings.keysUsed7d > 0 ? `，最近 7 天有 ${bindings.keysUsed7d} 个在用` : '';
-    return `还有 ${bindings.keys} 个客户 Key（${bindings.keyUsers} 位客户）绑在这个分组上${inUse}。分组删掉后，这些 Key 会被 Sub2API 拒绝，提示「API Key 所属分组已删除」。请先在 Sub2API 后台把这些 Key 换到别的分组或者删掉，再来删分组。`;
-  }
   if (bindings.subscriptions > 0) {
     return `还有 ${bindings.subscriptions} 个客户订阅挂在这个分组上。请先在 Sub2API 后台处理这些订阅，再来删分组。`;
   }
@@ -4145,6 +4199,7 @@ function previewDeleteRemoteGroup(groupId) {
   return {
     groupId: id,
     groupName: cached ? String(cached.name || '') : '',
+    keyWarning: describeGroupDeleteKeyWarning(bindings),
     stopAccounts: plan ? plan.stopChannels.map(channel => ({ id: Number(channel.id), name: channel.name || String(channel.id) })) : [],
     unlinkAccounts: plan
       ? plan.changes.filter(change => !change.stop).map(change => ({
@@ -4166,17 +4221,26 @@ function assertConfirmedGroupDeleteStops(plan, confirmedStopIds) {
     : null;
   if (confirmed && confirmed.length === expected.length && confirmed.every((id, index) => id === expected[index])) return;
   if (confirmed) throw new Error('分组里的账号刚刚有变化，这次没有删除。请刷新页面，再点一次删除，确认新的停用名单。');
+  // Only a page loaded before this check existed sends no stop list.
   const names = plan.stopChannels.map(channel => `「${channel.name || channel.id}」`).join('、');
-  throw new Error(`分组「${plan.group.name || plan.group.id}」里的账号 ${names} 还在接单，而且只在这个分组里。删除分组要一起停用它们，请在删除确认框里确认后再删。`);
+  throw new Error(`这个页面可能是旧版本，请先刷新页面。分组「${plan.group.name || plan.group.id}」里的账号 ${names} 还在接单，而且只在这个分组里，删除时要一起停用。刷新后再点删除，确认框里会列出来，点「确定」就行。`);
 }
 
-function buildDeleteRemoteGroupSql(groupId, stopIds) {
+function normalizeConfirmedKeyCount(value) {
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count > 0 ? count : 0;
+}
+
+// allowedKeyCount is the number of customer keys the user saw and accepted in
+// the confirm box. More keys than that, bound since the preview, abort.
+function buildDeleteRemoteGroupSql(groupId, stopIds, allowedKeyCount = 0) {
   const gid = normalizePositivePlanId(groupId, '分组 ID');
   const stops = normalizePositivePlanIds(stopIds, '账号 ID');
+  const allowedKeys = normalizeConfirmedKeyCount(allowedKeyCount);
   const statements = [
     remoteGroupExistenceGuardSql([gid]),
     `DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL) THEN
+  IF (SELECT count(*) FROM api_keys WHERE group_id = ${gid} AND deleted_at IS NULL) > ${allowedKeys} THEN
     RAISE EXCEPTION 'relay-tower: group has api keys';
   END IF;
   IF EXISTS (SELECT 1 FROM user_subscriptions s WHERE s.group_id = ${gid} AND (to_jsonb(s)->>'deleted_at') IS NULL) THEN
@@ -4222,7 +4286,7 @@ END $$;`,
 
 function describeGroupDeleteFailure(err) {
   const text = `${(err && err.stderr) || ''}\n${(err && err.message) || ''}`;
-  if (/relay-tower: group has api keys/.test(text)) return '还有客户 Key 绑在这个分组上，这次没有删除。请先在 Sub2API 后台把这些 Key 换到别的分组或者删掉。';
+  if (/relay-tower: group has api keys/.test(text)) return '这个分组上的客户 Key 和你确认时看到的不一样（可能刚有新的 Key 绑进来），这次没有删除。请刷新页面，再点一次删除，看清楚名单后再确认。';
   if (/relay-tower: group has subscriptions/.test(text)) return '还有客户订阅挂在这个分组上，这次没有删除。请先在 Sub2API 后台处理这些订阅。';
   if (/relay-tower: group is a fallback target/.test(text)) return '有别的分组把它设成了备用分组，这次没有删除。请先在 Sub2API 后台改掉这个设置。';
   if (/relay-tower: stop list changed|Scheduled account cannot be left without a priced group/.test(text)) return '分组里的账号刚刚有变化，这次没有删除。请刷新页面后再删一次。';
@@ -4232,12 +4296,12 @@ function describeGroupDeleteFailure(err) {
   return `删除没有完成：${detail.slice(0, 200)}。请刷新页面，看看分组是否还在。`;
 }
 
-// 删除业务分组：只在这个分组里的在用账号一起停用；客户 Key 还绑着时不删
-function deleteRemoteGroup(groupId, confirmedStopIds = null) {
+// 删除业务分组：只在这个分组里的在用账号一起停用；绑着的客户 Key 要用户在确认框里看过才删
+function deleteRemoteGroup(groupId, confirmedStopIds = null, confirmedKeyCount = 0) {
   const plan = prepareDeleteRemoteGroupPlan(groupId);
   assertConfirmedGroupDeleteStops(plan, confirmedStopIds);
   const stopIds = plan.stopChannels.map(channel => Number(channel.id)).sort((a, b) => a - b);
-  const sql = buildDeleteRemoteGroupSql(plan.group.id, stopIds);
+  const sql = buildDeleteRemoteGroupSql(plan.group.id, stopIds, confirmedKeyCount);
   try {
     if (executeRemoteSQL(sql) !== true) throw new Error('远端删除分组写入未确认');
   } catch (err) {
@@ -4255,7 +4319,11 @@ function deleteRemoteGroup(groupId, confirmedStopIds = null) {
     else invalidateSub2APIScheduler(affectedIds);
   }
   refreshSub2APISignatureAfterDirectMutation('删除分组', true);
-  return { stoppedIds: stopIds, stoppedNames: plan.stopChannels.map(channel => channel.name || String(channel.id)) };
+  return {
+    stoppedIds: stopIds,
+    stoppedNames: plan.stopChannels.map(channel => channel.name || String(channel.id)),
+    confirmedKeyCount: normalizeConfirmedKeyCount(confirmedKeyCount)
+  };
 }
 
 // 在分组维度批量分配上游渠道
@@ -7749,16 +7817,17 @@ async function handleRequest(req, res) {
     const groupId = match[1];
     try {
       const body = await getBody();
-      const result = deleteRemoteGroup(groupId, Array.isArray(body.stopAccountIds) ? body.stopAccountIds : null);
+      const result = deleteRemoteGroup(groupId, Array.isArray(body.stopAccountIds) ? body.stopAccountIds : null, body.confirmKeyCount);
       broadcastSSE('CHANNELS_UPDATED', state);
+      const parts = ['分组已删除'];
+      if (result.stoppedNames.length > 0) parts.push(`停用了只在这个分组里的 ${result.stoppedNames.length} 个账号：${result.stoppedNames.join('、')}`);
+      if (result.confirmedKeyCount > 0) parts.push('原来绑在这个分组上的客户 Key 现在用不了了，要继续用得在 Sub2API 后台换分组');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
         remoteSynced: true,
         stoppedAccounts: result.stoppedNames,
-        message: result.stoppedNames.length > 0
-          ? `分组已删除，并停用了只在这个分组里的 ${result.stoppedNames.length} 个账号：${result.stoppedNames.join('、')}`
-          : '分组已删除'
+        message: parts.join('；')
       }));
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'application/json' });

@@ -816,7 +816,7 @@ test('deleting the last priced group of an enabled account needs its stop list c
   };
   const { context, remoteWrites, invalidations, backgroundInvalidations } = groupMutator(state);
   const before = JSON.stringify(state);
-  assert.throws(() => context.deleteRemoteGroup(1), /「enabled」 还在接单，而且只在这个分组里/);
+  assert.throws(() => context.deleteRemoteGroup(1), /旧版本，请先刷新页面。.*「enabled」 还在接单，而且只在这个分组里/);
   assert.throws(() => context.deleteRemoteGroup(1, ['8']), /刚刚有变化/);
   assert.equal(remoteWrites.length, 0);
   assert.equal(invalidations.length, 0);
@@ -863,6 +863,18 @@ test('a confirmed group delete stops only-here accounts in the same transaction 
   assert.equal(signatureRefreshes.at(-1)[1], true, 'the full re-read runs in a background worker');
 });
 
+test('customer keys the user confirmed do not block a group delete, but any extra key does', () => {
+  const state = { allGroups: [{ id: 1, name: 'has-customers', sale_rate: 0.5 }], channels: [] };
+  const { context, remoteWrites } = groupMutator(state);
+  assert.match(context.buildDeleteRemoteGroupSql(1, []), /WHERE group_id = 1 AND deleted_at IS NULL\) > 0 THEN\s+RAISE EXCEPTION 'relay-tower: group has api keys'/);
+  const result = context.deleteRemoteGroup(1, [], 3);
+  assert.equal(result.confirmedKeyCount, 3);
+  assert.match(remoteWrites[0], /WHERE group_id = 1 AND deleted_at IS NULL\) > 3 THEN\s+RAISE EXCEPTION 'relay-tower: group has api keys'/);
+  for (const junk of [-1, 1.5, 'x', null, undefined]) {
+    assert.match(context.buildDeleteRemoteGroupSql(1, [], junk), /deleted_at IS NULL\) > 0 THEN/, String(junk));
+  }
+});
+
 test('a group without a valid sale price, and stopped accounts in unpriced groups, can still be deleted', () => {
   const state = {
     allGroups: [{ id: 1, name: 'free-test', sale_rate: 0 }, { id: 2, name: 'unpriced', sale_rate: null }],
@@ -898,28 +910,42 @@ test('database refusals of a group delete come back in plain words and leave the
       stderr: 'ERROR:  relay-tower: group has api keys\nCONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE\n'
     });
   };
-  assert.throws(() => context.deleteRemoteGroup(1), /还有客户 Key 绑在这个分组上，这次没有删除/);
+  assert.throws(() => context.deleteRemoteGroup(1), /客户 Key 和你确认时看到的不一样.*这次没有删除/);
   assert.equal(JSON.stringify(state), before);
   context.executeRemoteSQL = () => { throw Object.assign(new Error('spawnSync docker ETIMEDOUT'), { code: 'ETIMEDOUT' }); };
   assert.throws(() => context.deleteRemoteGroup(1), /删除没有完成：spawnSync docker ETIMEDOUT。请刷新页面/);
   assert.equal(JSON.stringify(state), before);
 });
 
-test('delete preview lists the accounts to stop and refuses while customer keys are bound', () => {
+test('delete preview names bound customer keys as a warning and still blocks subscriptions and fallback targets', () => {
   const state = {
     allGroups: [{ id: 1, name: 'retiring', sale_rate: 0.5 }],
     channels: [{ id: '7', name: 'only-here', schedulable: true, costMultiplier: 0.3, primaryGroupId: 1,
       groupsDetail: [{ id: 1, name: 'retiring', sale_rate: 0.5 }] }]
   };
-  const bindings = extra => JSON.stringify({ keys: 0, keysUsed7d: 0, keyUsers: 0, subscriptions: 0, fallbackFrom: [], ...extra });
-  const { context, psqlWrites, remoteWrites } = groupMutator(state, { createResult: bindings({ keys: 3, keysUsed7d: 1, keyUsers: 2 }) });
+  const bindings = extra => JSON.stringify({ keys: 0, keysUsed7d: 0, keyUsers: 0, keyOwners: [], subscriptions: 0, fallbackFrom: [], ...extra });
+  const owners = [
+    { owner: 'customer@example.com', keyName: 'test-key', status: 'active', lastUsedAt: '2026-09-03T11:53:00+00:00' },
+    { owner: '用户 #9', keyName: 'old-key', status: 'disabled', lastUsedAt: null }
+  ];
+  const { context, psqlWrites, remoteWrites } = groupMutator(state, { createResult: bindings({ keys: 3, keysUsed7d: 1, keyUsers: 2, keyOwners: owners }) });
   const preview = context.previewDeleteRemoteGroup(1);
   assert.equal(preview.groupName, 'retiring');
+  assert.equal(preview.blocked, null, 'customer keys alone no longer block the delete');
+  assert.match(preview.keyWarning, /还有 3 个客户 Key（2 位客户）绑在这个分组上，最近 7 天有 1 个在用。删掉分组后，这些 Key 就用不了了/);
+  assert.deepEqual(JSON.parse(JSON.stringify(preview.bindings.keyOwners)), owners);
   assert.deepEqual(JSON.parse(JSON.stringify(preview.stopAccounts)), [{ id: 7, name: 'only-here' }]);
-  assert.match(preview.blocked, /还有 3 个客户 Key（2 位客户）绑在这个分组上，最近 7 天有 1 个在用/);
   assert.match(psqlWrites[0], /FROM api_keys WHERE group_id = 1 AND deleted_at IS NULL/);
+  assert.match(psqlWrites[0], /LEFT JOIN users u ON u\.id = k\.user_id/);
+  assert.doesNotMatch(psqlWrites[0], /k\.key\b/, 'the key itself is never read');
   assert.equal(remoteWrites.length, 0, 'a preview never writes');
-  assert.equal(groupMutator(state, { createResult: bindings() }).context.previewDeleteRemoteGroup(1).blocked, null);
+
+  const quiet = groupMutator(state, { createResult: bindings({ keys: 1, keyUsers: 1 }) }).context.previewDeleteRemoteGroup(1);
+  assert.match(quiet.keyWarning, /最近 7 天没人用/);
+  const clear = groupMutator(state, { createResult: bindings() }).context.previewDeleteRemoteGroup(1);
+  assert.equal(clear.blocked, null);
+  assert.equal(clear.keyWarning, null);
+  assert.match(groupMutator(state, { createResult: bindings({ subscriptions: 2 }) }).context.previewDeleteRemoteGroup(1).blocked, /2 个客户订阅/);
   assert.match(groupMutator(state, { createResult: bindings({ fallbackFrom: ['GPT 通用'] }) }).context.previewDeleteRemoteGroup(1).blocked,
     /「GPT 通用」 把它设成了备用分组/);
   assert.throws(() => groupMutator(state, { createResult: 'not json' }).context.previewDeleteRemoteGroup(1), /为了安全先不删/);
@@ -930,7 +956,11 @@ test('console delete asks the server first and sends back exactly the confirmed 
   assert.doesNotMatch(app, /handleDeleteGroup\('\$\{g\.id\}', '\$\{g\.name\}'\)/, 'group names are no longer pasted into inline JavaScript');
   const requests = [];
   const dialogs = [];
-  let previewBody = { success: true, groupId: 5, groupName: "Demo's 示例分组", stopAccounts: [{ id: 7, name: 'only-here' }], unlinkAccounts: [], blocked: null };
+  let previewBody = {
+    success: true, groupId: 5, groupName: "Demo's 示例分组", stopAccounts: [{ id: 7, name: 'only-here' }], unlinkAccounts: [], blocked: null,
+    keyWarning: '还有 2 个客户 Key（1 位客户）绑在这个分组上，最近 7 天没人用。',
+    bindings: { keys: 2, keyOwners: [{ owner: 'customer@example.com', keyName: 'test-key', lastUsedAt: '2026-09-03T11:53:00+00:00' }] }
+  };
   const context = vm.createContext({
     fetch: async (url, options = {}) => {
       requests.push({ url, method: options.method || 'GET', body: options.body });
@@ -944,22 +974,32 @@ test('console delete asks the server first and sends back exactly the confirmed 
     renderNewGroupChannelSelector() {},
     loadAllGroupsDetails: async () => {}
   });
-  vm.runInContext(app.slice(app.indexOf('function buildGroupDeleteConfirmText('), app.indexOf('function openAssignAccountsModal(')), context);
+  vm.runInContext(app.slice(app.indexOf('function formatKeyLastUsed('), app.indexOf('function openAssignAccountsModal(')), context);
   const button = { innerHTML: '🗑', disabled: false, isConnected: true, set textContent(value) { this.innerHTML = value; } };
   await context.handleDeleteGroup('5', button);
   assert.deepEqual(requests.map(request => `${request.method} ${request.url}`), ['GET /api/groups/5/delete-preview', 'DELETE /api/groups/5']);
-  assert.deepEqual(JSON.parse(requests[1].body), { stopAccountIds: [7] });
+  assert.deepEqual(JSON.parse(requests[1].body), { stopAccountIds: [7], confirmKeyCount: 2 });
   assert.match(dialogs[0], /确定删除分组「Demo's 示例分组」吗？/);
+  assert.match(dialogs[0], /⚠️ 还有 2 个客户 Key（1 位客户）绑在这个分组上/);
+  assert.match(dialogs[0], /  · customer@example\.com 的「test-key」（最后使用 2026-09-0[34]）\n  · 还有 1 个没列出/);
   assert.match(dialogs[0], /会一起停用（不再接单）：\n  · only-here/);
+  assert.doesNotMatch(dialogs[0], /没有绑客户 Key/);
   assert.equal(button.innerHTML, '🗑');
   assert.equal(button.disabled, false);
 
-  previewBody = { ...previewBody, blocked: '还有 3 个客户 Key（2 位客户）绑在这个分组上。' };
+  previewBody = { ...previewBody, keyWarning: null, bindings: { keys: 0, keyOwners: [] } };
+  requests.length = 0;
+  dialogs.length = 0;
+  await context.handleDeleteGroup('5', button);
+  assert.deepEqual(JSON.parse(requests[1].body), { stopAccountIds: [7], confirmKeyCount: 0 });
+  assert.match(dialogs[0], /这个分组没有绑客户 Key。/);
+
+  previewBody = { ...previewBody, blocked: '还有 2 个客户订阅挂在这个分组上。' };
   requests.length = 0;
   dialogs.length = 0;
   await context.handleDeleteGroup('5', button);
   assert.deepEqual(requests.map(request => request.method), ['GET'], 'a blocked group is never sent a delete');
-  assert.match(dialogs[0], /现在不能删：\n\n还有 3 个客户 Key/);
+  assert.match(dialogs[0], /现在不能删：\n\n还有 2 个客户订阅/);
 });
 
 test('orchestration refuses a below-cost primary even before it becomes schedulable', () => {
@@ -1401,6 +1441,77 @@ test('ratio-change alert is emitted only when the remote multiplier won the thre
   assert.equal(locallyChangedState.channels[0].multiplier, 0.7);
   assert.equal(skipped.length, 0);
   assert.equal(second.ratioCalls.length, 0);
+});
+
+// Loads the real ratio-change handlers (the harnesses above stub them out).
+function ratioChangeHarness(state) {
+  const effects = { writes: [], sse: [], telegram: [] };
+  const context = vm.createContext({
+    state,
+    alerts: [],
+    ratioHistory: [],
+    IS_CONTROL_PLANE_WORKER: false,
+    ALERTS_FILE: 'alerts',
+    HISTORY_FILE: 'history',
+    CHANNELS_FILE: 'channels',
+    writeJSON(file) { effects.writes.push(file); },
+    broadcastSSE(event) { effects.sse.push(event); },
+    telegram: { notifyRatioChange(payload) { effects.telegram.push(payload); return Promise.resolve(); } },
+    lastSub2APISignature: 'before-rate-change',
+    safetyReconciliationPending: false,
+    cachedStability: {},
+    cachedUserActivity: {},
+    cachedGlobalUserStats: {},
+    cachedUserFinancialStats: {},
+    buildSub2APISyncSafetyPlan() { return { quarantineIds: [], calibrations: [] }; },
+    hasSub2APISyncSafetyWork() { return false; },
+    triggerBackgroundModelDiscovery() {},
+    broadcastChannelsUpdate() {},
+    requestBackgroundDashboardSnapshot() {},
+    requestBackgroundSub2APISafetyPlan() {},
+    requestBackgroundSchedulerInvalidation() {},
+    console: { log() {}, warn() {}, error() {} }
+  });
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('function buildRatioChangeAlert('), source.indexOf('// 选择最具代表性的销售分组作为核算基准')), context);
+  vm.runInContext(source.slice(source.indexOf('const CONTROL_PLANE_LOCAL_CHANNEL_FIELDS'), source.indexOf('function normalizeControlPlaneAccountIds')), context);
+  return { context, effects };
+}
+
+test('a multiplier change seen by the background sync is applied, recorded and announced', () => {
+  const baseline = { channels: [{ id: '7', name: 'acct', multiplier: 0.05, costMultiplier: 0.05 }], allGroups: [] };
+  const state = JSON.parse(JSON.stringify(baseline));
+  const { context, effects } = ratioChangeHarness(state);
+  context.applyControlPlaneWorkerResult('sync', {
+    changed: true,
+    signature: 'after-rate-change',
+    snapshot: {
+      channels: [{ id: '7', name: 'acct', multiplier: 0.06, costMultiplier: 0.06 }],
+      allGroups: [],
+      ratioChanges: [{ channelId: '7', oldMultiplier: 0.05, newMultiplier: 0.06 }]
+    }
+  }, baseline);
+  assert.equal(state.channels[0].multiplier, 0.06);
+  assert.equal(context.lastSub2APISignature, 'after-rate-change');
+  assert.equal(context.alerts[0].type, 'ratio_change');
+  assert.equal(context.ratioHistory[0].direction, 'up');
+  assert.deepEqual(effects.writes, ['channels', 'alerts', 'history']);
+  assert.deepEqual(effects.sse, ['RATIO_ALERT']);
+  assert.equal(effects.telegram.length, 1);
+  assert.equal(effects.telegram[0].direction, 'up');
+});
+
+test('a directly handled price drop is recorded with its direction', () => {
+  const { context, effects } = ratioChangeHarness({ activeChannelId: '', channels: [] });
+  const channel = { id: 9, name: 'acct', multiplier: 0.08 };
+  const alert = context.handleRatioChange(channel, 0.08, 0.06, 'test');
+  assert.equal(alert.direction, 'down');
+  assert.equal(channel.multiplier, 0.06);
+  assert.equal(channel.previousMultiplier, 0.08);
+  assert.equal(context.ratioHistory[0].direction, 'down');
+  assert.deepEqual(effects.writes, ['alerts', 'history', 'channels']);
+  assert.deepEqual(effects.sse, ['RATIO_ALERT', 'CHANNELS_UPDATED']);
+  assert.equal(effects.telegram[0].direction, 'down');
 });
 
 test('every changed control-plane snapshot schedules cache reconstruction from current account IDs', () => {
@@ -2196,6 +2307,32 @@ test('user configured rate_multiplier takes precedence over stale probe and New-
   assert.deepEqual(syncRes.models, ['gpt-5.4', 'claude-sonnet-5']);
 });
 
+test('a fresh upstream price wins over the configured rate even when Sub2API rate sync is off', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const between = (start, end) => {
+    const from = source.indexOf(start);
+    assert.ok(from >= 0, `missing ${start}`);
+    return source.slice(from, source.indexOf(end, from));
+  };
+  // The account snapshot, the safety worker and the write guards must agree on the cost.
+  const copies = [
+    between("CASE \n      WHEN (extra->'upstream_billing_rate_sync_enabled')", 'END::float as multiplier'),
+    between('const currentCostSql = `CASE', 'END`;'),
+    between('function remoteEffectiveCostSql(', 'END`;')
+  ];
+  for (const sql of copies) {
+    const order = [
+      sql.indexOf("'upstream_billing_rate_sync_enabled')::boolean = true THEN"),
+      sql.indexOf("'upstream_billing_probe'->>'status' = 'ok' AND CASE"),
+      sql.indexOf("'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T"),
+      sql.indexOf("'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()"),
+      sql.indexOf('rate_multiplier != 1.0 THEN')
+    ];
+    assert.ok(order.every(index => index >= 0), sql);
+    assert.deepEqual([...order].sort((a, b) => a - b), order, 'sync switch, then fresh upstream price, then configured rate');
+  }
+});
+
 test('active accounts in Sub2API database are authoritative and never pruned by tombstone, and un-tombstone automatically', () => {
   const untombstoned = [];
   const state = {
@@ -2283,9 +2420,8 @@ test('active accounts in Sub2API database are authoritative and never pruned by 
   assert.ok(state.channels.some(c => c.id === '245' && c.name === '灵犀 ds 0.2'));
   assert.ok(state.channels.some(c => c.id === '226' && c.name === '智云 pro 0.16'));
 
-  // 2. 真实存活账号自动解除了墓碑阻断
-  assert.equal(untombstoned.length, 1);
-  assert.equal(untombstoned[0].name, '灵犀 ds 0.2');
+  // 2. 真实存活账号自动解除了墓碑阻断（每个存活账号都会清一遍自己的地址和名字）
+  assert.deepEqual(untombstoned, accountsFromPostgres.map(acc => ({ url: acc.base_url, name: acc.name })));
 });
 
 test('setting channel as main in Group A isolates priority and preserves backup status in Group B', () => {

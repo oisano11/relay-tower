@@ -107,6 +107,21 @@ function normalizeUrlKey(rawUrl) {
   return s.replace(/\/+$/, '');
 }
 
+// 墓碑按上游地址的域名（含非默认端口）认人，路径、大小写、www. 都不算区别。
+// 只做完全相同比较：包含匹配会让 "并"、"通用上游" 这类短名字或短域名误挡一大片上游。
+function upstreamHostKey(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  let s = rawUrl.trim().toLowerCase();
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, '');
+  s = s.split(/[/?#]/)[0].replace(/^[^@]*@/, '');
+  s = s.replace(/:(80|443)$/, '').replace(/\.$/, '');
+  return s.replace(/^www\./, '');
+}
+
+function normalizeTombstoneName(name) {
+  return typeof name === 'string' ? name.trim().replace(/\s+/g, ' ').toLowerCase() : '';
+}
+
 class UpstreamScanner {
   constructor() {
     this.config = { ...DEFAULT_CONFIG, ...readJSON(CONFIG_FILE, {}) };
@@ -200,77 +215,77 @@ class UpstreamScanner {
     this.dismissActionsForChannel(id, cleanUrl, name);
   }
 
-  isTombstoned(url, name = null) {
-    if (!Array.isArray(this.config.tombstonedUrls)) return false;
-    const targetKey = normalizeUrlKey(url);
-    const targetName = (name || '').trim().toLowerCase();
-    if (!targetKey && !targetName) return false;
-
-    for (const raw of this.config.tombstonedUrls) {
-      if (!raw) continue;
-      if (typeof raw === 'string' && raw.startsWith('name:')) {
-        const tName = raw.slice(5).trim().toLowerCase();
-        if (targetName && (targetName === tName || targetName.includes(tName) || tName.includes(targetName))) {
-          return true;
-        }
-        continue;
-      }
-      const tKey = normalizeUrlKey(raw);
-      if (targetKey && tKey && (targetKey === tKey || targetKey.includes(tKey) || tKey.includes(targetKey))) {
-        return true;
-      }
+  // Sub2API 里没删的账号（本地 state.channels）所用的域名和名字：这些上游一律不算已删除
+  liveUpstreams() {
+    let channels = [];
+    try {
+      const state = this.context.getState ? this.context.getState() : null;
+      channels = state && Array.isArray(state.channels) ? state.channels : [];
+    } catch (_) {}
+    const hosts = new Set();
+    const names = new Set();
+    for (const channel of channels) {
+      if (!channel) continue;
+      const host = upstreamHostKey(channel.baseUrl);
+      if (host) hosts.add(host);
+      const nameKey = normalizeTombstoneName(channel.name);
+      if (nameKey) names.add(nameKey);
     }
-    return false;
+    return { hosts, names };
   }
 
+  // 有地址就只按地址判断，名字只在没有地址时兜底：同一个上游的面板名、账号名会变，也会被重新生成
+  isTombstoned(url, name = null) {
+    if (!Array.isArray(this.config.tombstonedUrls)) return false;
+    const host = upstreamHostKey(url);
+    const nameKey = host ? '' : normalizeTombstoneName(name);
+    if (!host && !nameKey) return false;
+    const live = this.liveUpstreams();
+    if (host ? live.hosts.has(host) : live.names.has(nameKey)) return false;
+
+    return this.config.tombstonedUrls.some(raw => {
+      if (!raw || typeof raw !== 'string') return false;
+      if (raw.startsWith('name:')) return !host && normalizeTombstoneName(raw.slice(5)) === nameKey;
+      return Boolean(host) && upstreamHostKey(raw) === host;
+    });
+  }
+
+  // 账号还活着：清掉它的地址、它的名字，以及塔台按「名称 (域名)」给这个地址生成过的供应商面板名
   removeTombstone(url, name = null) {
     if (!Array.isArray(this.config.tombstonedUrls)) return;
-    const cleanUrl = (url || '').trim().replace(/\/+$/, '');
-    const cleanKey = normalizeUrlKey(cleanUrl);
-    const cleanName = (name || '').trim().toLowerCase();
-    let changed = false;
+    const host = upstreamHostKey(url);
+    const nameKey = normalizeTombstoneName(name);
+    if (!host && !nameKey) return;
+    const before = this.config.tombstonedUrls.length;
 
     this.config.tombstonedUrls = this.config.tombstonedUrls.filter(raw => {
-      if (!raw) return false;
-      if (typeof raw === 'string' && raw.startsWith('name:')) {
-        const tName = raw.slice(5).trim().toLowerCase();
-        if (cleanName && (cleanName === tName || cleanName.includes(tName) || tName.includes(cleanName))) {
-          changed = true;
-          return false;
-        }
-        return true;
+      if (!raw || typeof raw !== 'string') return false;
+      if (raw.startsWith('name:')) {
+        const tName = normalizeTombstoneName(raw.slice(5));
+        if (nameKey && tName === nameKey) return false;
+        const panelHost = tName.match(/\(([^()\s]+)\)$/);
+        return !(host && panelHost && upstreamHostKey(panelHost[1]) === host);
       }
-      const tKey = normalizeUrlKey(raw);
-      if (cleanKey && tKey && (cleanKey === tKey || cleanKey.includes(tKey) || tKey.includes(cleanKey))) {
-        changed = true;
-        return false;
-      }
-      if (cleanUrl && (raw === cleanUrl || raw.replace(/\/+$/, '') === cleanUrl)) {
-        changed = true;
-        return false;
-      }
-      return true;
+      return !(host && upstreamHostKey(raw) === host);
     });
 
-    if (changed) {
+    if (this.config.tombstonedUrls.length !== before) {
       this.saveConfig();
-      console.log(`✨ [UpstreamScanner] 已为存活/新建上游移除墓碑阻断: ${cleanUrl || name}`);
+      console.log(`✨ [UpstreamScanner] 已为存活/新建上游移除墓碑阻断: ${url || name}`);
     }
   }
 
   dismissActionsForChannel(channelId, url = null, name = null) {
     this.pendingActions = readJSON(PENDING_FILE, []);
-    const cleanUrlKey = normalizeUrlKey(url);
-    const cleanName = (name || '').trim().toLowerCase();
+    const host = upstreamHostKey(url);
+    const nameKey = normalizeTombstoneName(name);
     const strId = channelId ? String(channelId) : '';
 
     let changed = false;
     this.pendingActions = (this.pendingActions || []).filter(item => {
       const matchId = strId && String(item.channelId) === strId;
-      const itemUrlKey = normalizeUrlKey(item.upstreamUrl || item.baseUrl || '');
-      const matchUrl = cleanUrlKey && itemUrlKey && (cleanUrlKey === itemUrlKey || itemUrlKey.includes(cleanUrlKey) || cleanUrlKey.includes(itemUrlKey));
-      const itemName = (item.channelName || item.name || item.provider || '').trim().toLowerCase();
-      const matchName = cleanName && itemName && (itemName === cleanName || itemName.includes(cleanName) || cleanName.includes(itemName));
+      const matchUrl = Boolean(host) && upstreamHostKey(item.upstreamUrl || item.baseUrl || '') === host;
+      const matchName = Boolean(nameKey) && normalizeTombstoneName(item.channelName || item.name || item.provider || '') === nameKey;
 
       if (matchId || matchUrl || matchName) {
         changed = true;
