@@ -4813,7 +4813,7 @@ function renderAllGroupsCards(groupsList) {
             <button class="btn btn-secondary" onclick="saveGroupRateFromInput('${g.id}', this)" style="font-size: 0.72rem; padding: 0.2rem 0.45rem;" title="保存新倍率到生产环境">
               保存
             </button>
-            <button class="btn btn-danger-glass" onclick="handleDeleteGroup('${g.id}', '${g.name}')" style="font-size: 0.72rem; padding: 0.2rem 0.4rem;" title="删除此分组">
+            <button class="btn btn-danger-glass" onclick="handleDeleteGroup('${g.id}', this)" style="font-size: 0.72rem; padding: 0.2rem 0.4rem;" title="删除此分组">
               🗑
             </button>
           </div>
@@ -4899,26 +4899,75 @@ async function saveGroupRateFromInput(groupId, btnEl) {
   }
 }
 
-async function handleDeleteGroup(groupId, groupName) {
-  if (!confirm(`确定要在 Sub2API 数据库中停用/删除业务分组 [${groupName}] 吗？\n删除后该分组与所有上游的绑定关系将被解除。`)) {
-    return;
+function buildGroupDeleteConfirmText(preview) {
+  const name = preview.groupName || `#${preview.groupId}`;
+  const lines = [`确定删除分组「${name}」吗？`, ''];
+  const stopAccounts = preview.stopAccounts || [];
+  const unlinkAccounts = preview.unlinkAccounts || [];
+  if (stopAccounts.length > 0) {
+    lines.push('这些账号只在这个分组里，会一起停用（不再接单）：');
+    stopAccounts.forEach(account => lines.push(`  · ${account.name}`));
+    lines.push('');
   }
+  if (unlinkAccounts.length > 0) {
+    lines.push('这些账号会移出这个分组：');
+    unlinkAccounts.forEach(account => lines.push(`  · ${account.name}${account.schedulable ? '（在别的分组照常接单）' : '（已停用）'}`));
+    lines.push('');
+  }
+  lines.push('这个分组没有绑客户 Key。删除后不能在塔台里恢复。');
+  return lines.join('\n');
+}
+
+const groupDeletesInFlight = new Set();
+
+async function handleDeleteGroup(groupId, btnEl) {
+  const key = String(groupId);
+  if (groupDeletesInFlight.has(key)) return;
+  groupDeletesInFlight.add(key);
+  const button = btnEl && typeof btnEl === 'object' ? btnEl : null;
+  const originalHtml = button ? button.innerHTML : '';
+  const showBusy = text => {
+    if (!button) return;
+    button.disabled = true;
+    button.textContent = text;
+  };
 
   try {
+    showBusy('检查中…');
+    const previewRes = await fetch(`/api/groups/${groupId}/delete-preview`);
+    const preview = await previewRes.json();
+    if (!previewRes.ok || !preview.success) throw new Error(preview.error || '检查分组失败');
+    const name = preview.groupName || `#${groupId}`;
+    if (preview.blocked) {
+      // A toast disappears after 4 seconds; this explains what to do first.
+      alert(`分组「${name}」现在不能删：\n\n${preview.blocked}`);
+      return;
+    }
+    if (!confirm(buildGroupDeleteConfirmText(preview))) return;
+
+    showBusy('正在删除…');
     const res = await fetch(`/api/groups/${groupId}`, {
-      method: 'DELETE'
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stopAccountIds: (preview.stopAccounts || []).map(account => account.id) })
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '删除分组失败');
+    if (!res.ok || !data.success) throw new Error(data.error || '删除分组失败');
 
-    showToast(data.message || `分组 [${groupName}] 已删除！`, 'success');
+    showToast(data.message || `分组「${name}」已删除`, 'success');
     await loadChannels();
     try {
       renderNewGroupChannelSelector();
     } catch (e) {}
     await loadAllGroupsDetails();
   } catch (e) {
-    showToast(e.message, 'error');
+    alert(`删除分组没有成功：\n\n${e.message}`);
+  } finally {
+    groupDeletesInFlight.delete(key);
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.innerHTML = originalHtml;
+    }
   }
 }
 

@@ -222,19 +222,22 @@ function groupMutator(state, { remoteResult = true, createResult = '99\n' } = {}
   const remoteWrites = [];
   const psqlWrites = [];
   const invalidations = [];
+  const backgroundInvalidations = [];
+  const signatureRefreshes = [];
   const context = vm.createContext({
     state,
     ...require('../routing-policy'),
     executeRemoteSQL(statement) { remoteWrites.push(statement); return remoteResult; },
     execPsql(statement) { psqlWrites.push(statement); return createResult; },
     invalidateSub2APIScheduler(ids) { invalidations.push(ids); },
+    requestBackgroundSchedulerInvalidation(ids) { backgroundInvalidations.push(ids); },
     getSub2APISignature() { return 'signature'; },
     lastSub2APISignature: '',
-    refreshSub2APISignatureAfterDirectMutation() { return 'signature'; },
+    refreshSub2APISignatureAfterDirectMutation(...args) { signatureRefreshes.push(args); return 'signature'; },
     console: { log() {}, warn() {}, error() {} }
   });
   loadGroupMutationHelpers(context);
-  return { context, remoteWrites, psqlWrites, invalidations };
+  return { context, remoteWrites, psqlWrites, invalidations, backgroundInvalidations, signatureRefreshes };
 }
 
 function roleSetter(state, remoteResult = true) {
@@ -805,18 +808,158 @@ test('adding an enabled account to a below-cost group is rejected before remote 
   assert.equal(JSON.stringify(state), before);
 });
 
-test('deleting the last priced group of an enabled account is rejected before remote write', () => {
+test('deleting the last priced group of an enabled account needs its stop list confirmed first', () => {
   const state = {
     allGroups: [{ id: 1, name: 'only-priced-group', sale_rate: 0.5 }],
     channels: [{ id: '7', name: 'enabled', schedulable: true, costMultiplier: 0.3,
       primaryGroupId: 1, groupsDetail: [{ id: 1, name: 'only-priced-group', sale_rate: 0.5 }] }]
   };
-  const { context, remoteWrites, invalidations } = groupMutator(state);
+  const { context, remoteWrites, invalidations, backgroundInvalidations } = groupMutator(state);
   const before = JSON.stringify(state);
-  assert.throws(() => context.deleteRemoteGroup(1), /没有可核验售价分组/);
+  assert.throws(() => context.deleteRemoteGroup(1), /「enabled」 还在接单，而且只在这个分组里/);
+  assert.throws(() => context.deleteRemoteGroup(1, ['8']), /刚刚有变化/);
   assert.equal(remoteWrites.length, 0);
   assert.equal(invalidations.length, 0);
+  assert.equal(backgroundInvalidations.length, 0);
   assert.equal(JSON.stringify(state), before);
+});
+
+test('a confirmed group delete stops only-here accounts in the same transaction and leaves cache work to the background', () => {
+  const state = {
+    allGroups: [{ id: 1, name: 'retiring', sale_rate: 0.5 }, { id: 2, name: 'kept', sale_rate: 0.5 }],
+    channels: [
+      { id: '7', name: 'only-here', schedulable: true, costMultiplier: 0.3, primaryGroupId: 1,
+        groupsDetail: [{ id: 1, name: 'retiring', sale_rate: 0.5 }] },
+      { id: '8', name: 'stopped-here', schedulable: false, costMultiplier: 0.3, primaryGroupId: 1,
+        groupsDetail: [{ id: 1, name: 'retiring', sale_rate: 0.5 }] },
+      { id: '9', name: 'shared', schedulable: true, costMultiplier: 0.3, primaryGroupId: 1,
+        groupsDetail: [{ id: 1, name: 'retiring', sale_rate: 0.5 }, { id: 2, name: 'kept', sale_rate: 0.5 }] },
+      { id: '10', name: 'elsewhere', schedulable: true, costMultiplier: 0.3, primaryGroupId: 2,
+        groupsDetail: [{ id: 2, name: 'kept', sale_rate: 0.5 }] }
+    ]
+  };
+  const { context, remoteWrites, invalidations, backgroundInvalidations, signatureRefreshes } = groupMutator(state);
+  const result = context.deleteRemoteGroup(1, ['7']);
+  assert.deepEqual([...result.stoppedIds], [7]);
+  assert.equal(remoteWrites.length, 1);
+  const sql = remoteWrites[0];
+  const stop = sql.indexOf('UPDATE accounts SET schedulable = false WHERE id IN (7) AND deleted_at IS NULL;');
+  assert.ok(stop > 0, 'the only-here account is stopped');
+  assert.ok(sql.indexOf('relay-tower: group has api keys') < stop, 'customer keys are checked before anything changes');
+  assert.ok(stop < sql.indexOf('Scheduled account cannot be left without a priced group'), 'stopped before the no-group guard runs');
+  assert.match(sql, /DELETE FROM user_allowed_groups WHERE group_id = 1;/);
+  assert.match(sql, /DELETE FROM account_groups WHERE group_id = 1;/);
+  assert.match(sql, /UPDATE groups SET deleted_at = NOW\(\) WHERE id = 1 AND deleted_at IS NULL;/);
+  assert.doesNotMatch(sql, /schedulable = false WHERE id IN \([^)]*\b(8|9|10)\b/, 'no other account is stopped');
+  assert.equal(state.channels[0].schedulable, false);
+  assert.equal(state.channels[0].groupsDetail.length, 0);
+  assert.equal(state.channels[1].schedulable, false);
+  assert.equal(state.channels[2].schedulable, true);
+  assert.deepEqual([...state.channels[2].groupsDetail].map(group => group.id), [2]);
+  assert.deepEqual([...state.channels[3].groupsDetail].map(group => group.id), [2]);
+  assert.deepEqual([...state.allGroups].map(group => group.id), [2]);
+  assert.equal(invalidations.length, 0, 'no Redis round trip while the console waits');
+  assert.deepEqual([...backgroundInvalidations[0]], [7, 8, 9]);
+  assert.equal(signatureRefreshes.at(-1)[1], true, 'the full re-read runs in a background worker');
+});
+
+test('a group without a valid sale price, and stopped accounts in unpriced groups, can still be deleted', () => {
+  const state = {
+    allGroups: [{ id: 1, name: 'free-test', sale_rate: 0 }, { id: 2, name: 'unpriced', sale_rate: null }],
+    channels: [{ id: '8', name: 'stopped', schedulable: false, costMultiplier: 0.3, primaryGroupId: 1,
+      groupsDetail: [{ id: 1, name: 'free-test', sale_rate: 0 }, { id: 2, name: 'unpriced', sale_rate: null }] }]
+  };
+  const { context, remoteWrites } = groupMutator(state);
+  context.deleteRemoteGroup(1);
+  assert.equal(remoteWrites.length, 1);
+  assert.doesNotMatch(remoteWrites[0], /UPDATE accounts SET schedulable = false/);
+  assert.deepEqual([...state.channels[0].groupsDetail].map(group => group.id), [2]);
+});
+
+test('an enabled shared account that would only be left in a below-cost group blocks the delete', () => {
+  const state = {
+    allGroups: [{ id: 1, name: 'retiring', sale_rate: 0.5 }, { id: 2, name: 'low-price', sale_rate: 0.2 }],
+    channels: [{ id: '9', name: 'shared', schedulable: true, costMultiplier: 0.3, primaryGroupId: 1,
+      groupsDetail: [{ id: 1, name: 'retiring', sale_rate: 0.5 }, { id: 2, name: 'low-price', sale_rate: 0.2 }] }]
+  };
+  const { context, remoteWrites } = groupMutator(state);
+  const before = JSON.stringify(state);
+  assert.throws(() => context.deleteRemoteGroup(1), /账号「shared」还在接单，删掉这个分组后它只剩 「low-price」/);
+  assert.equal(remoteWrites.length, 0);
+  assert.equal(JSON.stringify(state), before);
+});
+
+test('database refusals of a group delete come back in plain words and leave the cache untouched', () => {
+  const state = { allGroups: [{ id: 1, name: 'has-customers', sale_rate: 0.5 }], channels: [] };
+  const { context } = groupMutator(state);
+  const before = JSON.stringify(state);
+  context.executeRemoteSQL = () => {
+    throw Object.assign(new Error('Command failed: docker exec -i sub2api-postgres psql'), {
+      stderr: 'ERROR:  relay-tower: group has api keys\nCONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE\n'
+    });
+  };
+  assert.throws(() => context.deleteRemoteGroup(1), /还有客户 Key 绑在这个分组上，这次没有删除/);
+  assert.equal(JSON.stringify(state), before);
+  context.executeRemoteSQL = () => { throw Object.assign(new Error('spawnSync docker ETIMEDOUT'), { code: 'ETIMEDOUT' }); };
+  assert.throws(() => context.deleteRemoteGroup(1), /删除没有完成：spawnSync docker ETIMEDOUT。请刷新页面/);
+  assert.equal(JSON.stringify(state), before);
+});
+
+test('delete preview lists the accounts to stop and refuses while customer keys are bound', () => {
+  const state = {
+    allGroups: [{ id: 1, name: 'retiring', sale_rate: 0.5 }],
+    channels: [{ id: '7', name: 'only-here', schedulable: true, costMultiplier: 0.3, primaryGroupId: 1,
+      groupsDetail: [{ id: 1, name: 'retiring', sale_rate: 0.5 }] }]
+  };
+  const bindings = extra => JSON.stringify({ keys: 0, keysUsed7d: 0, keyUsers: 0, subscriptions: 0, fallbackFrom: [], ...extra });
+  const { context, psqlWrites, remoteWrites } = groupMutator(state, { createResult: bindings({ keys: 3, keysUsed7d: 1, keyUsers: 2 }) });
+  const preview = context.previewDeleteRemoteGroup(1);
+  assert.equal(preview.groupName, 'retiring');
+  assert.deepEqual(JSON.parse(JSON.stringify(preview.stopAccounts)), [{ id: 7, name: 'only-here' }]);
+  assert.match(preview.blocked, /还有 3 个客户 Key（2 位客户）绑在这个分组上，最近 7 天有 1 个在用/);
+  assert.match(psqlWrites[0], /FROM api_keys WHERE group_id = 1 AND deleted_at IS NULL/);
+  assert.equal(remoteWrites.length, 0, 'a preview never writes');
+  assert.equal(groupMutator(state, { createResult: bindings() }).context.previewDeleteRemoteGroup(1).blocked, null);
+  assert.match(groupMutator(state, { createResult: bindings({ fallbackFrom: ['GPT 通用'] }) }).context.previewDeleteRemoteGroup(1).blocked,
+    /「GPT 通用」 把它设成了备用分组/);
+  assert.throws(() => groupMutator(state, { createResult: 'not json' }).context.previewDeleteRemoteGroup(1), /为了安全先不删/);
+});
+
+test('console delete asks the server first and sends back exactly the confirmed stop list', async () => {
+  const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  assert.doesNotMatch(app, /handleDeleteGroup\('\$\{g\.id\}', '\$\{g\.name\}'\)/, 'group names are no longer pasted into inline JavaScript');
+  const requests = [];
+  const dialogs = [];
+  let previewBody = { success: true, groupId: 5, groupName: "Demo's 示例分组", stopAccounts: [{ id: 7, name: 'only-here' }], unlinkAccounts: [], blocked: null };
+  const context = vm.createContext({
+    fetch: async (url, options = {}) => {
+      requests.push({ url, method: options.method || 'GET', body: options.body });
+      const body = String(url).endsWith('/delete-preview') ? previewBody : { success: true, message: '分组已删除' };
+      return { ok: true, json: async () => body };
+    },
+    confirm: text => { dialogs.push(text); return true; },
+    alert: text => { dialogs.push(text); },
+    showToast() {},
+    loadChannels: async () => {},
+    renderNewGroupChannelSelector() {},
+    loadAllGroupsDetails: async () => {}
+  });
+  vm.runInContext(app.slice(app.indexOf('function buildGroupDeleteConfirmText('), app.indexOf('function openAssignAccountsModal(')), context);
+  const button = { innerHTML: '🗑', disabled: false, isConnected: true, set textContent(value) { this.innerHTML = value; } };
+  await context.handleDeleteGroup('5', button);
+  assert.deepEqual(requests.map(request => `${request.method} ${request.url}`), ['GET /api/groups/5/delete-preview', 'DELETE /api/groups/5']);
+  assert.deepEqual(JSON.parse(requests[1].body), { stopAccountIds: [7] });
+  assert.match(dialogs[0], /确定删除分组「Demo's 示例分组」吗？/);
+  assert.match(dialogs[0], /会一起停用（不再接单）：\n  · only-here/);
+  assert.equal(button.innerHTML, '🗑');
+  assert.equal(button.disabled, false);
+
+  previewBody = { ...previewBody, blocked: '还有 3 个客户 Key（2 位客户）绑在这个分组上。' };
+  requests.length = 0;
+  dialogs.length = 0;
+  await context.handleDeleteGroup('5', button);
+  assert.deepEqual(requests.map(request => request.method), ['GET'], 'a blocked group is never sent a delete');
+  assert.match(dialogs[0], /现在不能删：\n\n还有 3 个客户 Key/);
 });
 
 test('orchestration refuses a below-cost primary even before it becomes schedulable', () => {
