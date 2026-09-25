@@ -42,7 +42,7 @@ if [[ "${SKIP_TESTS:-}" != 1 ]]; then (cd "$LOCAL_DIR" && npm test >/tmp/relay-t
   || { echo "本地测试失败，已中止部署。日志：/tmp/relay-tower-test.log"; exit 1; }; fi
 
 step "2/6 检查服务器"
-"${SSH[@]}" true || { echo "连不上服务器 $TARGET（如果平时要先开代理/VPN，请先打开）"; exit 1; }
+"${SSH[@]}" true || { echo "连不上服务器 ${TARGET}（如果平时要先开代理/VPN，请先打开）"; exit 1; }
 # 非 root 用户：优先直接用 docker，否则尝试免密 sudo。
 if "${SSH[@]}" "docker ps >/dev/null 2>&1"; then SUDO=""
 elif "${SSH[@]}" "sudo -n docker ps >/dev/null 2>&1"; then SUDO="sudo -n "
@@ -95,7 +95,9 @@ TAR_PARENT="${CODE_DIR%/*}"; TAR_NAME="${CODE_DIR##*/}"; BACKUP_DIR="$TAR_PARENT
 # 目录不可写（例如属于 root）时，备份和同步也走免密 sudo。
 FSUDO=""; RSYNC_PATH=()
 if ! "${SSH[@]}" "test -w '$CODE_DIR' && test -w '$TAR_PARENT'"; then FSUDO="sudo -n "; RSYNC_PATH=(--rsync-path="sudo -n rsync"); fi
-echo "服务器就绪（$LAYOUT，健康检查端口 $HEALTH_PORT），使用：$COMPOSE${FSUDO:+（文件操作使用 sudo）}"
+# macOS bash 3.2 in a UTF-8 locale reads Chinese text right after $VAR as part
+# of the name, so any variable followed by Chinese text needs braces.
+echo "服务器就绪（${LAYOUT}，健康检查端口 ${HEALTH_PORT}），使用：${COMPOSE}${FSUDO:+（文件操作使用 sudo）}"
 
 step "3/6 备份服务器上的旧代码（不含 data）"
 BACKUP="$BACKUP_DIR/$TAR_NAME-$STAMP.tgz"
@@ -122,7 +124,7 @@ step "5/6 重建并重启塔台容器（Sub2API、数据库、Redis 不受影响
 run "${SSH[@]}" "$REBUILD" || rollback "重建或启动失败"
 
 step "6/6 健康检查"
-if [[ "${DRY_RUN:-}" == 1 ]]; then echo "[DRY_RUN] 跳过健康检查（端口 $HEALTH_PORT）"; exit 0; fi
+if [[ "${DRY_RUN:-}" == 1 ]]; then echo "[DRY_RUN] 跳过健康检查（端口 ${HEALTH_PORT}）"; exit 0; fi
 ok=0
 for i in $(seq 1 20); do
   sleep 3
