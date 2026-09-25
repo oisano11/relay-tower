@@ -1403,6 +1403,77 @@ test('ratio-change alert is emitted only when the remote multiplier won the thre
   assert.equal(second.ratioCalls.length, 0);
 });
 
+// Loads the real ratio-change handlers (the harnesses above stub them out).
+function ratioChangeHarness(state) {
+  const effects = { writes: [], sse: [], telegram: [] };
+  const context = vm.createContext({
+    state,
+    alerts: [],
+    ratioHistory: [],
+    IS_CONTROL_PLANE_WORKER: false,
+    ALERTS_FILE: 'alerts',
+    HISTORY_FILE: 'history',
+    CHANNELS_FILE: 'channels',
+    writeJSON(file) { effects.writes.push(file); },
+    broadcastSSE(event) { effects.sse.push(event); },
+    telegram: { notifyRatioChange(payload) { effects.telegram.push(payload); return Promise.resolve(); } },
+    lastSub2APISignature: 'before-rate-change',
+    safetyReconciliationPending: false,
+    cachedStability: {},
+    cachedUserActivity: {},
+    cachedGlobalUserStats: {},
+    cachedUserFinancialStats: {},
+    buildSub2APISyncSafetyPlan() { return { quarantineIds: [], calibrations: [] }; },
+    hasSub2APISyncSafetyWork() { return false; },
+    triggerBackgroundModelDiscovery() {},
+    broadcastChannelsUpdate() {},
+    requestBackgroundDashboardSnapshot() {},
+    requestBackgroundSub2APISafetyPlan() {},
+    requestBackgroundSchedulerInvalidation() {},
+    console: { log() {}, warn() {}, error() {} }
+  });
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  vm.runInContext(source.slice(source.indexOf('function buildRatioChangeAlert('), source.indexOf('// 选择最具代表性的销售分组作为核算基准')), context);
+  vm.runInContext(source.slice(source.indexOf('const CONTROL_PLANE_LOCAL_CHANNEL_FIELDS'), source.indexOf('function normalizeControlPlaneAccountIds')), context);
+  return { context, effects };
+}
+
+test('a multiplier change seen by the background sync is applied, recorded and announced', () => {
+  const baseline = { channels: [{ id: '7', name: 'acct', multiplier: 0.05, costMultiplier: 0.05 }], allGroups: [] };
+  const state = JSON.parse(JSON.stringify(baseline));
+  const { context, effects } = ratioChangeHarness(state);
+  context.applyControlPlaneWorkerResult('sync', {
+    changed: true,
+    signature: 'after-rate-change',
+    snapshot: {
+      channels: [{ id: '7', name: 'acct', multiplier: 0.06, costMultiplier: 0.06 }],
+      allGroups: [],
+      ratioChanges: [{ channelId: '7', oldMultiplier: 0.05, newMultiplier: 0.06 }]
+    }
+  }, baseline);
+  assert.equal(state.channels[0].multiplier, 0.06);
+  assert.equal(context.lastSub2APISignature, 'after-rate-change');
+  assert.equal(context.alerts[0].type, 'ratio_change');
+  assert.equal(context.ratioHistory[0].direction, 'up');
+  assert.deepEqual(effects.writes, ['channels', 'alerts', 'history']);
+  assert.deepEqual(effects.sse, ['RATIO_ALERT']);
+  assert.equal(effects.telegram.length, 1);
+  assert.equal(effects.telegram[0].direction, 'up');
+});
+
+test('a directly handled price drop is recorded with its direction', () => {
+  const { context, effects } = ratioChangeHarness({ activeChannelId: '', channels: [] });
+  const channel = { id: 9, name: 'acct', multiplier: 0.08 };
+  const alert = context.handleRatioChange(channel, 0.08, 0.06, 'test');
+  assert.equal(alert.direction, 'down');
+  assert.equal(channel.multiplier, 0.06);
+  assert.equal(channel.previousMultiplier, 0.08);
+  assert.equal(context.ratioHistory[0].direction, 'down');
+  assert.deepEqual(effects.writes, ['alerts', 'history', 'channels']);
+  assert.deepEqual(effects.sse, ['RATIO_ALERT', 'CHANNELS_UPDATED']);
+  assert.equal(effects.telegram[0].direction, 'down');
+});
+
 test('every changed control-plane snapshot schedules cache reconstruction from current account IDs', () => {
   const { context, cacheInvalidations } = controlPlaneSyncApplicationHarness();
   context.applyControlPlaneWorkerResult('sync', {
@@ -2194,6 +2265,32 @@ test('user configured rate_multiplier takes precedence over stale probe and New-
   assert.equal(syncRes.status, 'connected');
   assert.equal(syncRes.balanceUSD, 50);
   assert.deepEqual(syncRes.models, ['gpt-5.4', 'claude-sonnet-5']);
+});
+
+test('a fresh upstream price wins over the configured rate even when Sub2API rate sync is off', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const between = (start, end) => {
+    const from = source.indexOf(start);
+    assert.ok(from >= 0, `missing ${start}`);
+    return source.slice(from, source.indexOf(end, from));
+  };
+  // The account snapshot, the safety worker and the write guards must agree on the cost.
+  const copies = [
+    between("CASE \n      WHEN (extra->'upstream_billing_rate_sync_enabled')", 'END::float as multiplier'),
+    between('const currentCostSql = `CASE', 'END`;'),
+    between('function remoteEffectiveCostSql(', 'END`;')
+  ];
+  for (const sql of copies) {
+    const order = [
+      sql.indexOf("'upstream_billing_rate_sync_enabled')::boolean = true THEN"),
+      sql.indexOf("'upstream_billing_probe'->>'status' = 'ok' AND CASE"),
+      sql.indexOf("'upstream_billing_probe'->>'fresh_until' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T"),
+      sql.indexOf("'upstream_billing_probe'->>'fresh_until')::timestamptz > NOW()"),
+      sql.indexOf('rate_multiplier != 1.0 THEN')
+    ];
+    assert.ok(order.every(index => index >= 0), sql);
+    assert.deepEqual([...order].sort((a, b) => a - b), order, 'sync switch, then fresh upstream price, then configured rate');
+  }
 });
 
 test('active accounts in Sub2API database are authoritative and never pruned by tombstone, and un-tombstone automatically', () => {
