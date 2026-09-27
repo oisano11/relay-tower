@@ -956,7 +956,7 @@
           <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; margin-top: 0.75rem;">
             <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
               <div style="font-weight: 700; color: #1e40af; margin-bottom: 2px;">🔍 什么时候换号</div>
-              <div style="color: #1d4ed8; line-height: 1.35;">确认出了故障才换：余额用完、连续失败、失败率过高或长时间连不上。偶尔失败不会换</div>
+              <div style="color: #1d4ed8; line-height: 1.35;">确认出了故障才换：余额用完、连续失败、失败率过高、长时间连不上，或客户请求连续 3 次找不到账号接单（比如主调没配客户要的模型）。偶尔失败不会换</div>
             </div>
             <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
               <div style="font-weight: 700; color: #166534; margin-bottom: 2px;">🔁 换到哪个号</div>
@@ -2191,6 +2191,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260927_power_button"></script>
+  <script src="app.js?v=20260927_routing_failover"></script>
 </body>
 </html>

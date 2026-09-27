@@ -23,7 +23,10 @@ const DEFAULTS = Object.freeze({
   // 请求少的账号在 5 分钟窗口里凑不满「连续失败」门槛：最近几次真实请求连续失败时，
   // 再用一次真实生成探测确认，探测也失败才算故障。请求多的账号仍只按原门槛判断。
   suspectFailures: 3,
-  suspectProbeMaxAgeMs: 300000
+  suspectProbeMaxAgeMs: 300000,
+  // 客户请求在本组连续这么多次「找不到账号接单」（Sub2API 的 error_phase='routing'），就算当前主调出了问题。
+  // 这种报错常常不写账号（主调没被选上：模型没配、被 Sub2API 暂时冷却、并发满），按账号统计看不到。
+  routingFailuresThreshold: 3
 });
 
 function timestamp(value) {
@@ -72,21 +75,46 @@ function compatible(candidate, required) {
   return models.length === 0 || required.every(model => models.some(pattern => modelMatches(pattern, model)));
 }
 
+function supportsModel(channel, model) {
+  return compatible(channel, [model]);
+}
+
+/**
+ * 本组「找不到账号接单」的报错里，哪些算到当前主调头上：只算它当上当前账号之后、
+ * 本组最后一次成功请求之后、上次切换之后的。「模型不支持」只在主调不支持、而本组别的
+ * 能顶上的账号支持这个模型时才算（否则是客户点了本组没有的模型，换号也没用）。
+ */
+function routingEvidence({ groupMetrics, current, pool, since }) {
+  if (!current || !groupMetrics || !Array.isArray(groupMetrics.failures)) return { count: 0, models: [] };
+  const floor = Math.max(since || 0, timestamp(groupMetrics.lastSuccessAt) || 0);
+  const counted = groupMetrics.failures.filter(failure => {
+    const at = timestamp(failure && failure.at);
+    if (at == null || at <= floor) return false;
+    if (failure.type === 'model_not_found') {
+      return Boolean(failure.model) && !supportsModel(current, failure.model) && pool.some(channel => supportsModel(channel, failure.model));
+    }
+    return true;
+  });
+  return { count: counted.length, models: [...new Set(counted.filter(f => f.type === 'model_not_found').map(f => String(f.model)))] };
+}
+
 /** Pure decision only. Persist returned runtime; set lastSwitchAt AFTER a successful write. */
-function evaluateGroup({ group, channels, metrics = {}, config = {}, runtime = {}, now = Date.now() }) {
+function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, config = {}, runtime = {}, now = Date.now() }) {
   const options = { ...DEFAULTS, ...config };
   for (const [key, value] of Object.entries(DEFAULTS)) {
     if (typeof value === 'number') {
       options[key] = Number.isFinite(Number(options[key])) && Number(options[key]) >= 0 ? Number(options[key]) : value;
     }
   }
-  for (const key of ['probeFailuresThreshold', 'consecutiveFailuresThreshold', 'consecutiveQuotaThreshold', 'minSampleSize', 'recoverySuccesses']) {
+  for (const key of ['probeFailuresThreshold', 'consecutiveFailuresThreshold', 'consecutiveQuotaThreshold', 'minSampleSize', 'recoverySuccesses', 'routingFailuresThreshold']) {
     options[key] = Math.max(1, options[key]);
   }
   const next = { ...runtime, accounts: {} };
   const members = channels.filter(channel => groupIds(channel).includes(Number(group.id)));
   const current = members.filter(channel => channel.schedulable).sort((a, b) => priority(a, group) - priority(b, group) || Number(a.id) - Number(b.id))[0];
   if (current) {
+    // 它从什么时候起是当前账号：只有这之后本组「找不到账号接单」的报错，才算到它头上
+    next.currentSince = String(runtime.lastCurrentId) === String(current.id) && runtime.currentSince != null ? runtime.currentSince : now;
     next.lastCurrentId = current.id;
     next.requiredModels = requiredModels(current, group);
     // Failover promotes the backup to priority 1. That promotion must never be
@@ -101,14 +129,16 @@ function evaluateGroup({ group, channels, metrics = {}, config = {}, runtime = {
     } else {
       next.originalMainId = runtime.originalMainId;
     }
-  } else if (runtime.originalMainId) {
-    next.originalMainId = runtime.originalMainId;
+  } else {
+    next.currentSince = null;
+    if (runtime.originalMainId) next.originalMainId = runtime.originalMainId;
   }
   const reference = current || members.find(channel => String(channel.id) === String(runtime.lastCurrentId));
   const required = requiredModels(reference || { configuredModels: runtime.requiredModels || [] }, group);
   const health = new Map();
+  let routing = { count: 0, models: [] };
   const result = (action, reason, target) => ({ action, reason, currentId: current?.id ?? null, targetId: target?.id ?? null, runtime: next,
-    faults: Object.fromEntries([...health].map(([id, value]) => [id, value.fault])) });
+    faults: Object.fromEntries([...health].map(([id, value]) => [id, value.fault])), routing });
 
   for (const channel of members) {
     const id = String(channel.id);
@@ -195,10 +225,13 @@ function evaluateGroup({ group, channels, metrics = {}, config = {}, runtime = {
     const proofRequiredSince = timestamp(observation.proofRequiredSince);
     const proofOk = channel.passiveHealth === true || options.requireGenerationProbe === false || proofRequiredSince == null ||
       (genAt != null && genAt > proofRequiredSince && channel.lastGenerationProbeStatus === 'ok');
-    const recovered = proofOk && observation.successes >= options.recoverySuccesses && observation.healthySince != null && now - observation.healthySince >= options.recoveryHoldMs;
+    // 因为客户要的模型它不支持才被换下的账号，要等它的模型设置补上这些模型才算恢复，免得来回切
+    const routingModelsReady = !Array.isArray(observation.routingModels) || observation.routingModels.every(model => supportsModel(channel, model));
+    const recovered = proofOk && routingModelsReady && observation.successes >= options.recoverySuccesses && observation.healthySince != null && now - observation.healthySince >= options.recoveryHoldMs;
     if (!fault && recovered) {
       observation.needsRecovery = false;
       observation.proofRequiredSince = null;
+      delete observation.routingModels;
     }
     // Old empty balances cannot prove a CURRENT outage, but cannot qualify a
     // backup either: the gateway would reject that account until refreshed.
@@ -208,11 +241,25 @@ function evaluateGroup({ group, channels, metrics = {}, config = {}, runtime = {
     health.set(id, { fault, available, recovered });
   }
 
+  // 备用就是关掉：自动切号永远不把它换上来。能顶上的只有本组的副调和备选（以及没在接单的主调）。
+  const pool = members.filter(channel => channel !== current && groupRole(channel, group.id) !== 'standby' &&
+    health.get(String(channel.id)).available && groupCostIsSafe(channel, group));
+  // 客户请求在本组连续找不到账号接单：算当前主调出了问题（它自己的报错统计可能是空的）。
+  routing = routingEvidence({ groupMetrics, current, pool, since: Math.max(Number(next.currentSince) || 0, timestamp(runtime.lastSwitchAt) || 0) });
+  if (current && routing.count >= options.routingFailuresThreshold && !health.get(String(current.id)).fault) {
+    const observation = next.accounts[String(current.id)];
+    observation.needsRecovery = true;
+    observation.successes = 0;
+    observation.healthySince = null;
+    observation.proofRequiredSince = now;
+    if (routing.models.length) observation.routingModels = routing.models;
+    health.set(String(current.id), { fault: 'routing_failures', available: false, recovered: false });
+  }
+
   if (options.enabled === false || group.enabled === false) return result('hold', 'automation_disabled');
-  // 备用就是关掉：自动切号永远不把它换上来。能顶上的只有本组的副调和备选（以及没在接单的主调），
-  // 顺序固定为 主调 → 副调 → 备选，同一角色里先用进价低的。
-  const candidates = members.filter(channel => channel !== current && groupRole(channel, group.id) !== 'standby' &&
-    health.get(String(channel.id)).available && groupCostIsSafe(channel, group) && compatible(channel, required));
+  // 顺序固定为 主调 → 副调 → 备选，同一角色里先用进价低的。因为「模型不支持」换号时，顶上的账号必须支持那些模型。
+  const needed = health.get(String(current?.id))?.fault === 'routing_failures' ? [...new Set([...required, ...routing.models])] : required;
+  const candidates = pool.filter(channel => compatible(channel, needed));
   const byRole = (a, b) => ROLE_RANK[groupRole(a, group.id)] - ROLE_RANK[groupRole(b, group.id)];
   const byCost = (a, b) => Number(a.costMultiplier ?? a.multiplier) - Number(b.costMultiplier ?? b.multiplier);
   candidates.sort((a, b) => byRole(a, b) || byCost(a, b) || Number(a.id) - Number(b.id));

@@ -3163,3 +3163,55 @@ test('every row has an explicit close/open button and each group states when acc
   context.autoSwitchConfig.enabled = false;
   assert.match(context.groupRuleLine({ id: 27, name: '示例分组' }), /总开关关着/);
 });
+
+// ====== 2026-09-27 本组找不到账号接单也算主调出问题 ======
+
+test('group routing failures are read from ops_error_logs error_phase=routing in their own guarded query', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const sqls = [];
+  let reply = JSON.stringify({ 27: { lastSuccessAt: 1000, failures: [{ at: 2000, model: 'gpt-5', type: 'api_error' }] } });
+  const errors = [];
+  const context = vm.createContext({ Date, JSON, console: { error: (...args) => errors.push(args.join(' ')) },
+    execPsql(sql) { sqls.push(sql); if (reply instanceof Error) throw reply; return reply; } });
+  vm.runInContext(source.slice(source.indexOf('let recentGroupRoutingFailures'), source.indexOf('function evaluateAutoSwitch(')), context);
+  const data = context.fetchRecentGroupRoutingFailures();
+  assert.equal(data['27'].failures[0].model, 'gpt-5');
+  assert.match(sqls[0], /FROM ops_error_logs\s+WHERE created_at >= NOW\(\) - INTERVAL '5 minutes' AND error_phase = 'routing' AND group_id IS NOT NULL/);
+  assert.match(sqls[0], /FROM usage_logs/);
+  assert.doesNotMatch(sqls[0], /account_id IS NULL/, 'routing rows that name an exhausted account count too');
+  context.fetchRecentGroupRoutingFailures();
+  assert.equal(sqls.length, 1, 'cached for 30 seconds');
+  // 查询出错：只是这一项先不生效，不抛错、不影响别的统计
+  vm.runInContext('recentGroupRoutingFailures = { at: 0, data: {} }', context);
+  reply = new Error('column "error_phase" does not exist');
+  assert.deepEqual(JSON.parse(JSON.stringify(context.fetchRecentGroupRoutingFailures())), {});
+  assert.match(errors[0], /找不到账号接单统计/);
+});
+
+test('customers repeatedly finding no account in a group switch its main to the 副调', () => {
+  let switched = null;
+  const now = Date.now();
+  const failures = [1, 2, 3].map(i => ({ at: now - i * 5000, model: 'gpt-5', type: 'api_error' }));
+  const { context, state } = evaluator({
+    fetchRecentGroupRoutingFailures: () => ({ 1: { failures, lastSuccessAt: now - 120000 } }),
+    executeAutoSwitch: (from, to, reason, meta) => { switched = { from: String(from.id), to: String(to.id), reason, trigger: meta.triggerType }; return { executed: true }; }
+  });
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  state.channels = [
+    fixChannel(1, { priority: 1, schedulable: true, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] }),
+    fixChannel(2, { groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] })
+  ];
+  state.failoverRuntime = { 1: { lastCurrentId: '1', currentSince: now - 600000 } };
+  context.evaluateAutoSwitch();
+  assert.deepEqual(switched, { from: '1', to: '2', reason: 'A：客户请求连续找不到账号接单（主调没被 Sub2API 选上）', trigger: 'routing_failures' });
+
+  // 预演：还没到 3 次时，在当前账号上提示最近几次找不到账号接单
+  const preview = evaluator({ fetchRecentGroupRoutingFailures: () => ({ 1: { failures: failures.slice(0, 2) } }) });
+  preview.state.allGroups = state.allGroups;
+  preview.state.channels = state.channels.map(c => ({ ...c }));
+  preview.state.failoverRuntime = { 1: { lastCurrentId: '1', currentSince: now - 600000 } };
+  const row = preview.context.previewAutoSwitch(now).groups[0];
+  assert.equal(row.action, 'hold');
+  assert.equal(row.routingFailures, 2);
+  assert.ok(row.accounts.find(a => a.id === '1').notes.includes('本组最近 2 次请求找不到账号接单'));
+});

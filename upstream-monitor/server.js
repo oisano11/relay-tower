@@ -6143,6 +6143,42 @@ function fetchRecentFailoverMetrics() {
   }
   return recentFailoverMetrics.data;
 }
+// 每个分组近 5 分钟「找不到账号接单」的报错（Sub2API 记为 error_phase='routing'：没有可用账号、
+// 模型本组没人支持、全部被限流、并发满、被利润控制拒绝）。这类报错常常不写账号，按账号统计看不到，
+// 所以按分组取出来，由切号决策算到当前主调头上。单独查询、单独兜底：出错时只是这一项先不生效，
+// 不影响按账号的故障统计。
+let recentGroupRoutingFailures = { at: 0, data: {} };
+function fetchRecentGroupRoutingFailures() {
+  if (Date.now() - recentGroupRoutingFailures.at < 30000) return recentGroupRoutingFailures.data;
+  try {
+    const output = execPsql(`WITH f AS (
+      SELECT group_id, created_at, model, error_type
+      FROM ops_error_logs
+      WHERE created_at >= NOW() - INTERVAL '5 minutes' AND error_phase = 'routing' AND group_id IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 2000
+    ), s AS (
+      SELECT group_id, MAX(created_at) AS last_success
+      FROM usage_logs
+      WHERE created_at >= NOW() - INTERVAL '5 minutes' AND group_id IN (SELECT DISTINCT group_id FROM f)
+      GROUP BY group_id
+    )
+    SELECT COALESCE(json_object_agg(x.group_id::text, json_build_object('lastSuccessAt', x.last_success_ms, 'failures', x.failures)), '{}'::json)
+    FROM (
+      SELECT f.group_id,
+        (SELECT (EXTRACT(EPOCH FROM s.last_success) * 1000)::bigint FROM s WHERE s.group_id = f.group_id) AS last_success_ms,
+        json_agg(json_build_object('at', (EXTRACT(EPOCH FROM f.created_at) * 1000)::bigint, 'model', f.model, 'type', f.error_type) ORDER BY f.created_at DESC) AS failures
+      FROM f GROUP BY f.group_id
+    ) x;`, true).trim() || '{}';
+    const parsed = JSON.parse(output);
+    recentGroupRoutingFailures = { at: Date.now(), data: parsed && typeof parsed === 'object' ? parsed : {} };
+  } catch (error) {
+    recentGroupRoutingFailures = { at: Date.now(), data: {} };
+    console.error('[本组找不到账号接单统计]', error.message);
+  }
+  return recentGroupRoutingFailures.data;
+}
+
 function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
   if (!autoSwitchConfig.enabled) return { executed: false, reason: '自动切号已关闭' };
   const now = Date.now();
@@ -6150,6 +6186,7 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
   const reports = [], details = [];
   // Isolated tests and degraded startup may not have the DB metric helper loaded.
   const productionMetrics = typeof fetchRecentFailoverMetrics === 'function' ? fetchRecentFailoverMetrics() : {};
+  const groupRouting = typeof fetchRecentGroupRoutingFailures === 'function' ? fetchRecentGroupRoutingFailures() : {};
   const reasonNames = AUTO_SWITCH_REASON_NAMES;
   state.failoverRuntime = state.failoverRuntime || {};
   for (const group of groups || []) {
@@ -6165,14 +6202,14 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
       // assessment, while hiding shared backups from group-level promotion:
       // without verified group-scoped scheduler state, promoting one would
       // alter every other group that shares it.
-      const { groupCurrent, pricingEligibleChannels, metrics, isExclusiveToGroup } = buildGroupEvaluationInput(group, channels, productionMetrics);
+      const { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, isExclusiveToGroup } = buildGroupEvaluationInput(group, channels, productionMetrics, groupRouting);
       if (groupCurrent && typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(groupCurrent)) {
         details.push(`${group.name}：当前主调 [${groupCurrent.name}] 为例外渠道，保持人工控制`);
         continue;
       }
       // 决策时的路由版本必须在评估前取：评估结果写回后再取，与写入层比较的是同一个值，闸门形同虚设。
       const decisionRuntimeAt = Number(state.failoverRuntime[key]?.lastSwitchAt) || 0;
-      const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, config: { ...autoSwitchConfig, ...policy }, runtime: state.failoverRuntime[key] || {}, now });
+      const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, groupMetrics, config: { ...autoSwitchConfig, ...policy }, runtime: state.failoverRuntime[key] || {}, now });
       state.failoverRuntime[key] = decision.runtime;
       const current = channels.find(c => String(c.id) === String(decision.currentId)) || groupCurrent;
       if (decision.action === 'switch') {
@@ -6262,14 +6299,14 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
 }
 
 
-const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', main_recharged: '原主调充值恢复上线', automation_disabled: '自动切号已关闭' };
+const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', main_recharged: '原主调充值恢复上线', automation_disabled: '自动切号已关闭' };
 
 /**
  * 评估一个业务分组所需的输入（真实切号与只读预演共用，保证预演看到的就是实际决策）。
  * `schedulable` 与 priority 是账号级全局设置，而售价按分组：共享的当前主调保留以便评估健康，
  * 共享备选、例外渠道和在本组亏损的账号不允许被提升。
  */
-function buildGroupEvaluationInput(group, channels, productionMetrics = {}) {
+function buildGroupEvaluationInput(group, channels, productionMetrics = {}, groupRouting = {}) {
   const groupCurrent = [...channels].filter(channel => channel.schedulable).sort((a, b) => {
     const left = Number.isFinite(Number(a.priority)) ? Number(a.priority) : Number.MAX_SAFE_INTEGER;
     const right = Number.isFinite(Number(b.priority)) ? Number(b.priority) : Number.MAX_SAFE_INTEGER;
@@ -6294,10 +6331,11 @@ function buildGroupEvaluationInput(group, channels, productionMetrics = {}) {
     const observed = gatewayMetrics.summary(c.id), production = productionMetrics[String(c.id)];
     return [String(c.id), production?.totalCalls ? production : observed];
   }));
-  return { groupCurrent, pricingEligibleChannels, metrics, isExclusiveToGroup, excluded };
+  const groupMetrics = (groupRouting && groupRouting[String(group.id)]) || null;
+  return { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, isExclusiveToGroup, excluded };
 }
 
-const PREVIEW_FAULT_NAMES = { disabled: '已停用/不可提升', balance_empty: '欠费', request_failures: '请求故障', probe_failures: '探活连续失败' };
+const PREVIEW_FAULT_NAMES = { disabled: '已停用/不可提升', balance_empty: '欠费', request_failures: '请求故障', probe_failures: '探活连续失败', routing_failures: '客户请求连续找不到账号接单' };
 
 /** 说明分组为什么不参与自动切号，让运营者知道是哪条设置在起作用。 */
 function describeManualGroup(group, policy = {}) {
@@ -6312,6 +6350,7 @@ function describeManualGroup(group, policy = {}) {
 function previewAutoSwitch(now = Date.now()) {
   const groups = state.allGroups?.length ? state.allGroups : fetchAllSub2APIGroups();
   const productionMetrics = typeof fetchRecentFailoverMetrics === 'function' ? fetchRecentFailoverMetrics() : {};
+  const groupRouting = typeof fetchRecentGroupRoutingFailures === 'function' ? fetchRecentGroupRoutingFailures() : {};
   const result = [];
   for (const group of groups || []) {
     const key = String(group.id);
@@ -6321,10 +6360,11 @@ function previewAutoSwitch(now = Date.now()) {
     const row = { groupId: group.id, groupName: group.name, accounts: [] };
     if (!autoSwitchConfig.enabled) row.skipped = '全局自动切号已关闭';
     else if (isExemptGroup(group) || policy.enabled === false) row.skipped = describeManualGroup(group, policy);
-    const { groupCurrent, pricingEligibleChannels, metrics, excluded } = buildGroupEvaluationInput(group, channels, productionMetrics);
+    const { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, excluded } = buildGroupEvaluationInput(group, channels, productionMetrics, groupRouting);
     if (!row.skipped && groupCurrent && typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(groupCurrent)) row.skipped = `当前主调 [${groupCurrent.name}] 为例外渠道，保持人工控制`;
-    const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, config: { ...autoSwitchConfig, ...policy },
+    const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, groupMetrics, config: { ...autoSwitchConfig, ...policy },
       runtime: JSON.parse(JSON.stringify(state.failoverRuntime?.[key] || {})), now });
+    row.routingFailures = decision.routing?.count || 0;
     const byId = id => channels.find(c => String(c.id) === String(id));
     row.action = row.skipped ? 'skip' : decision.action;
     row.reason = row.skipped || AUTO_SWITCH_REASON_NAMES[decision.reason] || decision.reason;
@@ -6338,6 +6378,9 @@ function previewAutoSwitch(now = Date.now()) {
       const notes = [];
       if (excluded[id]) notes.push(excluded[id]);
       else if (fault) notes.push(PREVIEW_FAULT_NAMES[fault] || fault);
+      if (row.current?.id === id && row.routingFailures > 0 && fault !== 'routing_failures') {
+        notes.push(`本组最近 ${row.routingFailures} 次请求找不到账号接单`);
+      }
       if (observation.needsRecovery && !fault) notes.push(observation.proofRequiredSince != null ? '等待真实生成成功后恢复' : '恢复观察中');
       if (channel.lastProbeStatus !== 'online') notes.push(channel.probeMode === 'generation' ? '无 /v1/models，等待生成探测' : `探活: ${channel.lastProbeStatus || '无'}`);
       if (channel.lastGenerationProbeStatus && channel.lastGenerationProbeStatus !== 'ok') notes.push(`生成探测: ${channel.lastGenerationProbeStatus}${channel.lastGenerationProbeError ? '（' + String(channel.lastGenerationProbeError).slice(0, 80) + '）' : ''}`);

@@ -480,3 +480,70 @@ test('with nobody serving, auto-switch opens a 副调 first, never a 备用 or a
   // 只剩备用和手动关闭的：什么都不打开
   assert.equal(decide([channel(1, { ...off, priority: 1, autoSwitchDisabled: true }), channel(2, { ...off, priority: 100 })]).action, 'exhausted');
 });
+
+// ====== 客户请求在本组连续找不到账号接单（Sub2API error_phase='routing'）======
+
+test('customers repeatedly finding no account in the group count against the current main, and the 副调 takes over', () => {
+  const runtime = { lastCurrentId: 1, currentSince: START - 600000 };
+  const failures = [1, 2, 3].map(i => ({ at: START - i * 10000, model: 'gpt-5', type: 'api_error' }));
+  const channels = () => [channel(1), channel(10, { costMultiplier: 0.5 })];
+  const result = decide(channels(), { runtime, groupMetrics: { failures, lastSuccessAt: START - 120000 } });
+  assert.equal(result.action, 'switch');
+  assert.equal(result.reason, 'routing_failures');
+  assert.equal(result.targetId, 10);
+  assert.equal(result.routing.count, 3);
+  assert.equal(result.faults['1'], 'routing_failures');
+  assert.equal(result.runtime.accounts['1'].proofRequiredSince, START, 'switching back needs a real generation probe first');
+  // 两次还不够
+  assert.equal(decide(channels(), { runtime, groupMetrics: { failures: failures.slice(0, 2) } }).action, 'hold');
+  // 之后本组有过成功的请求：之前的不算
+  assert.equal(decide(channels(), { runtime, groupMetrics: { failures, lastSuccessAt: START - 5000 } }).action, 'hold');
+  // 上次切换之前的不算
+  assert.equal(decide(channels(), { runtime: { ...runtime, lastSwitchAt: START - 15000 }, groupMetrics: { failures } }).action, 'hold');
+  // 它刚当上当前账号（第一次看到它）：之前的报错不算到它头上
+  const first = decide(channels(), { runtime: {}, groupMetrics: { failures } });
+  assert.equal(first.action, 'hold');
+  assert.equal(first.runtime.currentSince, START);
+});
+
+test('a model the main lacks counts only when another account in the group can serve it, and the target must serve it', () => {
+  const runtime = { lastCurrentId: 1, currentSince: START - 600000 };
+  const failures = [1, 2, 3].map(i => ({ at: START - i * 10000, model: 'gpt-5-codex', type: 'model_not_found' }));
+  const main = channel(1, { configuredModels: ['gpt-4o'] });
+  const sub = channel(10, { costMultiplier: 0.5, configuredModels: ['gpt-4o', 'gpt-5-codex'] });
+  const cheaperSubWithoutModel = channel(9, { costMultiplier: 0.2, configuredModels: ['gpt-4o'] });
+  const result = decide([main, sub, cheaperSubWithoutModel], { runtime, groupMetrics: { failures } });
+  assert.equal(result.reason, 'routing_failures');
+  assert.equal(result.targetId, 10, 'the cheaper 副调 cannot serve the model, so it is skipped');
+  assert.deepEqual(result.runtime.accounts['1'].routingModels, ['gpt-5-codex']);
+  // 本组谁都不支持这个模型（客户点了本组没有的模型）：不是主调的问题，不切
+  assert.equal(decide([main, cheaperSubWithoutModel], { runtime, groupMetrics: { failures } }).action, 'hold');
+  // 主调自己支持（模型映射为空 = 全部放行）：不算
+  assert.equal(decide([channel(1), sub], { runtime, groupMetrics: { failures } }).action, 'hold');
+});
+
+test('a main switched away for a missing model is not switched back until its model settings include that model', () => {
+  const sub = now => channel(10, { schedulable: true, priority: 1, costMultiplier: 0.5, configuredModels: [], lastProbeTime: now });
+  const oldMain = (models, now) => channel(1, { schedulable: false, priority: 10, configuredModels: models, lastProbeTime: now,
+    lastGenerationProbeAt: START + 60000, lastGenerationProbeStatus: 'ok' });
+  let runtime = { originalMainId: 1, lastCurrentId: 10, currentSince: START - 1000, lastSwitchAt: START - 1000,
+    accounts: { 1: { needsRecovery: true, proofRequiredSince: START - 1000, routingModels: ['gpt-5-codex'], successes: 0, failures: 0, healthySince: null } } };
+  let result;
+  for (let minute = 1; minute <= 20; minute++) {
+    const now = START + minute * 60000;
+    result = decide([oldMain(['gpt-4o'], now), sub(now)], { now, runtime });
+    runtime = result.runtime;
+  }
+  assert.equal(result.action, 'hold', 'probes and the generation probe are fine, but the model is still missing');
+  assert.equal(runtime.accounts['1'].needsRecovery, true);
+  for (let minute = 21; minute <= 30; minute++) {
+    const now = START + minute * 60000;
+    result = decide([oldMain(['gpt-4o', 'gpt-5-codex'], now), sub(now)], { now, runtime });
+    runtime = result.runtime;
+    if (result.action === 'switch') break;
+  }
+  assert.equal(result.action, 'switch');
+  assert.equal(result.reason, 'main_recharged');
+  assert.equal(result.targetId, 1);
+  assert.equal(runtime.accounts['1'].routingModels, undefined);
+});
