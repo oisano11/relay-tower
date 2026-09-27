@@ -467,3 +467,16 @@ test('a legacy group policy that copied every global value only reports the real
   assert.deepEqual(view.customized, ['cooldownMinutes']);
   assert.equal(view.cooldownMinutes, 15);
 });
+
+test('with nobody serving, auto-switch opens a 副调 first, never a 备用 or a manually closed account', () => {
+  const off = { schedulable: false };
+  // 主调被手动关闭，分组里没人接单：打开副调，不碰备用
+  const closedMain = [channel(1, { ...off, priority: 1, autoSwitchDisabled: true }), channel(2, { ...off, priority: 100, costMultiplier: 0.01 }),
+    channel(3, { ...off, priority: 20 }), channel(4, { ...off, priority: 10, costMultiplier: 0.9 })];
+  const result = decide(closedMain);
+  assert.equal(result.action, 'switch');
+  assert.equal(result.reason, 'no_active_account');
+  assert.equal(result.targetId, 4);
+  // 只剩备用和手动关闭的：什么都不打开
+  assert.equal(decide([channel(1, { ...off, priority: 1, autoSwitchDisabled: true }), channel(2, { ...off, priority: 100 })]).action, 'exhausted');
+});

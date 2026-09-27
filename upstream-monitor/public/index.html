@@ -9,7 +9,7 @@
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=relay-tower-2026">
   <link rel="shortcut icon" href="favicon.ico?v=relay-tower-2026">
-  <link rel="stylesheet" href="style.css?v=20260925_upstream_keys">
+  <link rel="stylesheet" href="style.css?v=20260927_role_scope">
 </head>
 <body>
   <div class="app-layout">
@@ -347,8 +347,8 @@
 
             <div class="batch-actions">
               <span style="font-size: 0.72rem; color: #71717a;">批量:</span>
-              <button id="btnBatchEnableAll" class="btn-batch" title="解除当前筛选账号的人工停用：主调重新接单，副调、备选重新参与自动切号，备用仍然关着">全部解除停用</button>
-              <button id="btnBatchDisableAll" class="btn-batch" title="将当前筛选的账号标记为人工停用：马上不接单，自动切号也不会再启用">全部人工停用</button>
+              <button id="btnBatchEnableAll" class="btn-batch" title="打开当前筛选里手动关闭的账号：主调马上接单；副调、备选回到待命；备用仍然关着">全部打开</button>
+              <button id="btnBatchDisableAll" class="btn-batch" title="关闭当前筛选里的账号：马上不接单，以后也不会被自动打开">全部关闭</button>
             </div>
           </div>
         </div>
@@ -368,7 +368,7 @@
           <div class="strips-header-bar">
             <div class="col-th" style="text-align: center;">状态</div>
             <div class="col-th">上游名称 · 厂商 · 线路</div>
-            <div class="col-th" style="text-align: center;">调度开关</div>
+            <div class="col-th" style="text-align: center;">开关</div>
             <div class="col-th" style="text-align: center;">账户余额</div>
             <div class="col-th">进货成本 (Cost)</div>
             <div class="col-th">对外售价 (Sale)</div>
@@ -2191,6 +2191,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260927_role_scope"></script>
+  <script src="app.js?v=20260927_power_button"></script>
 </body>
 </html>

@@ -790,7 +790,7 @@ function renderFilterPills() {
       { key: 'main', label: `🌟 当前主调 (${mainCount})`, badgeClass: 'pill-active-main' },
       { key: 'sub', label: `🔵 当前副调 (${subCount})`, badgeClass: 'pill-active-sub' },
       { key: 'idle', label: `💤 待机静默无调用 (${idleCount})`, badgeClass: 'pill-active-idle' },
-      { key: 'disabled', label: `🚫 已停用通道 (${disabledCount})`, badgeClass: 'pill-active-disabled' },
+      { key: 'disabled', label: `🚫 手动关闭的 (${disabledCount})`, badgeClass: 'pill-active-disabled' },
       { key: 'all', label: `全部渠道 (${channelsData.length})`, badgeClass: '' }
     );
 
@@ -1269,14 +1269,17 @@ function renderStripsView(enabledChannels, standbyChannels) {
     const roleMismatchPill = mismatchGroups.length
       ? `<span class="strip-bal-warning-pill low" title="只有主调接单。它在${escapeHtml(mismatchGroups.map(gd => '【' + (gd.name || gd.id) + '】').join(''))}标着${mismatchRole}，接单开关却还开着，所以照样分到请求。点页面上方黄色提示条里的「查看并按角色关掉」处理">⚠️ 标着${mismatchRole}却在接单</span>`
       : '';
+    // 每行一个「关闭 / 打开」按钮：关闭 = 马上不接单，并且永远不会被自动打开，只能手动再打开
     const roleForToggle = effectiveGroupId ? role : bestChannelRole(ch);
-    const toggleStateText = ch.autoSwitchDisabled === true ? '人工停用'
-      : isSchedulable ? '接单中'
-      : roleForToggle === 'main' ? '未接单'
-      : roleForToggle === 'standby' ? '已关闭' : '待命';
-    const toggleTitle = ch.autoSwitchDisabled === true
-      ? '人工停用中：点一下解除。主调会重新接单；副调、备选重新参与自动切号（平时不接单）；备用仍然关着'
-      : '点一下人工停用：马上不接单，自动切号也不会再启用它';
+    const manuallyClosed = ch.autoSwitchDisabled === true;
+    const powerState = manuallyClosed ? ['手动关闭', '你手动关的：不接单，也不会被自动打开']
+      : isSchedulable ? ['接单中', '正在接单']
+      : roleForToggle === 'main' ? ['暂停中', '主调出了问题被自动换下，恢复后会自动打开、切回来']
+      : roleForToggle === 'standby' ? ['已关闭', '备用：不接单，也不会被自动打开']
+      : ['待命', `${ROLE_LABELS_CN[roleForToggle]}：平时不接单，主调出问题时会被自动打开`];
+    const powerButtonTitle = manuallyClosed
+      ? '打开：主调马上接单；副调、备选回到待命（主调出问题时才自动打开）；备用仍然关着，要用请在分组里改成主调、副调或备选'
+      : '关闭：马上不接单，以后也不会被自动打开（主调出问题时也不会用它）。要用时再点「打开」';
 
     return `
       <div class="channel-strip ${isActive ? 'is-active' : ''} ${!isSchedulable ? 'is-disabled' : ''} ${effectiveIsLoss ? 'is-loss' : ''} ${balanceStripClass}" data-channel-id="${ch.id}">
@@ -1305,11 +1308,9 @@ function renderStripsView(enabledChannels, standbyChannels) {
 
         <!-- 3. 人工纳入或停用；实际调度由自动策略决定 -->
         <div class="strip-col-toggle">
-          <label class="switch-control" title="${toggleTitle}">
-            <input type="checkbox" ${ch.autoSwitchDisabled !== true ? 'checked' : ''} onchange="toggleChannelSchedulable('${ch.id}', this.checked)" />
-            <span class="slider"></span>
-          </label>
-          <span style="font-size: 0.65rem; color: var(--text-muted);">${toggleStateText}</span>
+          <button type="button" class="btn-strip-power ${manuallyClosed ? 'is-open-action' : 'is-close-action'}" title="${powerButtonTitle}"
+                  onclick="toggleChannelSchedulable('${ch.id}', ${manuallyClosed ? 'true' : 'false'})">${manuallyClosed ? '打开' : '关闭'}</button>
+          <span class="strip-power-state state-${manuallyClosed ? 'manual' : (isSchedulable ? 'serving' : (roleForToggle === 'standby' ? 'closed' : 'waiting'))}" title="${powerState[1]}">${powerState[0]}</span>
         </div>
 
         <!-- 4. 上游账户余额 -->
@@ -1545,7 +1546,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
     html += `
       <div class="channel-section-header" style="${enabledChannels.length > 0 ? 'margin-top: 1.15rem;' : ''}">
         <span class="section-badge standby-badge">○ 没在接单 (${standbyChannels.length} 个)${standbyGroupSuffix}</span>
-        <span class="section-desc">副调、备选（平时不接单，主调出问题时替补）、备用（关掉）和人工停用的账号 · 已按模型归类 · 进货成本由低到高排列</span>
+        <span class="section-desc">副调、备选（平时不接单，主调出问题时自动打开）、备用和手动关闭的（不会被自动打开）· 已按模型归类 · 进货成本由低到高排列</span>
       </div>
     `;
 
@@ -1734,10 +1735,19 @@ function jumpToProblemChannel(targetChannelId = null) {
 
 window.jumpToProblemChannel = jumpToProblemChannel;
 
-// 人工管理候选池；恢复参与不等于立刻强制切主。
+// 行上的「关闭 / 打开」：关闭 = 手动关掉，永远不会被自动打开；打开 = 回到它的角色（主调接单，副调、备选待命，备用仍关着）。
 async function toggleChannelSchedulable(channelId, newSchedulable) {
   try {
     const target = channelsData.find(c => String(c.id) === String(channelId));
+    if (!newSchedulable && target && target.schedulable === true) {
+      // 正在接单的账号，关之前说清楚会发生什么
+      const lastServing = (target.groupsDetail || []).filter(gd => !(channelsData || []).some(c =>
+        String(c.id) !== String(target.id) && c.schedulable === true && (c.groupsDetail || []).some(g => String(g.id) === String(gd.id))));
+      const warn = lastServing.length
+        ? `\n\n它是${lastServing.map(gd => '【' + (gd.name || gd.id) + '】').join('')}里唯一在接单的账号。关掉后，这个分组有能用的副调或备选的话，自动切号会顶上（人工管理的分组除外）；没有的话，这个分组就没有账号接单了。`
+        : '';
+      if (!confirm(`确定关闭 [${target.name}] 吗？\n\n它现在正在接单，关掉后马上不接单，以后也不会被自动打开，要用时再点「打开」。${warn}`)) return;
+    }
     const res = await fetch(`/api/channels/${channelId}/toggle`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1747,7 +1757,7 @@ async function toggleChannelSchedulable(channelId, newSchedulable) {
     if (!res.ok) throw new Error(data.error || '操作失败');
 
     await loadChannels();
-    showToast(data.message || `[${target ? target.name : channelId}] ${newSchedulable ? '已解除人工停用' : '已人工停用，不会自动重新启用'}`, 'success');
+    showToast(data.message || `[${target ? target.name : channelId}] ${newSchedulable ? '已打开' : '已关闭，不会被自动打开'}`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -1772,13 +1782,13 @@ async function batchToggleVisible(schedulable) {
   const filterDesc = [currentFilterPill === 'all' ? '' : pillLabel, searchText ? `搜索“${searchText}”` : ''].filter(Boolean).join('，');
   const scope = unfiltered ? '全部' : `当前筛选（${filterDesc}）里的`;
   const effect = schedulable
-    ? '解除人工停用（主调重新接单；副调、备选重新参与自动切号，平时不接单；备用仍然关着）'
-    : '人工停用，线上立即不再调度，自动切号也不会再启用它们';
+    ? '打开（主调马上接单；副调、备选回到待命，主调出问题时才自动打开；备用仍然关着）'
+    : '关闭（马上不接单，以后也不会被自动打开，要用时再手动打开）';
   const warnAll = unfiltered ? '\n\n⚠️ 现在没有筛选，这会影响所有渠道！' : '';
   if (!confirm(`确定把${scope} ${ids.length} 条渠道${effect}吗？${warnAll}`)) return;
 
   try {
-    showToast(`正在批量${schedulable ? '开启' : '停用'} ${ids.length} 条上游...`, 'warning');
+    showToast(`正在${schedulable ? '打开' : '关闭'} ${ids.length} 个账号...`, 'warning');
     const res = await fetch('/api/batch/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1789,8 +1799,8 @@ async function batchToggleVisible(schedulable) {
 
     await loadChannels();
     showToast(schedulable
-      ? `已解除 ${ids.length} 个账号的人工停用，其中 ${data.servingCount || 0} 个主调重新接单`
-      : `${ids.length} 个账号已人工停用`, 'success');
+      ? `已打开 ${ids.length} 个账号：其中 ${data.servingCount || 0} 个主调在接单，其余按角色待命或关着`
+      : `已关闭 ${ids.length} 个账号，它们不会被自动打开`, 'success');
   } catch (e) {
     showToast(e.message, 'error');
   }
@@ -5334,8 +5344,31 @@ function renderGroupControlBanner(groupName) {
           <span class="gcc-stat-val">${standbyChs.length} 个</span>
         </div>
       </div>
+      <div class="gcc-rule-line">${escapeHtml(groupRuleLine(group))}</div>
     </div>
   `;
+}
+
+// 与服务端 isExemptGroup 同一套判断：人工管理的分组不参与自动切号
+function isManualGroupFront(group) {
+  if (!group) return false;
+  const config = autoSwitchConfig || {};
+  const id = String(group.id || '');
+  if ((config.exemptGroupIds || []).map(String).includes(id)) return true;
+  if (((config.groupPolicies || {})[id] || {}).enabled === false) return true;
+  const name = String(group.name || '').toLowerCase();
+  return (config.exemptKeywords || ['通用', '自用', '私人', 'private']).some(kw => name.includes(String(kw).toLowerCase()));
+}
+
+// 分组顶部的一句话规则：什么时候会被自动打开
+function groupRuleLine(group) {
+  if (autoSwitchConfig && autoSwitchConfig.enabled === false) {
+    return '📌 只有主调接单。自动切号总开关关着：塔台不会自动打开任何账号。';
+  }
+  if (isManualGroupFront(group)) {
+    return '📌 只有主调接单。这个分组是人工管理的：塔台不会自动打开或关闭里面的任何账号。';
+  }
+  return '📌 只有主调接单。主调出问题（没余额、连续失败、连不上）时，自动打开副调；没有能用的副调，再打开备选。主调恢复后自动切回去。备用和手动关闭的，永远不会被自动打开。';
 }
 
 // 打开业务分组通道编排弹窗

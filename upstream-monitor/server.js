@@ -4102,16 +4102,17 @@ function bestGroupRole(channel) {
   return roles.length ? order.find(role => roles.includes(role)) : null;
 }
 
+// 行上「关闭 / 打开」按钮的结果说明。关闭 = 手动关掉，永远不会被自动打开；打开 = 回到它的角色。
 function describeToggleResult(channel, restored, serving) {
   const name = `[${channel.name}]`;
-  if (!restored) return `${name} 已人工停用：不接单，自动切号也不会启用它`;
-  if (serving) return `${name} 已恢复：它是主调，已开始接单`;
+  if (!restored) return `${name} 已关闭：不接单，以后也不会被自动打开，要用时再点「打开」`;
+  if (serving) return `${name} 已打开：它是主调，开始接单`;
   const role = bestGroupRole(channel);
   if (role === 'sub' || role === 'alt') {
-    return `${name} 已恢复参与自动切号：它是${ROLE_LABELS[role]}，平时不接单，主调出问题时按顺序顶上`;
+    return `${name} 已打开：它是${ROLE_LABELS[role]}，平时不接单，主调出问题时会被自动打开`;
   }
-  if (role === 'standby') return `${name} 已解除人工停用：它是备用，仍然关着不接单；要用它请在分组里改成主调、副调或备选`;
-  return `${name} 已解除人工停用：它不在任何分组里，不会接单`;
+  if (role === 'standby') return `${name} 已取消手动关闭，但它是备用，仍然关着不接单；要用它请在分组里改成主调、副调或备选`;
+  return `${name} 已取消手动关闭：它不在任何分组里，不会接单`;
 }
 
 // The remote update is one all-or-nothing transaction. Local callers mutate

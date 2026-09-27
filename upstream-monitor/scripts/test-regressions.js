@@ -3090,10 +3090,10 @@ test('restoring a paused account only switches a main back on; backups rejoin au
   assert.match(remoteWrites[0], /UPDATE accounts SET schedulable = true WHERE id IN \(1\);/);
   assert.equal(context.toggleRemoteAccountSchedulable('2', true), false);
   assert.equal(remoteWrites.length, 1, 'restoring only a backup writes nothing');
-  assert.match(context.describeToggleResult(state.channels[0], true, true), /主调，已开始接单/);
-  assert.match(context.describeToggleResult(state.channels[1], true, false), /副调，平时不接单/);
+  assert.match(context.describeToggleResult(state.channels[0], true, true), /已打开：它是主调，开始接单/);
+  assert.match(context.describeToggleResult(state.channels[1], true, false), /副调，平时不接单，主调出问题时会被自动打开/);
   assert.match(context.describeToggleResult(state.channels[2], true, false), /备用，仍然关着/);
-  assert.match(context.describeToggleResult(state.channels[2], false, false), /人工停用/);
+  assert.match(context.describeToggleResult(state.channels[2], false, false), /已关闭：不接单，以后也不会被自动打开/);
   // 停用照旧一律关掉
   context.toggleRemoteAccountsSchedulable(['1', '2', '3'], false);
   assert.match(remoteWrites.at(-1), /UPDATE accounts SET schedulable = false WHERE id IN \(1,2,3\);/);
@@ -3144,4 +3144,22 @@ test('same-request gateway retries never fall back onto a standby', () => {
     ]
   };
   assert.deepEqual(gateway.selectRetryCandidates(state, { now }).map(c => c.id), ['1', '3']);
+});
+
+test('every row has an explicit close/open button and each group states when accounts are opened automatically', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const index = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
+  assert.match(app, /class="btn-strip-power/);
+  assert.doesNotMatch(app, /class="switch-control"/, 'the unstyled checkbox is gone');
+  assert.match(index, />全部关闭</);
+  assert.match(index, />全部打开</);
+  // 分组顶部的规则说明：自动切号关闭、人工管理分组、普通分组三种说法
+  const context = vm.createContext({ autoSwitchConfig: { enabled: true, exemptKeywords: ['通用'] } });
+  vm.runInContext(app.slice(app.indexOf('function isManualGroupFront('), app.indexOf('// 打开业务分组通道编排弹窗')), context);
+  assert.match(context.groupRuleLine({ id: 2, name: 'GPT 通用' }), /人工管理的：塔台不会自动打开或关闭/);
+  assert.match(context.groupRuleLine({ id: 27, name: '示例分组' }), /自动打开副调；没有能用的副调，再打开备选.*备用和手动关闭的，永远不会被自动打开/);
+  context.autoSwitchConfig.groupPolicies = { 27: { enabled: false } };
+  assert.match(context.groupRuleLine({ id: 27, name: '示例分组' }), /人工管理/);
+  context.autoSwitchConfig.enabled = false;
+  assert.match(context.groupRuleLine({ id: 27, name: '示例分组' }), /总开关关着/);
 });
