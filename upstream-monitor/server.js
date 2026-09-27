@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const { execSync, execFileSync, fork } = require('child_process');
 const gateway = require('./gateway');
 const gatewayMetrics = new gateway.GatewayMetrics();
-const { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority } = require('./routing-policy');
+const { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority, ROLE_PRIORITY, ROLE_LABELS, roleForPriority, groupRole } = require('./routing-policy');
 const { evaluateGroup, lowTrafficSuspect, resolveGroupPolicy, groupPolicyOverrides } = require('./auto-failover-policy');
 const accountSplit = require('./account-split');
 const upstreamKeys = require('./upstream-keys');
@@ -987,15 +987,15 @@ async function connectUpstreamKey({ uid, groupId, name }) {
   const template = upstreamKeys.pickTemplate(state.channels, upstreamKeys.hostKey(panel.backendUrl), platform, key.group_id, keyGroupByApiKey);
   if (!template) throw new Error(`本站还没有这家上游的 ${platform} 账号可以参照。请先在 Sub2API 后台手动加一个，之后的新 Key 就能一键接入`);
 
-  // 空分组直接当主调；已有账号时先当备用（单主独占模式下备用不接流量，由自动切号按需启用）
+  // 空分组直接当主调；已有账号时先当备用：备用就是关着，不接单，自动切号也不用它，
+  // 要用它时由运营者在分组里改成主调、副调或备选。
   const members = (state.channels || []).filter(c => groupIds(c).includes(gid));
-  const exclusive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false);
   const role = members.length === 0 ? 'main' : 'standby';
   const accountName = String(name || '').trim() || upstreamKeys.suggestAccountName(panel.name, key.name, rate);
   const notes = `[中转塔台接入] 上游 ${panel.name} 的 Key #${key.id}「${key.name || ''}」，上游分组「${(key.group && key.group.name) || '-'}」（${upstreamPlatform || '-'} ${rate}x），参照账号 #${template.id}`;
   const sql = upstreamKeys.buildConnectSql({
     templateId: template.id, groupId: gid, apiKey: key.key, name: accountName, notes, rate,
-    priority: role === 'main' ? 1 : 100, schedulable: role === 'main' || !exclusive, keepModelMapping: template.keepModelMapping
+    priority: ROLE_PRIORITY[role], schedulable: role === 'main', keepModelMapping: template.keepModelMapping
   });
   const output = execPsql(`BEGIN;\n${sql}\nCOMMIT;`, true);
   const ids = String(output || '').split(/\r?\n/).map(value => value.trim()).filter(value => /^\d+$/.test(value));
@@ -1005,7 +1005,7 @@ async function connectUpstreamKey({ uid, groupId, name }) {
   invalidateSub2APIScheduler([newId], gid);
   refreshSub2APISignatureAfterDirectMutation('接入上游新 Key');
   syncRealSub2APIAccounts();
-  const message = `已接入：在分组【${group.name}】新建账号 #${newId}「${accountName}」，进价 ${rate}x，${role === 'main' ? '这个分组原来没有账号，已设为主调' : '先当备用'}`;
+  const message = `已接入：在分组【${group.name}】新建账号 #${newId}「${accountName}」，进价 ${rate}x，${role === 'main' ? '这个分组原来没有账号，已设为主调' : '先当备用（关着，不接单；要用时在分组里改成主调、副调或备选）'}`;
   alerts.unshift({ id: 'upkey_connect_' + Date.now(), type: 'account_connect', channelId: String(newId), channelName: accountName, groupId: gid, timestamp: new Date().toISOString(), note: message });
   if (alerts.length > 200) alerts = alerts.slice(0, 200);
   writeJSON(ALERTS_FILE, alerts);
@@ -2817,20 +2817,25 @@ function setRemoteAccountRole(accountId, role) {
   const peers = state.channels.filter(c => String(c.id) !== String(id) && groupIds(c).some(gid => scope.includes(gid)));
   const priority = { main: 1, sub: 10, alt: 20, alternative: 20, fallback: 100, standby: 100 }[role];
   if (!priority) throw new Error('无效调度角色');
-  const enabled = role === 'main' || !exclusive;
+  // 只有主调接单：副调/备选/备用不管是不是“多主分流”模式，接单开关都关掉。
+  const enabled = role === 'main';
   // accounts.schedulable is global. Any role that enables an account must be
   // profitable in every group it can serve, not just its primary group.
   if (enabled) assertChannelPricingIsSafe(target);
   const safeToDisableIds = role === 'main' && exclusive
     ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid))).map(c => Number(c.id)).filter(peerId => Number.isSafeInteger(peerId) && peerId > 0)
     : [];
+  // 不带分组的角色设置作用于这个账号的所有分组：分组里显示的角色 (account_groups.priority)
+  // 跟着一起改，否则控制台还显示旧角色，和实际接不接单对不上。
   let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${id} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Account missing'; END IF; END $$;
-UPDATE accounts SET schedulable = ${enabled}, priority = ${priority} WHERE id = ${id};`;
+UPDATE accounts SET schedulable = ${enabled}, priority = ${priority} WHERE id = ${id};
+UPDATE account_groups SET priority = ${priority} WHERE account_id = ${id};`;
   if (safeToDisableIds.length) {
     // Shared peers keep their global priority and schedulable state. Without
     // verified group-scoped priority, changing either could disrupt a group
     // outside this manual role change.
-    sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisableIds.join(',')});`;
+    sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisableIds.join(',')});
+UPDATE account_groups SET priority = GREATEST(priority, 10) WHERE account_id IN (${safeToDisableIds.join(',')});`;
   }
   const remoteOk = executeRemoteSQL(sql);
   if (remoteOk !== true) throw new Error('远端调度角色写入未确认，本地状态未改变');
@@ -2880,36 +2885,72 @@ function setChannelRole(targetId, role, operator = 'Web 控制台', groupId = nu
   if (isGroupScoped) {
     const targetGroupObj = (state.allGroups || []).find(g => Number(g.id) === gid);
     const targetPriority = currentMeta.priority;
+    const accountId = Number(targetChannel.id);
+    const isMain = normalizedRole === 'main';
 
     // 🌟 单通道分组硬性保障：当分组仅有 1 条通道时，绝对不能降级为副调/备选/备用，必须始终保持为主调 (priority = 1)
     const channelsInThisGroup = state.channels.filter(c => groupIds(c).includes(gid));
-    if (channelsInThisGroup.length <= 1 && normalizedRole !== 'main') {
+    if (channelsInThisGroup.length <= 1 && !isMain) {
       return { success: false, error: '该分组仅有 1 条通道，必须保持为主调，无法降级为副调或备用' };
     }
 
-    // 若设为主调，验证该通道对本组的进货成本是否安全（杜绝倒贴赔钱）
-    if (normalizedRole === 'main' && targetGroupObj) {
-      assertChannelPricingIsSafe(targetChannel, gid);
+    // 只有主调接单：主调打开接单开关，副调/备选/备用一律关掉。Sub2API 的接单开关是整个账号共用的，
+    // 所以同时在别的分组的账号，只有在每个分组里“是不是主调”都一致时才能改，否则会在别的分组里照样接单或被误关。
+    const groupName = id => ((state.allGroups || []).find(g => Number(g.id) === Number(id)) || {}).name || `分组 ${id}`;
+    const conflicting = groupIds(targetChannel).filter(id => id !== gid && (groupRole(targetChannel, id) === 'main') !== isMain);
+    if (conflicting.length > 0) {
+      const names = conflicting.map(id => `【${groupName(id)}】`).join('、');
+      return {
+        success: false,
+        error: isMain
+          ? `[${targetChannel.name}] 同时在 ${names} 里，而且在那边不是主调。Sub2API 的接单开关整个账号共用，设成主调后它在那边也会接单。请先在「系统管理 → 拆分共享账号」把它拆开。`
+          : `[${targetChannel.name}] 同时是 ${names} 的主调。Sub2API 的接单开关整个账号共用，没法只在这个分组关掉它。请先在「系统管理 → 拆分共享账号」把它拆开。`
+      };
+    }
+    // 不能一下子让分组没有账号接单：先设好新的主调，再把原来的改掉。
+    if (!isMain && targetChannel.schedulable === true &&
+        !channelsInThisGroup.some(c => String(c.id) !== String(targetChannel.id) && c.schedulable === true)) {
+      return { success: false, error: `[${targetChannel.name}] 是本组现在唯一在接单的账号，改成${currentMeta.label}后这个分组就没有账号接单了。请先把另一个账号设成主调，再改它。` };
     }
 
-    let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${targetId} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Account missing'; END IF; END $$;
-INSERT INTO account_groups (account_id, group_id, priority) VALUES (${targetId}, ${gid}, ${targetPriority})
+    // 若设为主调，验证该通道的进货成本是否安全（杜绝倒贴赔钱）；共享账号要在它所有分组里都不倒贴
+    if (isMain) {
+      if (targetGroupObj) assertChannelPricingIsSafe(targetChannel, gid);
+      if (groupIds(targetChannel).some(id => id !== gid)) assertChannelPricingIsSafe(targetChannel);
+    }
+
+    let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${accountId} AND deleted_at IS NULL) THEN RAISE EXCEPTION 'Account missing'; END IF; END $$;`;
+    if (!isMain) {
+      // 与上面的本地检查相同，在同一事务里按数据库的最新状态再核一次
+      sql += `\nDO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM accounts WHERE id = ${accountId} AND schedulable = true)
+     AND NOT EXISTS (
+       SELECT 1 FROM accounts a JOIN account_groups ag ON ag.account_id = a.id
+       WHERE ag.group_id = ${gid} AND a.id <> ${accountId} AND a.deleted_at IS NULL AND a.schedulable = true
+     ) THEN
+    RAISE EXCEPTION 'relay-tower: last serving account';
+  END IF;
+END $$;`;
+    }
+    sql += `
+INSERT INTO account_groups (account_id, group_id, priority) VALUES (${accountId}, ${gid}, ${targetPriority})
 ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
-
-    if (normalizedRole === 'main') {
-      sql += `\nUPDATE accounts SET schedulable = true WHERE id = ${targetId};`;
-    }
-    // 保持 accounts.priority 同步为该通道在各有效业务分组中的最高优先级（最小值）
-    sql += `\nUPDATE accounts SET priority = (SELECT COALESCE(MIN(priority), ${targetPriority}) FROM account_groups WHERE account_id = ${targetId}) WHERE id = ${targetId};`;
+    // 接单开关跟着角色走；accounts.priority 同步为该通道在各有效业务分组中的最高优先级（最小值）
+    sql += `\nUPDATE accounts SET schedulable = ${isMain}, priority = (SELECT COALESCE(MIN(priority), ${targetPriority}) FROM account_groups WHERE account_id = ${accountId}) WHERE id = ${accountId};`;
     // 单通道分组始终强制为优先级 1 主调
     sql += `\nUPDATE account_groups SET priority = 1 WHERE group_id IN (SELECT group_id FROM account_groups GROUP BY group_id HAVING COUNT(*) = 1) AND priority <> 1;`;
 
     const remoteOk = executeRemoteSQL(sql);
     if (remoteOk !== true) throw new Error('远端分组调度角色写入未确认，本地状态未改变');
-    invalidateSub2APIScheduler([Number(targetId)], gid);
+    invalidateSub2APIScheduler([accountId], gid);
     refreshSub2APISignatureAfterDirectMutation('手动业务组调度角色更新');
 
     targetChannel.autoSwitchDisabled = false;
+    if (!isMain) {
+      targetChannel.schedulable = false;
+      targetChannel.isActive = false;
+      targetChannel.manualLocked = false;
+    }
     if (!Array.isArray(targetChannel.groupsDetail)) targetChannel.groupsDetail = [];
     let gd = targetChannel.groupsDetail.find(g => Number(g.id) === gid);
     if (gd) {
@@ -3012,6 +3053,7 @@ ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
         c.isActive = true;
         c.schedulable = true;
         c.manualLocked = true;
+        (c.groupsDetail || []).forEach(g => { g.priority = 1; });
       } else {
         // Only peers wholly inside the target scope were changed remotely.
         // Keep shared peers locally untouched as well, avoiding a remote/JSON
@@ -3021,6 +3063,7 @@ ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
           c.isActive = false;
           c.manualLocked = false;
           c.schedulable = false; // 单主独占下的同范围副调
+          (c.groupsDetail || []).forEach(g => { g.priority = Math.max(10, Number(g.priority) || 10); });
         } else if (String(c.id) === String(previousActiveId)) {
           c.isActive = false;
           c.manualLocked = false;
@@ -3041,7 +3084,8 @@ ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
         c.priority = 10;
         c.isActive = false;
         c.manualLocked = false;
-        c.schedulable = !isSingleActive;
+        c.schedulable = false; // 只有主调接单
+        (c.groupsDetail || []).forEach(g => { g.priority = 10; });
       }
     });
     if (String(state.activeChannelId) === String(targetId)) {
@@ -3058,7 +3102,8 @@ ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
         c.priority = 20;
         c.isActive = false;
         c.manualLocked = false;
-        c.schedulable = !isSingleActive;
+        c.schedulable = false; // 只有主调接单
+        (c.groupsDetail || []).forEach(g => { g.priority = 20; });
       }
     });
     if (String(state.activeChannelId) === String(targetId)) {
@@ -3073,7 +3118,8 @@ ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
         c.priority = 100;
         c.isActive = false;
         c.manualLocked = false;
-        c.schedulable = !isSingleActive;
+        c.schedulable = false; // 只有主调接单
+        (c.groupsDetail || []).forEach(g => { g.priority = 100; });
       }
     });
     if (String(state.activeChannelId) === String(targetId)) {
@@ -3130,6 +3176,102 @@ ON CONFLICT (account_id, group_id) DO UPDATE SET priority = ${targetPriority};`;
     activeChannelId: state.activeChannelId,
     remoteSynced: remoteOk
   };
+}
+
+function describeRoleChangeFailure(err) {
+  const text = `${(err && err.stderr) || ''}\n${(err && err.message) || ''}`;
+  if (/relay-tower: last serving account/.test(text)) return '它是本组现在唯一在接单的账号，改了之后这个分组就没有账号接单了。请先把另一个账号设成主调，再改它。';
+  if (/Account missing/.test(text)) return '这个账号已经不存在了，请刷新页面。';
+  if (/Unsafe scheduled account pricing/.test(text)) return '进价高于分组售价，设成主调会倒贴，这次没有改。';
+  const message = String((err && err.message) || '');
+  if (/[\u4e00-\u9fff]/.test(message.split('\n')[0]) && !/^Command failed/.test(message)) return message.split('\n')[0];
+  const detail = text.split('\n').map(line => line.trim()).find(line => /^(ERROR|FATAL):/.test(line)) || message.split('\n')[0] || '未知错误';
+  return `角色没有改成：${detail.slice(0, 200)}。请刷新页面后再试。`;
+}
+
+/**
+ * 找出“角色和接单开关对不上”的账号：在某个分组里标着副调/备选/备用，接单开关却开着。
+ * 只有主调接单，所以这些账号应该关掉。能直接关的（只在这一个分组、分组里还有主调在接单）标 fixable；
+ * 共享账号（接单开关整个账号共用）和“分组里没有主调在接单”的，只提示，不自动关，免得误关别的分组或让分组断流。
+ */
+function planRoleMismatchRepair() {
+  const groups = Array.isArray(state.allGroups) ? state.allGroups : [];
+  const items = [];
+  for (const group of groups) {
+    const gid = Number(group.id);
+    if (!Number.isSafeInteger(gid) || gid <= 0) continue;
+    const serving = (state.channels || []).filter(c => c.schedulable === true && groupIds(c).includes(gid));
+    const servingMains = serving.filter(c => groupRole(c, gid) === 'main');
+    for (const channel of serving) {
+      const role = groupRole(channel, gid);
+      if (role === 'main') continue;
+      const shared = groupIds(channel).some(id => id !== gid);
+      const blockedReason = shared
+        ? '这个账号同时在别的分组，接单开关整个账号共用，请先在「系统管理 → 拆分共享账号」拆开'
+        : servingMains.length === 0 ? '本组现在没有主调在接单，关掉它这个分组就断了。请先把一个账号设成主调' : null;
+      items.push({
+        accountId: String(channel.id), accountName: channel.name, groupId: gid, groupName: group.name,
+        role, roleLabel: ROLE_LABELS[role], fixable: !blockedReason, blockedReason,
+        servingMains: servingMains.map(c => c.name)
+      });
+    }
+  }
+  return { items, fixableCount: items.filter(item => item.fixable).length };
+}
+
+// 把确认过的“标着副调/备选/备用却开着接单”的账号关掉。在同一事务里按数据库最新状态再核一遍：
+// 账号仍只在这个分组、仍不是主调，并且分组里还有别的主调在接单，否则整批不改。
+function applyRoleMismatchRepair(requestedIds, operator = 'Web 控制台') {
+  if (!Array.isArray(requestedIds) || requestedIds.length === 0) throw new Error('请至少选择一个账号');
+  const wanted = new Set(requestedIds.map(id => Number(id)).filter(id => Number.isSafeInteger(id) && id > 0));
+  const selected = planRoleMismatchRepair().items.filter(item => item.fixable && wanted.has(Number(item.accountId)));
+  if (selected.length === 0) return { switchedOff: [], message: '这些账号现在已经没有问题了，没有需要关掉的' };
+  const ids = [...new Set(selected.map(item => Number(item.accountId)))];
+  const guards = selected.map(item => {
+    const id = Number(item.accountId), gid = Number(item.groupId);
+    return `DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM account_groups WHERE account_id = ${id} AND group_id = ${gid} AND priority > 1)
+     OR EXISTS (SELECT 1 FROM account_groups ag JOIN groups g ON g.id = ag.group_id AND g.deleted_at IS NULL WHERE ag.account_id = ${id} AND ag.group_id <> ${gid}) THEN
+    RAISE EXCEPTION 'relay-tower: role changed';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM accounts a JOIN account_groups ag ON ag.account_id = a.id
+    WHERE ag.group_id = ${gid} AND ag.priority <= 1 AND a.schedulable = true AND a.deleted_at IS NULL AND a.id NOT IN (${ids.join(',')})
+  ) THEN
+    RAISE EXCEPTION 'relay-tower: last serving account';
+  END IF;
+END $$;`;
+  });
+  const sql = `${guards.join('\n')}
+UPDATE accounts SET schedulable = false,
+  priority = COALESCE((SELECT MIN(ag.priority) FROM account_groups ag WHERE ag.account_id = accounts.id), priority)
+WHERE id IN (${ids.join(',')}) AND deleted_at IS NULL;`;
+  if (executeRemoteSQL(sql) !== true) throw new Error('远端写入未确认，本地状态未改变');
+  invalidateSub2APIScheduler(ids);
+  refreshSub2APISignatureAfterDirectMutation('关掉不是主调却在接单的账号');
+  for (const item of selected) {
+    const channel = state.channels.find(c => String(c.id) === item.accountId);
+    if (!channel) continue;
+    channel.schedulable = false;
+    channel.isActive = false;
+    channel.manualLocked = false;
+    const priority = channelGroupPriority(channel, item.groupId);
+    if (Number.isFinite(priority) && priority < Number.MAX_SAFE_INTEGER) channel.priority = priority;
+  }
+  writeJSON(CHANNELS_FILE, state);
+  const note = `已按角色关掉 ${selected.length} 个不是主调却还在接单的账号：${selected.map(item => `【${item.groupName}】${item.accountName}（${item.roleLabel}）`).join('、')} (操作人: ${operator})`;
+  alerts.unshift({ id: 'role_fix_' + Date.now(), type: 'role_change', timestamp: new Date().toISOString(), note });
+  if (alerts.length > 200) alerts = alerts.slice(0, 200);
+  writeJSON(ALERTS_FILE, alerts);
+  broadcastSSE('CHANNELS_UPDATED', state);
+  return { switchedOff: selected.map(item => ({ accountId: item.accountId, accountName: item.accountName, groupName: item.groupName, roleLabel: item.roleLabel })), message: note };
+}
+
+function describeRoleRepairFailure(err) {
+  const text = `${(err && err.stderr) || ''}\n${(err && err.message) || ''}`;
+  if (/relay-tower: role changed/.test(text)) return '有账号的角色或分组刚刚变了，这次一个都没关。请刷新页面后再试。';
+  if (/relay-tower: last serving account/.test(text)) return '关掉后有分组会没有主调接单，这次一个都没关。请刷新页面，先确认每个分组都有主调在接单。';
+  return describeRoleChangeFailure(err);
 }
 
 // 通用激活/切换主用渠道逻辑 (可供 Web 控制台、自动切线引擎及 Telegram 机器人调用)
@@ -3198,8 +3340,9 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
       ch.isActive = false;
       const isShared = groupIds(ch).some(gid => String(gid) !== String(group.id));
       if (!isShared) ch.schedulable = false;
+      ch.groupsDetail = (ch.groupsDetail || []).map(g => String(g.id) === String(group.id) ? { ...g, priority: 100 } : g);
       assignedRoles[ch.id] = { role: 'fallback', priority: 100, name: ch.name, group: group.name, cost: ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier, isLoss: true };
-      updates.push({ accountId: ch.id, priority: 100, schedulable: isShared ? (ch.schedulable ?? true) : false });
+      updates.push({ accountId: ch.id, groupId: group.id, priority: 100, schedulable: isShared ? (ch.schedulable ?? true) : false });
     });
 
     // 核心法则：按照价格来是第一要素！严格按进货成本由低到高排序
@@ -3208,8 +3351,6 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
       const costB = b.costMultiplier !== undefined ? b.costMultiplier : b.multiplier;
       return costA - costB;
     });
-
-    const isSingleActive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false);
 
     profitable.forEach((ch, index) => {
       let role = 'sub';
@@ -3228,31 +3369,34 @@ function autoQualifyChannelsByCost(targetGroupId = null, operator = 'Web 控制�
         role = 'sub';
         priority = 10;
         ch.isActive = false;
-        schedulable = isShared || !isSingleActive; // 跨组共享渠道保留调度状态，独立组渠道冷备停调
+        schedulable = isShared ? (ch.schedulable ?? true) : false; // 只有主调接单；跨组共享渠道保留调度状态
       } else if (index === 2) {
         // 第三顺位为备选 (第2顺位冷备)！
         role = 'alt';
         priority = 20;
         ch.isActive = false;
-        schedulable = isShared || !isSingleActive;
+        schedulable = isShared ? (ch.schedulable ?? true) : false;
       } else {
         // 其余合规通道全部归入备用待命池 (按价格升序兜底)！
         role = 'standby';
         priority = 100;
         ch.isActive = false;
-        schedulable = isShared || !isSingleActive;
+        schedulable = isShared ? (ch.schedulable ?? true) : false;
       }
 
       ch.priority = priority;
       ch.schedulable = schedulable;
+      // plannedChannels 是浅拷贝：换一个新数组，数据库写失败时不会改到真实状态
+      ch.groupsDetail = (ch.groupsDetail || []).map(g => String(g.id) === String(group.id) ? { ...g, priority } : g);
       assignedRoles[ch.id] = { role, priority, name: ch.name, group: group.name, cost: ch.costMultiplier !== undefined ? ch.costMultiplier : ch.multiplier };
-      updates.push({ accountId: ch.id, priority, schedulable });
+      updates.push({ accountId: ch.id, groupId: group.id, priority, schedulable });
     });
   });
 
   if (updates.length > 0) {
-    const sqlStatements = updates.map(u => `UPDATE accounts SET schedulable = ${u.schedulable ? 'true' : 'false'}, priority = ${u.priority} WHERE id = ${u.accountId};`).join('\n');
-    if (!updates.every(u => Number.isSafeInteger(Number(u.accountId)) && Number(u.accountId) > 0)) {
+    const sqlStatements = updates.map(u => `UPDATE accounts SET schedulable = ${u.schedulable ? 'true' : 'false'}, priority = ${u.priority} WHERE id = ${Number(u.accountId)};
+UPDATE account_groups SET priority = ${u.priority} WHERE account_id = ${Number(u.accountId)} AND group_id = ${Number(u.groupId)};`).join('\n');
+    if (!updates.every(u => Number.isSafeInteger(Number(u.accountId)) && Number(u.accountId) > 0 && Number.isSafeInteger(Number(u.groupId)) && Number(u.groupId) > 0)) {
       return { success: false, message: '存在无效账号ID，本地状态保持不变', updatedCount: 0, assignedRoles: {} };
     }
     try {
@@ -3850,6 +3994,18 @@ function prepareGroupOrchestrationPlan(groupId, input = {}) {
     : normalizePositiveSaleRate(input.saleRate, `分组 [${group.name || group.id}] 售价`);
   const proposedGroup = { ...group, sale_rate: saleRate };
   const assignedChannels = getCachedChannelsForPlan(assignedIds, operation);
+  // 只有主调接单，而 Sub2API 的接单开关整个账号共用：同时在别的分组的账号，
+  // 只能在每个分组里“是不是主调”都一致，否则它在某个分组会名不副实地接单或被误关。
+  for (const channel of assignedChannels) {
+    const others = currentCachedGroupIds(channel).filter(id => id !== group.id);
+    const isMain = Number(channel.id) === mainId;
+    const conflicting = others.filter(id => (groupRole(channel, id) === 'main') !== isMain);
+    if (conflicting.length === 0) continue;
+    const names = conflicting.map(id => `【${((state.allGroups || []).find(g => Number(g.id) === id) || {}).name || `分组 ${id}`}】`).join('、');
+    throw new Error(isMain
+      ? `账号「${channel.name || channel.id}」同时在 ${names} 里，而且在那边不是主调。接单开关整个账号共用，设成本组主调后它在那边也会接单。请先在「系统管理 → 拆分共享账号」把它拆开。`
+      : `账号「${channel.name || channel.id}」同时是 ${names} 的主调。接单开关整个账号共用，在本组当副调、备选或备用会照样接本组的单。请先在「系统管理 → 拆分共享账号」把它拆开。`);
+  }
   const assignedIdSet = new Set(assignedIds);
   const affectedChannels = (state.channels || []).filter(channel => assignedIdSet.has(Number(channel.id)) || currentCachedGroupIds(channel).includes(group.id));
   const changes = affectedChannels.map(channel => {
@@ -3859,7 +4015,9 @@ function prepareGroupOrchestrationPlan(groupId, input = {}) {
     const groups = groupIds.length > 0
       ? resolveCachedGroupPlans(groupIds, operation, { [String(group.id)]: proposedGroup })
       : [];
-    assertPlannedChannelMembershipIsSafe(channel, groups, operation, Number(channel.id) === mainId);
+    // 编排后本组只有主调接单，其余勾选的账号都会关掉接单开关，不会倒贴，不用再核它们的进价。
+    const switchedOff = selected && Number(channel.id) !== mainId;
+    if (!switchedOff) assertPlannedChannelMembershipIsSafe(channel, groups, operation, Number(channel.id) === mainId);
     return { channel, groupIds, groups, selected };
   });
   return { group, saleRate, saleRateProvided, proposedGroup, mainId, subId, altId, standbyIds, assignedIds, assignedChannels, affectedChannels, changes };
@@ -3869,9 +4027,10 @@ function executeRemoteGroupOrchestrationPlan(plan) {
   const statements = [
     remoteGroupExistenceGuardSql([plan.group.id]),
     remoteAccountExistenceGuardSql(plan.assignedIds),
+    // 编排后只有主调开着接单开关，只核主调的进价；其余勾选的账号会在同一事务里被关掉。
     plan.saleRateProvided
-      ? remoteProposedSaleRateSafetyGuardSql(plan.assignedIds, plan.saleRate, plan.mainId === null ? [] : [plan.mainId])
-      : remoteProspectiveMembershipSafetyGuardSql(plan.assignedIds, [plan.group.id], plan.mainId === null ? [] : [plan.mainId]),
+      ? remoteProposedSaleRateSafetyGuardSql(plan.mainId === null ? [] : [plan.mainId], plan.saleRate, plan.mainId === null ? [] : [plan.mainId])
+      : remoteProspectiveMembershipSafetyGuardSql(plan.mainId === null ? [] : [plan.mainId], [plan.group.id], plan.mainId === null ? [] : [plan.mainId]),
     remoteGroupRemovalLeavesScheduledUngroupedGuardSql(plan.group.id, plan.assignedIds),
     remoteRemainingMembershipSafetyAfterGroupRemovalGuardSql(plan.group.id),
     plan.saleRateProvided
@@ -3889,7 +4048,8 @@ function executeRemoteGroupOrchestrationPlan(plan) {
     const channel = plan.assignedChannels.find(c => Number(c.id) === id);
     const isShared = channel && currentCachedGroupIds(channel).some(gid => gid !== plan.group.id);
     const priority = id === plan.mainId ? 1 : id === plan.subId ? 10 : id === plan.altId ? 20 : 100;
-    const keepSchedulable = id === plan.mainId || (isShared && channel.schedulable === true);
+    // 只有主调接单；副调/备选/备用一律关掉接单开关（共享账号已在编排前核对过角色一致）
+    const keepSchedulable = id === plan.mainId;
     if (isShared) {
       statements.push(`UPDATE accounts SET schedulable = ${keepSchedulable}, priority = LEAST(priority, ${priority}) WHERE id = ${id};`);
     } else {
@@ -3904,7 +4064,7 @@ function executeRemoteGroupOrchestrationPlan(plan) {
   for (const channel of plan.assignedChannels) {
     const id = Number(channel.id);
     const isShared = currentCachedGroupIds(channel).some(gid => gid !== plan.group.id);
-    const keepSchedulable = id === plan.mainId || (isShared && channel.schedulable === true);
+    const keepSchedulable = id === plan.mainId;
     const rolePriority = id === plan.mainId ? 1 : id === plan.subId ? 10 : id === plan.altId ? 20 : 100;
     channel.manualLocked = id === plan.mainId;
     channel.schedulable = keepSchedulable;
@@ -3930,9 +4090,35 @@ function executeRemoteGroupOrchestrationPlan(plan) {
   };
 }
 
+// 只有主调接单：账号在任一分组里是主调，才算“该开着接单开关”。
+function servesAsMain(channel) {
+  return groupIds(channel).some(gid => groupRole(channel, gid) === 'main');
+}
+
+// 账号在它所有分组里最靠前的角色（主调 > 副调 > 备选 > 备用）；不在任何分组时返回 null。
+function bestGroupRole(channel) {
+  const order = ['main', 'sub', 'alt', 'standby'];
+  const roles = groupIds(channel).map(gid => groupRole(channel, gid));
+  return roles.length ? order.find(role => roles.includes(role)) : null;
+}
+
+function describeToggleResult(channel, restored, serving) {
+  const name = `[${channel.name}]`;
+  if (!restored) return `${name} 已人工停用：不接单，自动切号也不会启用它`;
+  if (serving) return `${name} 已恢复：它是主调，已开始接单`;
+  const role = bestGroupRole(channel);
+  if (role === 'sub' || role === 'alt') {
+    return `${name} 已恢复参与自动切号：它是${ROLE_LABELS[role]}，平时不接单，主调出问题时按顺序顶上`;
+  }
+  if (role === 'standby') return `${name} 已解除人工停用：它是备用，仍然关着不接单；要用它请在分组里改成主调、副调或备选`;
+  return `${name} 已解除人工停用：它不在任何分组里，不会接单`;
+}
+
 // The remote update is one all-or-nothing transaction. Local callers mutate
 // their cached channels only after this returns, so a failed batch cannot
 // leave memory/JSON claiming a change that did not reach Sub2API.
+// 恢复（schedulable=true）只是解除“人工停用”、重新参与自动切号：只有主调会打开接单开关，
+// 副调/备选继续关着等自动切号按顺序启用，备用继续关着。返回的 enabledIds 是真正打开接单的账号。
 function toggleRemoteAccountsSchedulable(accountIds, schedulable) {
   if (typeof schedulable !== 'boolean') throw new Error('schedulable 必须为布尔值');
   const rawIds = Array.isArray(accountIds) ? accountIds : [accountIds];
@@ -3942,22 +4128,31 @@ function toggleRemoteAccountsSchedulable(accountIds, schedulable) {
   const ids = [...new Set(parsedIds)];
   const targets = ids.map(id => state.channels.find(channel => String(channel.id) === String(id)));
   if (targets.some(channel => !channel)) throw new Error('目标通道不存在');
-  // accounts.schedulable is global, so every requested account must be safe
-  // for every attached business group before an enable operation can proceed.
-  if (schedulable) targets.forEach(target => assertChannelPricingIsSafe(target));
+  const enabledTargets = schedulable ? targets.filter(servesAsMain) : [];
+  const enabledIds = enabledTargets.map(target => Number(target.id));
+  // accounts.schedulable is global, so every account that is switched on must
+  // be safe for every attached business group before the operation can proceed.
+  enabledTargets.forEach(target => assertChannelPricingIsSafe(target));
 
-  const remoteOk = executeRemoteSQL(`UPDATE accounts SET schedulable = ${schedulable ? 'true' : 'false'} WHERE id IN (${ids.join(',')});`);
-  if (remoteOk !== true) throw new Error('远端调度写入未确认，本地状态未改变');
-  invalidateSub2APIScheduler(ids);
-  refreshSub2APISignatureAfterDirectMutation('手动调度开关更新');
+  const sql = schedulable
+    ? (enabledIds.length ? `UPDATE accounts SET schedulable = true WHERE id IN (${enabledIds.join(',')});` : '')
+    : `UPDATE accounts SET schedulable = false WHERE id IN (${ids.join(',')});`;
+  if (sql) {
+    const remoteOk = executeRemoteSQL(sql);
+    if (remoteOk !== true) throw new Error('远端调度写入未确认，本地状态未改变');
+    invalidateSub2APIScheduler(schedulable ? enabledIds : ids);
+    refreshSub2APISignatureAfterDirectMutation('手动调度开关更新');
+  }
+  targets.enabledIds = enabledIds;
   return targets;
 }
 
 // 开启/关闭单个渠道调度。由于 accounts.schedulable 是全局字段，开启前
 // 必须确认所有关联业务分组均不倒贴，不能再只看一个 primary group。
+// 返回这个账号现在是否开着接单开关。
 function toggleRemoteAccountSchedulable(accountId, schedulable) {
-  toggleRemoteAccountsSchedulable([accountId], schedulable);
-  return true;
+  const targets = toggleRemoteAccountsSchedulable([accountId], schedulable);
+  return schedulable ? targets.enabledIds.length > 0 : false;
 }
 
 // 直接修改上游进货倍率 (免登后台)
@@ -5654,33 +5849,53 @@ function executeAutoSwitch(fromChannel, toChannel, reason, meta = {}) {
     throw new Error('安全拦截：共享来源通道不能通过组级自动切换改写全局调度状态，请先配置经验证的组级调度能力');
   }
   const exclusive = Boolean(!autoSwitchConfig || autoSwitchConfig.singleActiveExclusive !== false) && !scope.some(gid => isExemptGroup(gid));
+  // 角色写在哪些分组上：组级切号只动本组；不带分组的老调用动目标账号的全部非例外分组。
+  const roleGroupIds = hasTargetGroup ? [targetGroupId] : scope;
+  // 备用就是关掉：自动切号（包括人工批准的切线请示）都不会启用备用账号。
+  if (roleGroupIds.length > 0 && roleGroupIds.every(gid => groupRole(toChannel, gid) === 'standby')) {
+    throw new Error('目标账号是备用（已关闭），自动切号不会启用它；要用它请先在分组里改成主调、副调或备选');
+  }
+  // 换下去的原主调接过换上来那个账号原来的角色（副调或备选），并关掉接单开关：
+  // 只有主调接单，控制台上显示的角色和实际接不接单一致，原主调恢复后也能按角色被切回来。
+  const targetOldRole = roleGroupIds.length > 0 ? groupRole(toChannel, roleGroupIds[0]) : roleForPriority(toChannel.priority);
+  const handoverPriority = targetOldRole === 'alt' ? ROLE_PRIORITY.alt : ROLE_PRIORITY.sub;
+  const sourceId = Number(fromChannel.id);
+  const demoteSource = Number.isSafeInteger(sourceId) && sourceId > 0 && String(sourceId) !== targetId &&
+    !groupIds(fromChannel).some(gid => !scope.includes(gid)) &&
+    !(typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(fromChannel));
   const peers = state.channels.filter(c => String(c.id) !== targetId && groupIds(c).some(gid => scope.includes(gid)));
   const safeToDisableIds = exclusive
-    ? peers.filter(c => !groupIds(c).some(gid => !scope.includes(gid)) &&
+    ? peers.filter(c => !(demoteSource && Number(c.id) === sourceId) && !groupIds(c).some(gid => !scope.includes(gid)) &&
         !(typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(c))).map(c => Number(c.id)).filter(peerId => Number.isSafeInteger(peerId) && peerId > 0)
     : [];
   const safeToDisableIdSet = new Set(safeToDisableIds);
-  // 非独占模式（允许多主调分流）下不停用同组其他账号，但出故障的来源账号必须让位：
-  // 否则它仍是优先级 1 且可调度，Sub2API 会继续把流量分给它，切号形同虚设。
-  // 欠费/人工停用的来源直接停调；其余故障降为备用优先级，仍可作为 Sub2API 的兜底。
-  const sourceId = Number(fromChannel.id);
-  const demoteSource = !exclusive && Number.isSafeInteger(sourceId) && sourceId > 0 && String(sourceId) !== targetId &&
-    !groupIds(fromChannel).some(gid => !scope.includes(gid)) &&
-    !(typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(fromChannel));
-  const parkSource = demoteSource && ['balance_empty', 'disabled'].includes(meta.triggerType);
+  const roleGroupSql = roleGroupIds.length > 0 ? ` AND group_id IN (${roleGroupIds.map(Number).join(',')})` : ' AND false';
   let sql = `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = ${id} AND deleted_at IS NULL AND status = 'active') THEN RAISE EXCEPTION 'Target unavailable'; END IF; END $$;
-UPDATE accounts SET schedulable = true, priority = 1 WHERE id = ${id};`;
-  if (safeToDisableIds.length) sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisableIds.join(',')});`;
-  if (demoteSource) sql += `UPDATE accounts SET priority = GREATEST(priority, 10)${parkSource ? ', schedulable = false' : ''} WHERE id = ${sourceId};`;
+UPDATE accounts SET schedulable = true, priority = 1 WHERE id = ${id};
+UPDATE account_groups SET priority = 1 WHERE account_id = ${id}${roleGroupSql};`;
+  if (safeToDisableIds.length) {
+    sql += `UPDATE accounts SET schedulable = false, priority = GREATEST(priority, 10) WHERE id IN (${safeToDisableIds.join(',')});
+UPDATE account_groups SET priority = GREATEST(priority, 10) WHERE account_id IN (${safeToDisableIds.join(',')})${roleGroupSql};`;
+  }
+  if (demoteSource) {
+    sql += `UPDATE accounts SET schedulable = false, priority = ${handoverPriority} WHERE id = ${sourceId};
+UPDATE account_groups SET priority = ${handoverPriority} WHERE account_id = ${sourceId}${roleGroupSql};`;
+  }
   // account priority is global. Do not downgrade shared peers while handling
   // one group, because that would silently reshape another group's routing.
   // Automatic routing never changes business sale prices.
   const remoteOk = executeRemoteSQL(sql);
   if (remoteOk !== true) throw new Error('远端自动切线写入未确认，本地状态未改变');
+  const setLocalGroupPriority = (channel, value) => {
+    for (const detail of (channel.groupsDetail || [])) {
+      if (roleGroupIds.includes(Number(detail.id))) detail.priority = typeof value === 'function' ? value(detail.priority) : value;
+    }
+  };
   toChannel.priority = 1;
   toChannel.isActive = true;
   toChannel.schedulable = true;
   toChannel.manualLocked = Boolean(meta.manualConfirmed);
+  setLocalGroupPriority(toChannel, 1);
   if (String(state.manualLockedChannelId) === oldId) state.manualLockedChannelId = meta.manualConfirmed ? targetId : null;
   for (const peer of peers) {
     if (!safeToDisableIdSet.has(Number(peer.id))) continue;
@@ -5688,13 +5903,15 @@ UPDATE accounts SET schedulable = true, priority = 1 WHERE id = ${id};`;
     peer.priority = Math.max(10, Number(peer.priority) || 10);
     peer.isActive = false;
     peer.manualLocked = false;
+    setLocalGroupPriority(peer, previous => Math.max(10, Number(previous) || 10));
   }
   if (demoteSource) {
     const source = state.channels.find(c => String(c.id) === String(sourceId)) || fromChannel;
-    source.priority = Math.max(10, Number(source.priority) || 10);
+    source.priority = handoverPriority;
     source.isActive = false;
     source.manualLocked = false;
-    if (parkSource) source.schedulable = false;
+    source.schedulable = false;
+    setLocalGroupPriority(source, handoverPriority);
   }
   if (String(state.activeChannelId) === oldId || !state.activeChannelId) state.activeChannelId = targetId;
   // 一次性推进路由版本并登记本次切线，供三个触发路径共用去重。
@@ -5726,7 +5943,9 @@ UPDATE accounts SET schedulable = true, priority = 1 WHERE id = ${id};`;
     groupId: meta.groupId || null,
     oldSaleRate: meta.oldSaleRate || null,
     newSaleRate: meta.newSaleRate || null,
-    newMarginPercent: meta.newMarginPercent || null
+    newMarginPercent: meta.newMarginPercent || null,
+    // 换下去的账号现在的角色（关掉接单，等恢复后可被切回）
+    fromNewRole: demoteSource ? ROLE_LABELS[roleForPriority(handoverPriority)] : null
   };
 
   autoSwitchLogs.unshift(logEntry);
@@ -6021,7 +6240,7 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
           const degradedNote = keptDegraded.length
             ? ` 当前账号 [${keptDegraded.map(c => c.name).join('、')}] 仍在服务（${reasonNames[decision.reason] || decision.reason}），未关停以免整组断流。`
             : '';
-          const note = group.name + ' 暂无可用且不亏损的备用账号，请检查余额并充值；系统会继续探测并自动恢复。' + degradedNote + sharedProtection;
+          const note = group.name + ' 没有能顶上的副调或备选（备用是关掉的，不会被换上），请检查余额并充值，或在分组里设一个副调；系统会继续探测并自动恢复。' + degradedNote + sharedProtection;
           alerts.unshift({ id: 'pool_' + key + '_' + now, type: 'pool_exhausted', groupId: group.id, timestamp: new Date(now).toISOString(), note });
           writeJSON(ALERTS_FILE, alerts);
           broadcastSSE('POOL_EXHAUSTED', { groupId: group.id, note });
@@ -6062,9 +6281,12 @@ function buildGroupEvaluationInput(group, channels, productionMetrics = {}) {
     const mayRemainCurrent = String(channel.id) === groupCurrentId;
     const exempt = typeof isExemptChannel === 'function' && isExemptChannel(channel);
     const shared = !isExclusiveToGroup(channel) && !mayRemainCurrent;
+    // 备用就是关掉：不参与自动切号（它若正开着接单、成了当前账号，仍按当前账号评估健康）
+    const standby = !mayRemainCurrent && groupRole(channel, group.id) === 'standby';
     const loss = !groupCostIsSafe(channel, group);
-    if (!exempt && !shared && !loss) return channel;
-    excluded[String(channel.id)] = channel.autoSwitchDisabled === true ? '人工停用' : exempt ? '例外渠道' : shared ? '共享账号（可一键拆分）' : '进价高于本组售价或倍率未知';
+    if (!exempt && !shared && !standby && !loss) return channel;
+    excluded[String(channel.id)] = channel.autoSwitchDisabled === true ? '人工停用' : exempt ? '例外渠道' : shared ? '共享账号（可一键拆分）' :
+      standby ? '备用（已关闭，自动切号不用它）' : '进价高于本组售价或倍率未知';
     return { ...channel, schedulable: false, autoSwitchDisabled: true };
   });
   const metrics = Object.fromEntries(channels.map(c => {
@@ -6107,8 +6329,7 @@ function previewAutoSwitch(now = Date.now()) {
     row.reason = row.skipped || AUTO_SWITCH_REASON_NAMES[decision.reason] || decision.reason;
     row.current = decision.currentId != null ? { id: String(decision.currentId), name: byId(decision.currentId)?.name } : (groupCurrent ? { id: String(groupCurrent.id), name: groupCurrent.name } : null);
     row.target = decision.targetId != null ? { id: String(decision.targetId), name: byId(decision.targetId)?.name } : null;
-    // Sub2API 按账号全局优先级调度：与当前账号优先级相同的可调度账号会一起分到流量。
-    const currentPriority = row.current ? Number(byId(row.current.id)?.priority) : NaN;
+    // Sub2API 给 OpenAI 类账号派单时优先级只是打分的一项：开着接单开关的账号都会分到流量。
     for (const channel of channels) {
       const id = String(channel.id);
       const observation = decision.runtime.accounts?.[id] || {};
@@ -6121,7 +6342,8 @@ function previewAutoSwitch(now = Date.now()) {
       if (channel.lastGenerationProbeStatus && channel.lastGenerationProbeStatus !== 'ok') notes.push(`生成探测: ${channel.lastGenerationProbeStatus}${channel.lastGenerationProbeError ? '（' + String(channel.lastGenerationProbeError).slice(0, 80) + '）' : ''}`);
       row.accounts.push({ id, name: channel.name, cost: channel.costMultiplier ?? channel.multiplier, priority: channel.priority,
         schedulable: channel.schedulable === true, isCurrent: row.current?.id === id, isTarget: row.target?.id === id,
-        isCoCurrent: row.current?.id !== id && channel.schedulable === true && Number.isFinite(currentPriority) && Number(channel.priority) === currentPriority,
+        isCoCurrent: row.current?.id !== id && channel.schedulable === true,
+        role: groupRole(channel, group.id),
         balance: channel.balance, balanceStatus: channel.balanceStatus, probe: channel.lastProbeStatus || null, probeMode: channel.probeMode || null,
         debt: observation.debt === true, candidate: !excluded[id] && !fault && !observation.needsRecovery && channel.lastProbeStatus === 'online',
         notes });
@@ -7986,7 +8208,12 @@ async function handleRequest(req, res) {
       else if (p >= 100) role = 'fallback';
       else role = 'sub';
     }
-    const result = setChannelRole(targetId, role, 'Web 控制台', body.groupId);
+    let result;
+    try {
+      result = setChannelRole(targetId, role, 'Web 控制台', body.groupId);
+    } catch (err) {
+      result = { success: false, error: describeRoleChangeFailure(err) };
+    }
     if (!result.success) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: result.error }));
@@ -7995,6 +8222,27 @@ async function handleRequest(req, res) {
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
+    return;
+  }
+
+  // 角色检查：列出标着副调/备选/备用却还开着接单开关的账号
+  if (pathname === '/api/role-check' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, ...planRoleMismatchRepair() }));
+    return;
+  }
+
+  // 按角色关掉上面确认过的账号（只有主调接单）
+  if (pathname === '/api/role-check/fix' && req.method === 'POST') {
+    const body = await getBody();
+    try {
+      const result = applyRoleMismatchRepair(body.accountIds, 'Web 控制台');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, ...result }));
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: describeRoleRepairFailure(err) }));
+    }
     return;
   }
 
@@ -8028,16 +8276,17 @@ async function handleRequest(req, res) {
     }
 
     const newSchedulable = body.schedulable !== undefined ? Boolean(body.schedulable) : Boolean(targetChannel.autoSwitchDisabled);
-    let remoteOk = false;
+    let nowServing = false;
     try {
-      remoteOk = toggleRemoteAccountSchedulable(targetId, newSchedulable);
+      nowServing = toggleRemoteAccountSchedulable(targetId, newSchedulable);
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
       return;
     }
 
-    targetChannel.schedulable = newSchedulable;
+    // 解除停用时只有主调会被打开；没写库的账号保持原来的开关状态，和数据库一致
+    targetChannel.schedulable = newSchedulable ? (nowServing || targetChannel.schedulable === true) : false;
     targetChannel.autoSwitchDisabled = !newSchedulable;
     writeJSON(CHANNELS_FILE, state);
     evaluateAutoSwitch('候选号池调整');
@@ -8048,9 +8297,9 @@ async function handleRequest(req, res) {
     res.end(JSON.stringify({
       success: true,
       channel: targetChannel,
-      schedulable: newSchedulable,
-      remoteSynced: remoteOk,
-      message: `[${targetChannel.name}] 已${newSchedulable ? '开启' : '暂停'}调度`
+      schedulable: nowServing,
+      remoteSynced: true,
+      message: describeToggleResult(targetChannel, newSchedulable, nowServing)
     }));
     return;
   }
@@ -8145,8 +8394,9 @@ async function handleRequest(req, res) {
       res.end(JSON.stringify({ error: err.message }));
       return;
     }
+    const enabledIdSet = new Set(changedChannels.enabledIds || []);
     changedChannels.forEach(channel => {
-      channel.schedulable = schedulable;
+      channel.schedulable = schedulable ? (enabledIdSet.has(Number(channel.id)) || channel.schedulable === true) : false;
       channel.autoSwitchDisabled = !schedulable;
     });
     writeJSON(CHANNELS_FILE, state);
@@ -8154,7 +8404,7 @@ async function handleRequest(req, res) {
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     evaluateAutoSwitch('批量候选号池调整');
-    res.end(JSON.stringify({ success: true, count: changedChannels.length, schedulable, remoteSynced: true }));
+    res.end(JSON.stringify({ success: true, count: changedChannels.length, schedulable, servingCount: enabledIdSet.size, remoteSynced: true }));
     return;
   }
 

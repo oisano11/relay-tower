@@ -205,7 +205,7 @@
                   <span class="kpi-sub-label">倒贴预警</span>
                   <strong id="barLossCount" class="mono safe">0 条</strong>
                 </div>
-                <div class="kpi-sub-item" id="kpiAutoSwitchItem" style="cursor: pointer;" title="点击打开自动切号设置，查看各分组有没有备用账号">
+                <div class="kpi-sub-item" id="kpiAutoSwitchItem" style="cursor: pointer;" title="点击打开自动切号设置，查看各分组有没有副调或备选">
                   <span class="kpi-sub-label">自动切号</span>
                   <strong id="kpiAutoSwitchState" class="mono">--</strong>
                 </div>
@@ -347,14 +347,17 @@
 
             <div class="batch-actions">
               <span style="font-size: 0.72rem; color: #71717a;">批量:</span>
-              <button id="btnBatchEnableAll" class="btn-batch" title="将当前筛选的账号纳入候选池，由自动策略选择使用">全部纳入自动调度</button>
-              <button id="btnBatchDisableAll" class="btn-batch" title="将当前筛选的账号标记为人工停用，不再自动启用">全部人工停用</button>
+              <button id="btnBatchEnableAll" class="btn-batch" title="解除当前筛选账号的人工停用：主调重新接单，副调、备选重新参与自动切号，备用仍然关着">全部解除停用</button>
+              <button id="btnBatchDisableAll" class="btn-batch" title="将当前筛选的账号标记为人工停用：马上不接单，自动切号也不会再启用">全部人工停用</button>
             </div>
           </div>
         </div>
 
         <!-- 正在调度异常预警横幅 -->
         <div id="activeStabilityWarningBanner" class="active-stability-warning-banner" style="display: none;"></div>
+
+        <!-- 角色与接单对不上：标着副调/备选/备用却还开着接单开关 -->
+        <div id="roleMismatchBanner" class="active-stability-warning-banner" style="display: none; background: #fffbeb; border-color: #fde68a; border-left-color: #d97706;"></div>
 
         <!-- 业务分组专属管控中枢与调配面板 (在选定具体分组时动态呈现) -->
         <div id="groupControlBanner" class="group-control-banner" style="display: none;"></div>
@@ -498,7 +501,7 @@
           </div>
 
           <div class="dialog-actions" style="margin-top: 1.25rem;">
-            <button id="modalBtnSwitchLowest" class="btn btn-success" title="只在这个账号所在的分组里换主调，不影响别的分组">
+            <button id="modalBtnSwitchLowest" class="btn btn-success" title="只在这个账号所在的分组里换主调：便宜的那个当主调接单，涨价的这个改当副调（不接单），不影响别的分组">
               切到本组更便宜的账号 (<span id="modalLowestCandidateText">0.0600x</span>)
             </button>
             <button id="modalBtnGoGroup" class="btn btn-secondary" title="打开这个账号所在的分组：可以改售价、换主调、调整本组设置">
@@ -957,7 +960,7 @@
             </div>
             <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
               <div style="font-weight: 700; color: #166534; margin-bottom: 2px;">🔁 换到哪个号</div>
-              <div style="color: #15803d; line-height: 1.35;">同组里健康、支持同样模型、进价不高于售价的备用账号，优先选最便宜的</div>
+              <div style="color: #15803d; line-height: 1.35;">先换本组的副调，没有可用的再换备选（都要健康、支持同样模型、进价不高于售价）。备用是关掉的，不会被换上</div>
             </div>
             <div style="background: #fefce8; border: 1px solid #fef08a; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
               <div style="font-weight: 700; color: #854d0e; margin-bottom: 2px;">💰 你只需要充值</div>
@@ -1956,7 +1959,7 @@
             <!-- 四层角色指派区域 -->
             <div style="display: flex; flex-direction: column; gap: 0.55rem; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 0.75rem;">
               <div style="font-size: 0.8rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 0.35rem;">
-                <span>🎯 四层调度流转角色指定（单主独占·严格逐级冷备）</span>
+                <span>🎯 本组角色：只有主调接单，副调、备选按顺序替补，备用关掉</span>
               </div>
 
               <!-- 1. 🌟 主调 -->
@@ -1968,39 +1971,39 @@
                 <select id="selectOrchestrateMain" class="form-input" style="flex: 1; font-size: 0.8rem; height: 30px; font-weight: 700; background: #ffffff;">
                   <option value="">-- 请选择主调通道 --</option>
                 </select>
-                <span style="font-size: 0.7rem; color: #15803d; white-space: nowrap;">开启调度 · 独占分流</span>
+                <span style="font-size: 0.7rem; color: #15803d; white-space: nowrap;">接单</span>
               </div>
 
               <!-- 2. 🔵 副调 -->
               <div style="display: flex; align-items: center; gap: 0.6rem; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.45rem 0.65rem;">
                 <div style="min-width: 100px; display: flex; align-items: center; gap: 0.3rem;">
                   <span style="font-size: 0.95rem;">🔵</span>
-                  <strong style="color: #1e40af; font-size: 0.78rem;">第1顺位副调:</strong>
+                  <strong style="color: #1e40af; font-size: 0.78rem;">副调:</strong>
                 </div>
                 <select id="selectOrchestrateSub" class="form-input" style="flex: 1; font-size: 0.8rem; height: 30px; font-weight: 600; background: #ffffff;">
                   <option value="">-- 请选择副调通道 (可选) --</option>
                 </select>
-                <span style="font-size: 0.7rem; color: #1d4ed8; white-space: nowrap;">冷备停调 · 首选替补</span>
+                <span style="font-size: 0.7rem; color: #1d4ed8; white-space: nowrap;">不接单 · 第一替补</span>
               </div>
 
               <!-- 3. 🟡 备选 -->
               <div style="display: flex; align-items: center; gap: 0.6rem; background: #fefce8; border: 1px solid #fde047; border-radius: 6px; padding: 0.45rem 0.65rem;">
                 <div style="min-width: 100px; display: flex; align-items: center; gap: 0.3rem;">
                   <span style="font-size: 0.95rem;">🟡</span>
-                  <strong style="color: #854d0e; font-size: 0.78rem;">第2顺位备选:</strong>
+                  <strong style="color: #854d0e; font-size: 0.78rem;">备选:</strong>
                 </div>
                 <select id="selectOrchestrateAlt" class="form-input" style="flex: 1; font-size: 0.8rem; height: 30px; font-weight: 600; background: #ffffff;">
                   <option value="">-- 请选择备选通道 (可选) --</option>
                 </select>
-                <span style="font-size: 0.7rem; color: #a16207; white-space: nowrap;">冷备停调 · 次席替补</span>
+                <span style="font-size: 0.7rem; color: #a16207; white-space: nowrap;">不接单 · 第二替补</span>
               </div>
 
               <!-- 4. ⚪ 其余全部为备用通道提示 -->
               <div style="display: flex; align-items: flex-start; gap: 0.5rem; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 0.45rem 0.65rem; font-size: 0.73rem; color: #475569;">
                 <span style="font-size: 0.9rem; line-height: 1;">⚪</span>
                 <div>
-                  <strong>备用待命池 (其余组内通道)：</strong>
-                  <span id="orchestrateStandbySummary">除上方选定通道外，下方勾选的其余合规通道将全部自动作为该组的备用通道，按进货成本由低到高排列兜底。</span>
+                  <strong>备用（其余勾选的账号）：</strong>
+                  <span id="orchestrateStandbySummary">除上面选好的，下方勾选的其余账号都放进备用：关掉，不接单，自动切号也不会用它们。</span>
                 </div>
               </div>
             </div>
@@ -2056,7 +2059,7 @@
 
           <h3 style="color: #0f172a; font-size: 1.18rem; margin: 4px 0 2px 0;">⚡ 本组的自动切号设置</h3>
           <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.55rem 0.75rem; font-size: 0.75rem; color: #1e40af; line-height: 1.5; margin-top: 0.4rem;">
-            本组当前账号出故障时，会换到本组里健康、支持同样模型、进价不高于售价的备用账号，优先选最便宜的。<br/>
+            本组主调出故障时，先换副调，没有可用的副调再换备选（都要健康、支持同样模型、进价不高于售价）。备用是关掉的，不会被换上。<br/>
             下面的设置<strong>默认跟随全站</strong>：只有你改过的项才单独对本组生效；没改的项，全站怎么调，本组就跟着变。
           </div>
           <div id="groupAutoSwitchFollowNote" style="font-size: 0.75rem; color: #475569; margin-top: 0.45rem; line-height: 1.5;"></div>
@@ -2149,7 +2152,7 @@
             <div class="as-config-row" style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.55rem 0.75rem;">
               <div class="as-config-info">
                 <span class="as-config-label" style="font-size: 0.8rem; font-weight: 700; color: #166534;">💸 更便宜的账号恢复后，自动换过去</span>
-                <span class="as-config-desc" style="font-size: 0.72rem; color: #15803d;">关闭时只会切回原来的主账号；开启后，本组有便宜 5% 以上的备用账号稳定恢复时，也会主动换过去（换号会让缓存失效）</span>
+                <span class="as-config-desc" style="font-size: 0.72rem; color: #15803d;">关闭时只会切回原来的主账号；开启后，本组有便宜 5% 以上的副调或备选稳定恢复时，也会主动换过去（换号会让缓存失效）</span>
               </div>
               <button id="btnToggleGroupAutoRecover" class="toggle-switch-btn is-off" onclick="toggleGroupAutoRecoverState()" style="flex-shrink: 0; white-space: nowrap;">
                 <span>●</span> <span id="textGroupAutoRecoverState">已停用</span>
@@ -2188,6 +2191,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260925_group_delete"></script>
+  <script src="app.js?v=20260927_role_scope"></script>
 </body>
 </html>

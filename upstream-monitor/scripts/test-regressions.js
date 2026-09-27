@@ -354,7 +354,7 @@ test('global account enable checks every attached group and waits for remote con
   const state = {
     allGroups: [{ id: 1, name: 'full-price', sale_rate: 0.5 }, { id: 2, name: 'low-price', sale_rate: 0.2 }],
     channels: [{ id: '7', name: 'shared', costMultiplier: 0.3, saleMultiplier: 0.5, primaryGroupId: 1,
-      groupsDetail: [{ id: 1, name: 'full-price', sale_rate: 0.5 }, { id: 2, name: 'low-price', sale_rate: 0.2 }] }]
+      groupsDetail: [{ id: 1, name: 'full-price', sale_rate: 0.5, priority: 1 }, { id: 2, name: 'low-price', sale_rate: 0.2, priority: 1 }] }]
   };
   const { context, remoteWrites, invalidations } = toggler(state);
   assert.throws(() => context.toggleRemoteAccountSchedulable('7', true), /low-price/);
@@ -375,7 +375,7 @@ test('missing or invalid live group pricing fails closed instead of using a stal
   const state = {
     allGroups: [{ id: 1, name: 'business', sale_rate: null }],
     channels: [{ id: '7', name: 'stale-priced', costMultiplier: 0.3, primaryGroupId: 1,
-      groupsDetail: [{ id: 1, name: 'business', sale_rate: 0.5 }] }]
+      groupsDetail: [{ id: 1, name: 'business', sale_rate: 0.5, priority: 1 }] }]
   };
   const { context, remoteWrites } = toggler(state);
   assert.throws(() => context.toggleRemoteAccountSchedulable('7', true), /未核验/);
@@ -385,9 +385,10 @@ test('missing or invalid live group pricing fails closed instead of using a stal
   assert.throws(() => context.toggleRemoteAccountSchedulable('7', true), /未核验/);
   assert.equal(remoteWrites.length, 0);
 
+  // 不在任何分组里就不是主调：恢复也不会打开接单开关，自然也不会倒贴
   state.channels[0].groupsDetail = [];
   state.channels[0].saleMultiplier = 0.5;
-  assert.throws(() => context.toggleRemoteAccountSchedulable('7', true), /未核验/);
+  assert.equal(context.toggleRemoteAccountSchedulable('7', true), false);
   assert.equal(remoteWrites.length, 0);
 });
 
@@ -395,8 +396,8 @@ test('batch toggle validates every channel and updates remote state before any l
   const state = {
     allGroups: [{ id: 1, name: 'full-price', sale_rate: 0.5 }, { id: 2, name: 'low-price', sale_rate: 0.2 }],
     channels: [
-      { id: '1', name: 'safe', costMultiplier: 0.3, groupsDetail: [{ id: 1, name: 'full-price', sale_rate: 0.5 }] },
-      { id: '2', name: 'unsafe', costMultiplier: 0.3, groupsDetail: [{ id: 2, name: 'low-price', sale_rate: 0.2 }] }
+      { id: '1', name: 'safe', costMultiplier: 0.3, groupsDetail: [{ id: 1, name: 'full-price', sale_rate: 0.5, priority: 1 }] },
+      { id: '2', name: 'unsafe', costMultiplier: 0.3, groupsDetail: [{ id: 2, name: 'low-price', sale_rate: 0.2, priority: 1 }] }
     ]
   };
   const { context, remoteWrites, invalidations } = toggler(state);
@@ -562,7 +563,7 @@ test('automatic switching never lowers a shared peer global priority for one gro
     executeRemoteSQL(statement) { sql = statement; return true; } });
   loadAutoSwitch(context);
   context.executeAutoSwitch(from, target, 'test', { groupId: 1 });
-  assert.match(sql, /WHERE id IN \(1\)/);
+  assert.match(sql, /UPDATE accounts SET schedulable = false, priority = 10 WHERE id = 1;/);
   assert.doesNotMatch(sql, /\b3\b/);
   assert.equal(shared.schedulable, true);
   assert.equal(shared.priority, 7);
@@ -1046,7 +1047,7 @@ test('orchestration supports cross-group shared accounts and preserves external 
         primaryGroupId: 27,
         groupsDetail: [
           { id: 27, name: '测试专用分组', sale_rate: 0.25 },
-          { id: 2, name: '通用保障分组', sale_rate: 1.0 }
+          { id: 2, name: '通用保障分组', sale_rate: 1.0, priority: 1 }
         ]
       }
     ]
@@ -1060,6 +1061,50 @@ test('orchestration supports cross-group shared accounts and preserves external 
   assert.match(remoteWrites[0], /INSERT INTO account_groups \(account_id, group_id, priority\) VALUES \(219, 27, 1\)/);
   assert.equal(state.channels[0].schedulable, true);
   assert.equal(state.channels[0].groupsDetail.length, 2);
+});
+
+test('orchestration refuses a shared account whose on/off switch would contradict its role in another group', () => {
+  const makeState = otherPriority => ({
+    allGroups: [{ id: 27, name: '测试专用分组', sale_rate: 0.25 }, { id: 2, name: '通用保障分组', sale_rate: 1.0 }],
+    channels: [
+      { id: '5', name: '本组主调', schedulable: true, costMultiplier: 0.1, primaryGroupId: 27, groupsDetail: [{ id: 27, name: '测试专用分组', sale_rate: 0.25, priority: 1 }] },
+      { id: '219', name: '共享账号', schedulable: true, costMultiplier: 0.1, primaryGroupId: 27,
+        groupsDetail: [{ id: 27, name: '测试专用分组', sale_rate: 0.25, priority: 100 }, { id: 2, name: '通用保障分组', sale_rate: 1.0, priority: otherPriority }] }
+    ]
+  });
+  // 在别的分组是主调（开着接单），放进本组当备用会照样接本组的单：拒绝
+  let state = makeState(1);
+  let { context, remoteWrites } = groupMutator(state);
+  assert.throws(() => context.prepareGroupOrchestrationPlan(27, { mainId: '5', standbyIds: ['219'] }), /通用保障分组.*拆分共享账号/);
+  assert.equal(remoteWrites.length, 0);
+  // 在别的分组也不是主调：放进本组当备用，接单开关一并关掉
+  state = makeState(100);
+  ({ context, remoteWrites } = groupMutator(state));
+  context.executeRemoteGroupOrchestrationPlan(context.prepareGroupOrchestrationPlan(27, { mainId: '5', standbyIds: ['219'] }));
+  assert.match(remoteWrites[0], /UPDATE accounts SET schedulable = false, priority = LEAST\(priority, 100\) WHERE id = 219;/);
+  assert.equal(state.channels[1].schedulable, false);
+  assert.equal(state.channels[0].schedulable, true);
+});
+
+test('orchestration switches off every non-main account and only price-checks the main', () => {
+  const state = {
+    allGroups: [{ id: 3, name: '业务', sale_rate: 0.5 }],
+    channels: [
+      { id: '1', name: '新主调', schedulable: false, costMultiplier: 0.2, primaryGroupId: 3, groupsDetail: [{ id: 3, name: '业务', sale_rate: 0.5, priority: 10 }] },
+      { id: '2', name: '原主调', schedulable: true, costMultiplier: 0.3, primaryGroupId: 3, groupsDetail: [{ id: 3, name: '业务', sale_rate: 0.5, priority: 1 }] },
+      // 进价已经高于售价、还开着接单：放进备用会被关掉，所以不该挡住这次编排
+      { id: '3', name: '涨价的旧账号', schedulable: true, costMultiplier: 0.9, primaryGroupId: 3, groupsDetail: [{ id: 3, name: '业务', sale_rate: 0.5, priority: 100 }] }
+    ]
+  };
+  const { context, remoteWrites } = groupMutator(state);
+  const plan = context.prepareGroupOrchestrationPlan(3, { mainId: '1', subId: '2', standbyIds: ['3'] });
+  context.executeRemoteGroupOrchestrationPlan(plan);
+  const sql = remoteWrites[0];
+  assert.match(sql, /UPDATE accounts SET schedulable = true, priority = 1 WHERE id = 1;/);
+  assert.match(sql, /UPDATE accounts SET schedulable = false, priority = 10 WHERE id = 2;/);
+  assert.match(sql, /UPDATE accounts SET schedulable = false, priority = 100 WHERE id = 3;/);
+  assert.match(sql, /WHERE a\.id IN \(1\)/, 'only the main is price-checked in the remote guard');
+  assert.deepEqual(state.channels.map(c => c.schedulable), [true, false, false]);
 });
 
 test('failed multi-step membership plan never advances the local cache', () => {
@@ -1119,7 +1164,9 @@ test('automatic failover UI has no manual approval or stale cost-role entry poin
   assert.match(app, /getAttribute\('data-channel-id'\)/);
   assert.doesNotMatch(app, /getAttribute\('data-id'\)/);
   assert.doesNotMatch(telegram, /failover_act:|优先调度 100|故障兜底 1/);
-  assert.match(telegram, /主调 \(优先级 1\)/);
+  assert.match(telegram, /主调 \(接单\)/);
+  assert.match(telegram, /副调 \(不接单 · 第一替补\)/);
+  assert.match(telegram, /备用 \(关掉\)/);
 });
 
 function controlPlaneSnapshotHarness(account, groups) {
@@ -2424,50 +2471,26 @@ test('active accounts in Sub2API database are authoritative and never pruned by 
   assert.deepEqual(untombstoned, accountsFromPostgres.map(acc => ({ url: acc.base_url, name: acc.name })));
 });
 
-test('setting channel as main in Group A isolates priority and preserves backup status in Group B', () => {
-  const chX = {
-    id: '101',
-    name: '多组渠道-X',
-    priority: 20,
-    schedulable: false,
-    costMultiplier: 0.1,
-    multiplier: 0.1,
-    groupsDetail: [
-      { id: 1, name: '分组-A', sale_rate: 1.0, priority: 20 },
-      { id: 2, name: '分组-B', sale_rate: 1.0, priority: 20 }
-    ]
-  };
-  const chY = {
-    id: '102',
-    name: 'B组原主调-Y',
-    priority: 1,
-    schedulable: true,
-    costMultiplier: 0.2,
-    multiplier: 0.2,
-    groupsDetail: [
-      { id: 2, name: '分组-B', sale_rate: 1.0, priority: 1 }
-    ]
-  };
+test('group roles decide the on/off switch: only mains serve, shared accounts must agree, a group never loses its last server', () => {
+  // X 同时在分组 A、B，两边都是备选（关着）；Y 是 B 的主调；Z 只在 B，是备选
+  const chX = { id: '101', name: '多组渠道-X', priority: 20, schedulable: false, costMultiplier: 0.1, multiplier: 0.1,
+    groupsDetail: [{ id: 1, name: '分组-A', sale_rate: 1.0, priority: 20 }, { id: 2, name: '分组-B', sale_rate: 1.0, priority: 20 }] };
+  const chY = { id: '102', name: 'B组原主调-Y', priority: 1, schedulable: true, costMultiplier: 0.2, multiplier: 0.2,
+    groupsDetail: [{ id: 2, name: '分组-B', sale_rate: 1.0, priority: 1 }] };
+  const chZ = { id: '103', name: 'B组备选-Z', priority: 20, schedulable: false, costMultiplier: 0.3, multiplier: 0.3,
+    groupsDetail: [{ id: 2, name: '分组-B', sale_rate: 1.0, priority: 20 }] };
   const state = {
     activeChannelId: '102',
-    allGroups: [
-      { id: 1, name: '分组-A', sale_rate: 1.0 },
-      { id: 2, name: '分组-B', sale_rate: 1.0 }
-    ],
-    channels: [chX, chY]
+    allGroups: [{ id: 1, name: '分组-A', sale_rate: 1.0 }, { id: 2, name: '分组-B', sale_rate: 1.0 }],
+    channels: [chX, chY, chZ]
   };
-
   const executedSql = [];
   const context = vm.createContext({
     state,
     ...require('../routing-policy'),
-    autoSwitchConfig: { singleActiveExclusive: true },
+    autoSwitchConfig: { singleActiveExclusive: false },
     isExemptGroup: () => false,
-    assertChannelPricingIsSafe: (channel, targetGroupId) => {
-      assert.equal(typeof targetGroupId, 'number', 'targetGroupId 必须为正整数 ID，不能为数组或对象');
-      assert.ok(targetGroupId > 0);
-      return true;
-    },
+    assertChannelPricingIsSafe: () => true,
     executeRemoteSQL: (sql) => { executedSql.push(sql); return true; },
     invalidateSub2APIScheduler: () => {},
     refreshSub2APISignatureAfterDirectMutation: () => {},
@@ -2479,74 +2502,54 @@ test('setting channel as main in Group A isolates priority and preserves backup 
     CHANNELS_FILE: '/channels.json',
     console: { log() {}, warn() {}, error() {} }
   });
-
   const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
-  const roleCode = source.slice(source.indexOf('function setChannelRole('), source.indexOf('\n// 通用激活/切换主用渠道逻辑'));
-  vm.runInContext(roleCode, context);
+  vm.runInContext(source.slice(source.indexOf('function setChannelRole('), source.indexOf('\n// 通用激活/切换主用渠道逻辑')), context);
 
-  // 1. 在分组 A (id: 1) 中将 通道 X 设为主调
-  const resA = context.setChannelRole('101', 'main', '单元测试', 1);
-  assert.equal(resA.success, true);
-  assert.equal(resA.role, 'main');
-  assert.equal(resA.priority, 1);
+  // 1. 共享账号 X 在 B 不是主调：在 A 设成主调会让它在 B 也接单，拒绝并提示拆分
+  const before = JSON.stringify(state);
+  const refused = context.setChannelRole('101', 'main', '单元测试', 2);
+  assert.equal(refused.success, false);
+  assert.match(refused.error, /分组-A.*拆分共享账号/);
+  assert.equal(executedSql.length, 0);
+  assert.equal(JSON.stringify(state), before);
 
-  // 验证 SQL：只更新 account_groups 中 group_id = 1 的记录
-  assert.ok(executedSql[0].includes('account_groups (account_id, group_id, priority) VALUES (101, 1, 1)'));
-  assert.ok(!executedSql[0].includes('group_id = 2'));
-
-  // 验证内存状态隔离：
-  const gdA = chX.groupsDetail.find(g => g.id === 1);
-  const gdB = chX.groupsDetail.find(g => g.id === 2);
-  assert.equal(gdA.priority, 1, '通道 X 在分组 A 中必须变为主调 (priority=1)');
-  assert.equal(gdB.priority, 20, '通道 X 在分组 B 中必须严格保留备选 (priority=20)，绝不能变为主调！');
-  assert.equal(chX.schedulable, true);
-
-  // 验证分组 B 里的原主调通道 Y 没有被误伤
-  const chY_gdB = chY.groupsDetail.find(g => g.id === 2);
-  assert.equal(chY_gdB.priority, 1, '分组 B 的主调通道 Y 必须依然是优先级 1');
-
-  // 2. 模拟前端 getChannelRole 判定隔离
-  const appSource = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
-  const frontContext = vm.createContext({
-    activeChannelId: '101', // 即使全局 activeChannelId 是 101
-    currentDimension: 'group',
-    currentFilterPill: '分组-B'
-  });
-  vm.runInContext(appSource.slice(appSource.indexOf('function getChannelRole('), appSource.indexOf('// 调整渠道调度定性')), frontContext);
-
-  // 在分组 A 视角下：通道 X 是主调
-  assert.equal(frontContext.getChannelRole(chX, 1), 'main', '分组 A 视角下通道 X 为 main');
-  // 在分组 B 视角下：通道 X 是备选，绝不是主调！
-  assert.equal(frontContext.getChannelRole(chX, 2), 'alt', '分组 B 视角下通道 X 必须为 alt (备选)');
-  // 分组 B 原主调通道 Y 依然是主调
-  assert.equal(frontContext.getChannelRole(chY, 2), 'main', '分组 B 视角下通道 Y 依然为 main');
-
-  // 3. 反向操作验证：在分组 B 中将 通道 X 调整为副调 (sub, priority=10)
-  const resB = context.setChannelRole('101', 'sub', '单元测试', 2);
-  assert.equal(resB.success, true);
-  assert.equal(resB.role, 'sub');
-  assert.equal(resB.priority, 10);
-
-  // 验证 SQL：只更新 account_groups 中 group_id = 2 的记录，绝不破坏 group_id = 1
-  assert.ok(executedSql[executedSql.length - 1].includes('account_groups (account_id, group_id, priority) VALUES (101, 2, 10)'));
-
-  // 验证内存状态：
-  assert.equal(chX.groupsDetail.find(g => g.id === 1).priority, 1, '通道 X 在分组 A 的主调状态丝毫不受分组 B 调整影响！');
-  assert.equal(chX.groupsDetail.find(g => g.id === 2).priority, 10, '通道 X 在分组 B 中成功更新为副调 (priority=10)');
-  assert.equal(frontContext.getChannelRole(chX, 1), 'main', '分组 A 视角下通道 X 依然是主调');
-  assert.equal(frontContext.getChannelRole(chX, 2), 'sub', '分组 B 视角下通道 X 变为副调');
-
-  // 4. 多主调测试：在分组 B 中将 通道 X 设为主调，原本主调的通道 Y 依然保持主调（不踢人）
-  const resB_main = context.setChannelRole('101', 'main', '单元测试', 2);
-  assert.equal(resB_main.success, true);
-  assert.equal(chX.groupsDetail.find(g => g.id === 2).priority, 1, '通道 X 在分组 B 成为主调');
-  assert.equal(chY.groupsDetail.find(g => g.id === 2).priority, 1, '通道 Y 在分组 B 依然保持主调，不被互斥踢出');
-
-  // 5. 单通道分组保护：分组 A 只有 1 条通道 (chX)，尝试将其降级为副调将被安全拦截
+  // 2. 单通道分组保护：分组 A 只有 X，不能降级
   const resA_demote = context.setChannelRole('101', 'sub', '单元测试', 1);
   assert.equal(resA_demote.success, false);
   assert.match(resA_demote.error, /仅有 1 条通道/);
-  assert.equal(chX.groupsDetail.find(g => g.id === 1).priority, 1, '单通道分组始终保持主调');
+
+  // 3. 多主调：Z 在 B 设成主调就打开接单，Y 仍是主调、仍在接单（不踢人）
+  const resZ = context.setChannelRole('103', 'main', '单元测试', 2);
+  assert.equal(resZ.success, true);
+  assert.match(executedSql.at(-1), /VALUES \(103, 2, 1\)/);
+  assert.match(executedSql.at(-1), /UPDATE accounts SET schedulable = true, priority = /);
+  assert.equal(chZ.schedulable, true);
+  assert.equal(chY.schedulable, true);
+  assert.equal(chY.groupsDetail[0].priority, 1);
+
+  // 4. Y 改成副调：只有主调接单，Y 的接单开关一并关掉；数据库里也再核一次“不是最后一个在接单的”
+  const resY = context.setChannelRole('102', 'sub', '单元测试', 2);
+  assert.equal(resY.success, true);
+  assert.match(executedSql.at(-1), /relay-tower: last serving account/);
+  assert.match(executedSql.at(-1), /UPDATE accounts SET schedulable = false, priority = /);
+  assert.equal(chY.schedulable, false);
+  assert.equal(chY.groupsDetail[0].priority, 10);
+
+  // 5. Z 现在是 B 唯一在接单的账号：改成备用会让 B 断流，拒绝，什么都不写
+  const sqlCount = executedSql.length;
+  const resZ_off = context.setChannelRole('103', 'standby', '单元测试', 2);
+  assert.equal(resZ_off.success, false);
+  assert.match(resZ_off.error, /唯一在接单/);
+  assert.equal(executedSql.length, sqlCount);
+  assert.equal(chZ.schedulable, true);
+
+  // 6. 前端按分组看角色，互不串组
+  const appSource = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const frontContext = vm.createContext({ activeChannelId: '101', currentDimension: 'group', currentFilterPill: '分组-B' });
+  vm.runInContext(appSource.slice(appSource.indexOf('function getChannelRole('), appSource.indexOf('// 调整渠道调度定性')), frontContext);
+  assert.equal(frontContext.getChannelRole(chX, 2), 'alt');
+  assert.equal(frontContext.getChannelRole(chY, 2), 'sub');
+  assert.equal(frontContext.getChannelRole(chZ, 2), 'main');
 });
 
 // ====== 2026-09 自动调配修复回归 ======
@@ -2617,7 +2620,8 @@ test('executeAutoSwitch never parks a keyword-exempt peer', () => {
     executeRemoteSQL(statement) { sql = statement; return true; } });
   loadAutoSwitch(context);
   context.executeAutoSwitch(from, to, 'test', { groupId: 1 });
-  assert.match(sql, /WHERE id IN \(1\)/);
+  assert.match(sql, /UPDATE accounts SET schedulable = false, priority = 10 WHERE id = 1;/);
+  assert.doesNotMatch(sql, /\b3\b/);
   assert.equal(exempt.schedulable, true);
 });
 
@@ -2933,13 +2937,13 @@ test('group editor opens with the group own roles and members, not the previousl
   assert.doesNotMatch(selects.selectOrchestrateSub.innerHTML, /selected/);
 });
 
-test('without single-active exclusivity, failover still demotes the failing source so traffic really moves', () => {
-  for (const [trigger, parked] of [['request_failures', false], ['balance_empty', true]]) {
+test('failover hands the target role to the failing source and switches it off, even without single-active exclusivity', () => {
+  for (const trigger of ['request_failures', 'balance_empty']) {
     const { context, state } = evaluator();
     state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
-    const from = fixChannel(1, { priority: 1, schedulable: true });
-    const other = fixChannel(3, { priority: 1, schedulable: true });
-    const to = fixChannel(2);
+    const from = fixChannel(1, { priority: 1, schedulable: true, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] });
+    const other = fixChannel(3, { priority: 1, schedulable: true, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] });
+    const to = fixChannel(2, { groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] });
     state.channels = [from, to, other];
     let sql, invalidated;
     Object.assign(context, { CHANNELS_FILE: '', AUTO_SWITCH_LOGS_FILE: '', ALERTS_FILE: '', autoSwitchLogs: [], alerts: [],
@@ -2949,13 +2953,195 @@ test('without single-active exclusivity, failover still demotes the failing sour
       executeRemoteSQL(statement) { sql = statement; return true; } });
     loadAutoSwitch(context);
     context.executeAutoSwitch(from, to, 'test', { groupId: 1, triggerType: trigger });
-    assert.match(sql, /UPDATE accounts SET priority = GREATEST\(priority, 10\)/);
-    assert.equal(/schedulable = false WHERE id = 1/.test(sql), parked);
-    assert.doesNotMatch(sql, /WHERE id IN \(.*3/, 'other concurrent mains are left alone');
+    // 换上来的当主调；换下去的接过它原来的副调角色，并关掉接单开关（只有主调接单）
+    assert.match(sql, /UPDATE accounts SET schedulable = true, priority = 1 WHERE id = 2;/);
+    assert.match(sql, /UPDATE account_groups SET priority = 1 WHERE account_id = 2 AND group_id IN \(1\);/);
+    assert.match(sql, /UPDATE accounts SET schedulable = false, priority = 10 WHERE id = 1;/);
+    assert.match(sql, /UPDATE account_groups SET priority = 10 WHERE account_id = 1 AND group_id IN \(1\);/);
+    assert.doesNotMatch(sql, /\b3\b/, 'other concurrent mains are left alone');
     assert.equal(from.priority, 10);
-    assert.equal(from.schedulable, !parked);
+    assert.equal(from.schedulable, false);
+    assert.equal(from.groupsDetail[0].priority, 10);
+    assert.equal(to.groupsDetail[0].priority, 1);
     assert.equal(other.schedulable, true);
     assert.equal(other.priority, 1);
     assert.equal(JSON.stringify(invalidated), JSON.stringify([[2, 1], 1]), 'sticky sessions of the moved accounts are cleared for this group');
+    assert.equal(context.autoSwitchLogs[0].fromNewRole, '副调');
   }
+});
+
+test('failover onto an alternate makes the old main the alternate, and a standby is never switched on', () => {
+  const { context, state } = evaluator();
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const from = fixChannel(1, { priority: 1, schedulable: true, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] });
+  const alt = fixChannel(2, { priority: 20, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 20 }] });
+  const standby = fixChannel(4, { priority: 100, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 100 }] });
+  state.channels = [from, alt, standby];
+  let sql = '';
+  Object.assign(context, { CHANNELS_FILE: '', AUTO_SWITCH_LOGS_FILE: '', ALERTS_FILE: '', autoSwitchLogs: [], alerts: [],
+    broadcastSSE() {}, telegram: { notifyAutoSwitch() {} }, getSub2APISignature: () => '', invalidateSub2APIScheduler() {},
+    autoSwitchConfig: { singleActiveExclusive: false, groupLastSwitchTimes: {} },
+    executeRemoteSQL(statement) { sql += statement; return true; } });
+  loadAutoSwitch(context);
+  assert.throws(() => context.executeAutoSwitch(from, standby, 'test', { groupId: 1 }), /备用/);
+  assert.equal(sql, '');
+  assert.equal(standby.schedulable, false);
+  context.executeAutoSwitch(from, alt, 'test', { groupId: 1 });
+  assert.match(sql, /UPDATE accounts SET schedulable = false, priority = 20 WHERE id = 1;/);
+  assert.equal(from.groupsDetail[0].priority, 20);
+  assert.equal(alt.groupsDetail[0].priority, 1);
+});
+
+// ====== 2026-09-27 角色范围：只有主调接单，备用就是关掉 ======
+
+function roleCheckState() {
+  // 分组 27：主调 A 在接单；备用 B、副调 C 也开着接单开关（修复前留下的状态）；备用 D 已关
+  // 分组 2：只有一个“备用”在接单，没有主调在接单；共享账号 S 同时在 27 和 2
+  return {
+    allGroups: [{ id: 27, name: '示例分组', sale_rate: 0.3 }, { id: 2, name: '通用示例', sale_rate: 1 }],
+    channels: [
+      { id: '260', name: 'A', schedulable: true, priority: 1, groupsDetail: [{ id: 27, name: '示例分组', priority: 1 }] },
+      { id: '219', name: 'B', schedulable: true, priority: 100, groupsDetail: [{ id: 27, name: '示例分组', priority: 100 }] },
+      { id: '250', name: 'C', schedulable: true, priority: 10, groupsDetail: [{ id: 27, name: '示例分组', priority: 10 }] },
+      { id: '252', name: 'D', schedulable: false, priority: 100, groupsDetail: [{ id: 27, name: '示例分组', priority: 100 }] },
+      { id: '258', name: 'E', schedulable: true, priority: 100, groupsDetail: [{ id: 2, name: '通用示例', priority: 100 }] },
+      { id: '300', name: 'S', schedulable: true, priority: 20, groupsDetail: [{ id: 27, name: '示例分组', priority: 20 }, { id: 2, name: '通用示例', priority: 20 }] }
+    ]
+  };
+}
+
+function roleRepairer(state, remoteResult = true) {
+  const { context, remoteWrites, invalidations } = roleSetter(state, remoteResult);
+  Object.assign(context, { alerts: [] });
+  return { context, remoteWrites, invalidations };
+}
+
+test('role check lists every non-main account that still serves, and marks which ones are safe to switch off', () => {
+  const state = roleCheckState();
+  const { context } = roleRepairer(state);
+  const plan = JSON.parse(JSON.stringify(context.planRoleMismatchRepair()));
+  const byId = Object.fromEntries(plan.items.map(item => [`${item.groupId}:${item.accountId}`, item]));
+  assert.deepEqual(Object.keys(byId).sort(), ['27:219', '27:250', '27:300', '2:258', '2:300']);
+  assert.equal(byId['27:219'].fixable, true);
+  assert.equal(byId['27:219'].roleLabel, '备用');
+  assert.deepEqual(byId['27:219'].servingMains, ['A']);
+  assert.equal(byId['27:250'].fixable, true);
+  assert.equal(byId['27:250'].roleLabel, '副调');
+  assert.equal(byId['27:300'].fixable, false, 'a shared account cannot be switched off for one group');
+  assert.match(byId['27:300'].blockedReason, /拆分共享账号/);
+  assert.equal(byId['2:258'].fixable, false, 'switching off the only server would cut the group off');
+  assert.match(byId['2:258'].blockedReason, /没有主调在接单/);
+  assert.equal(plan.fixableCount, 2);
+});
+
+test('role repair switches off only confirmed, still-fixable accounts in one guarded transaction', () => {
+  const state = roleCheckState();
+  const { context, remoteWrites, invalidations } = roleRepairer(state);
+  const result = context.applyRoleMismatchRepair(['219', '250', '258', '300', '999']);
+  assert.deepEqual([...result.switchedOff.map(item => item.accountId)], ['219', '250']);
+  assert.equal(remoteWrites.length, 1);
+  const sql = remoteWrites[0];
+  assert.match(sql, /relay-tower: role changed/);
+  assert.match(sql, /relay-tower: last serving account/);
+  assert.match(sql, /a\.id NOT IN \(219,250\)/, 'the group must keep another serving main after the batch');
+  assert.match(sql, /UPDATE accounts SET schedulable = false,[\s\S]*WHERE id IN \(219,250\)/);
+  assert.deepEqual([...invalidations[0]], [219, 250]);
+  const byId = Object.fromEntries(state.channels.map(c => [c.id, c]));
+  assert.equal(byId['219'].schedulable, false);
+  assert.equal(byId['250'].schedulable, false);
+  assert.equal(byId['250'].priority, 10);
+  assert.equal(byId['258'].schedulable, true, 'the only server of its group is left alone');
+  assert.equal(byId['300'].schedulable, true, 'the shared account is left alone');
+  assert.equal(byId['260'].schedulable, true);
+  assert.match(context.alerts[0].note, /已按角色关掉 2 个/);
+
+  // 已经没有问题时不写库
+  assert.equal(context.applyRoleMismatchRepair(['219']).switchedOff.length, 0);
+  assert.equal(remoteWrites.length, 1);
+  assert.throws(() => context.applyRoleMismatchRepair([]), /至少选择/);
+});
+
+test('a failed role repair leaves the local cache untouched and explains the refusal', () => {
+  const state = roleCheckState();
+  const { context } = roleRepairer(state, false);
+  const before = JSON.stringify(state);
+  assert.throws(() => context.applyRoleMismatchRepair(['219']), /未确认/);
+  assert.equal(JSON.stringify(state), before);
+  assert.match(context.describeRoleRepairFailure({ message: 'Command failed\nERROR:  relay-tower: last serving account' }), /没有主调接单/);
+  assert.match(context.describeRoleRepairFailure({ stderr: 'ERROR:  relay-tower: role changed' }), /刚刚变了/);
+  assert.match(context.describeRoleChangeFailure({ message: 'Command failed: docker exec\nERROR:  relay-tower: last serving account' }), /唯一在接单/);
+  assert.match(context.describeRoleChangeFailure(new Error('安全拦截：通道 [x] 进货成本 (0.5x) 对 [A] 售价 0.3x 倒贴或无法核验，严禁开启调度！')), /^安全拦截/);
+});
+
+test('restoring a paused account only switches a main back on; backups rejoin auto-switch but stay off', () => {
+  const state = {
+    allGroups: [{ id: 1, name: 'A', sale_rate: 0.5 }],
+    channels: [
+      { id: '1', name: '主调', costMultiplier: 0.3, groupsDetail: [{ id: 1, name: 'A', sale_rate: 0.5, priority: 1 }] },
+      { id: '2', name: '副调', costMultiplier: 0.3, groupsDetail: [{ id: 1, name: 'A', sale_rate: 0.5, priority: 10 }] },
+      { id: '3', name: '备用', costMultiplier: 0.9, groupsDetail: [{ id: 1, name: 'A', sale_rate: 0.5, priority: 100 }] }
+    ]
+  };
+  const { context, remoteWrites } = toggler(state);
+  // 备用进价已经倒贴，但它不会被打开，所以不拦
+  const targets = context.toggleRemoteAccountsSchedulable(['1', '2', '3'], true);
+  assert.deepEqual([...targets.enabledIds], [1]);
+  assert.equal(remoteWrites.length, 1);
+  assert.match(remoteWrites[0], /UPDATE accounts SET schedulable = true WHERE id IN \(1\);/);
+  assert.equal(context.toggleRemoteAccountSchedulable('2', true), false);
+  assert.equal(remoteWrites.length, 1, 'restoring only a backup writes nothing');
+  assert.match(context.describeToggleResult(state.channels[0], true, true), /主调，已开始接单/);
+  assert.match(context.describeToggleResult(state.channels[1], true, false), /副调，平时不接单/);
+  assert.match(context.describeToggleResult(state.channels[2], true, false), /备用，仍然关着/);
+  assert.match(context.describeToggleResult(state.channels[2], false, false), /人工停用/);
+  // 停用照旧一律关掉
+  context.toggleRemoteAccountsSchedulable(['1', '2', '3'], false);
+  assert.match(remoteWrites.at(-1), /UPDATE accounts SET schedulable = false WHERE id IN \(1,2,3\);/);
+});
+
+test('a role set without a group switches non-main accounts off and keeps every group label in sync', () => {
+  const state = manualRoleState(0.5);
+  const { context, remoteWrites } = roleSetter(state);
+  context.autoSwitchConfig.singleActiveExclusive = false;
+  const target = state.channels[1];
+  const result = context.setChannelRole(target.id, 'standby', '单元测试');
+  assert.equal(result.success, true);
+  assert.match(remoteWrites[0], new RegExp(`UPDATE accounts SET schedulable = false, priority = 100 WHERE id = ${target.id};`));
+  assert.match(remoteWrites[0], new RegExp(`UPDATE account_groups SET priority = 100 WHERE account_id = ${target.id};`));
+  assert.equal(target.schedulable, false);
+  assert.ok(target.groupsDetail.every(g => g.priority === 100));
+});
+
+test('auto-switch preview marks standbys as switched off and never counts them as backups', () => {
+  const { context, state } = evaluator();
+  const observedAt = new Date().toISOString();
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const healthy = { status: 'online', configuredStatus: 'active', costMultiplier: 0.2, balance: 10, balanceStatus: 'ok', balanceUpdated: observedAt,
+    lastProbeStatus: 'online', lastProbeTime: observedAt };
+  state.channels = [
+    { id: '1', name: 'main', priority: 1, schedulable: true, ...healthy, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] },
+    { id: '2', name: 'sub', priority: 10, schedulable: false, ...healthy, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] },
+    { id: '3', name: 'standby', priority: 100, schedulable: false, ...healthy, costMultiplier: 0.05, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 100 }] }
+  ];
+  const input = context.buildGroupEvaluationInput(state.allGroups[0], state.channels, {});
+  assert.equal(input.excluded['3'], '备用（已关闭，自动切号不用它）');
+  assert.equal(input.excluded['2'], undefined);
+  const accounts = context.previewAutoSwitch(Date.now()).groups[0].accounts;
+  assert.equal(accounts.find(a => a.id === '3').role, 'standby');
+  assert.equal(accounts.find(a => a.id === '3').notes[0], '备用（已关闭，自动切号不用它）');
+});
+
+test('same-request gateway retries never fall back onto a standby', () => {
+  const now = Date.now();
+  const probe = { lastProbeStatus: 'online', lastProbeTime: new Date(now).toISOString(), status: 'online', apiKey: 'k' };
+  const state = {
+    activeChannelId: '1',
+    allGroups: [{ id: 1, sale_rate: 0.5 }],
+    channels: [
+      { id: '1', baseUrl: 'https://a/v1', schedulable: true, priority: 1, costMultiplier: 0.1, groupsDetail: [{ id: 1, priority: 1 }], ...probe },
+      { id: '2', baseUrl: 'https://b/v1', schedulable: false, priority: 100, costMultiplier: 0.1, groupsDetail: [{ id: 1, priority: 100 }], ...probe },
+      { id: '3', baseUrl: 'https://c/v1', schedulable: false, priority: 20, costMultiplier: 0.2, groupsDetail: [{ id: 1, priority: 20 }], ...probe }
+    ]
+  };
+  assert.deepEqual(gateway.selectRetryCandidates(state, { now }).map(c => c.id), ['1', '3']);
 });

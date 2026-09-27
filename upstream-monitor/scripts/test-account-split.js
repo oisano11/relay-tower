@@ -38,9 +38,33 @@ test('split SQL guards membership, copies the whole row and moves only the copie
   assert.match(sql, /LATERAL jsonb_populate_record\(NULL::accounts/);
   assert.match(sql, /SELECT ins\.id, 101, 5, now\(\)/);
   assert.match(sql, /DELETE FROM account_groups WHERE account_id = 7 AND group_id = 103;/);
-  assert.doesNotMatch(sql, /group_id = 102;/, 'the primary group membership is kept');
+  assert.doesNotMatch(sql, /DELETE FROM account_groups WHERE account_id = 7 AND group_id = 102;/, 'the primary group membership is kept');
   assert.match(sql, /'A站-Claude · O''Neil组'/, 'names are SQL-escaped');
-  assert.doesNotMatch(sql, /UPDATE accounts SET (schedulable|priority|concurrency)/, 'routing settings are copied, not changed');
+  assert.doesNotMatch(sql, /concurrency/, 'concurrency is copied, not changed');
+});
+
+test('split copies follow their group role: only mains keep serving, unless a copy is the last server of its group', () => {
+  // 原账号开着接单：在「标准」是主调，在「低价」是备用，在「临时」是副调但那个分组只有它在接单
+  const account = { id: '7', name: 'A站', apiKey: 'sk-a', configuredStatus: 'active', schedulable: true, primaryGroupId: 102,
+    groupsDetail: [{ id: 101, name: '标准', priority: 1 }, { id: 102, name: '低价', priority: 100 }, { id: 103, name: '临时', priority: 10 }] };
+  const other = { id: '8', name: '低价主调', apiKey: 'sk-b', schedulable: true, groupsDetail: [{ id: 102, name: '低价', priority: 1 }] };
+  const plan = buildSplitPlan([account, other]);
+  const item = plan.items[0];
+  assert.equal(item.keepGroupId, 102);
+  assert.equal(item.keepSchedulable, false, 'the original is a standby in the group it keeps: switched off');
+  const [standard, temp] = item.copies;
+  assert.equal(standard.schedulable, true);
+  assert.equal(standard.groupPriority, 1);
+  assert.equal(temp.schedulable, true, 'the only server of its group keeps serving...');
+  assert.equal(temp.groupPriority, 1, '...and becomes that group main');
+  const { sql } = buildSplitSql(plan, ['7']);
+  assert.match(sql, /'priority', 1,\s+'schedulable', a\.schedulable,/);
+  assert.match(sql, /UPDATE account_groups SET priority = 100 WHERE account_id = 7 AND group_id = 102;\nUPDATE accounts SET priority = 100, schedulable = false WHERE id = 7;/);
+
+  // 原账号本来就关着：拆出来的也都关着
+  const off = buildSplitPlan([{ ...account, schedulable: false }, other]).items[0];
+  assert.deepEqual(off.copies.map(copy => copy.schedulable), [false, false]);
+  assert.match(buildSplitSql({ items: [off] }, ['7']).sql, /'schedulable', false,/);
 });
 
 test('requests for unknown, non-shared or empty selections are rejected', () => {

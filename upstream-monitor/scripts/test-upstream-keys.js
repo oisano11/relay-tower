@@ -125,6 +125,7 @@ function serverHarness({ exclusive = true } = {}) {
     state: { channels: JSON.parse(JSON.stringify(channels)), allGroups: JSON.parse(JSON.stringify(groups)) },
     autoSwitchConfig: { singleActiveExclusive: exclusive },
     groupIds: c => (c.groupsDetail || []).map(g => Number(g.id)),
+    ROLE_PRIORITY: require('../routing-policy').ROLE_PRIORITY,
     upstreamKeyState: { dismissed: [], seen: [] },
     upstreamKeyDiscovery: { items: [], panels: [], checkedAt: null },
     UPSTREAM_KEY_STATE_FILE: 'state.json', ALERTS_FILE: 'alerts.json', alerts: [],
@@ -163,15 +164,17 @@ test('connecting a key into a group that already has accounts adds a cold standb
   assert.equal(effects.writes['alerts.json'][0].type, 'account_connect');
 });
 
-test('an empty group gets the new account as its main; outside exclusive mode standbys stay schedulable', async () => {
+test('an empty group gets the new account as its main; a standby is switched off even outside exclusive mode', async () => {
   const main = serverHarness();
   assert.equal((await main.context.connectUpstreamKey({ uid: 'panel_up:6029', groupId: 5 })).role, 'main');
   assert.match(main.effects.sql[0], /'priority', 1,\s+'schedulable', true/);
   assert.match(main.effects.sql[0], /'name', '示例上游 GPT 特惠 0\.065'/, 'default name follows the upstream and key name');
 
+  // 备用就是关掉：“多主分流”模式下新接入的备用也不接单
   const open = serverHarness({ exclusive: false });
-  await open.context.connectUpstreamKey({ uid: 'panel_up:6029', groupId: 3 });
-  assert.match(open.effects.sql[0], /'priority', 100,\s+'schedulable', true/);
+  const result = await open.context.connectUpstreamKey({ uid: 'panel_up:6029', groupId: 3 });
+  assert.match(open.effects.sql[0], /'priority', 100,\s+'schedulable', false/);
+  assert.match(result.message, /先当备用（关着，不接单/);
 });
 
 test('connecting is refused for a losing price, a mismatched platform, a missing template or an already connected key', async () => {

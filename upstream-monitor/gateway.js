@@ -1,7 +1,7 @@
 const http = require('http');
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
-const { groupIds, groupCostIsSafe } = require('./routing-policy');
+const { groupIds, groupCostIsSafe, groupRole } = require('./routing-policy');
 
 const defaultHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 256, keepAliveMsecs: 60000, timeout: 30000 });
 const defaultHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 256, keepAliveMsecs: 60000, timeout: 30000 });
@@ -463,7 +463,10 @@ function selectRetryCandidates(state, { model, primary, now = Date.now(), probeF
   if (!active) return [];
   const scopeGroups = groupIds(active);
   const inScope = channel => scopeGroups.length === 0 || groupIds(channel).some(groupId => scopeGroups.includes(groupId));
-  const eligible = all.filter(channel => inScope(channel) && pricingSafeInSharedGroups(channel, active, state?.allGroups) &&
+  // 备用就是关掉：同一请求里的后备重试也不会用它
+  const notStandby = channel => String(channel.id) === String(active.id) || scopeGroups.length === 0 ||
+    groupIds(channel).filter(groupId => scopeGroups.includes(groupId)).some(groupId => groupRole(channel, groupId) !== 'standby');
+  const eligible = all.filter(channel => inScope(channel) && notStandby(channel) && pricingSafeInSharedGroups(channel, active, state?.allGroups) &&
     isRetryEligible(channel, { now, probeFreshnessMs }) && supportsModel(channel, model));
   const ordered = eligible.sort((a, b) => Number(a.priority ?? Number.MAX_SAFE_INTEGER) - Number(b.priority ?? Number.MAX_SAFE_INTEGER) || Number(a.id) - Number(b.id));
   // The active route leads the list, but only while it is itself route-worthy:

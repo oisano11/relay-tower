@@ -909,7 +909,7 @@ function getChannelsRenderFingerprint(channels, activeId) {
   return (channels || []).map(c => [
     c.id, c.name, c.schedulable ? 1 : 0, c.autoSwitchDisabled, c.priority, c.multiplier, c.costMultiplier, c.saleMultiplier,
     c.status, c.balance, c.isLoss ? 1 : 0, c.primaryGroupId,
-    (c.groupsDetail || []).map(g => `${g.id}:${g.sale_rate}:${g.is_loss ? 1 : 0}`).join(','),
+    (c.groupsDetail || []).map(g => `${g.id}:${g.sale_rate}:${g.is_loss ? 1 : 0}:${g.priority}`).join(','),
     (c.userActivity ? c.userActivity.activeUsers15m : 0)
   ].join(':')).join(';') + `|act:${activeId}|dim:${currentDimension}|pill:${currentFilterPill}|s:${search}`;
 }
@@ -1080,6 +1080,8 @@ function renderChannels() {
       warningBanner.style.display = 'none';
     }
   }
+
+  renderRoleMismatchBanner();
 
   // 业务分组专属横幅渲染控制
   if (currentDimension === 'group' && currentFilterPill !== 'all') {
@@ -1261,6 +1263,21 @@ function renderStripsView(enabledChannels, standbyChannels) {
 
     const balanceStripClass = isZeroBalance ? 'is-balance-empty' : (isLowBalance ? 'is-balance-low' : '');
 
+    // 只有主调接单：标着副调/备选/备用却还开着接单开关，就会照样分到请求
+    const mismatchGroups = roleMismatchGroups(ch).filter(gd => !effectiveGroupId || String(gd.id) === String(effectiveGroupId));
+    const mismatchRole = mismatchGroups.length ? ROLE_LABELS_CN[getChannelRole(ch, mismatchGroups[0].id)] : '';
+    const roleMismatchPill = mismatchGroups.length
+      ? `<span class="strip-bal-warning-pill low" title="只有主调接单。它在${escapeHtml(mismatchGroups.map(gd => '【' + (gd.name || gd.id) + '】').join(''))}标着${mismatchRole}，接单开关却还开着，所以照样分到请求。点页面上方黄色提示条里的「查看并按角色关掉」处理">⚠️ 标着${mismatchRole}却在接单</span>`
+      : '';
+    const roleForToggle = effectiveGroupId ? role : bestChannelRole(ch);
+    const toggleStateText = ch.autoSwitchDisabled === true ? '人工停用'
+      : isSchedulable ? '接单中'
+      : roleForToggle === 'main' ? '未接单'
+      : roleForToggle === 'standby' ? '已关闭' : '待命';
+    const toggleTitle = ch.autoSwitchDisabled === true
+      ? '人工停用中：点一下解除。主调会重新接单；副调、备选重新参与自动切号（平时不接单）；备用仍然关着'
+      : '点一下人工停用：马上不接单，自动切号也不会再启用它';
+
     return `
       <div class="channel-strip ${isActive ? 'is-active' : ''} ${!isSchedulable ? 'is-disabled' : ''} ${effectiveIsLoss ? 'is-loss' : ''} ${balanceStripClass}" data-channel-id="${ch.id}">
         <!-- 1. 状态指示器与主副标签 -->
@@ -1274,6 +1291,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
           <div class="strip-name-row">
             <strong class="strip-name" title="${escapeHtml(ch.name)}">${escapeHtml(ch.name)}</strong>
             ${balWarningPill}
+            ${roleMismatchPill}
             <span class="vendor-tag ${vTheme.pillClass}">${vTheme.shortLabel}</span>
             <span class="strip-provider-tag" title="上游供应商 / 平台">${escapeHtml(ch.provider || '三方')}</span>
             ${userBadgeHtml}
@@ -1287,11 +1305,11 @@ function renderStripsView(enabledChannels, standbyChannels) {
 
         <!-- 3. 人工纳入或停用；实际调度由自动策略决定 -->
         <div class="strip-col-toggle">
-          <label class="switch-control" title="${ch.autoSwitchDisabled === true ? '人工停用：点击重新纳入自动调度候选池' : '已纳入自动调度：点击人工停用，系统将不再自动启用此账号'}">
+          <label class="switch-control" title="${toggleTitle}">
             <input type="checkbox" ${ch.autoSwitchDisabled !== true ? 'checked' : ''} onchange="toggleChannelSchedulable('${ch.id}', this.checked)" />
             <span class="slider"></span>
           </label>
-          <span style="font-size: 0.65rem; color: var(--text-muted);">${ch.autoSwitchDisabled === true ? '人工停用' : (isSchedulable ? '使用中' : '自动待命')}</span>
+          <span style="font-size: 0.65rem; color: var(--text-muted);">${toggleStateText}</span>
         </div>
 
         <!-- 4. 上游账户余额 -->
@@ -1389,19 +1407,19 @@ function renderStripsView(enabledChannels, standbyChannels) {
         <!-- 10. 快捷操作区：角色按分组设置，只在选中某个分组时出现 -->
         <div class="strip-col-actions">
           ${effectiveGroupId ? `
-          <div class="role-segmented-control" data-channel-id="${ch.id}" title="为该通道指定本组内的调度角色：主调(1) / 副调(10) / 备选(20) / 备用(100)。SUB2 数字越小越优先">
+          <div class="role-segmented-control" data-channel-id="${ch.id}" title="本组角色：只有主调接单；副调、备选平时不接单，主调出问题时按顺序顶上；备用就是关掉">
             <button class="role-seg-btn role-main ${role === 'main' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'main', '${effectiveGroupId || ''}')" 
-                    title="定性为主调 (优先级 1 · 使用中账号)">主调</button>
+                    title="设为主调：马上开始接单">主调</button>
             <button class="role-seg-btn role-sub ${role === 'sub' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'sub', '${effectiveGroupId || ''}')" 
-                    title="定性为副调 (优先级 10 · 第一替补)">副调</button>
+                    title="设为副调：不接单；主调出问题时，自动切号第一个换上它">副调</button>
             <button class="role-seg-btn role-alt ${role === 'alt' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'alt', '${effectiveGroupId || ''}')" 
-                    title="定性为备选 (优先级 20 · 第二替补)">备选</button>
+                    title="设为备选：不接单；主调和副调都不能用时，才换上它">备选</button>
             <button class="role-seg-btn role-standby ${role === 'standby' ? 'active' : ''}" 
                     onclick="setChannelRole('${ch.id}', 'standby', '${effectiveGroupId || ''}')" 
-                    title="定性为备用 (优先级 100 · 后备池)">备用</button>
+                    title="设为备用：关掉，不接单，自动切号也不会用它">备用</button>
           </div>` : ''}
           <button class="btn-strip-icon" title="测速并拉取最新状态" onclick="probeSingleChannel('${ch.id}')">
             ⟳
@@ -1440,11 +1458,11 @@ function renderStripsView(enabledChannels, standbyChannels) {
     // 1. 🌟 主调
     const isMultiMain = mains.length > 1;
     const mainBadgeText = isMultiMain
-      ? `🌟 活跃主调 (${mains.length} 条) · 多模型分流`
-      : `🌟 当前主调 (1 条) · 正在调度 · 独占承接`;
+      ? `🌟 主调 (${mains.length} 个) · 一起接单`
+      : `🌟 主调 · 接单`;
     const mainDescText = isMultiMain
-      ? `当前线上生产流量按专属模型分流承接的通道（若模型重叠建议单主独占以提高 Prompt Cache 命中率）`
-      : `当前线上生产流量正在独占承接的通道 · 全组严格单主独占力保 Prompt Cache 缓存命中率`;
+      ? `本组只有主调接单，几个主调一起分流（模型重叠时建议只留一个主调，缓存命中更好）`
+      : `本组只有主调接单`;
 
     html += `
       <div class="channel-section-header group-tier-header tier-main">
@@ -1455,46 +1473,46 @@ function renderStripsView(enabledChannels, standbyChannels) {
     if (mains.length > 0) {
       html += mains.map(renderSingleStrip).join('');
     } else {
-      html += `<div class="group-empty-tier-notice">⚠️ 暂无生效主调！请在下方通道中点击「主调」按钮，或点击上方「⚙ 分组账号与手动编排」指定。</div>`;
+      html += `<div class="group-empty-tier-notice">⚠️ 本组没有主调，没有账号接单！请在下方账号那一行点「主调」，或点上方「⚙ 分组账号与手动编排」指定。</div>`;
     }
 
     // 2. 🔵 副调
     html += `
       <div class="channel-section-header group-tier-header tier-sub" style="margin-top: 1.15rem;">
-        <span class="section-badge" style="background: #1e40af; color: #fff; font-weight: 700;">🔵 第 1 顺位副调 (${subs.length} 条) · 冷备待命</span>
-        <span class="section-desc">当主调发生连续硬故障、失败率超标或余额耗尽时，第一顺位优先自动切线替补</span>
+        <span class="section-badge" style="background: #1e40af; color: #fff; font-weight: 700;">🔵 副调 (${subs.length} 个) · 不接单 · 第一替补</span>
+        <span class="section-desc">平时不接单。主调欠费、连续失败或连不上时，自动切号第一个换上它</span>
       </div>
     `;
     if (subs.length > 0) {
       html += subs.map(renderSingleStrip).join('');
     } else {
-      html += `<div class="group-empty-tier-notice muted">○ 暂无指定副调（主调故障时将依次切至备选或备用通道）</div>`;
+      html += `<div class="group-empty-tier-notice muted">○ 没有副调（主调出问题时会直接换备选；没有备选就无法自动切换）</div>`;
     }
 
     // 3. 🟡 备选
     html += `
       <div class="channel-section-header group-tier-header tier-alt" style="margin-top: 1.15rem;">
-        <span class="section-badge" style="background: #b45309; color: #fff; font-weight: 700;">🟡 第 2 顺位备选 (${alts.length} 条) · 冷备待命</span>
-        <span class="section-desc">当主调与副调均不可用时的第二顺位替补渠道 · 冷备停调确保业务永不宕机</span>
+        <span class="section-badge" style="background: #b45309; color: #fff; font-weight: 700;">🟡 备选 (${alts.length} 个) · 不接单 · 第二替补</span>
+        <span class="section-desc">平时不接单。主调和副调都不能用时，自动切号才换上它</span>
       </div>
     `;
     if (alts.length > 0) {
       html += alts.map(renderSingleStrip).join('');
     } else {
-      html += `<div class="group-empty-tier-notice muted">○ 暂无指定备选渠道</div>`;
+      html += `<div class="group-empty-tier-notice muted">○ 没有备选</div>`;
     }
 
     // 4. ⚪ 备用待命池
     html += `
       <div class="channel-section-header group-tier-header tier-standby" style="margin-top: 1.15rem;">
-        <span class="section-badge standby-badge" style="font-weight: 700;">⚪ 备用待命池 (${standbys.length} 条) · 进货成本由低到高排列</span>
-        <span class="section-desc">未被选为主调/副调/备选的组内合规渠道全部归入此池 · 严格按进货价格升序兜底</span>
+        <span class="section-badge standby-badge" style="font-weight: 700;">⚪ 备用 (${standbys.length} 个) · 关掉</span>
+        <span class="section-desc">不接单，自动切号也不会用它。要用时改成主调、副调或备选</span>
       </div>
     `;
     if (standbys.length > 0) {
       html += standbys.map(renderSingleStrip).join('');
     } else {
-      html += `<div class="group-empty-tier-notice muted">○ 暂无备用通道</div>`;
+      html += `<div class="group-empty-tier-notice muted">○ 没有备用账号</div>`;
     }
 
     container.innerHTML = html;
@@ -1504,8 +1522,8 @@ function renderStripsView(enabledChannels, standbyChannels) {
   let html = '';
 
   if (enabledChannels.length > 0) {
-    let sectionBadgeText = `● 正在调度中 (${enabledChannels.length} 条)`;
-    let sectionDescText = '当前线上生产流量正在分流承接的通道 · 排列在最前';
+    let sectionBadgeText = `● 接单中 (${enabledChannels.length} 个)`;
+    let sectionDescText = '接单开关开着、正在分到请求的账号 · 排列在最前';
     if (currentDimension === 'active') {
       sectionBadgeText = `🔥 活跃渠道 · 按使用人数与用量降序 (${enabledChannels.length} 条)`;
       sectionDescText = '严格按照在线人数、今日使用人数及24h累计用量由高到低排列';
@@ -1526,8 +1544,8 @@ function renderStripsView(enabledChannels, standbyChannels) {
     const standbyGroupSuffix = (currentDimension === 'group' && currentFilterPill !== 'all') ? ` · ${currentFilterPill}` : '';
     html += `
       <div class="channel-section-header" style="${enabledChannels.length > 0 ? 'margin-top: 1.15rem;' : ''}">
-        <span class="section-badge standby-badge">○ 备用待命池 (${standbyChannels.length} 条)${standbyGroupSuffix}</span>
-        <span class="section-desc">未开启调度的备用通道 · 已按模型归类 · 进货成本由低到高排列</span>
+        <span class="section-badge standby-badge">○ 没在接单 (${standbyChannels.length} 个)${standbyGroupSuffix}</span>
+        <span class="section-desc">副调、备选（平时不接单，主调出问题时替补）、备用（关掉）和人工停用的账号 · 已按模型归类 · 进货成本由低到高排列</span>
       </div>
     `;
 
@@ -1729,7 +1747,7 @@ async function toggleChannelSchedulable(channelId, newSchedulable) {
     if (!res.ok) throw new Error(data.error || '操作失败');
 
     await loadChannels();
-    showToast(`[${target ? target.name : channelId}] ${newSchedulable ? '已重新纳入自动调度候选池' : '已人工停用，不会自动重新启用'}`, 'success');
+    showToast(data.message || `[${target ? target.name : channelId}] ${newSchedulable ? '已解除人工停用' : '已人工停用，不会自动重新启用'}`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -1754,7 +1772,7 @@ async function batchToggleVisible(schedulable) {
   const filterDesc = [currentFilterPill === 'all' ? '' : pillLabel, searchText ? `搜索“${searchText}”` : ''].filter(Boolean).join('，');
   const scope = unfiltered ? '全部' : `当前筛选（${filterDesc}）里的`;
   const effect = schedulable
-    ? '纳入自动调度候选池（之后由自动切号决定用哪个）'
+    ? '解除人工停用（主调重新接单；副调、备选重新参与自动切号，平时不接单；备用仍然关着）'
     : '人工停用，线上立即不再调度，自动切号也不会再启用它们';
   const warnAll = unfiltered ? '\n\n⚠️ 现在没有筛选，这会影响所有渠道！' : '';
   if (!confirm(`确定把${scope} ${ids.length} 条渠道${effect}吗？${warnAll}`)) return;
@@ -1770,7 +1788,9 @@ async function batchToggleVisible(schedulable) {
     if (!res.ok) throw new Error(data.error || '批量操作失败');
 
     await loadChannels();
-    showToast(`${ids.length} 家上游已${schedulable ? '纳入自动调度候选池' : '人工停用'}`, 'success');
+    showToast(schedulable
+      ? `已解除 ${ids.length} 个账号的人工停用，其中 ${data.servingCount || 0} 个主调重新接单`
+      : `${ids.length} 个账号已人工停用`, 'success');
   } catch (e) {
     showToast(e.message, 'error');
   }
@@ -2095,7 +2115,8 @@ async function setChannelRole(channelId, role, groupId = null) {
   }
 
   const currentRole = getChannelRole(target, targetGroupId);
-  if (currentRole === role) return;
+  // 同一个角色再点一次：只有“标着副调/备选/备用却还开着接单开关”时才重新执行一遍，把开关关掉
+  if (currentRole === role && !(role !== 'main' && target.schedulable)) return false;
 
   const roleMeta = {
     main: { label: '主调', priority: 1 },
@@ -2127,9 +2148,8 @@ async function setChannelRole(channelId, role, groupId = null) {
         target.groupsDetail.push({ id: Number(targetGroupId), priority: targetMeta.priority });
       }
 
-      if (role === 'main') {
-        target.schedulable = true;
-      }
+      // 只有主调接单：副调/备选/备用的接单开关由服务端一并关掉
+      target.schedulable = role === 'main';
     } else {
       // 全局定性回退
       if (role === 'main') {
@@ -2160,11 +2180,133 @@ async function setChannelRole(channelId, role, groupId = null) {
 
     renderOverviewMetrics();
     renderChannels();
-    showToast(`已成功将 [${target.name}] 定性为【${targetMeta.label}】(优先级 ${targetMeta.priority})！`, 'success');
+    const roleEffect = {
+      main: '开始接单',
+      sub: '不接单，主调出问题时第一个顶上',
+      alt: '不接单，主调和副调都不行时才顶上',
+      standby: '已关掉，不接单，自动切号也不会用它',
+      fallback: '已关掉，不接单，自动切号也不会用它'
+    }[role] || '';
+    showToast(`[${target.name}] 已设为${targetMeta.label}：${roleEffect}`, 'success');
+    return true;
   } catch (err) {
     showToast(err.message, 'error');
+    return false;
   }
 }
+
+const ROLE_LABELS_CN = { main: '主调', sub: '副调', alt: '备选', standby: '备用' };
+
+// 只有主调接单：列出这个账号“标着副调/备选/备用却还开着接单开关”的分组
+function roleMismatchGroups(ch) {
+  if (!ch || ch.schedulable !== true || !Array.isArray(ch.groupsDetail)) return [];
+  return ch.groupsDetail.filter(gd => getChannelRole(ch, gd.id) !== 'main');
+}
+
+// 账号在它所有分组里最靠前的角色（主调 > 副调 > 备选 > 备用）
+function bestChannelRole(ch) {
+  const roles = (ch && Array.isArray(ch.groupsDetail) ? ch.groupsDetail : []).map(gd => getChannelRole(ch, gd.id));
+  return ['main', 'sub', 'alt', 'standby'].find(r => roles.includes(r)) || 'standby';
+}
+
+function renderRoleMismatchBanner() {
+  const banner = document.getElementById('roleMismatchBanner');
+  if (!banner) return;
+  const items = [];
+  (channelsData || []).forEach(ch => roleMismatchGroups(ch).forEach(gd => items.push({ ch, gd })));
+  if (!items.length) {
+    banner.style.display = 'none';
+    banner.innerHTML = '';
+    return;
+  }
+  const names = items.slice(0, 6).map(({ ch, gd }) =>
+    `【${escapeHtml(gd.name || ('分组 ' + gd.id))}】${escapeHtml(ch.name)}（${ROLE_LABELS_CN[getChannelRole(ch, gd.id)]}）`).join('、');
+  banner.style.display = 'flex';
+  banner.innerHTML = `
+    <div class="asw-icon">⚠️</div>
+    <div class="asw-content" style="color: #78350f;">
+      <div class="asw-title"><strong>有 ${items.length} 个账号不是主调，却还开着接单开关，照样在分到请求：</strong></div>
+      <div class="asw-desc" style="color: #92400e;">${names}${items.length > 6 ? ` 等 ${items.length} 个` : ''}。只有主调接单：副调、备选平时不接单，备用是关掉的。</div>
+    </div>
+    <div class="asw-actions">
+      <button class="btn btn-warning" onclick="openRoleMismatchModal()" style="font-size: 0.76rem; padding: 0.25rem 0.65rem;">查看并按角色关掉</button>
+    </div>`;
+}
+
+async function openRoleMismatchModal() {
+  document.getElementById('roleMismatchModalBackdrop')?.remove();
+  let plan;
+  try {
+    const res = await fetch('/api/role-check');
+    plan = await res.json();
+    if (!res.ok || !plan.success) throw new Error(plan.error || '读取失败');
+  } catch (err) {
+    showToast('读取角色检查结果失败: ' + err.message, 'error');
+    return;
+  }
+  const items = plan.items || [];
+  const rows = items.length ? items.map(item => {
+    const head = `<b>${escapeHtml(item.accountName)}</b> <span style="color: #64748b;">#${escapeHtml(item.accountId)} · 【${escapeHtml(item.groupName)}】标着${escapeHtml(item.roleLabel)}</span>`;
+    const detail = item.fixable
+      ? `<div style="padding-left: 1.4rem; color: #334155;">关掉后本组由 ${item.servingMains.map(name => `「${escapeHtml(name)}」`).join('、')} 接单</div>`
+      : `<div style="padding-left: 1.4rem; color: #b45309;">⚠️ 先不关：${escapeHtml(item.blockedReason)}</div>`;
+    const box = item.fixable
+      ? `<label style="display: flex; gap: 0.45rem; align-items: center; cursor: pointer;"><input type="checkbox" class="role-fix-checkbox" value="${escapeHtml(item.accountId)}" checked /> ${head}</label>`
+      : `<div style="display: flex; gap: 0.45rem; align-items: center; color: #94a3b8;"><input type="checkbox" disabled /> ${head}</div>`;
+    return `<div style="padding: 0.45rem 0.55rem; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 0.2rem;">${box}${detail}</div>`;
+  }).join('') : '<div style="padding: 1rem; text-align: center; color: #16a34a; font-size: 0.8rem;">✅ 没有问题：每个分组都只有主调在接单。</div>';
+  const html = `
+    <div id="roleMismatchModalBackdrop" class="modal-backdrop open" style="z-index: 1050;">
+      <div class="modal-dialog" style="max-width: 600px;">
+        <div class="dialog-content">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.2rem;">
+            <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a;">按角色关掉不该接单的账号</div>
+            <button type="button" onclick="document.getElementById('roleMismatchModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+          <p style="font-size: 0.74rem; color: #64748b; margin: 0 0 0.5rem;">
+            只有主调接单。下面这些账号标着副调、备选或备用，接单开关却还开着，所以还在分到请求。勾选的会关掉接单开关，角色不变：
+            副调、备选继续当替补（主调出问题时自动切号按顺序换上），备用就一直关着。关掉后，这些账号上的请求（包括进行中的对话）都会转给本组主调，请先确认主调能正常接单。
+          </p>
+          <div style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 340px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">${rows}</div>
+          <div class="dialog-actions" style="margin-top: 0.7rem; display: flex; gap: 0.5rem;">
+            <button id="btnConfirmRoleFix" class="btn btn-primary" style="flex: 1; justify-content: center; font-weight: 600;" ${plan.fixableCount ? '' : 'disabled'}>关掉勾选的账号</button>
+            <button onclick="document.getElementById('roleMismatchModalBackdrop').remove()" class="btn btn-secondary">取消</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = html;
+  document.body.appendChild(wrapper.firstElementChild);
+  document.getElementById('btnConfirmRoleFix')?.addEventListener('click', async event => {
+    const accountIds = [...document.querySelectorAll('.role-fix-checkbox:checked')].map(cb => cb.value);
+    if (!accountIds.length) {
+      showToast('请至少勾选一个账号', 'warning');
+      return;
+    }
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = '正在关掉...';
+    try {
+      const res = await fetch('/api/role-check/fix', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountIds })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || '操作失败');
+      document.getElementById('roleMismatchModalBackdrop')?.remove();
+      await loadChannels();
+      renderChannels();
+      showToast(data.switchedOff && data.switchedOff.length ? `已关掉 ${data.switchedOff.length} 个账号，现在只有主调在接单` : data.message, 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+      button.disabled = false;
+      button.textContent = '关掉勾选的账号';
+    }
+  });
+}
+window.openRoleMismatchModal = openRoleMismatchModal;
 
 // 单渠道测速
 async function probeSingleChannel(channelId) {
@@ -2259,7 +2401,7 @@ function triggerPriceChangeModal(alert, channel, isManualInspect = false) {
     document.getElementById('modalActiveWarning').style.display = 'flex';
   } else if (isUp) {
     dialog.className = 'modal-dialog alert-dialog danger';
-    document.getElementById('modalAlertBadge').textContent = `⚠️ [${vendor}] 备用/未调度渠道涨价提醒`;
+    document.getElementById('modalAlertBadge').textContent = `⚠️ [${vendor}] 没在接单的账号涨价提醒`;
     document.getElementById('modalActiveWarning').style.display = 'none';
   } else {
     dialog.className = 'modal-dialog alert-dialog';
@@ -2284,7 +2426,7 @@ function triggerPriceChangeModal(alert, channel, isManualInspect = false) {
     deltaPill.textContent = `-${alert.changePercent}% 降价`;
   }
 
-  // 只在这个账号所在的业务分组里找更便宜的备用，并且只切这一个组；
+  // 只在这个账号所在的业务分组里找更便宜的账号，并且只切这一个组；
   // 别的组的账号、以及同时挂在多个组的共享账号都不在这里一键切，免得影响别的分组。
   const currentChId = String(currentCh.id || alert.channelId);
   const chGroups = currentCh.groupsDetail || [];
@@ -2321,18 +2463,23 @@ function triggerPriceChangeModal(alert, channel, isManualInspect = false) {
     document.getElementById('modalLowestCandidateText').textContent = `${lowest.name}: ${formatRate(costOf(lowest))}x`;
     switchBtn.onclick = async () => {
       modal.classList.remove('open');
-      await setChannelRole(lowest.id, 'main', String(homeGroup.id));
+      const switched = await setChannelRole(lowest.id, 'main', String(homeGroup.id));
+      // 切过去之后，涨价的这个账号改当副调：不再接单，新主调出问题时它第一个顶上
+      const priced = (channelsData || []).find(c => String(c.id) === currentChId);
+      if (switched && priced && getChannelRole(priced, homeGroup.id) === 'main') {
+        await setChannelRole(currentChId, 'sub', String(homeGroup.id));
+      }
     };
   } else {
     switchBtn.style.display = 'none';
     if (vendorNotice) {
       vendorNotice.style.display = 'block';
       if (!isProductionInUse) {
-        vendorNotice.innerHTML = `<strong>备选通道调价提示：</strong>该渠道当前未加入线上调度池，涨价暂不会对线上业务造成亏损影响。如需启用请前往渠道列表调整。`;
+        vendorNotice.innerHTML = `<strong>没在接单的账号调价：</strong>这个账号现在不接单，涨价暂时不影响线上。以后要用它，请先核对进价。`;
       } else if (!homeGroup && chGroups.length > 1) {
         vendorNotice.innerHTML = `<strong>共享账号：</strong>这个账号同时在 ${chGroups.length} 个分组里，不能在这里一键切换（会影响别的分组）。可以用「系统管理 → 拆分共享账号」拆开，或去各分组里处理。`;
       } else {
-        vendorNotice.innerHTML = `<strong>本组没有更便宜的备用：</strong>${homeGroup ? `【${escapeHtml(homeGroup.name)}】` : '所在分组'}里暂时没有更便宜、有余额、可用的备用账号。可以给这个分组改售价，或在 Sub2API 给它加一个备用账号。`;
+        vendorNotice.innerHTML = `<strong>本组没有更便宜的账号：</strong>${homeGroup ? `【${escapeHtml(homeGroup.name)}】` : '所在分组'}里暂时没有更便宜、有余额、可用的账号。可以给这个分组改售价，或在 Sub2API 给它加一个账号。`;
       }
     }
   }
@@ -3337,7 +3484,7 @@ async function syncBackendChannels() {
 }
 
 // ====== 切号预演（只读） ======
-const AUTO_SWITCH_PREVIEW_ACTIONS = { switch: ['⚡ 将切换', '#b45309'], exhausted: ['🚨 无可用备选', '#dc2626'], hold: ['✅ 保持', '#16a34a'], skip: ['⏸ 不参与', '#64748b'] };
+const AUTO_SWITCH_PREVIEW_ACTIONS = { switch: ['⚡ 将切换', '#b45309'], exhausted: ['🚨 没有能顶上的副调或备选', '#dc2626'], hold: ['✅ 保持', '#16a34a'], skip: ['⏸ 不参与', '#64748b'] };
 let lastAutoSwitchPreview = null;
 
 async function fetchAutoSwitchPreview() {
@@ -3363,8 +3510,9 @@ function autoSwitchPreviewGroupsHtml(data, changedIds = new Set()) {
     const changed = changedIds.has(String(group.groupId));
     const accounts = group.accounts.map(acc => {
       const tag = acc.isCurrent ? '<span style="color:#2563eb;font-weight:700;">当前</span>' : acc.isTarget ? '<span style="color:#b45309;font-weight:700;">→ 目标</span>'
-        : acc.isCoCurrent ? '<span style="color:#2563eb;" title="和当前账号优先级相同，Sub2API 会一起给它分配流量">同时在用</span>'
-        : acc.candidate ? '<span style="color:#16a34a;">可做备选</span>' : '<span style="color:#94a3b8;">不可用</span>';
+        : acc.isCoCurrent ? '<span style="color:#2563eb;" title="接单开关开着，Sub2API 会一起给它分配请求">同时在接单</span>'
+        : acc.candidate ? `<span style="color:#16a34a;">可以顶上${acc.role === 'alt' ? '（备选）' : acc.role === 'sub' ? '（副调）' : ''}</span>`
+        : acc.role === 'standby' ? '<span style="color:#94a3b8;">备用·关掉</span>' : '<span style="color:#94a3b8;">不可用</span>';
       const balanceNames = { unknown: '查不到', unlimited: '不限额', empty: '0', pending: '待查询' };
       const bal = acc.balance == null ? (balanceNames[acc.balanceStatus] || acc.balanceStatus || '-') : acc.balance;
       return `<tr style="border-top:1px solid #f1f5f9;">
@@ -3478,12 +3626,13 @@ async function openSplitSharedModal() {
   }
   const items = plan.items || [];
   const rows = items.length ? items.map(item => {
-    const copies = item.copies.map(copy => `<div style="padding-left: 1.4rem; color: #334155;">＋ 新建 <b>${escapeHtml(copy.name)}</b> → 只挂「${escapeHtml(copy.groupName)}」</div>`).join('');
+    const outcome = (role, serving) => serving ? '主调，接单' : `${ROLE_LABELS_CN[role] || '备用'}，不接单`;
+    const copies = item.copies.map(copy => `<div style="padding-left: 1.4rem; color: #334155;">＋ 新建 <b>${escapeHtml(copy.name)}</b> → 只挂「${escapeHtml(copy.groupName)}」（${outcome(copy.role, copy.schedulable)}）</div>`).join('');
     const head = item.splittable
       ? `<label style="display: flex; gap: 0.45rem; align-items: center; cursor: pointer;"><input type="checkbox" class="split-acc-checkbox" value="${escapeHtml(item.accountId)}" checked /> <b>${escapeHtml(item.name)}</b> <span style="color: #64748b;">#${escapeHtml(item.accountId)}</span></label>`
       : `<div style="display: flex; gap: 0.45rem; align-items: center; color: #94a3b8;"><input type="checkbox" disabled /> <b>${escapeHtml(item.name)}</b> <span>#${escapeHtml(item.accountId)}</span></div>`;
     const detail = item.splittable
-      ? `<div style="padding-left: 1.4rem; color: #334155;">原账号保留在「${escapeHtml(item.keepGroupName)}」</div>${copies}`
+      ? `<div style="padding-left: 1.4rem; color: #334155;">原账号保留在「${escapeHtml(item.keepGroupName)}」（${outcome(item.keepRole, item.keepSchedulable)}）</div>${copies}`
       : `<div style="padding-left: 1.4rem; color: #b45309;">⚠️ ${escapeHtml(item.blockedReason)}</div>`;
     return `<div style="padding: 0.45rem 0.55rem; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 0.2rem;">${head}${detail}</div>`;
   }).join('') : '<div style="padding: 1rem; text-align: center; color: #16a34a; font-size: 0.8rem;">✅ 当前没有共享账号，每个账号都只属于一个分组。</div>';
@@ -3498,7 +3647,7 @@ async function openSplitSharedModal() {
           </div>
           <p style="font-size: 0.74rem; color: #64748b; margin: 0 0 0.5rem;">
             共 ${plan.sharedCount || 0} 个共享账号，可拆 ${plan.splittableCount || 0} 个，将新建 ${plan.newAccountCount || 0} 个账号。
-            新账号完整复制原账号的 Key、模型映射、倍率、代理、<b>并发上限（照抄原值）</b>、优先级和调度开关，拆分瞬间各组路由不变；余额仍是同一个上游钱包。
+            新账号完整复制原账号的 Key、模型映射、倍率、代理、<b>并发上限（照抄原值）</b>；接单开关按它在各分组的角色来：只有主调接单，副调、备选、备用关着（分组里只有它在接单时，拆开后仍接单并当主调）。余额仍是同一个上游钱包。
             ${plan.synced === false ? '<br><span style="color:#dc2626;">⚠️ 未能连接 Sub2API，以下为缓存数据，执行时会再次校验。</span>' : ''}
           </p>
           <div style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 340px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">${rows}</div>
@@ -3634,7 +3783,7 @@ async function openUpstreamKeysModal() {
           </div>
           <p style="font-size:0.74rem;color:#64748b;margin:0 0 0.5rem;line-height:1.55;">
             你在上游网站（Sub2API 搭的站）新建的 Key 会自动出现在这里，塔台每 10 分钟检查一次。选好放进本站哪个分组，点「接入」：
-            塔台照着这家上游已有的账号，在 Sub2API 里新建一个账号，只换 Key、名称和进价。分组里已有账号时，新账号先当备用；空分组直接当主调。进价不低于分组售价的不能接。
+            塔台照着这家上游已有的账号，在 Sub2API 里新建一个账号，只换 Key、名称和进价。分组里已有账号时，新账号先当备用（关着，不接单，要用时在分组里改成主调、副调或备选）；空分组直接当主调。进价不低于分组售价的不能接。
           </p>
           <div id="upstreamKeysPanels" style="display:flex;flex-direction:column;gap:0.2rem;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:0.45rem 0.6rem;margin-bottom:0.5rem;">正在读取…</div>
           <div id="upstreamKeysList" style="display:flex;flex-direction:column;gap:0.45rem;max-height:420px;overflow-y:auto;"></div>
@@ -3675,7 +3824,7 @@ async function connectUpstreamKeyItem(uid, button) {
   if (!item) return;
   if (!groupId) { showToast('请先选择要放进的本站分组', 'warning'); return; }
   const group = (item.candidateGroups || []).find(g => String(g.id) === String(groupId));
-  const role = group && group.members ? `分组里已有 ${group.members} 个账号，新账号先当备用。` : '这个分组还没有账号，新账号会直接当主调。';
+  const role = group && group.members ? `分组里已有 ${group.members} 个账号，新账号先当备用（关着，不接单）。` : '这个分组还没有账号，新账号会直接当主调。';
   if (!confirm(`把「${item.panelName} · ${item.keyName || item.keyTail}」接入分组【${group ? group.name : groupId}】吗？\n\n会在 Sub2API 新建账号「${name || item.suggestedName}」，进价 ${item.upstreamGroup.rate}x（分组售价 ${group ? group.saleRate : '?'}x）。\n${role}`)) return;
   button.disabled = true;
   button.textContent = '接入中…';
@@ -5155,11 +5304,11 @@ function renderGroupControlBanner(groupName) {
           </div>
           <div class="gcc-meta-row">
             <span class="gcc-rule-tag">准入规则: <strong>${escapeHtml(category)} 分类</strong> 且 进货成本 <strong>&lt; ${formatRate(saleRate)}x</strong></span>
-            <span class="gcc-cap-tag">本组账号 <strong>${currentAssigned.length}</strong> 个${sharedCount > 0 ? ` · 其中 <strong style="color: #b45309;">${sharedCount}</strong> 个同时在别的分组（共享账号不能当自动切号备用，可在「系统管理 → 拆分共享账号」拆开）` : ''}</span>
+            <span class="gcc-cap-tag">本组账号 <strong>${currentAssigned.length}</strong> 个${sharedCount > 0 ? ` · 其中 <strong style="color: #b45309;">${sharedCount}</strong> 个同时在别的分组（共享账号不能当自动切号的替补，可在「系统管理 → 拆分共享账号」拆开）` : ''}</span>
           </div>
         </div>
         <div class="gcc-actions">
-          <button class="btn btn-primary btn-gcc-orchestrate" onclick="openGroupOrchestrateModal('${group.id}')" title="指定主调、副调、备选，其余通道一键归为备用">
+          <button class="btn btn-primary btn-gcc-orchestrate" onclick="openGroupOrchestrateModal('${group.id}')" title="指定主调、副调、备选，其余勾选的账号放进备用（关掉）">
             <span>⚙</span> 分组账号与手动编排
           </button>
           <button class="btn btn-secondary btn-gcc-autoswitch" onclick="openGroupAutoSwitchModal('${group.id}')" title="本组单独的自动切号设置（默认跟随全站，只影响本组）">
@@ -5169,20 +5318,20 @@ function renderGroupControlBanner(groupName) {
       </div>
       <div class="gcc-status-bar">
         <div class="gcc-stat-item">
-          <span class="gcc-stat-label">🌟 主调:</span>
+          <span class="gcc-stat-label">🌟 主调（接单）:</span>
           <span class="gcc-stat-val ${mainCh ? 'is-valid' : 'is-empty'}">${mainCh ? escapeHtml(mainCh.name) + ' (' + formatRate(mainCh.costMultiplier !== undefined ? mainCh.costMultiplier : mainCh.multiplier) + 'x)' : '未指定 (请点编排)'}</span>
         </div>
         <div class="gcc-stat-item">
-          <span class="gcc-stat-label">🔵 第 1 副调:</span>
+          <span class="gcc-stat-label">🔵 副调（第一替补）:</span>
           <span class="gcc-stat-val">${subCh ? escapeHtml(subCh.name) + ' (' + formatRate(subCh.costMultiplier !== undefined ? subCh.costMultiplier : subCh.multiplier) + 'x)' : '无'}</span>
         </div>
         <div class="gcc-stat-item">
-          <span class="gcc-stat-label">🟡 第 2 备选:</span>
+          <span class="gcc-stat-label">🟡 备选（第二替补）:</span>
           <span class="gcc-stat-val">${altCh ? escapeHtml(altCh.name) + ' (' + formatRate(altCh.costMultiplier !== undefined ? altCh.costMultiplier : altCh.multiplier) + 'x)' : '无'}</span>
         </div>
         <div class="gcc-stat-item">
-          <span class="gcc-stat-label">⚪ 备用待命池:</span>
-          <span class="gcc-stat-val">${standbyChs.length} 条通道 (按进价升序兜底)</span>
+          <span class="gcc-stat-label">⚪ 备用（关掉）:</span>
+          <span class="gcc-stat-val">${standbyChs.length} 个</span>
         </div>
       </div>
     </div>
@@ -5370,10 +5519,10 @@ function renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned,
         const cost = c.costMultiplier !== undefined ? Number(c.costMultiplier) : Number(c.multiplier || 0);
         const isOver = cost >= saleRate;
         const vTheme = getVendorTheme(c.vendor);
-        // 已经属于别的分组的账号：勾进来就变成共享账号，自动切号不会拿它当备用
+        // 已经属于别的分组的账号：勾进来就变成共享账号，当不了自动切号的替补
         const otherGroups = (c.groupsDetail || []).filter(g => String(g.id) !== String(group.id)).map(g => g.name);
         const sharedTag = otherGroups.length
-          ? `<span class="orch-loss-tag" style="background: #fffbeb; color: #b45309; border-color: #fde68a;" title="已在【${escapeHtml(otherGroups.join('、'))}】里。勾进本组后会变成共享账号：自动切号不会拿它当备用，也可能影响那些分组">⚠️ 已在别的组</span>`
+          ? `<span class="orch-loss-tag" style="background: #fffbeb; color: #b45309; border-color: #fde68a;" title="已在【${escapeHtml(otherGroups.join('、'))}】里。勾进本组后会变成共享账号：当不了自动切号的替补；接单开关整个账号共用，它在每个分组的角色必须一致（都是主调，或都不是）">⚠️ 已在别的组</span>`
           : '';
 
         return `
@@ -5455,7 +5604,7 @@ function updateOrchestrateStandbySummary() {
 
   const summaryEl = document.getElementById('orchestrateStandbySummary');
   if (summaryEl) {
-    summaryEl.textContent = `组内其余 ${standbyIds.length} 条已勾选通道将自动作为备用通道，按进货成本由低到高在待命池中排列兜底。`;
+    summaryEl.textContent = `其余 ${standbyIds.length} 个勾选的账号放进备用：关掉，不接单，自动切号也不会用它们。`;
   }
 }
 
@@ -5896,7 +6045,7 @@ async function openModelStabilityModal(channelId) {
   document.getElementById('modalStabilityChannelName').innerHTML = `
     ${escapeHtml(channel.name)}
     <span class="strip-vendor-badge" style="font-size: 0.72rem;">${escapeHtml(channel.vendor || '')}</span>
-    ${channel.schedulable ? '<span class="section-badge active-badge" style="font-size: 0.7rem; padding: 0.1rem 0.45rem;">正在分流调度</span>' : '<span class="section-badge standby-badge" style="font-size: 0.7rem; padding: 0.1rem 0.45rem;">备用待命中</span>'}
+    ${channel.schedulable ? '<span class="section-badge active-badge" style="font-size: 0.7rem; padding: 0.1rem 0.45rem;">接单中</span>' : '<span class="section-badge standby-badge" style="font-size: 0.7rem; padding: 0.1rem 0.45rem;">没在接单</span>'}
     ${userModalBadge}
   `;
   document.getElementById('modalStabilityChannelUrl').textContent = channel.baseUrl || '';
@@ -6758,7 +6907,7 @@ function summarizeAutoSwitchCoverage(data) {
     const tally = {};
     for (const acc of others) {
       const notes = (acc.notes || []).join(' ');
-      const kind = /共享账号/.test(notes) ? '共享账号' : /售价|倍率未知/.test(notes) ? '进价高于售价' : /人工停用|例外渠道/.test(notes) ? '人工停用' : '暂时不可用';
+      const kind = /共享账号/.test(notes) ? '共享账号' : /备用（已关闭/.test(notes) ? '备用（关掉的）' : /售价|倍率未知/.test(notes) ? '进价高于售价' : /人工停用|例外渠道/.test(notes) ? '人工停用' : '暂时不可用';
       tally[kind] = (tally[kind] || 0) + 1;
     }
     const why = others.length ? '其余 ' + Object.entries(tally).map(([kind, count]) => `${count} 个${kind}`).join('、') : '只有 1 个账号';
@@ -6777,17 +6926,17 @@ function renderAutoSwitchCoverage(data) {
     </div>` : '';
   const { covered, exposed, manual, urgent } = summarizeAutoSwitchCoverage(data);
   const hints = [];
-  if (exposed.length) hints.push('给没有备用的分组各加一个同类模型、进价不高于售价的备用账号，出问题时就能自动切换。');
-  if (exposed.some(item => item.shared)) hints.push('共享账号不能直接当备用，可以点 <button type="button" class="btn-micro-edit" onclick="openSplitSharedModal()">🧩 拆分共享账号</button> 拆开。');
+  if (exposed.length) hints.push('给这些分组各设一个副调（同类模型、进价不高于售价），出问题时就能自动切换。备用是关掉的，不会被换上；想让它顶上，就在分组里把它改成副调或备选。');
+  if (exposed.some(item => item.shared)) hints.push('共享账号不能当替补，可以点 <button type="button" class="btn-micro-edit" onclick="openSplitSharedModal()">🧩 拆分共享账号</button> 拆开。');
   box.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;">
       <strong style="color:#0f172a;">🛡️ 各分组的保护情况</strong>
       <span style="font-size:0.7rem;color:#94a3b8;">${escapeHtml(new Date(data.generatedAt).toLocaleTimeString())} 检查</span>
     </div>
     ${data.enabled ? `
-      ${line('🚨', '#dc2626', urgent.length, '当前账号出了问题，而且没有备用可切，请尽快充值或补充账号', urgent.map(name).join('、'))}
-      ${line('✅', '#16a34a', covered.length, '有备用账号，出问题会自动切换', covered.map(item => `${name(item.group)}（${item.backups} 个备用）`).join('、'))}
-      ${line('⚠️', '#b45309', exposed.length, '没有可用的备用账号，出问题时无法自动切换', exposed.map(item => `${name(item.group)}（${escapeHtml(item.why)}）`).join('、'))}
+      ${line('🚨', '#dc2626', urgent.length, '当前账号出了问题，而且没有副调或备选可切，请尽快充值或补充账号', urgent.map(name).join('、'))}
+      ${line('✅', '#16a34a', covered.length, '有能顶上的副调或备选，出问题会自动切换', covered.map(item => `${name(item.group)}（${item.backups} 个能顶上）`).join('、'))}
+      ${line('⚠️', '#b45309', exposed.length, '没有能顶上的副调或备选，出问题时无法自动切换', exposed.map(item => `${name(item.group)}（${escapeHtml(item.why)}）`).join('、'))}
       ${line('⏸', '#64748b', manual.length, '由你人工管理，不自动切换', manual.map(group => `${name(group)}（${escapeHtml(String(group.reason || '').split('，')[0])}）`).join('、'))}
       ${hints.length ? `<div style="margin-top:0.45rem;padding-top:0.4rem;border-top:1px dashed #cbd5e1;color:#475569;font-size:0.74rem;">💡 ${hints.join('')}</div>` : ''}`
     : '<div style="color:#dc2626;font-weight:700;margin-top:0.3rem;">⏸ 自动切号总开关目前是关闭的，所有分组都不会自动切换。</div>'}

@@ -1,6 +1,6 @@
 'use strict';
 
-const { groupIds, groupCostIsSafe } = require('./routing-policy');
+const { groupIds, groupCostIsSafe, groupRole } = require('./routing-policy');
 
 const DEFAULTS = Object.freeze({
   probeFreshnessMs: 180000,
@@ -19,9 +19,6 @@ const DEFAULTS = Object.freeze({
   // clear a debt that no balance API can confirm) before traffic returns.
   generationProofMaxAgeMs: 1800000,
   requireGenerationProbe: true,
-  // 'cost' = cheapest eligible backup first; 'role' = native SUB2 priority
-  // (主调 1 / 副调 10 / 备选 20 / 备用 100) first, cost as tie-breaker.
-  candidateOrder: 'cost',
   autoRecoverLowestCost: true,
   // 请求少的账号在 5 分钟窗口里凑不满「连续失败」门槛：最近几次真实请求连续失败时，
   // 再用一次真实生成探测确认，探测也失败才算故障。请求多的账号仍只按原门槛判断。
@@ -55,6 +52,8 @@ function lowTrafficSuspect(stats = {}, config = {}) {
 function priority(channel) {
   return Number.isFinite(Number(channel?.priority)) ? Number(channel.priority) : Number.MAX_SAFE_INTEGER;
 }
+
+const ROLE_RANK = Object.freeze({ main: 0, sub: 1, alt: 2, standby: 3 });
 
 function modelMatches(pattern, model) {
   const expression = String(pattern).split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*');
@@ -210,11 +209,13 @@ function evaluateGroup({ group, channels, metrics = {}, config = {}, runtime = {
   }
 
   if (options.enabled === false || group.enabled === false) return result('hold', 'automation_disabled');
-  const candidates = members.filter(channel => channel !== current && health.get(String(channel.id)).available &&
-    groupCostIsSafe(channel, group) && compatible(channel, required));
+  // 备用就是关掉：自动切号永远不把它换上来。能顶上的只有本组的副调和备选（以及没在接单的主调），
+  // 顺序固定为 主调 → 副调 → 备选，同一角色里先用进价低的。
+  const candidates = members.filter(channel => channel !== current && groupRole(channel, group.id) !== 'standby' &&
+    health.get(String(channel.id)).available && groupCostIsSafe(channel, group) && compatible(channel, required));
+  const byRole = (a, b) => ROLE_RANK[groupRole(a, group.id)] - ROLE_RANK[groupRole(b, group.id)];
   const byCost = (a, b) => Number(a.costMultiplier ?? a.multiplier) - Number(b.costMultiplier ?? b.multiplier);
-  const byPriority = (a, b) => priority(a) - priority(b);
-  candidates.sort((a, b) => (options.candidateOrder === 'role' ? byPriority(a, b) || byCost(a, b) : byCost(a, b) || byPriority(a, b)) || Number(a.id) - Number(b.id));
+  candidates.sort((a, b) => byRole(a, b) || byCost(a, b) || Number(a.id) - Number(b.id));
   const currentFault = current ? health.get(String(current.id)).fault : 'no_active_account';
   if (currentFault) {
     next.originalMainId = runtime.originalMainId || current?.id || next.originalMainId;

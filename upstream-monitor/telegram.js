@@ -1032,14 +1032,15 @@ class TelegramBotManager {
     if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
     if (operator && operator.includes('Telegram')) return;
 
+    // 只有主调接单；副调、备选平时不接单，按顺序替补；备用就是关掉
     const roleName = {
-      main: '⚡ 主调 (优先级 1)',
-      sub: '🔵 副调 (优先级 10)',
-      alt: '🟡 备选 (优先级 20)',
-      alternative: '🟡 备选 (优先级 20)',
-      standby: '⚪ 备用 (优先级 100)',
-      fallback: '⚪ 备用 (优先级 100)'
-    }[role] || '⚪ 备用 (优先级 100)';
+      main: '⚡ 主调 (接单)',
+      sub: '🔵 副调 (不接单 · 第一替补)',
+      alt: '🟡 备选 (不接单 · 第二替补)',
+      alternative: '🟡 备选 (不接单 · 第二替补)',
+      standby: '⚪ 备用 (关掉)',
+      fallback: '⚪ 备用 (关掉)'
+    }[role] || '⚪ 备用 (关掉)';
     const message = 
       `🎯 <b>【上游定性级别调整】</b>\n` +
       `━━━━━━━━━━━━━━━━━━\n` +

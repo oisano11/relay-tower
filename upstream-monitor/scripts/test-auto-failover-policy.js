@@ -245,10 +245,31 @@ test('passive (OAuth / no API key) accounts recover from request faults without 
   assert.equal(result.reason, 'cheaper_recovered');
 });
 
-test('candidate order can prefer native role priority over cost', () => {
-  const channels = [channel(1, { balance: 0, balanceStatus: 'empty' }), channel(2, { priority: 100, costMultiplier: 0.2 }), channel(3, { priority: 10, costMultiplier: 0.3 })];
-  assert.equal(decide(channels).targetId, 2);
-  assert.equal(decide(channels, { config: { candidateOrder: 'role' } }).targetId, 3);
+test('failover never promotes a standby and goes 副调 before 备选, cheapest first within a role', () => {
+  const debt = { balance: 0, balanceStatus: 'empty' };
+  const channels = [channel(1, debt), channel(2, { priority: 100, costMultiplier: 0.05 }), channel(3, { priority: 20, costMultiplier: 0.1 }),
+    channel(4, { priority: 10, costMultiplier: 0.3 }), channel(5, { priority: 10, costMultiplier: 0.25 })];
+  assert.equal(decide(channels).targetId, 5, 'cheapest 副调 first, even though a 备选 and a 备用 are cheaper');
+  assert.equal(decide(channels.filter(c => c.id !== 4 && c.id !== 5)).targetId, 3, 'no 副调 left: the 备选');
+  assert.equal(decide(channels, { config: { candidateOrder: 'cost' } }).targetId, 5, 'the old cost-first option no longer exists');
+  const onlyStandby = decide([channel(1, debt), channel(2, { priority: 100 })]);
+  assert.equal(onlyStandby.action, 'exhausted', '备用就是关掉：只剩备用时不切');
+  // 分组里显示的角色 (account_groups.priority) 为准，账号全局优先级只决定谁是当前账号
+  const labelled = [channel(1, debt), channel(2, { priority: 1, groupsDetail: [{ id: 1, priority: 100 }] }),
+    channel(3, { priority: 20, groupsDetail: [{ id: 1, priority: 20 }] })];
+  assert.equal(decide(labelled).targetId, 3);
+});
+
+test('saving money never moves traffic onto a standby', () => {
+  let runtime = {};
+  let result;
+  for (let minute = 0; minute <= 12; minute++) {
+    const now = START + minute * 60000;
+    result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }), channel(2, { priority: 100, costMultiplier: 0.1, lastProbeTime: now })], { now, runtime });
+    runtime = result.runtime;
+  }
+  assert.equal(result.action, 'hold');
+  assert.equal(result.reason, 'healthy');
 });
 
 test('decisions expose per-account faults so callers only shut down confirmed debt', () => {
