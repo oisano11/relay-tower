@@ -3359,3 +3359,209 @@ test('the protection overview says when a group\'s backups lack the models custo
   assert.equal(summary.exposed[0].why, '其余 1 个缺客户在用模型的账号');
   assert.equal(summary.urgent.length, 1);
 });
+
+// ---- 余额：面板里存的旧快照不能顶掉更新的读数 ----
+
+function balancePanelSyncContext(fetchImpl, extra = {}) {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const context = vm.createContext({
+    fetch: fetchImpl,
+    AbortSignal: { timeout: () => {} },
+    isKnownNonSub2APIUrl: () => false,
+    checkIsSub2APIUpstream: async () => true,
+    upstreamPanels: [],
+    writeJSON() {},
+    UPSTREAM_PANELS_FILE: '',
+    CHANNELS_FILE: '',
+    IS_CONTROL_PLANE_WORKER: false,
+    broadcastSSE() {},
+    autoSwitchConfig: { enabled: false },
+    state: { channels: [] },
+    console: { log() {}, warn() {}, error() {} },
+    ...extra
+  });
+  vm.runInContext(source.slice(source.indexOf('async function syncSingleUpstreamPanel('), source.indexOf('// 批量同步所有已启用的上游后台')), context);
+  return context;
+}
+
+// 只有 API Key、没有登录账号的 Sub2API 上游：登录接口 401，只有 /v1/usage 能查到钱包
+function keyOnlyUpstreamFetch(readWallet) {
+  return async url => {
+    if (url.endsWith('/v1/usage')) {
+      const wallet = readWallet();
+      return { ok: true, status: 200, json: async () => ({ balance: wallet, remaining: wallet, unit: 'USD', mode: 'unrestricted' }) };
+    }
+    if (url.endsWith('/api/v1/auth/me')) return { ok: false, status: 401, json: async () => ({}) };
+    if (url.includes('/dashboard/billing/')) return { ok: true, status: 200, json: async () => { throw new Error('not json'); } };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+}
+
+function storedKeyPanel(balanceUSD) {
+  return {
+    id: 'panel_auto_x', name: 'X', backendUrl: 'https://x.test', authMode: 'token_cookie', userToken: 'sk-panel-key',
+    enabled: true, balanceUSD, userInfo: { id: 'api_key_user', role: 'user', quota: Math.round(balanceUSD * 500000), balanceUSD, usedQuota: 0 }
+  };
+}
+
+test('a key-only upstream panel re-reads its wallet on every sync instead of replaying the stored snapshot', async () => {
+  let wallet = 0.4;
+  const context = balancePanelSyncContext(keyOnlyUpstreamFetch(() => wallet));
+  // 面板建好时读到 12.5，之后上游实际只剩 0.4：以前每次同步都原样返回 12.5，还刷新同步时间
+  const first = await context.syncSingleUpstreamPanel(storedKeyPanel(12.5));
+  assert.equal(first.balanceUSD, 0.4);
+  assert.equal(first.userInfo.balanceUSD, 0.4);
+  assert.equal(first.balanceStale, false);
+  wallet = 8.25;
+  const second = await context.syncSingleUpstreamPanel(first);
+  assert.equal(second.balanceUSD, 8.25);
+  assert.equal(second.balanceStale, false);
+});
+
+test('a panel that cannot read its wallet keeps the old number, marks it stale and writes nothing into channels', async () => {
+  const channels = [{ id: '1', baseUrl: 'https://x.test/v1', apiKey: 'sk-panel-key', balance: 8.25, balanceStatus: 'ok', balanceUpdated: '2026-09-30T01:00:00.000Z' }];
+  const context = balancePanelSyncContext(async () => ({ ok: false, status: 500, json: async () => ({}) }), { state: { channels } });
+  const stored = { ...storedKeyPanel(0.6), models: ['gpt-5.4'] };
+  const res = await context.syncSingleUpstreamPanel(stored);
+  assert.equal(res.balanceStale, true);
+  assert.equal(res.balanceUSD, 0.6);
+  assert.equal(channels[0].balance, 8.25);
+  assert.equal(channels[0].balanceStatus, 'ok');
+  assert.equal(channels[0].balanceUpdated, '2026-09-30T01:00:00.000Z');
+});
+
+test('a wallet the panel really read this time is written into the channels on its host', async () => {
+  const channels = [
+    { id: '1', baseUrl: 'https://x.test/v1', apiKey: 'sk-panel-key', balance: 0.6, balanceStatus: 'low', balanceUpdated: '2026-09-30T01:00:00.000Z' },
+    { id: '2', baseUrl: 'https://other.test/v1', apiKey: 'sk-other', balance: 3, balanceStatus: 'low', balanceUpdated: '2026-09-30T01:00:00.000Z' }
+  ];
+  const context = balancePanelSyncContext(keyOnlyUpstreamFetch(() => 8.25), { state: { channels } });
+  await context.syncSingleUpstreamPanel(storedKeyPanel(0.6));
+  assert.equal(channels[0].balance, 8.25);
+  assert.equal(channels[0].balanceStatus, 'ok');
+  assert.equal(channels[1].balance, 3, 'channels on other hosts are left alone');
+});
+
+test('a failed panel sync leaves the old snapshot marked stale', async () => {
+  const context = balancePanelSyncContext(async () => { throw new Error('offline'); });
+  const stored = storedKeyPanel(0.6);
+  await assert.rejects(context.syncSingleUpstreamPanel({ ...stored, userInfo: null, models: [] }), /未能从上游后台/);
+  const kept = context.upstreamPanels.find(p => p.id === 'panel_auto_x');
+  assert.equal(kept.status, 'error');
+  assert.equal(kept.balanceStale, true);
+});
+
+function accountSyncWithPanel({ panel, channel }) {
+  const built = syncedAccount(remoteAccount({ id: '7', base_url: 'https://example.test/v1' }), [{ id: 1, name: 'business', sale_rate: 1 }]);
+  built.context.upstreamPanels.push(panel);
+  built.state.channels.push({ id: '7', name: 'remote', baseUrl: 'https://example.test/v1', ...channel });
+  return built.context.syncRealSub2APIAccounts()[0];
+}
+
+const samplePanel = (overrides = {}) => ({
+  id: 'panel_auto_example', backendUrl: 'https://example.test', enabled: true, status: 'connected',
+  lastSyncTime: '2026-09-30T01:01:00.000Z', userInfo: { balanceUSD: 0.6 }, ...overrides
+});
+
+test('the account sync keeps a channel balance that was read after the panel snapshot', () => {
+  const channel = accountSyncWithPanel({
+    panel: samplePanel(),
+    channel: { balance: 8.25, balanceUnit: 'USD', balanceStatus: 'ok', balanceUpdated: '2026-09-30T01:05:00.000Z' }
+  });
+  assert.equal(channel.balance, 8.25);
+  assert.equal(channel.balanceStatus, 'ok');
+  assert.equal(channel.balanceUpdated, '2026-09-30T01:05:00.000Z');
+});
+
+test('the account sync keeps a gateway arrears mark that is newer than the panel snapshot', () => {
+  const channel = accountSyncWithPanel({
+    panel: samplePanel({ userInfo: { balanceUSD: 12 } }),
+    channel: { balance: 0, balanceUnit: 'USD', balanceStatus: 'empty', balanceUpdated: '2026-09-30T01:02:00.000Z' }
+  });
+  assert.equal(channel.balance, 0);
+  assert.equal(channel.balanceStatus, 'empty');
+});
+
+test('the account sync takes the panel wallet when it is newer than the channel reading or the channel has none', () => {
+  const newer = accountSyncWithPanel({
+    panel: samplePanel({ lastSyncTime: '2026-09-30T01:10:00.000Z', userInfo: { balanceUSD: 8.25 } }),
+    channel: { balance: 0.6, balanceUnit: 'USD', balanceStatus: 'low', balanceUpdated: '2026-09-30T01:05:00.000Z' }
+  });
+  assert.equal(newer.balance, 8.25);
+  assert.equal(newer.balanceStatus, 'ok');
+  assert.equal(newer.balanceUpdated, '2026-09-30T01:10:00.000Z');
+
+  const unread = accountSyncWithPanel({
+    panel: samplePanel({ userInfo: { balanceUSD: 4.2 } }),
+    channel: { balance: null, balanceStatus: 'pending' }
+  });
+  assert.equal(unread.balance, 4.2);
+  assert.equal(unread.balanceStatus, 'low');
+});
+
+test('the account sync never uses a panel snapshot that the panel marked stale', () => {
+  const channel = accountSyncWithPanel({
+    panel: samplePanel({ lastSyncTime: '2026-09-30T01:10:00.000Z', balanceStale: true, userInfo: { balanceUSD: 0.6 } }),
+    channel: { balance: 8.25, balanceUnit: 'USD', balanceStatus: 'ok', balanceUpdated: '2026-09-30T01:05:00.000Z' }
+  });
+  assert.equal(channel.balance, 8.25);
+  const unread = accountSyncWithPanel({
+    panel: samplePanel({ balanceStale: true, userInfo: { balanceUSD: 0.6 } }),
+    channel: { balance: null, balanceStatus: 'pending' }
+  });
+  assert.equal(unread.balance, null, 'a stale snapshot is not a reading, even for a channel with none');
+});
+
+function balanceFallbackContext(panels) {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const context = vm.createContext({
+    fetch: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+    AbortSignal: { timeout: () => {} },
+    upstreamPanels: panels,
+    state: { channels: [] },
+    console: { log() {}, warn() {}, error() {} }
+  });
+  vm.runInContext(source.slice(source.indexOf('// 获取单上游钱包余额'), source.indexOf('// 脱敏上游供应商配置并附加关联与墓碑状态')), context);
+  return context;
+}
+
+test('the balance query falls back to a panel only when that panel really read its wallet', async () => {
+  const channel = { baseUrl: 'https://x.test/v1', apiKey: 'sk-channel-key' };
+  const live = balanceFallbackContext([{ id: 'p', backendUrl: 'https://x.test', enabled: true, status: 'connected',
+    lastSyncTime: new Date().toISOString(), userInfo: { balanceUSD: 0.6 } }]);
+  const fromPanel = await live.fetchChannelBalance(channel);
+  assert.equal(fromPanel.balance, 0.6);
+  assert.equal(fromPanel.source, 'panel');
+
+  const stale = balanceFallbackContext([{ id: 'p', backendUrl: 'https://x.test', enabled: true, status: 'connected',
+    lastSyncTime: new Date().toISOString(), balanceStale: true, userInfo: { balanceUSD: 0.6 } }]);
+  const unknown = await stale.fetchChannelBalance(channel);
+  assert.equal(unknown.balance, null);
+  assert.equal(unknown.status, 'unknown');
+});
+
+test('a panel reading never overwrites a newer channel reading, while the channel\'s own key reading always does', () => {
+  const context = balanceFallbackContext([]);
+  const held = () => ({ balance: 8.25, balanceUnit: 'USD', balanceStatus: 'ok', balanceUpdated: '2026-09-30T01:05:00.000Z' });
+
+  const older = held();
+  assert.equal(context.applyChannelBalanceInfo(older, { balance: 0.6, unit: 'USD', status: 'low', source: 'panel', lastUpdated: '2026-09-30T01:01:00.000Z' }), false);
+  assert.equal(older.balance, 8.25);
+  assert.equal(older.balanceUpdated, '2026-09-30T01:05:00.000Z');
+
+  const newer = held();
+  assert.equal(context.applyChannelBalanceInfo(newer, { balance: 3, unit: 'USD', status: 'low', source: 'panel', lastUpdated: '2026-09-30T01:10:00.000Z' }), true);
+  assert.equal(newer.balance, 3);
+
+  const byKey = held();
+  assert.equal(context.applyChannelBalanceInfo(byKey, { balance: 0.4, unit: 'USD', status: 'low', lastUpdated: '2026-09-30T01:01:00.000Z' }), true);
+  assert.equal(byKey.balance, 0.4, 'a reading taken with the channel\'s own key is the source of truth');
+
+  const unread = { balance: null, balanceStatus: 'pending' };
+  assert.equal(context.applyChannelBalanceInfo(unread, { balance: 4.2, unit: 'USD', status: 'low', source: 'panel', lastUpdated: '2026-09-30T01:01:00.000Z' }), true);
+  assert.equal(unread.balance, 4.2);
+
+  const unlimited = { balance: null, balanceStatus: 'unlimited', balanceUpdated: '2026-09-30T01:05:00.000Z' };
+  assert.equal(context.applyChannelBalanceInfo(unlimited, { balance: 4.2, unit: 'USD', status: 'low', source: 'panel', lastUpdated: '2026-09-30T01:01:00.000Z' }), false);
+  assert.equal(unlimited.balanceStatus, 'unlimited');
+});

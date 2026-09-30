@@ -322,3 +322,25 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - `npm test` 217/217。新增 10 个用例；另按新规则改写 2 个旧用例，它们原来断言的是刚报过错的便宜账号几分钟后就会被换过去。这 12 个用例在改动前的代码上全部失败。
 - 两条新查询在生产库只读执行通过。
 - 用生产数据空跑决策：主调出问题时，原规则的结果是 `exhausted`，新规则会换到副调。把出问题的账号降为副调、开着便宜优先时，它的探测连续 15 分钟正常，也不会被换回去。
+
+## 刷新余额后过一会儿又跳回旧金额（2026-09-30）
+
+用户反馈：点「同步上游余额」后账号余额是对的，过一会儿又变回之前欠费时的金额。只读核对生产数据和日志，找到两层原因。
+
+1. **面板里的钱包余额是冻结的快照。** `syncSingleUpstreamPanel` 开头是 `let userInfo = params.userInfo || null`，而下面每一种查余额的办法（`/api/v1/auth/me`、`/api/user/self`、`/v1/dashboard/billing/subscription`、`/v1/usage`）都带着 `!userInfo` 条件。面板对象自带上次存下的 `userInfo`，所以这几步全被跳过，结果原样返回，`lastSyncTime` 照常刷新，状态还是 `connected`。登录账号密码的面板不受影响：会话探活会重新读出 `userInfo`。只有 API Key 接入的面板（自动发现建出来的，`userToken` 是 `sk-` 开头的 Key，没有账号密码）第一次同步之后再也读不到新余额。线上这样的面板，有的存着比实际高出很多的数，有的存着比实际低很多的数，同一个面板连续两次同步的余额一分不差，只有同步时间在变。
+2. **旧快照有三条路写进账号：**
+   - `syncSingleUpstreamPanel` 末尾把余额写进这个地址下的所有账号。每 10 分钟的 `refreshAllBalances` 先同步全部面板，再逐个账号用自己的 Key 查 `/v1/usage`。生产上按 2 秒间隔观察到：面板同步的瞬间，一批账号的余额被改成面板里的旧数，约 4 秒后才改回来。这几秒里还会广播 SSE，自动切号开着时还会触发一次 `evaluateAutoSwitch`。
+   - 直接调用的 `syncRealSub2APIAccounts()`：只要账号匹配到面板，就用面板的 `userInfo.balanceUSD` 盖掉账号现有余额，不看谁更新。它在改分组、调角色、「同步后台」、单个账号测速时会被调用，`upstream_scanner.js` 的 `runScan` 一开头也调用它，也就是每 3 小时一次的巡检，以及每次在「上游供应商后台」里添加或同步面板之后。盖掉之后要等下一次 `refreshAllBalances` 才恢复。后台控制面 worker 的合并跳过 `balance*` 字段，不受影响。
+   - `fetchChannelBalance` 里账号自己的 Key 查不到时退回面板；同步后没有重新取列表里换上的新面板对象，读的是旧对象。
+
+改法：
+
+- **`syncSingleUpstreamPanel`：** `userInfo` 每次从空开始读，上次的值单独放在 `previousUserInfo`，读不到时才退回它，并把结果标成 `balanceStale: true`。凭模型列表占位的 `balanceUSD: 0` 也算「没读到」。`balanceStale` 的面板不写进任何账号；同步整个失败时写进面板列表的记录也带 `balanceStale: true`。登录受限时不再直接采用旧值，先用上次的凭据再读一遍。
+- **`syncRealSub2APIAccounts`：** 面板余额只在两种情况下采用：账号没有余额读数（`balance` 为空且不是不限额），或面板 `lastSyncTime` 晚于账号的 `balanceUpdated`。`balanceStale` 的面板一律不用。网关记下的欠费会把 `balanceUpdated` 设成当时的时间，所以同样不会被更早的面板数顶掉。
+- **`fetchChannelBalance` / `applyChannelBalanceInfo`：** 退回面板时结果带 `source: 'panel'`，并读列表里最新的面板对象；`balanceStale` 的面板不算读数。新增 `applyChannelBalanceInfo`，整批刷新和单个账号刷新共用：`source: 'panel'` 的结果读取时间不晚于账号现有读数时不写，账号自己 Key 查到的数一律写。单个账号刷新遇到不采用的情况，回给页面的是账号现在的读数。
+- 没有新增账号字段，`CONTROL_PLANE_LOCAL_CHANNEL_FIELDS` 不用改。顶部「上游备付金」是把面板余额加起来的，面板不再冻结，它也就跟着准了。
+
+验收：
+- `npm test` 227/227。新增 10 个用例：面板每次重读余额、读不到时标 `balanceStale` 且不写账号、真读到的写进本地址的账号、同步失败标 `balanceStale`、账号同步不覆盖更新的读数和网关欠费记录、面板更新时才采用、不用 `balanceStale` 的面板、兜底只用真读到的面板、`applyChannelBalanceInfo` 的先后规则。前 8 个在改动前的代码上有 7 个失败，剩下 1 个是对照用例。
+- 生产只读核对：每个面板的 Key 与该地址下账号的 Key 是否同一把（只比较指纹）、各上游 `/v1/usage` 实际返回、2 秒间隔观察一次 10 分钟同步里账号余额被改成旧数又改回来的全过程。全程没有写入生产数据。
+- 未部署。

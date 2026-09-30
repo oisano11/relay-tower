@@ -768,24 +768,29 @@ async function fetchChannelBalance(channel) {
       if (!matchedPanel.userInfo || matchedPanel.status !== 'connected' || (Date.now() - new Date(matchedPanel.lastSyncTime || 0).getTime() > 600000)) {
         await syncSingleUpstreamPanel(matchedPanel);
       }
-      if (matchedPanel.userInfo) {
-        const isUnlimited = !!(matchedPanel.isUnlimited || (matchedPanel.userInfo && matchedPanel.userInfo.isUnlimited) || Number(matchedPanel.userInfo.balanceUSD) >= 1000000);
+      // 同步会用新对象换掉列表里的面板，读余额要拿换过之后的那个
+      const panel = upstreamPanels.find(p => p.id === matchedPanel.id) || matchedPanel;
+      // 面板这次没读到余额时，里面是上次留下的旧值，不当读数用
+      if (panel.userInfo && panel.balanceStale !== true) {
+        const isUnlimited = !!(panel.isUnlimited || (panel.userInfo && panel.userInfo.isUnlimited) || Number(panel.userInfo.balanceUSD) >= 1000000);
         if (isUnlimited) {
           return {
             balance: null,
             isUnlimited: true,
             unit: 'USD',
             status: 'unlimited',
-            lastUpdated: matchedPanel.lastSyncTime || new Date().toISOString()
+            source: 'panel',
+            lastUpdated: panel.lastSyncTime || new Date().toISOString()
           };
         }
-        const b = matchedPanel.userInfo.balanceUSD;
+        const b = panel.userInfo.balanceUSD;
         return {
           balance: (b !== null && b !== undefined) ? Number(Number(b).toFixed(2)) : null,
           isUnlimited: false,
           unit: 'USD',
           status: (b === null || b === undefined) ? 'unknown' : (Number(b) < 5 ? (Number(b) <= 0.001 ? 'empty' : 'low') : 'ok'),
-          lastUpdated: matchedPanel.lastSyncTime || new Date().toISOString()
+          source: 'panel',
+          lastUpdated: panel.lastSyncTime || new Date().toISOString()
         };
       }
     } catch (e) {
@@ -802,6 +807,39 @@ async function fetchChannelBalance(channel) {
   };
 }
 
+// 把一次余额查询的结果写进通道，返回有没有写。
+// 走面板兜底拿到的数，读取时间不比通道现有读数晚时不写：刚查到的余额、网关刚记下的欠费，
+// 不能被更早的面板快照顶回去。用通道自己的 Key 查到的数一律直接写。
+function applyChannelBalanceInfo(ch, balInfo) {
+  if (!balInfo) return false;
+  if (balInfo.source === 'panel') {
+    const readAt = Date.parse(balInfo.lastUpdated || '');
+    const heldAt = Date.parse(ch.balanceUpdated || '');
+    const hasHeldReading = Number.isFinite(heldAt) &&
+      ((ch.balance !== null && ch.balance !== undefined) || ch.balanceStatus === 'unlimited');
+    if (hasHeldReading && !(readAt > heldAt)) return false;
+  }
+  if (balInfo.isUnlimited) {
+    ch.balance = null;
+    ch.isUnlimited = true;
+    ch.balanceUnit = balInfo.unit || 'USD';
+    ch.balanceStatus = 'unlimited';
+    ch.balanceUpdated = balInfo.lastUpdated;
+  } else if (balInfo.balance !== null && !isNaN(balInfo.balance)) {
+    ch.balance = balInfo.balance;
+    ch.isUnlimited = false;
+    ch.balanceUnit = balInfo.unit || 'USD';
+    ch.balanceStatus = balInfo.status;
+    ch.balanceUpdated = balInfo.lastUpdated;
+  } else {
+    ch.balance = null;
+    ch.isUnlimited = false;
+    ch.balanceStatus = balInfo.status || 'unknown';
+    ch.balanceUpdated = balInfo.lastUpdated;
+  }
+  return true;
+}
+
 // 刷新全部通道余额 (遍历所有上游后台管理池)
 async function refreshAllBalances() {
   try {
@@ -811,27 +849,7 @@ async function refreshAllBalances() {
   }
 
   const promises = state.channels.map(async (ch) => {
-    const balInfo = await fetchChannelBalance(ch);
-    if (balInfo) {
-      if (balInfo.isUnlimited) {
-        ch.balance = null;
-        ch.isUnlimited = true;
-        ch.balanceUnit = balInfo.unit || 'USD';
-        ch.balanceStatus = 'unlimited';
-        ch.balanceUpdated = balInfo.lastUpdated;
-      } else if (balInfo.balance !== null && !isNaN(balInfo.balance)) {
-        ch.balance = balInfo.balance;
-        ch.isUnlimited = false;
-        ch.balanceUnit = balInfo.unit;
-        ch.balanceStatus = balInfo.status;
-        ch.balanceUpdated = balInfo.lastUpdated;
-      } else {
-        ch.balance = null;
-        ch.isUnlimited = false;
-        ch.balanceStatus = balInfo.status || 'unknown';
-        ch.balanceUpdated = balInfo.lastUpdated;
-      }
-    }
+    applyChannelBalanceInfo(ch, await fetchChannelBalance(ch));
   });
   await Promise.allSettled(promises);
   writeJSON(CHANNELS_FILE, state);
@@ -1256,7 +1274,13 @@ async function syncSingleUpstreamPanel(params = {}) {
     }
   }
 
-  let userInfo = params.userInfo || null;
+  // 钱包余额每次同步都要重新读。上次存下的 userInfo 只在这次真的读不到时才拿来顶：
+  // 以前一上来就把它当成这次的结果，下面所有查余额的步骤都因为「已经有了」被跳过，
+  // 只有 API Key、没有登录账号的上游，余额就永远停在面板刚建好那一刻。
+  const previousUserInfo = params.userInfo || null;
+  let userInfo = null;
+  // 这次没读到，拿的是上次的旧值（或凭模型列表占位）：不写进通道，别处也不当读数用
+  let userInfoStale = false;
   let models = params.models || [];
 
   try {
@@ -1409,9 +1433,8 @@ async function syncSingleUpstreamPanel(params = {}) {
       }
 
       if (!loginOk && !token) {
-        if (params.userInfo && params.userInfo.balanceUSD !== undefined) {
-          console.warn(`[UpstreamPanel] [${name}] 登录受限 (${lastLoginErr})，沿用现有有效用户与额度信息: $${params.userInfo.balanceUSD}`);
-          userInfo = params.userInfo;
+        if (previousUserInfo && previousUserInfo.balanceUSD !== undefined) {
+          console.warn(`[UpstreamPanel] [${name}] 登录受限 (${lastLoginErr})，沿用上次的登录凭据再读一次余额，读不到就先保留旧值: $${previousUserInfo.balanceUSD}`);
           token = params.userToken || '';
           cookie = params.cookie || '';
         } else {
@@ -1594,8 +1617,10 @@ async function syncSingleUpstreamPanel(params = {}) {
 
     // 检查并归一化用户信息：即使查额端点未开放，只要模型可用亦判定连通成功
     if (!userInfo) {
-      if (params.userInfo && params.userInfo.balanceUSD !== undefined) {
-        userInfo = params.userInfo;
+      // 走到这里说明这次没有读到钱包余额：旧值和占位值都不是读数
+      userInfoStale = true;
+      if (previousUserInfo && previousUserInfo.balanceUSD !== undefined) {
+        userInfo = previousUserInfo;
       } else if (models && models.length > 0) {
         userInfo = {
           id: 'api_key_user',
@@ -1657,6 +1682,8 @@ async function syncSingleUpstreamPanel(params = {}) {
       balanceUSD: userInfo.balanceUSD,
       isUnlimited: !!userInfo.isUnlimited,
       lastSyncTime: new Date().toISOString(),
+      // true = 这次没读到余额，balanceUSD 是上次留下的旧值，别当读数用
+      balanceStale: userInfoStale,
       userInfo,
       models,
       groups: panelGroups,
@@ -1675,13 +1702,13 @@ async function syncSingleUpstreamPanel(params = {}) {
     writeJSON(UPSTREAM_PANELS_FILE, upstreamPanels);
     if (typeof syncUpstreamPanelConfigCompat === 'function') syncUpstreamPanelConfigCompat();
 
-    // 同步更新关联通道渠道数据中的余额信息
+    // 同步更新关联通道渠道数据中的余额信息（只写这次真正读到的余额；旧快照写进去会把通道刚查到的余额顶回去）
     let channelsUpdated = false;
     state.channels.forEach(c => {
       const isMatch = (c.upstreamPanelId && c.upstreamPanelId === id) ||
                       (c.panelSync === true && id === 'panel_jinlong') ||
                       (c.baseUrl && backendUrl && c.baseUrl.includes(backendUrl.replace(/^https?:\/\//, '')));
-      if (isMatch) {
+      if (isMatch && !userInfoStale) {
         if (userInfo.isUnlimited) {
           c.balance = null;
           c.isUnlimited = true;
@@ -1726,6 +1753,7 @@ async function syncSingleUpstreamPanel(params = {}) {
       userToken: token,
       status: 'error',
       balanceUSD: params.balanceUSD || 0,
+      balanceStale: true,
       userInfo: params.userInfo || null,
       models: params.models || [],
       lastSyncTime: new Date().toISOString(),
@@ -2278,7 +2306,14 @@ SELECT json_agg(t) FROM (
           (p.backendUrl && acc.base_url && acc.base_url.includes(p.backendUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '')))
         )
       );
-      if (matchedAccPanel && matchedAccPanel.userInfo) {
+      // 面板里的钱包只在两种情况下采用：通道还没读到过余额，或者面板读到的时间比通道现有读数更晚。
+      // 通道现有读数（刷新余额、网关记下的欠费）比面板上次同步还新时，不能被面板的旧快照顶回去；
+      // 面板这次没读到余额（balanceStale）时里面是旧数，一律不用。
+      const heldReadingAt = Date.parse(balanceUpdated || '');
+      const hasHeldReading = Number.isFinite(heldReadingAt) && (balance !== null || balanceStatus === 'unlimited');
+      const panelReadingAt = matchedAccPanel ? Date.parse(matchedAccPanel.lastSyncTime || '') : NaN;
+      const panelReadingIsNewer = !hasHeldReading || panelReadingAt > heldReadingAt;
+      if (matchedAccPanel && matchedAccPanel.userInfo && matchedAccPanel.balanceStale !== true && panelReadingIsNewer) {
         const isUnl = !!(matchedAccPanel.isUnlimited || (matchedAccPanel.userInfo && matchedAccPanel.userInfo.isUnlimited) || Number(matchedAccPanel.userInfo.balanceUSD) >= 1000000);
         if (isUnl) {
           balance = null;
@@ -8569,39 +8604,33 @@ async function handleRequest(req, res) {
     }
 
     fetchChannelBalance(targetChannel).then(balInfo => {
+      let reported = balInfo;
       if (balInfo) {
-        if (balInfo.isUnlimited) {
-          targetChannel.balance = null;
-          targetChannel.isUnlimited = true;
-          targetChannel.balanceUnit = balInfo.unit || 'USD';
-          targetChannel.balanceStatus = 'unlimited';
-          targetChannel.balanceUpdated = balInfo.lastUpdated;
-        } else if (balInfo.balance !== null && !isNaN(balInfo.balance)) {
-          targetChannel.balance = balInfo.balance;
-          targetChannel.isUnlimited = false;
-          targetChannel.balanceUnit = balInfo.unit || 'USD';
-          targetChannel.balanceStatus = balInfo.status;
-          targetChannel.balanceUpdated = balInfo.lastUpdated;
-        } else {
-          targetChannel.balance = null;
-          targetChannel.isUnlimited = false;
-          targetChannel.balanceStatus = balInfo.status || 'unknown';
-          targetChannel.balanceUpdated = balInfo.lastUpdated;
-        }
-        writeJSON(CHANNELS_FILE, state);
-        broadcastSSE('CHANNELS_UPDATED', state);
-        if (autoSwitchConfig && autoSwitchConfig.enabled) {
-          try {
-            evaluateAutoSwitch('单通道余额变动评估', false);
-          } catch (e) {
-            console.error('[单通道余额变动切线评估异常]:', e.message);
+        if (applyChannelBalanceInfo(targetChannel, balInfo)) {
+          writeJSON(CHANNELS_FILE, state);
+          broadcastSSE('CHANNELS_UPDATED', state);
+          if (autoSwitchConfig && autoSwitchConfig.enabled) {
+            try {
+              evaluateAutoSwitch('单通道余额变动评估', false);
+            } catch (e) {
+              console.error('[单通道余额变动切线评估异常]:', e.message);
+            }
           }
+        } else {
+          // 只查到一个比通道现有读数更早的面板快照，没有采用：页面上报通道现在的读数
+          reported = {
+            balance: targetChannel.balance,
+            isUnlimited: Boolean(targetChannel.isUnlimited),
+            unit: targetChannel.balanceUnit || 'USD',
+            status: targetChannel.balanceStatus,
+            lastUpdated: targetChannel.balanceUpdated
+          };
         }
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
-        balanceInfo: balInfo,
+        balanceInfo: reported,
         channel: targetChannel,
         upstreamPanels: upstreamPanels.map(maskPanel)
       }));
