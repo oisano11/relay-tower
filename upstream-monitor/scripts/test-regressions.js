@@ -3565,3 +3565,28 @@ test('a panel reading never overwrites a newer channel reading, while the channe
   assert.equal(context.applyChannelBalanceInfo(unlimited, { balance: 4.2, unit: 'USD', status: 'low', source: 'panel', lastUpdated: '2026-09-30T01:01:00.000Z' }), false);
   assert.equal(unlimited.balanceStatus, 'unlimited');
 });
+
+// ====== 2026-09-30 分组视图里每一行也能改售价 ======
+
+test('every row has a 改售价 button: in the group view it edits the group being viewed', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const container = { innerHTML: '' };
+  const blank = new Proxy({}, { get: () => '' });
+  const context = vm.createContext({ document: { getElementById: () => container }, currentDimension: 'group', currentFilterPill: '示例分组',
+    allGroups: [], autoSwitchConfig: {}, state: {},
+    formatRate: v => Number(v).toFixed(4), escapeHtml: s => String(s ?? ''), getChannelRole: () => 'main', getVendorTheme: () => blank,
+    formatTime: () => '', formatTimeAgo: () => '', roleMismatchGroups: () => [], bestChannelRole: () => 'main' });
+  vm.runInContext(app.slice(app.indexOf('function renderStripsView('), app.indexOf('// 【核心功能】点击顶部倒贴')), context);
+  const account = { id: '5', name: '示例账号', vendor: 'OpenAI / GPT', multiplier: 0.11, costMultiplier: 0.11, schedulable: true, balance: 5, balanceStatus: 'ok',
+    primaryGroupId: 3, primaryGroupName: '另一个分组', groups: ['另一个分组', '示例分组'],
+    groupsDetail: [{ id: 3, name: '另一个分组', sale_rate: 0.3 }, { id: 27, name: '示例分组', sale_rate: 0.21 }] };
+  context.renderStripsView([account], []);
+  assert.match(container.innerHTML, /openSaleRateEditModal\('27', '示例分组', 0\.21\)"[^>]*>✎ 改售价<\/button>/);
+  // 不按分组看时，改这个账号主分组的售价
+  vm.runInContext("currentDimension = 'active'; currentFilterPill = 'all'", context);
+  context.renderStripsView([account], []);
+  assert.match(container.innerHTML, /openSaleRateEditModal\('3', '另一个分组', /);
+  // 不在任何分组里的账号没有这个按钮
+  context.renderStripsView([{ ...account, primaryGroupId: null, groupsDetail: [], groups: [] }], []);
+  assert.doesNotMatch(container.innerHTML, /改售价<\/button>/);
+});

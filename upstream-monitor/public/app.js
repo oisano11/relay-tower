@@ -1118,9 +1118,9 @@ function renderStripsView(enabledChannels, standbyChannels) {
       : '';
     const role = getChannelRole(ch, effectiveGroupId);
     const isActive = role === 'main';
-    // 分组视图里分组横幅上已有「改售价」，行内不再重复；其他视图改这个渠道主分组的售价。
+    // 分组视图里改正在看的这个分组的售价（整组生效，和分组卡片顶部的「改售价」一样）；其他视图改这个渠道主分组的售价。
     const primaryGroupId = Number(ch.primaryGroupId);
-    const saleEditGroupId = effectiveGroupId ? '' : (primaryGroupId > 0 ? String(primaryGroupId) : '');
+    const saleEditGroupId = effectiveGroupId ? String(effectiveGroupId) : (primaryGroupId > 0 ? String(primaryGroupId) : '');
     const isSchedulable = Boolean(ch.schedulable);
     const vTheme = getVendorTheme(ch.vendor);
 
