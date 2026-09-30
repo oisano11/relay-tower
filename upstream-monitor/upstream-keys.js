@@ -122,6 +122,59 @@ function pickTemplate(channels, host, platform, upstreamGroupId, keyGroupByApiKe
   return { id: String(chosen.id), name: chosen.name, keepModelMapping: Boolean(sameGroup) };
 }
 
+function platformLabel(platform) {
+  const p = String(platform || '').toLowerCase();
+  return { anthropic: 'Claude', openai: 'OpenAI 兼容', grok: 'Grok', gemini: 'Gemini' }[p] || p;
+}
+
+// 一把 Key 一个分组都放不进时，用大白话写清楚为什么、怎么办；能放进去时返回 null。
+function explainUnconnectable({ key, rate, candidateGroups, upstreamPlatform }) {
+  if (candidateGroups.some(g => !g.blocked)) return null;
+  if (rate === null) {
+    if (key.group_id === null || key.group_id === undefined) {
+      return { kind: 'no_group', text: '这把 Key 在上游没有绑定分组，塔台不知道它的进价。先去上游给它选一个分组。' };
+    }
+    if (!key.group) {
+      return { kind: 'group_gone', text: '这把 Key 绑定的上游分组已经被删除（或者你的账号看不到它），上游没给出进价，这把 Key 多半也用不了。先去上游给它换一个分组，或者点「删除」把它藏起来。' };
+    }
+    return { kind: 'no_rate', text: '上游没有给出这个分组的倍率，塔台核对不了进价。等上游补上倍率，或者点「删除」把它藏起来。' };
+  }
+  if (!candidateGroups.length) {
+    const label = platformLabel(upstreamPlatform);
+    return { kind: 'no_local_group', text: `这是${label ? ` ${label} 的` : '这个平台的'} Key，本站没有同类分组可放。先在 Sub2API 后台建一个同类分组。` };
+  }
+  const kinds = [];
+  const parts = [];
+  if (candidateGroups.some(g => g.blocked === '进价不低于售价')) {
+    const sales = candidateGroups.map(g => g.saleRate).filter(Number.isFinite);
+    const top = sales.length ? Math.max(...sales) : null;
+    kinds.push('no_margin');
+    parts.push(top === null
+      ? `进价 ${rate}x，本站同类分组都没有设售价，塔台核对不了利润。先在控制台给一个同类分组设好对外售价。`
+      : `进价 ${rate}x，本站同类分组最高只卖 ${top}x，${rate > top ? '接进去会亏钱' : '接进去没有利润'}。要接，先在控制台把一个同类分组的对外售价调到高于 ${rate}x。`);
+  }
+  const noTemplate = candidateGroups.filter(g => String(g.blocked).startsWith('这家上游还没有'));
+  if (noTemplate.length) {
+    kinds.push('no_template');
+    parts.push(`本站还没有这家上游的 ${platformLabel(noTemplate[0].platform)} 账号可以参照。先在 Sub2API 后台手动加一个，之后这家上游的新 Key 就能一键接入。`);
+  }
+  if (!parts.length) return { kind: 'unknown', text: '现在没有能放这把 Key 的分组。' };
+  return { kind: kinds.length === 1 ? kinds[0] : 'mixed', text: parts.join(' ') };
+}
+
+// 「待接入」只数能接的 Key；接不进的另算，不计入数字
+function pendingCount(items) {
+  return (items || []).filter(item => !item.dismissed && item.connectable !== false).length;
+}
+
+function recountPanels(items, panels) {
+  for (const panel of panels || []) {
+    const mine = (items || []).filter(item => item.panelId === panel.id && !item.dismissed);
+    panel.pending = mine.filter(item => item.connectable !== false).length;
+    panel.blocked = mine.length - panel.pending;
+  }
+}
+
 /**
  * 根据各家上游的 Key 列表，算出还没接入本站的 Key 以及每个 Key 能放进哪些本站分组。
  * panelResults: [{ panel, status: 'ok'|'token_invalid'|'unsupported'|'error'|'skipped', keys, rates, message }]
@@ -135,7 +188,7 @@ function planUpstreamKeys({ panelResults, channels, groups, dismissed = [] }) {
   for (const result of panelResults || []) {
     const panel = result.panel || {};
     const host = hostKey(panel.backendUrl);
-    const summary = { id: panel.id, name: panel.name, host, status: result.status, message: result.message || '', total: 0, connected: 0, pending: 0 };
+    const summary = { id: panel.id, name: panel.name, host, status: result.status, message: result.message || '', total: 0, connected: 0, pending: 0, blocked: 0 };
     panels.push(summary);
     if (result.status !== 'ok') continue;
 
@@ -165,6 +218,7 @@ function planUpstreamKeys({ panelResults, channels, groups, dismissed = [] }) {
         };
       }).filter(g => g.blocked !== '平台不同').sort((a, b) => (a.blocked ? 1 : 0) - (b.blocked ? 1 : 0) || b.score - a.score || String(a.name).localeCompare(String(b.name)));
       const best = candidateGroups.find(g => !g.blocked && g.score > 0);
+      const explained = explainUnconnectable({ key, rate, candidateGroups, upstreamPlatform: upstreamGroup.platform });
       const item = {
         uid, panelId: panel.id, panelName: panel.name, host,
         keyId: key.id, keyName: key.name || '', keyTail: keyTail(key.key),
@@ -173,10 +227,16 @@ function planUpstreamKeys({ panelResults, channels, groups, dismissed = [] }) {
         suggestedName: suggestAccountName(panel.name, key.name, rate),
         suggestedGroupId: best ? best.id : null,
         candidateGroups: candidateGroups.map(({ score, ...g }) => g),
+        // 一个分组都放不进的 Key：connectable 为 false，problem 是给人看的原因和办法
+        connectable: !explained,
+        problemKind: explained ? explained.kind : null,
+        problem: explained ? explained.text : '',
         dismissed: dismissedSet.has(uid)
       };
       items.push(item);
-      if (!item.dismissed) summary.pending++;
+      if (!item.dismissed) {
+        if (item.connectable) summary.pending++; else summary.blocked++;
+      }
     }
   }
   return { items, panels };
@@ -245,5 +305,6 @@ RETURNING account_id;`;
 
 module.exports = {
   KEY_PAGE_SIZE, hostKey, keyTail, uidOf, effectiveRate, parseKeyList, localPlatformsFor, groupPlatform,
-  groupMatchScore, suggestAccountName, pickTemplate, planUpstreamKeys, buildConnectSql
+  groupMatchScore, suggestAccountName, pickTemplate, platformLabel, explainUnconnectable, pendingCount, recountPanels,
+  planUpstreamKeys, buildConnectSql
 };

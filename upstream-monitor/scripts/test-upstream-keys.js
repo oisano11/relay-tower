@@ -208,3 +208,145 @@ test('discovery notifies each new key once, and a deleted key stays hidden until
   await context.discoverUpstreamKeys();
   assert.equal(context.upstreamKeyDiscovery.panels.length, 0, 'upstreams deleted from the tower are not read');
 });
+
+// ---- 接不进任何分组的 Key：写明原因，不算进「待接入」 ----
+const deletedGroupKey = { id: 7001, name: 'orphaned', key: 'sk-new-orphaned', status: 'active', group_id: 9084, group: null, created_at: '2026-09-27T23:24:30Z', last_used_at: null };
+const noGroupKey = { id: 7002, name: 'ungrouped', key: 'sk-new-ungrouped', status: 'active', group_id: null, group: null };
+const noRateKey = { id: 7003, name: 'norate', key: 'sk-new-norate', status: 'active', group_id: 9, group: { id: 9, name: '没写倍率的组', platform: 'openai' } };
+const claudeKey = rate => ({ id: 7004, name: 'cc', key: 'sk-new-cc', status: 'active', group_id: 18, group: { id: 18, name: 'Claude MAX', platform: 'anthropic', rate_multiplier: rate } });
+const planFor = (keyList, { channelList = channels, groupList = groups, dismissed = [] } = {}) =>
+  upstreamKeys.planUpstreamKeys({ panelResults: [{ panel, status: 'ok', keys: keyList, rates: {} }], channels: channelList, groups: groupList, dismissed });
+
+test('a key whose upstream group was deleted says so and cannot be connected', () => {
+  const [item] = planFor([deletedGroupKey]).items;
+  assert.equal(item.connectable, false);
+  assert.equal(item.problemKind, 'group_gone');
+  assert.match(item.problem, /绑定的上游分组已经被删除/);
+  assert.match(item.problem, /换一个分组/);
+  assert.ok(item.candidateGroups.every(g => g.blocked === '上游没给出倍率'));
+
+  const [orphan] = planFor([noGroupKey]).items;
+  assert.equal(orphan.problemKind, 'no_group');
+  assert.match(orphan.problem, /没有绑定分组/);
+
+  const [unpriced] = planFor([noRateKey]).items;
+  assert.equal(unpriced.problemKind, 'no_rate');
+  assert.match(unpriced.problem, /没有给出这个分组的倍率/);
+});
+
+test('a key that would earn nothing says which price is too low, and a losing one says it would lose money', () => {
+  const [even] = planFor([claudeKey(1.2)]).items;
+  assert.equal(even.connectable, false);
+  assert.equal(even.problemKind, 'no_margin');
+  assert.match(even.problem, /进价 1\.2x，本站同类分组最高只卖 1\.2x，接进去没有利润/);
+  assert.match(even.problem, /调到高于 1\.2x/);
+
+  const [losing] = planFor([claudeKey(1.5)]).items;
+  assert.match(losing.problem, /进价 1\.5x，本站同类分组最高只卖 1\.2x，接进去会亏钱/);
+
+  const [fine] = planFor([claudeKey(0.9)]).items;
+  assert.equal(fine.connectable, true);
+  assert.equal(fine.problem, '');
+  assert.equal(fine.problemKind, null);
+});
+
+test('a key with no same-platform group or no template account explains what to add first', () => {
+  const [noGroup] = planFor([claudeKey(0.5)], { groupList: groups.filter(g => g.platform !== 'anthropic') }).items;
+  assert.equal(noGroup.connectable, false);
+  assert.equal(noGroup.problemKind, 'no_local_group');
+  assert.match(noGroup.problem, /Claude 的 Key，本站没有同类分组可放/);
+
+  const [noTemplate] = planFor([claudeKey(0.5)], { channelList: channels.filter(c => c.platform !== 'anthropic') }).items;
+  assert.equal(noTemplate.connectable, false);
+  assert.equal(noTemplate.problemKind, 'no_template');
+  assert.match(noTemplate.problem, /还没有这家上游的 Claude 账号可以参照/);
+});
+
+test('only keys that can be connected count as pending; the rest are counted separately', () => {
+  const plan = planFor([keys[1], deletedGroupKey, claudeKey(1.2), noGroupKey], { dismissed: ['panel_up:7002'] });
+  assert.deepEqual(plan.items.map(i => [i.keyId, i.connectable, i.dismissed]), [[6029, true, false], [7001, false, false], [7004, false, false], [7002, false, true]]);
+  const [summary] = plan.panels;
+  assert.equal(summary.pending, 1);
+  assert.equal(summary.blocked, 2, 'a dismissed key is in neither count');
+  assert.equal(upstreamKeys.pendingCount(plan.items), 1);
+
+  plan.items[0].dismissed = true;
+  upstreamKeys.recountPanels(plan.items, plan.panels);
+  assert.deepEqual([summary.pending, summary.blocked], [0, 2]);
+  assert.equal(upstreamKeys.pendingCount(plan.items), 0);
+});
+
+test('discovery counts, badge and notification only promise what can be connected', async () => {
+  const { context, effects } = serverHarness();
+  context.fetch = async url => ({
+    status: 200,
+    json: async () => (url.includes('/groups/rates') ? { code: 0, data: {} } : { code: 0, data: { items: [keys[1], deletedGroupKey] } })
+  });
+  await context.discoverUpstreamKeys({ notify: true });
+  assert.equal(context.upstreamKeyDiscoverySummary().pending, 1, 'the dead key is not pending');
+  assert.equal(context.upstreamKeyDiscovery.panels[0].blocked, 1);
+  assert.equal(effects.telegram.length, 1);
+  assert.match(effects.telegram[0], /发现 2 个上游 Key 还没接入本站/);
+  assert.match(effects.telegram[0], /orphaned（上游分组 -，进价 \?x）（现在接不进，原因见控制台）/);
+  assert.match(effects.telegram[0], /选好分组就能接入/);
+
+  const onlyDead = serverHarness();
+  onlyDead.context.fetch = async url => ({
+    status: 200,
+    json: async () => (url.includes('/groups/rates') ? { code: 0, data: {} } : { code: 0, data: { items: [deletedGroupKey] } })
+  });
+  await onlyDead.context.discoverUpstreamKeys({ notify: true });
+  assert.equal(onlyDead.context.upstreamKeyDiscoverySummary().pending, 0);
+  assert.doesNotMatch(onlyDead.effects.telegram[0], /选好分组就能接入/);
+  assert.match(onlyDead.effects.telegram[0], /现在都接不进/);
+
+  onlyDead.context.dismissUpstreamKey('panel_up:7001');
+  assert.equal(onlyDead.context.upstreamKeyDiscovery.panels[0].blocked, 0, 'hiding a blocked key removes it from the blocked count');
+});
+
+// ---- 弹窗页面：接不进的卡片写原因、按钮置灰 ----
+function keysDialog() {
+  const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const start = app.indexOf('const UPSTREAM_KEY_PANEL_STATUS');
+  const end = app.indexOf('async function openUpstreamKeysModal(');
+  assert.ok(start > 0 && end > start, 'new-key dialog code found in app.js');
+  const context = vm.createContext({
+    escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]),
+    upstreamKeysData: null, upstreamKeysShowDismissed: false, document: { getElementById: () => null }
+  });
+  vm.runInContext(app.slice(start, end), context);
+  return context;
+}
+
+test('the dialog shows a blocked key with its reason, a greyed-out connect button and no group picker', () => {
+  const dialog = keysDialog();
+  const plan = planFor([keys[1], deletedGroupKey]);
+  const [ok, blocked] = plan.items;
+  const okHtml = dialog.upstreamKeyRowHtml(ok);
+  assert.match(okHtml, /<select class="form-input upstream-key-group"/);
+  assert.match(okHtml, /onclick="connectUpstreamKeyItem\(/);
+  assert.doesNotMatch(okHtml, /upstream-key-problem/);
+
+  const html = dialog.upstreamKeyRowHtml(blocked);
+  assert.match(html, /upstream-key-problem/);
+  assert.match(html, /现在接不进：这把 Key 绑定的上游分组已经被删除/);
+  assert.doesNotMatch(html, /<select/);
+  assert.match(html, /<button type="button" class="btn btn-primary"[^>]*disabled[^>]*>接入<\/button>/);
+  assert.doesNotMatch(html, /onclick="connectUpstreamKeyItem\(/);
+  assert.match(html, /dismissUpstreamKeyItem\('panel_up:7001', false\)/, 'a blocked key can still be hidden');
+
+  const dismissed = dialog.upstreamKeyRowHtml({ ...blocked, dismissed: true });
+  assert.doesNotMatch(dismissed, /upstream-key-problem/);
+  assert.match(dismissed, /恢复/);
+});
+
+test('the dialog counts pending and blocked keys separately, connectable keys first', () => {
+  const dialog = keysDialog();
+  const plan = planFor([deletedGroupKey, keys[1]]);
+  const html = dialog.upstreamKeysPanelsHtml(plan);
+  assert.match(html, /待接入 1 个/);
+  assert.match(html, /暂时接不进 1 个/);
+  assert.deepEqual([...dialog.upstreamKeysOrdered(plan.items)].map(i => i.keyId), [6029, 7001]);
+  assert.equal(dialog.upstreamKeysPendingCount(plan.items), 1);
+  assert.equal(dialog.upstreamKeysPendingCount([{ dismissed: false }, { dismissed: false, connectable: false }, { dismissed: true }]), 1, 'items without the flag count as connectable');
+});

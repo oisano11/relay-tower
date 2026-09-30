@@ -923,13 +923,17 @@ async function fetchUpstreamKeyInventory(panel, { allowRelogin = false } = {}) {
 }
 
 function upstreamKeyDiscoverySummary() {
-  return { pending: upstreamKeyDiscovery.items.filter(item => !item.dismissed).length, checkedAt: upstreamKeyDiscovery.checkedAt };
+  // 接不进任何分组的 Key 不算待接入
+  return { pending: upstreamKeys.pendingCount(upstreamKeyDiscovery.items), checkedAt: upstreamKeyDiscovery.checkedAt };
 }
 
 function announceNewUpstreamKeys(fresh) {
-  const lines = fresh.slice(0, 10).map(item => `${item.panelName}：${item.keyName || item.keyTail}（上游分组 ${item.upstreamGroup.name || '-'}，进价 ${item.upstreamGroup.rate ?? '?'}x）`);
+  const lines = fresh.slice(0, 10).map(item => `${item.panelName}：${item.keyName || item.keyTail}（上游分组 ${item.upstreamGroup.name || '-'}，进价 ${item.upstreamGroup.rate ?? '?'}x）${item.connectable === false ? '（现在接不进，原因见控制台）' : ''}`);
   const more = fresh.length > 10 ? `\n……另外还有 ${fresh.length - 10} 个` : '';
-  const note = `发现 ${fresh.length} 个上游 Key 还没接入本站：\n${lines.join('\n')}${more}\n到控制台「系统管理 → 接入上游新 Key」选好分组就能接入。`;
+  const tail = fresh.some(item => item.connectable !== false)
+    ? '到控制台「系统管理 → 接入上游新 Key」选好分组就能接入。'
+    : '这些 Key 现在都接不进，原因和办法写在控制台「系统管理 → 接入上游新 Key」里。';
+  const note = `发现 ${fresh.length} 个上游 Key 还没接入本站：\n${lines.join('\n')}${more}\n${tail}`;
   alerts.unshift({ id: 'upkey_' + Date.now(), type: 'upstream_key', timestamp: new Date().toISOString(), note });
   if (alerts.length > 200) alerts = alerts.slice(0, 200);
   writeJSON(ALERTS_FILE, alerts);
@@ -1029,10 +1033,8 @@ async function connectUpstreamKey({ uid, groupId, name }) {
   writeJSON(ALERTS_FILE, alerts);
   upstreamKeyDiscovery.items = upstreamKeyDiscovery.items.filter(item => item.uid !== text);
   const summary = upstreamKeyDiscovery.panels.find(p => p.id === panelId);
-  if (summary) {
-    summary.connected += 1;
-    summary.pending = Math.max(0, summary.pending - 1);
-  }
+  if (summary) summary.connected += 1;
+  upstreamKeys.recountPanels(upstreamKeyDiscovery.items, upstreamKeyDiscovery.panels);
   broadcastSSE('CHANNELS_UPDATED', state);
   broadcastSSE('UPSTREAM_KEYS_UPDATED', upstreamKeyDiscoverySummary());
   return { accountId: String(newId), role, message };
@@ -1049,9 +1051,7 @@ function dismissUpstreamKey(uid, restore = false) {
   for (const item of upstreamKeyDiscovery.items) {
     if (item.uid === text) item.dismissed = !restore;
   }
-  for (const panel of upstreamKeyDiscovery.panels) {
-    panel.pending = upstreamKeyDiscovery.items.filter(item => item.panelId === panel.id && !item.dismissed).length;
-  }
+  upstreamKeys.recountPanels(upstreamKeyDiscovery.items, upstreamKeyDiscovery.panels);
   broadcastSSE('UPSTREAM_KEYS_UPDATED', upstreamKeyDiscoverySummary());
   return upstreamKeyDiscoverySummary();
 }

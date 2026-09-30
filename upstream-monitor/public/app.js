@@ -3718,7 +3718,7 @@ async function loadUpstreamKeys(refresh = false) {
   const data = await res.json();
   if (!data.success) throw new Error(data.error || '读取失败');
   upstreamKeysData = data;
-  updateUpstreamKeysBadge((data.items || []).filter(item => !item.dismissed).length);
+  updateUpstreamKeysBadge(upstreamKeysPendingCount(data.items));
   return data;
 }
 
@@ -3726,11 +3726,29 @@ const UPSTREAM_KEY_PANEL_STATUS = {
   ok: ['✅', '#16a34a'], token_invalid: ['⚠️', '#b45309'], unsupported: ['⏸', '#64748b'], error: ['❌', '#dc2626'], skipped: ['⏸', '#94a3b8']
 };
 
+// 「待接入」只数能接的 Key；一个分组都放不进的（connectable 为 false）另算，不计入数字
+function upstreamKeysPendingCount(items) {
+  return (items || []).filter(item => !item.dismissed && item.connectable !== false).length;
+}
+
+// 能接入的排在前面，接不进的排在后面（各自保持原来的顺序）
+function upstreamKeysOrdered(items) {
+  return [...(items || [])].sort((a, b) => (a.connectable === false ? 1 : 0) - (b.connectable === false ? 1 : 0));
+}
+
+function recountUpstreamKeyPanels() {
+  for (const panelSummary of upstreamKeysData?.panels || []) {
+    const mine = (upstreamKeysData.items || []).filter(i => i.panelId === panelSummary.id && !i.dismissed);
+    panelSummary.pending = mine.filter(i => i.connectable !== false).length;
+    panelSummary.blocked = mine.length - panelSummary.pending;
+  }
+}
+
 function upstreamKeysPanelsHtml(data) {
   return (data.panels || []).map(p => {
     const [icon, color] = UPSTREAM_KEY_PANEL_STATUS[p.status] || ['•', '#334155'];
     const detail = p.status === 'ok'
-      ? `上游共 ${p.total} 个 Key，已接入 ${p.connected} 个${p.pending ? `，<b style="color:#2563eb;">待接入 ${p.pending} 个</b>` : ''}`
+      ? `上游共 ${p.total} 个 Key，已接入 ${p.connected} 个${p.pending ? `，<b style="color:#2563eb;">待接入 ${p.pending} 个</b>` : ''}${p.blocked ? `，<span style="color:#b45309;">暂时接不进 ${p.blocked} 个</span>` : ''}`
       : escapeHtml(p.message || '');
     return `<div style="font-size:0.74rem;color:#334155;"><span style="color:${color};">${icon}</span> <b>${escapeHtml(p.name || p.host)}</b> <span style="color:#94a3b8;">${escapeHtml(p.host || '')}</span> · ${detail}</div>`;
   }).join('') || '<div style="font-size:0.74rem;color:#64748b;">还没有登记上游供应商。</div>';
@@ -3738,6 +3756,8 @@ function upstreamKeysPanelsHtml(data) {
 
 function upstreamKeyRowHtml(item) {
   const g = item.upstreamGroup || {};
+  // 一个分组都放不进：卡片上写明原因和办法，不给选分组，「接入」按钮置灰
+  const stuck = item.connectable === false && !item.dismissed;
   const options = (item.candidateGroups || []).map(cg => {
     const members = cg.members ? `${cg.members} 个账号` : '空分组';
     const label = `${cg.name}（售价 ${cg.saleRate ?? '?'}x · ${members}${cg.blocked ? ` · ${cg.blocked}` : ''}）`;
@@ -3747,7 +3767,9 @@ function upstreamKeyRowHtml(item) {
   const used = item.lastUsedAt ? `，最近使用 ${String(item.lastUsedAt).slice(0, 10)}` : '，还没用过';
   const actions = item.dismissed
     ? `<button type="button" class="btn btn-secondary" style="font-size:0.74rem;padding:0.25rem 0.6rem;" onclick="dismissUpstreamKeyItem('${escapeHtml(item.uid)}', true)">恢复</button>`
-    : `<button type="button" class="btn btn-primary" style="font-size:0.74rem;padding:0.25rem 0.7rem;" onclick="connectUpstreamKeyItem('${escapeHtml(item.uid)}', this)">接入</button>
+    : `${stuck
+        ? '<button type="button" class="btn btn-primary" disabled title="现在接不进，原因见上面的说明" style="font-size:0.74rem;padding:0.25rem 0.7rem;opacity:0.45;cursor:not-allowed;">接入</button>'
+        : `<button type="button" class="btn btn-primary" style="font-size:0.74rem;padding:0.25rem 0.7rem;" onclick="connectUpstreamKeyItem('${escapeHtml(item.uid)}', this)">接入</button>`}
        <button type="button" class="btn btn-secondary" style="font-size:0.74rem;padding:0.25rem 0.6rem;color:#64748b;" title="不接这个 Key，以后不再提示（可以恢复）" onclick="dismissUpstreamKeyItem('${escapeHtml(item.uid)}', false)">删除</button>`;
   return `<div class="upstream-key-row" data-uid="${escapeHtml(item.uid)}" style="background:${item.dismissed ? '#f8fafc' : '#fff'};border:1px solid #e2e8f0;border-radius:6px;padding:0.5rem 0.6rem;display:flex;flex-direction:column;gap:0.35rem;${item.dismissed ? 'opacity:0.7;' : ''}">
     <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:baseline;flex-wrap:wrap;">
@@ -3755,7 +3777,8 @@ function upstreamKeyRowHtml(item) {
       <div style="font-size:0.72rem;color:#475569;">上游分组「${escapeHtml(g.name || '-')}」· ${escapeHtml(g.platform || '-')} · 进价 <b class="mono">${g.rate ?? '?'}x</b></div>
     </div>
     <div style="font-size:0.7rem;color:#94a3b8;">${created ? `${created} 创建` : ''}${used}</div>
-    ${item.dismissed ? '' : `<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;">
+    ${stuck ? `<div class="upstream-key-problem" style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:6px;padding:0.35rem 0.5rem;font-size:0.74rem;line-height:1.55;">⚠️ 现在接不进：${escapeHtml(item.problem || '本站没有能放这把 Key 的分组。')}</div>` : ''}
+    ${item.dismissed || stuck ? '' : `<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;">
       <select class="form-input upstream-key-group" style="flex:2;min-width:220px;font-size:0.76rem;">
         <option value="">-- 选择放进本站哪个分组 --</option>${options}
       </select>
@@ -3771,12 +3794,15 @@ function renderUpstreamKeysModal() {
   const meta = document.getElementById('upstreamKeysMeta');
   if (!box || !upstreamKeysData) return;
   const items = upstreamKeysData.items || [];
-  const active = items.filter(item => !item.dismissed);
+  const active = upstreamKeysOrdered(items.filter(item => !item.dismissed));
   const dismissed = items.filter(item => item.dismissed);
+  const connectableCount = upstreamKeysPendingCount(items);
+  const stuckCount = active.length - connectableCount;
   if (panelsBox) panelsBox.innerHTML = upstreamKeysPanelsHtml(upstreamKeysData);
   if (meta) meta.textContent = upstreamKeysData.checkedAt ? `上次检查：${new Date(upstreamKeysData.checkedAt).toLocaleString()}` : '';
   const shown = upstreamKeysShowDismissed ? [...active, ...dismissed] : active;
-  box.innerHTML = (shown.length ? shown.map(upstreamKeyRowHtml).join('') : '<div style="padding:1rem;text-align:center;color:#16a34a;font-size:0.8rem;">✅ 没有待接入的新 Key。</div>')
+  box.innerHTML = (stuckCount > 0 ? `<div style="font-size:0.74rem;color:#64748b;">${connectableCount ? `${connectableCount} 把可以接入` : '现在没有能接入的 Key'}；${stuckCount} 把暂时接不进，原因和办法写在各自的卡片上。</div>` : '')
+    + (shown.length ? shown.map(upstreamKeyRowHtml).join('') : '<div style="padding:1rem;text-align:center;color:#16a34a;font-size:0.8rem;">✅ 没有待接入的新 Key。</div>')
     + (dismissed.length ? `<div style="text-align:center;font-size:0.72rem;color:#64748b;"><a href="#" onclick="toggleDismissedUpstreamKeys(event)">${upstreamKeysShowDismissed ? '收起已删除的' : `已删除 ${dismissed.length} 个 · 显示`}</a></div>` : '');
 }
 
@@ -3793,7 +3819,7 @@ async function openUpstreamKeysModal() {
           </div>
           <p style="font-size:0.74rem;color:#64748b;margin:0 0 0.5rem;line-height:1.55;">
             你在上游网站（Sub2API 搭的站）新建的 Key 会自动出现在这里，塔台每 10 分钟检查一次。选好放进本站哪个分组，点「接入」：
-            塔台照着这家上游已有的账号，在 Sub2API 里新建一个账号，只换 Key、名称和进价。分组里已有账号时，新账号先当备用（关着，不接单，要用时在分组里改成主调、副调或备选）；空分组直接当主调。进价不低于分组售价的不能接。
+            塔台照着这家上游已有的账号，在 Sub2API 里新建一个账号，只换 Key、名称和进价。分组里已有账号时，新账号先当备用（关着，不接单，要用时在分组里改成主调、副调或备选）；空分组直接当主调。进价不低于分组售价的不能接；接不进的 Key，卡片上会写明原因和怎么办。
           </p>
           <div id="upstreamKeysPanels" style="display:flex;flex-direction:column;gap:0.2rem;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:0.45rem 0.6rem;margin-bottom:0.5rem;">正在读取…</div>
           <div id="upstreamKeysList" style="display:flex;flex-direction:column;gap:0.45rem;max-height:420px;overflow-y:auto;"></div>
@@ -3846,13 +3872,11 @@ async function connectUpstreamKeyItem(uid, button) {
     if (upstreamKeysData) {
       upstreamKeysData.items = upstreamKeysData.items.filter(i => i.uid !== uid);
       const panelSummary = (upstreamKeysData.panels || []).find(p => p.id === item.panelId);
-      if (panelSummary) {
-        panelSummary.connected += 1;
-        panelSummary.pending = Math.max(0, panelSummary.pending - 1);
-      }
+      if (panelSummary) panelSummary.connected += 1;
+      recountUpstreamKeyPanels();
     }
     renderUpstreamKeysModal();
-    updateUpstreamKeysBadge((upstreamKeysData?.items || []).filter(i => !i.dismissed).length);
+    updateUpstreamKeysBadge(upstreamKeysPendingCount(upstreamKeysData?.items));
     await loadChannels();
   } catch (err) {
     showToast('接入失败（没有做任何修改）：' + err.message, 'error');
@@ -3868,9 +3892,7 @@ async function dismissUpstreamKeyItem(uid, restore) {
     if (!data.success) throw new Error(data.error || '操作失败');
     const item = (upstreamKeysData?.items || []).find(i => i.uid === uid);
     if (item) item.dismissed = !restore;
-    for (const panelSummary of upstreamKeysData?.panels || []) {
-      panelSummary.pending = upstreamKeysData.items.filter(i => i.panelId === panelSummary.id && !i.dismissed).length;
-    }
+    recountUpstreamKeyPanels();
     renderUpstreamKeysModal();
     updateUpstreamKeysBadge(data.pending);
     showToast(restore ? '已恢复显示这个 Key' : '已删除，这个 Key 以后不再提示（可在下方「已删除」里恢复）', 'success');
