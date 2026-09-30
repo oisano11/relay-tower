@@ -63,6 +63,23 @@ test('server starts without database; malformed cookies and database failures do
   assert.equal((await request('/api/auth/status')).status, 200);
 });
 
+test('customer usage endpoint needs a login, rejects unknown ranges and reports database trouble without crashing', async t => {
+  const server = await startIsolatedServer(t);
+  const request = (route, options = {}) => fetch(`http://127.0.0.1:${server.address().port}${route}`, options);
+  assert.equal((await request('/api/user-usage?range=7d')).status, 401, 'usage numbers are behind the console login');
+  const login = await request('/api/login', { method: 'POST', body: JSON.stringify({ password: 'test-password' }) });
+  const headers = { Authorization: `Bearer ${(await login.json()).token}` };
+  const bad = await request('/api/user-usage?range=7d;DROP', { headers });
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).success, false);
+  // 没有数据库时给出一句人话，接口不崩，控制台其它功能照常
+  const noDatabase = await request('/api/user-usage?range=month', { headers });
+  assert.equal(noDatabase.status, 500);
+  assert.deepEqual(await noDatabase.json(), { success: false, error: '读取客户用量失败，请稍后再试' });
+  assert.equal((await request('/api/user-usage', { headers })).status, 500, 'no range means the default range, not an error about the range');
+  assert.equal((await request('/api/auth/status')).status, 200);
+});
+
 test('a dead primary is retried on a schedulable backup inside one /v1 request', async t => {
   const http = require('http');
   const attempts = [];

@@ -4,13 +4,14 @@ const fs = require('fs');
 const path = require('path');
 const url = require('url');
 const crypto = require('crypto');
-const { execSync, execFileSync, fork } = require('child_process');
+const { execSync, execFileSync, fork, spawn } = require('child_process');
 const gateway = require('./gateway');
 const gatewayMetrics = new gateway.GatewayMetrics();
 const { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority, ROLE_PRIORITY, ROLE_LABELS, roleForPriority, groupRole } = require('./routing-policy');
 const { evaluateGroup, lowTrafficSuspect, missingModels, resolveGroupPolicy, groupPolicyOverrides } = require('./auto-failover-policy');
 const accountSplit = require('./account-split');
 const upstreamKeys = require('./upstream-keys');
+const userUsage = require('./user-usage');
 const { EventEmitter } = require('events');
 // A worker is deliberately read-only with respect to local runtime JSON.  It
 // can use the synchronous DB/SSH adapters without blocking the gateway, but
@@ -181,6 +182,69 @@ function execPsql(sql, isTupleOnly = true) {
     return execFileSync('ssh', sshArgs, options);
   }
   throw new Error('未配置 Sub2API 数据库连接');
+}
+
+// 只读的异步数据库查询：连的库和 execPsql 一样，但查询期间塔台照常转发请求，不会卡住网关。
+// 数据库自己限时（statement_timeout）并强制只读；只杀掉本地的 docker 命令，库里的查询还会接着跑。
+function execPsqlAsync(sql, { timeoutMs = 20000, maxOutputChars = 16 * 1024 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    const pgOptions = `-c statement_timeout=${Math.floor(timeoutMs)} -c default_transaction_read_only=on`;
+    const dockerArgs = ['exec', '-i', '-e', `PGOPTIONS=${pgOptions}`, 'sub2api-postgres',
+      'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'sub2api', '-d', 'sub2api', '-q', '-t', '-A'];
+    let command;
+    let args;
+    if (IS_VPS) {
+      command = 'docker';
+      args = dockerArgs;
+    } else if (SSH_HOST) {
+      const quote = value => `'${String(value).replace(/'/g, "'\\''")}'`;
+      command = 'ssh';
+      args = [...(SSH_KEY ? ['-i', SSH_KEY] : []), '-p', SSH_PORT, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4',
+        `${SSH_USER}@${SSH_HOST}`, 'docker ' + dockerArgs.map(quote).join(' ')];
+    } else {
+      reject(new Error('未配置 Sub2API 数据库连接'));
+      return;
+    }
+    let settled = false;
+    let child;
+    let killTimer = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      fn(value);
+    };
+    try {
+      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+      if (stdout.length > maxOutputChars) {
+        child.kill();
+        finish(reject, new Error('数据库返回的内容过大'));
+      }
+    });
+    child.stderr.on('data', chunk => { if (stderr.length < 4096) stderr += chunk; });
+    child.on('error', err => finish(reject, err));
+    child.on('close', code => {
+      if (code === 0) finish(resolve, stdout);
+      else finish(reject, new Error(`数据库查询失败${stderr.trim() ? ': ' + stderr.trim().split('\n')[0] : ` (退出码 ${code})`}`));
+    });
+    // 数据库超时后会自己中止查询；这里再多等 5 秒，还没结果（比如 SSH 卡住）就放弃。
+    killTimer = setTimeout(() => {
+      child.kill();
+      finish(reject, new Error('数据库查询超时'));
+    }, timeoutMs + 5000);
+    child.stdin.on('error', () => {});
+    child.stdin.end(sql);
+  });
 }
 
 
@@ -5589,6 +5653,31 @@ FROM u_summary u, r_stats r, s_stats s, paying_count pc, daily_trends dt, users_
   }
 }
 
+// ====== 📈 每个客户的用量、用过的模型与利润 ======
+// 按需查询（打开「用量与模型利润」页签、切换时间范围时才查），不放进后台定时任务。
+// 同一个范围 30 秒内直接用上次的结果；同一个范围正在查时，后来的请求等同一次结果，不重复查库。
+const USER_USAGE_CACHE_MS = 30000;
+const userUsageCache = new Map();
+const userUsageInflight = new Map();
+
+async function fetchUserUsageReport(rangeKey, { force = false } = {}) {
+  const cached = userUsageCache.get(rangeKey);
+  if (!force && cached && Date.now() - cached.at < USER_USAGE_CACHE_MS) return cached.report;
+  if (userUsageInflight.has(rangeKey)) return userUsageInflight.get(rangeKey);
+  const pending = (async () => {
+    const output = await execPsqlAsync(userUsage.buildUserUsageSql(rangeKey));
+    const report = userUsage.buildUserUsageReport(userUsage.parseUserUsageRows(output), rangeKey, new Date());
+    userUsageCache.set(rangeKey, { at: Date.now(), report });
+    return report;
+  })();
+  userUsageInflight.set(rangeKey, pending);
+  try {
+    return await pending;
+  } finally {
+    userUsageInflight.delete(rangeKey);
+  }
+}
+
 // 管理员直接为用户进行余额充值/赠送/补偿操作
 function executeUserRecharge(userId, amount, notes = '') {
   try {
@@ -7964,6 +8053,26 @@ async function handleRequest(req, res) {
     const data = fetchUserFinancialStats(force);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, ...data }));
+    return;
+  }
+
+  // 每个客户在所选时间范围内的用量（请求次数、tokens）、用过的模型和产生的利润
+  if (pathname === '/api/user-usage' && req.method === 'GET') {
+    const range = userUsage.normalizeRange(parsedUrl.query.range);
+    if (!range) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: '不支持的时间范围' }));
+      return;
+    }
+    try {
+      const report = await fetchUserUsageReport(range, { force: parsedUrl.query.refresh === 'true' });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, ...report }));
+    } catch (err) {
+      console.error('[用量统计失败]', err.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: '读取客户用量失败，请稍后再试' }));
+    }
     return;
   }
 

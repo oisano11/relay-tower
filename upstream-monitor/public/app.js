@@ -7844,7 +7844,7 @@ function renderUserFinancesTable() {
             ${roleBadge}
             <span class="mono" style="font-size: 0.68rem; padding: 1px 5px; border-radius: 4px; background: #eff6ff; color: #0284c7; border: 1px solid #bae6fd;" title="最大并发限制: ${user.concurrency || 10} 路">⚡${user.concurrency || 10}路</span>
           </div>
-          ${user.username ? `<div style="font-size: 0.7rem; color: #64748b;" class="mono">@${escapeHtml(user.username)}</div>` : ''}
+          <div style="font-size: 0.7rem; color: #64748b;" class="mono">${user.username ? `@${escapeHtml(user.username)} · ` : ''}<button type="button" class="usage-link-btn" onclick="openUserUsageFor(${Number(user.id)})" title="查看该用户用了多少量、用了哪些模型、产生了多少利润">📈 用量与模型</button></div>
         </td>
         <td style="text-align: right;">
           <strong class="mono" style="color: ${balance > 10 ? '#059669' : (balance > 0 ? '#d97706' : '#94a3b8')}; font-weight: 700; font-size: 0.86rem;">
@@ -7962,6 +7962,344 @@ function renderRecentRecharges(recentList) {
       </tr>
     `;
   }).join('');
+}
+
+// ==========================================================================
+// 📈 用量与模型利润：每个客户用了多少量、用了哪些模型、产生多少利润
+// ==========================================================================
+let userUsageData = null;
+let currentUsageRange = '7d';
+let currentUsageScope = 'customers'; // 'customers' | 'all'
+let currentUsageSort = 'profit_desc';
+let currentUsageSearch = '';
+let usageRequestSeq = 0; // 只认最后一次请求的结果：快速切换时间范围时，旧结果不会盖掉新的
+const expandedUsageUsers = new Set();
+
+// ==== 用量与模型利润：纯计算与拼页面文字（不碰页面元素，测试直接切出来跑） 开始 ====
+const USAGE_RANGE_HINTS = {
+  today: '今天 0 点到现在',
+  yesterday: '昨天 0 点到 24 点',
+  '7d': '最近 7×24 小时',
+  '30d': '最近 30×24 小时',
+  month: '本月 1 日 0 点到现在',
+  all: '从有记录以来'
+};
+
+// tokens 用「万 / 亿」显示，鼠标放上去能看到精确数字
+function formatTokenCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (n < 10000) return Math.round(n).toLocaleString('zh-CN');
+  if (n < 1e8) return `${Number((n / 1e4).toFixed(1)).toLocaleString('zh-CN')} 万`;
+  return `${Number((n / 1e8).toFixed(2))} 亿`;
+}
+
+// 金额保留两位小数；凑不满一分钱的当成 0，页面上不会出现「-¥0.00」
+function formatYuan(value, withSign = false) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '¥0.00';
+  const cents = Math.round(Math.abs(n) * 100);
+  if (cents === 0) return '¥0.00';
+  const text = (cents / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `${n < 0 ? '-' : (withSign ? '+' : '')}¥${text}`;
+}
+
+function formatCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n).toLocaleString('zh-CN') : '0';
+}
+
+// 「外部客户」的判断和「用户收支明细」页签一致：管理员、1 号账号、邮箱带 test / example 的不算
+function usageIsCustomer(user) {
+  return user.role !== 'admin' && user.userId !== 1 && !user.isTestAccount;
+}
+
+function filterUsageUsers(users, scope, search) {
+  let list = (users || []).slice();
+  if (scope === 'customers') list = list.filter(usageIsCustomer);
+  const q = String(search || '').trim().toLowerCase();
+  if (q) {
+    list = list.filter(user => [user.email, user.username, String(user.userId)]
+      .some(value => String(value || '').toLowerCase().includes(q)));
+  }
+  return list;
+}
+
+function sortUsageUsers(users, sortKey) {
+  const num = value => (Number.isFinite(Number(value)) ? Number(value) : 0);
+  const compareMargin = (a, b) => {
+    if (a.marginPercent == null && b.marginPercent == null) return 0;
+    if (a.marginPercent == null) return 1;
+    if (b.marginPercent == null) return -1;
+    return b.marginPercent - a.marginPercent;
+  };
+  const comparators = {
+    profit_desc: (a, b) => num(b.profit) - num(a.profit),
+    profit_asc: (a, b) => num(a.profit) - num(b.profit),
+    spent_desc: (a, b) => num(b.spent) - num(a.spent),
+    requests_desc: (a, b) => num(b.requests) - num(a.requests),
+    tokens_desc: (a, b) => num(b.totalTokens) - num(a.totalTokens),
+    margin_desc: compareMargin
+  };
+  const compare = comparators[sortKey] || comparators.profit_desc;
+  return (users || []).slice().sort((a, b) => compare(a, b) || num(b.spent) - num(a.spent) || a.userId - b.userId);
+}
+
+// 页面上正在显示的这些客户合计
+function summarizeUsageUsers(users) {
+  const total = { userCount: users.length, requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, spent: 0, cost: 0, profit: 0 };
+  const models = new Set();
+  for (const user of users) {
+    total.requests += user.requests;
+    total.inputTokens += user.inputTokens;
+    total.outputTokens += user.outputTokens;
+    total.cacheReadTokens += user.cacheReadTokens;
+    total.cacheWriteTokens += user.cacheWriteTokens;
+    total.totalTokens += user.totalTokens;
+    total.spent += user.spent;
+    total.cost += user.cost;
+    total.profit += user.profit;
+    for (const model of user.models) models.add(model.model);
+  }
+  return { ...total, modelCount: models.size, marginPercent: total.spent > 0 ? total.profit / total.spent * 100 : null };
+}
+
+function usageTokenBreakdown(item) {
+  const cache = item.cacheReadTokens + item.cacheWriteTokens;
+  return `输入 ${formatTokenCount(item.inputTokens)} · 输出 ${formatTokenCount(item.outputTokens)} · 缓存 ${formatTokenCount(cache)}`;
+}
+
+function usageTokensHtml(item) {
+  if (!item.totalTokens) return '<span class="usage-zero">-</span>';
+  const exact = `共 ${formatCount(item.totalTokens)} tokens：输入 ${formatCount(item.inputTokens)}，输出 ${formatCount(item.outputTokens)}，缓存读取 ${formatCount(item.cacheReadTokens)}，缓存写入 ${formatCount(item.cacheWriteTokens)}`;
+  const cache = item.cacheReadTokens + item.cacheWriteTokens;
+  return `<div class="usage-tokens" title="${escapeHtml(exact)}"><strong>${formatTokenCount(item.totalTokens)}</strong>`
+    + `<span class="usage-sub">输入 ${formatTokenCount(item.inputTokens)} · 输出 ${formatTokenCount(item.outputTokens)}</span>`
+    + `<span class="usage-sub">缓存 ${formatTokenCount(cache)}</span></div>`;
+}
+
+function usageProfitHtml(profit, margin) {
+  const marginText = margin == null ? '' : `<span class="usage-margin">${Number(margin).toFixed(1)}% 毛利</span>`;
+  if (profit > 0) return `<div class="usage-profit is-plus"><strong>${formatYuan(profit, true)}</strong>${marginText}</div>`;
+  if (profit < 0) return `<div class="usage-profit is-minus"><strong>${formatYuan(profit, true)}</strong>${marginText}</div>`;
+  return '<span class="usage-zero">¥0.00</span>';
+}
+
+// 占比按消费算；这个客户一分钱没花时是按请求次数算的，文字上要说清楚
+function usageShareBasis(user) {
+  return user.spent > 0 ? '消费' : '请求次数';
+}
+
+function usageChipsHtml(user, limit = 3) {
+  const chips = user.models.slice(0, limit).map(model => {
+    const tip = `${model.model}：占这个客户${usageShareBasis(user)}的 ${model.sharePercent}%${model.profit < 0 ? '，这个模型在亏本' : ''}`;
+    return `<span class="usage-model-chip${model.profit < 0 ? ' is-loss' : ''}" title="${escapeHtml(tip)}"><span class="name">${escapeHtml(model.model)}</span><span class="pct">${model.sharePercent}%</span></span>`;
+  });
+  const more = user.models.length - chips.length;
+  if (more > 0) chips.push(`<span class="usage-model-chip is-more" title="还有 ${more} 个模型，点「展开」查看">+${more} 个</span>`);
+  return chips.length ? chips.join('') : '<span class="usage-zero">-</span>';
+}
+
+function usageIdentityHtml(user) {
+  const isAdmin = user.role === 'admin' || user.userId === 1;
+  let badge = '<span class="badge-role-user">客户</span>';
+  if (isAdmin) badge = '<span class="badge-role-admin">管理员</span>';
+  else if (user.isTestAccount) badge = '<span class="badge-role-admin" style="background: #fef2f2; color: #991b1b; border-color: #fecaca;">测试号</span>';
+  const deleted = user.deleted ? '<span class="badge-role-admin" style="background: #fff7ed; color: #9a3412; border-color: #fed7aa;">已删除</span>' : '';
+  const username = user.username ? ` @${escapeHtml(user.username)}` : '';
+  return `<div class="usage-identity"><strong>${escapeHtml(user.email || `用户 #${user.userId}`)}</strong>${badge}${deleted}</div>`
+    + `<div class="usage-sub"><span class="uid-badge">#${user.userId}</span>${username} · 最近用过 ${escapeHtml(formatTimeAgo(user.lastUsedAt))}</div>`;
+}
+
+function usageModelDetailHtml(user) {
+  const basis = usageShareBasis(user);
+  const rows = user.models.map(model => `
+      <tr>
+        <td class="usage-model-name" title="${escapeHtml(model.model)}"><strong>${escapeHtml(model.model)}</strong></td>
+        <td class="usage-num">${formatCount(model.requests)}</td>
+        <td class="usage-num" title="${escapeHtml(formatCount(model.inputTokens))} tokens">${formatTokenCount(model.inputTokens)}</td>
+        <td class="usage-num" title="${escapeHtml(formatCount(model.outputTokens))} tokens">${formatTokenCount(model.outputTokens)}</td>
+        <td class="usage-num" title="${escapeHtml(`缓存读取 ${formatCount(model.cacheReadTokens)}，缓存写入 ${formatCount(model.cacheWriteTokens)}`)}">${formatTokenCount(model.cacheReadTokens + model.cacheWriteTokens)}</td>
+        <td class="usage-num">${formatYuan(model.spent)}</td>
+        <td class="usage-num usage-cost">${formatYuan(model.cost)}</td>
+        <td class="usage-num">${usageProfitHtml(model.profit, model.marginPercent)}</td>
+        <td class="usage-num"><span class="usage-share-bar"><span style="width: ${Math.max(0, Math.min(100, Number(model.sharePercent) || 0))}%;"></span></span>${model.sharePercent}%</td>
+      </tr>`).join('');
+  return `<tr class="usage-detail-row"><td colspan="9">
+    <table class="usage-model-table">
+      <thead><tr>
+        <th style="text-align: left;">模型</th><th>请求次数</th><th>输入</th><th>输出</th><th title="缓存读取 + 缓存写入">缓存</th>
+        <th>客户消费</th><th>采购成本</th><th>产生利润 (毛利率)</th><th title="占这个客户${basis}的比例">占比</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </td></tr>`;
+}
+
+function usageRowHtml(user, rank, expanded) {
+  const rankHtml = rank <= 3 ? `<span class="rank-badge rank-${rank}">${rank}</span>` : `<span style="font-size: 0.75rem; color: #94a3b8;">${rank}</span>`;
+  return `
+    <tr class="usage-user-row${expanded ? ' is-open' : ''}" data-usage-user="${user.userId}">
+      <td style="text-align: center;">${rankHtml}</td>
+      <td>${usageIdentityHtml(user)}</td>
+      <td class="usage-num" style="text-align: right;">${formatCount(user.requests)}</td>
+      <td style="text-align: right;">${usageTokensHtml(user)}</td>
+      <td><div class="usage-chip-row">${usageChipsHtml(user)}</div></td>
+      <td class="usage-num" style="text-align: right;">${user.spent > 0 ? formatYuan(user.spent) : '<span class="usage-zero">-</span>'}</td>
+      <td class="usage-num usage-cost" style="text-align: right;">${user.cost > 0 ? formatYuan(user.cost) : '<span class="usage-zero">-</span>'}</td>
+      <td style="text-align: right;">${usageProfitHtml(user.profit, user.marginPercent)}</td>
+      <td style="text-align: center;"><button class="btn-micro-action usage-toggle-btn" data-usage-toggle="${user.userId}" aria-expanded="${expanded ? 'true' : 'false'}">${expanded ? '收起 ▴' : '展开 ▾'}</button></td>
+    </tr>${expanded ? usageModelDetailHtml(user) : ''}`;
+}
+
+function usageStatHtml(label, value, sub, tone = '') {
+  return `<div class="usage-stat${tone ? ` ${tone}` : ''}"><div class="usage-stat-label">${label}</div><div class="usage-stat-value">${value}</div><div class="usage-stat-sub">${sub}</div></div>`;
+}
+
+function usageSummaryHtml(summary) {
+  const marginText = summary.marginPercent == null ? '毛利率 --' : `毛利率 ${summary.marginPercent.toFixed(1)}%`;
+  return [
+    usageStatHtml('有用量的客户', `${formatCount(summary.userCount)} 位`, `用了 ${formatCount(summary.modelCount)} 种模型`),
+    usageStatHtml('请求次数', `${formatCount(summary.requests)} 次`, '成功计费的请求'),
+    usageStatHtml('用量', `${formatTokenCount(summary.totalTokens)} tokens`, usageTokenBreakdown(summary)),
+    usageStatHtml('客户消费', formatYuan(summary.spent), `采购成本 ${formatYuan(summary.cost)}`),
+    usageStatHtml('产生利润', formatYuan(summary.profit, true), marginText, summary.profit > 0 ? 'is-profit' : (summary.profit < 0 ? 'is-loss' : ''))
+  ].join('');
+}
+// ==== 用量与模型利润：纯计算与拼页面文字 结束 ====
+
+// 读取用量数据。只认最后一次请求的结果；出错时保留原来显示的数据，只在状态行提示。
+async function loadUserUsage(force = false) {
+  const seq = ++usageRequestSeq;
+  const range = currentUsageRange;
+  const refreshBtn = document.getElementById('btnRefreshUsage');
+  if (refreshBtn) refreshBtn.disabled = true;
+  setUsageStatus(userUsageData ? `正在更新「${USAGE_RANGE_HINTS[range] || range}」的用量…` : '正在统计…', false);
+  try {
+    const res = await fetch(`/api/user-usage?range=${encodeURIComponent(range)}${force ? '&refresh=true' : ''}`);
+    const data = await res.json().catch(() => ({}));
+    if (seq !== usageRequestSeq) return;
+    if (!res.ok || !data.success) throw new Error(data.error || '读取客户用量失败');
+    userUsageData = data;
+    renderUserUsage();
+    if (force) showToast('客户用量已刷新', 'success');
+  } catch (err) {
+    if (seq !== usageRequestSeq) return;
+    console.error('loadUserUsage error:', err);
+    setUsageStatus(`读取失败：${err.message || '读取客户用量失败'}。点右上角「刷新」再试一次。`, true);
+    if (!userUsageData) renderUserUsage();
+  } finally {
+    if (seq === usageRequestSeq && refreshBtn) refreshBtn.disabled = false;
+  }
+}
+
+function setUsageStatus(text, isError) {
+  const el = document.getElementById('usageStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('is-error', Boolean(isError));
+}
+
+function renderUserUsage() {
+  const body = document.getElementById('usageTableBody');
+  const summaryEl = document.getElementById('usageSummary');
+  if (!body) return;
+  if (!userUsageData) {
+    if (summaryEl) summaryEl.innerHTML = '';
+    body.innerHTML = '<tr><td colspan="9" style="text-align: center; padding: 1.5rem; color: #94a3b8;">正在统计…</td></tr>';
+    return;
+  }
+  const visible = sortUsageUsers(filterUsageUsers(userUsageData.users, currentUsageScope, currentUsageSearch), currentUsageSort);
+  if (summaryEl) summaryEl.innerHTML = usageSummaryHtml(summarizeUsageUsers(visible));
+  const updated = new Date(userUsageData.generatedAt);
+  const updatedText = isNaN(updated.getTime()) ? '' : ` · 数据更新于 ${updated.toLocaleTimeString('zh-CN', { hour12: false })}`;
+  setUsageStatus(`统计范围：${userUsageData.rangeLabel}（${USAGE_RANGE_HINTS[userUsageData.range] || ''}）${updatedText}`, false);
+  if (visible.length === 0) {
+    const why = (userUsageData.users || []).length === 0 ? '这段时间没有任何用量记录。' : '没有符合条件的客户，可以试试「全部用户」或清空搜索。';
+    body.innerHTML = `<tr><td colspan="9" style="text-align: center; padding: 1.5rem; color: #94a3b8;">${why}</td></tr>`;
+    return;
+  }
+  body.innerHTML = visible.map((user, index) => usageRowHtml(user, index + 1, expandedUsageUsers.has(user.userId))).join('');
+}
+
+// 让工具栏上的按钮、搜索框、排序框和当前状态一致
+function syncUsageToolbar() {
+  document.querySelectorAll('#usageRangeToggle [data-range]').forEach(btn => btn.classList.toggle('active', btn.dataset.range === currentUsageRange));
+  document.querySelectorAll('#usageScopeToggle [data-scope]').forEach(btn => btn.classList.toggle('active', btn.dataset.scope === currentUsageScope));
+  const search = document.getElementById('usageSearchInput');
+  if (search && search.value !== currentUsageSearch) search.value = currentUsageSearch;
+  const sort = document.getElementById('usageSortSelect');
+  if (sort) sort.value = currentUsageSort;
+}
+
+// 从「用户收支明细」某一行的「用量」按钮跳过来：切到用量页签，只看这个客户并展开他的模型明细
+function openUserUsageFor(userId) {
+  const id = Number(userId);
+  const user = ((userFinancesData && userFinancesData.users) || []).find(u => u.id === id);
+  currentUsageSearch = user ? (user.email || user.username || String(id)) : String(id);
+  if (!user || !usageIsCustomer({ role: user.role, userId: user.id, isTestAccount: user.isTestAccount })) currentUsageScope = 'all';
+  expandedUsageUsers.add(id);
+  syncUsageToolbar();
+  const tab = document.querySelector('.fin-tab-btn[data-fintab="usage"]');
+  if (tab) tab.click();
+}
+
+function initUserUsageEvents() {
+  const rangeToggle = document.getElementById('usageRangeToggle');
+  if (rangeToggle) {
+    rangeToggle.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-range]');
+      if (!btn || btn.dataset.range === currentUsageRange) return;
+      currentUsageRange = btn.dataset.range;
+      userUsageData = null;
+      syncUsageToolbar();
+      renderUserUsage();
+      loadUserUsage(false);
+    });
+  }
+  const scopeToggle = document.getElementById('usageScopeToggle');
+  if (scopeToggle) {
+    scopeToggle.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-scope]');
+      if (!btn) return;
+      currentUsageScope = btn.dataset.scope;
+      syncUsageToolbar();
+      renderUserUsage();
+    });
+  }
+  const sortSelect = document.getElementById('usageSortSelect');
+  if (sortSelect) {
+    sortSelect.addEventListener('change', (e) => {
+      currentUsageSort = e.target.value;
+      renderUserUsage();
+    });
+  }
+  const searchInput = document.getElementById('usageSearchInput');
+  if (searchInput) {
+    let debounce = null;
+    searchInput.addEventListener('input', (e) => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        currentUsageSearch = e.target.value.trim();
+        renderUserUsage();
+      }, 150);
+    });
+  }
+  const refreshBtn = document.getElementById('btnRefreshUsage');
+  if (refreshBtn) refreshBtn.addEventListener('click', () => loadUserUsage(true));
+  const body = document.getElementById('usageTableBody');
+  if (body) {
+    // 点整行或「展开」按钮都能展开 / 收起这个客户的模型明细
+    body.addEventListener('click', (e) => {
+      const row = e.target.closest('[data-usage-user]');
+      if (!row) return;
+      const id = Number(row.dataset.usageUser);
+      if (expandedUsageUsers.has(id)) expandedUsageUsers.delete(id);
+      else expandedUsageUsers.add(id);
+      renderUserUsage();
+    });
+  }
+  syncUsageToolbar();
 }
 
 // 打开快捷加款模态弹窗
@@ -8178,13 +8516,16 @@ function initUserFinancesEvents() {
 
       const overviewTab = document.getElementById('finTabOverview');
       const usersTab = document.getElementById('finTabUsers');
+      const usageTab = document.getElementById('finTabUsage');
       const rechargesTab = document.getElementById('finTabRecharges');
 
       if (overviewTab) overviewTab.style.display = targetTab === 'overview' ? 'block' : 'none';
       if (usersTab) usersTab.style.display = targetTab === 'users' ? 'block' : 'none';
+      if (usageTab) usageTab.style.display = targetTab === 'usage' ? 'block' : 'none';
       if (rechargesTab) rechargesTab.style.display = targetTab === 'recharges' ? 'block' : 'none';
 
       if (targetTab === 'users') renderUserFinancesTable();
+      if (targetTab === 'usage') { renderUserUsage(); loadUserUsage(false); }
       if (targetTab === 'recharges' && userFinancesData) renderRecentRecharges(userFinancesData.recentRecharges);
     });
   });
@@ -8280,6 +8621,9 @@ function initUserFinancesEvents() {
       }
     });
   }
+
+  // 10. 用量与模型利润页签
+  initUserUsageEvents();
 }
 
 // 暴露函数供全局 inline onclick 调用
@@ -8287,6 +8631,7 @@ window.openQuickRechargeModal = openQuickRechargeModal;
 window.closeQuickRechargeModal = closeQuickRechargeModal;
 window.openQuickConcurrencyModal = openQuickConcurrencyModal;
 window.closeQuickConcurrencyModal = closeQuickConcurrencyModal;
+window.openUserUsageFor = openUserUsageFor;
 window.setPresetConcurrency = setPresetConcurrency;
 window.setChannelRole = setChannelRole;
 

@@ -4533,7 +4533,8 @@ body {
   background: #ffffff;
 }
 
-.scope-btn {
+.scope-btn,
+.usage-seg-btn {
   background: transparent;
   border: none;
   font-size: 0.76rem;
@@ -4544,13 +4545,15 @@ body {
   transition: all 0.15s ease;
 }
 
-.scope-btn.active {
+.scope-btn.active,
+.usage-seg-btn.active {
   background: #eff6ff;
   color: #1d4ed8;
   font-weight: 700;
 }
 
-.scope-btn:hover:not(.active) {
+.scope-btn:hover:not(.active),
+.usage-seg-btn:hover:not(.active) {
   background: #f8fafc;
   color: #1e293b;
 }
@@ -5043,3 +5046,189 @@ body {
   color: #475569;
   line-height: 1.5;
 }
+
+/* ====== 📈 用户财务：用量与模型利润 ====== */
+.usage-toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.usage-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.6rem;
+  margin: 0.75rem 0 0.4rem;
+}
+.usage-stat {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.5rem 0.8rem;
+  min-width: 0;
+}
+.usage-stat-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #64748b;
+}
+.usage-stat-value {
+  font-size: 1.12rem;
+  font-weight: 800;
+  color: #0f172a;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.usage-stat-sub {
+  font-size: 0.68rem;
+  color: #94a3b8;
+  line-height: 1.35;
+}
+.usage-stat.is-profit {
+  border-color: #6ee7b7;
+  background: linear-gradient(180deg, #ecfdf5 0%, #ffffff 65%);
+}
+.usage-stat.is-profit .usage-stat-value { color: #059669; }
+.usage-stat.is-loss {
+  border-color: #fecaca;
+  background: linear-gradient(180deg, #fef2f2 0%, #ffffff 65%);
+}
+.usage-stat.is-loss .usage-stat-value { color: #dc2626; }
+.usage-status {
+  min-height: 1.1rem;
+  margin: 0.1rem 0 0.45rem;
+  font-size: 0.74rem;
+  color: #64748b;
+}
+.usage-status.is-error { color: #b91c1c; }
+.usage-note {
+  margin: 0.6rem 0 0;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: #94a3b8;
+}
+.usage-num { font-variant-numeric: tabular-nums; text-align: right; }
+.usage-cost { color: #64748b; }
+.usage-zero { color: #cbd5e1; }
+.usage-sub {
+  display: block;
+  font-size: 0.68rem;
+  color: #94a3b8;
+  line-height: 1.4;
+}
+.usage-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+.usage-identity strong { color: #0f172a; font-size: 0.82rem; word-break: break-all; }
+.usage-tokens strong { display: block; color: #0f172a; font-variant-numeric: tabular-nums; }
+.usage-tokens .usage-sub { white-space: nowrap; }
+.usage-toggle-btn { white-space: nowrap; }
+.usage-profit {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.usage-profit strong { font-weight: 700; font-variant-numeric: tabular-nums; }
+.usage-profit .usage-margin { font-size: 0.68rem; font-weight: 600; }
+.usage-profit.is-plus strong, .usage-profit.is-plus .usage-margin { color: #059669; }
+.usage-profit.is-minus strong, .usage-profit.is-minus .usage-margin { color: #dc2626; }
+.usage-user-row { cursor: pointer; }
+.usage-user-row.is-open > td { background: #f8fafc; }
+.usage-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.usage-model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 200px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1e40af;
+  font-size: 0.7rem;
+  line-height: 1.5;
+}
+.usage-model-chip .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-model-chip .pct {
+  flex-shrink: 0;
+  font-weight: 700;
+  color: #64748b;
+}
+.usage-model-chip.is-more {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+  color: #475569;
+}
+.usage-model-chip.is-loss {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+.usage-detail-row > td {
+  padding: 0.55rem 0.9rem 0.85rem 2.6rem;
+  background: #f8fafc;
+}
+.usage-model-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  font-size: 0.76rem;
+}
+.usage-model-table th {
+  padding: 0.4rem 0.6rem;
+  background: #f1f5f9;
+  border-bottom: 1px solid #e2e8f0;
+  color: #475569;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-align: right;
+  white-space: nowrap;
+}
+.usage-model-table td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #f1f5f9;
+  color: #1e293b;
+}
+.usage-model-table tbody tr:last-child td { border-bottom: none; }
+.usage-model-name {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-share-bar {
+  display: inline-block;
+  width: 56px;
+  height: 6px;
+  margin-right: 0.35rem;
+  border-radius: 3px;
+  background: #e2e8f0;
+  overflow: hidden;
+  vertical-align: middle;
+}
+.usage-share-bar > span {
+  display: block;
+  height: 100%;
+  background: #3b82f6;
+}
+.usage-link-btn {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #2563eb;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+.usage-link-btn:hover { text-decoration: underline; }

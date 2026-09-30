@@ -9,7 +9,7 @@
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=relay-tower-2026">
   <link rel="shortcut icon" href="favicon.ico?v=relay-tower-2026">
-  <link rel="stylesheet" href="style.css?v=20260927_role_scope">
+  <link rel="stylesheet" href="style.css?v=20260930_user_usage">
 </head>
 <body>
   <div class="app-layout">
@@ -1420,6 +1420,9 @@
             <button class="fin-tab-btn" data-fintab="users">
               <span>👥</span> 用户收支明细与排行 (<span id="tabUserCountPill">0</span>)
             </button>
+            <button class="fin-tab-btn" data-fintab="usage">
+              <span>📈</span> 用量与模型利润
+            </button>
             <button class="fin-tab-btn" data-fintab="recharges">
               <span>🧾</span> 最近充值明细流水
             </button>
@@ -1642,6 +1645,68 @@
                 </tbody>
               </table>
             </div>
+          </div>
+
+          <!-- Tab 内容：每个客户用了多少量、用了哪些模型、产生多少利润 -->
+          <div id="finTabUsage" class="fin-tab-content" style="display: none;">
+            <div class="fin-filter-toolbar">
+              <div class="usage-toolbar-group">
+                <div class="fin-scope-toggle" id="usageRangeToggle" title="统计哪一段时间的用量">
+                  <button class="usage-seg-btn" data-range="today">今天</button>
+                  <button class="usage-seg-btn" data-range="yesterday">昨天</button>
+                  <button class="usage-seg-btn active" data-range="7d">近 7 天</button>
+                  <button class="usage-seg-btn" data-range="30d">近 30 天</button>
+                  <button class="usage-seg-btn" data-range="month">本月</button>
+                  <button class="usage-seg-btn" data-range="all">全部</button>
+                </div>
+                <div class="fin-scope-toggle" id="usageScopeToggle">
+                  <button class="usage-seg-btn active" data-scope="customers">仅看外部客户</button>
+                  <button class="usage-seg-btn" data-scope="all">全部用户 (含测试号与管理员)</button>
+                </div>
+              </div>
+              <div class="usage-toolbar-group">
+                <div class="search-box" style="position: relative; width: 220px;">
+                  <input type="text" id="usageSearchInput" placeholder="搜索邮箱、用户名或用户 ID..." style="width: 100%; font-size: 0.8rem; padding: 0.35rem 0.75rem 0.35rem 1.8rem;" />
+                  <span style="position: absolute; left: 0.55rem; top: 50%; transform: translateY(-50%); font-size: 0.75rem; color: #94a3b8; pointer-events: none;">🔍</span>
+                </div>
+                <select id="usageSortSelect" class="form-input" style="font-size: 0.78rem; padding: 0.3rem 0.6rem; width: 215px;">
+                  <option value="profit_desc" selected>按利润：高 → 低</option>
+                  <option value="spent_desc">按客户消费：高 → 低</option>
+                  <option value="requests_desc">按请求次数：高 → 低</option>
+                  <option value="tokens_desc">按用量：高 → 低</option>
+                  <option value="margin_desc">按毛利率：高 → 低</option>
+                  <option value="profit_asc">按利润：低 → 高（亏本在前）</option>
+                </select>
+                <button id="btnRefreshUsage" class="btn btn-secondary" style="font-size: 0.76rem; padding: 0.3rem 0.75rem;">⟳ 刷新</button>
+              </div>
+            </div>
+
+            <div id="usageSummary" class="usage-summary"></div>
+            <div id="usageStatus" class="usage-status"></div>
+
+            <div class="fin-table-scroll-wrap" style="max-height: 460px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px;">
+              <table class="fin-table usage-table">
+                <thead>
+                  <tr>
+                    <th style="width: 44px; text-align: center;">排名</th>
+                    <th style="min-width: 176px; text-align: left;">客户</th>
+                    <th style="width: 76px; text-align: right;" title="成功计费的请求次数">请求次数</th>
+                    <th style="width: 150px; text-align: right;" title="输入 + 输出 + 缓存读写的 tokens 总数">用量 (tokens)</th>
+                    <th style="min-width: 176px; text-align: left;" title="按客户消费从多到少排，百分比是这个模型占该客户消费的比例">用了哪些模型</th>
+                    <th style="width: 88px; text-align: right;" title="客户实际被扣的钱">客户消费</th>
+                    <th style="width: 88px; text-align: right;" title="上游的进价：用量原价 × 账号倍率">采购成本</th>
+                    <th style="width: 112px; text-align: right;" title="客户消费 − 采购成本">产生利润 (毛利率)</th>
+                    <th style="width: 76px; text-align: center;">明细</th>
+                  </tr>
+                </thead>
+                <tbody id="usageTableBody">
+                  <!-- 由 app.js 动态渲染 -->
+                </tbody>
+              </table>
+            </div>
+            <p class="usage-note">
+              产生利润 = 客户消费 − 采购成本，算法和「核心收支大盘」完全一样，两边的数字对得上。只统计成功计费的请求；用量 tokens 含缓存读写。点某个客户的「展开」，看他每个模型各用了多少、赚了多少。
+            </p>
           </div>
 
           <!-- Tab 3 内容：最近充值明细流水 -->
@@ -2191,6 +2256,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260930_key_dialog"></script>
+  <script src="app.js?v=20260930_user_usage"></script>
 </body>
 </html>
