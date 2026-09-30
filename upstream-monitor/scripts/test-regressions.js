@@ -138,6 +138,7 @@ function evaluator(overrides = {}) {
   const policy = require('../routing-policy');
   const context = vm.createContext({ state, autoSwitchConfig: { enabled: true, manualLockPolicy: 'strict_lock' },
     evaluateGroup: require('../auto-failover-policy').evaluateGroup,
+    missingModels: require('../auto-failover-policy').missingModels,
     console: { log() {}, warn() {}, error() {} }, ...policy,
     gatewayMetrics: new gateway.GatewayMetrics(), fetchChannelStabilityMetrics: () => ({}),
     getChannelStabilitySummary: () => ({}), isExemptGroup: () => false,
@@ -3214,4 +3215,147 @@ test('customers repeatedly finding no account in a group switch its main to the 
   assert.equal(row.action, 'hold');
   assert.equal(row.routingFailures, 2);
   assert.ok(row.accounts.find(a => a.id === '1').notes.includes('本组最近 2 次请求找不到账号接单'));
+});
+
+// ====== 2026-09-29 替补只看客户在用的模型；没替补时每小时提醒；为省钱换号前看最近报错 ======
+
+test('model demand and recent account errors come from their own guarded, cached queries', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const sqls = [];
+  const errors = [];
+  let reply = '';
+  const context = vm.createContext({ Date, JSON, console: { error: (...args) => errors.push(args.join(' ')) },
+    execPsql(sql) { sqls.push(sql); if (reply instanceof Error) throw reply; return reply; } });
+  vm.runInContext(source.slice(source.indexOf('let groupModelDemand'), source.indexOf('function evaluateAutoSwitch(')), context);
+
+  reply = JSON.stringify({ 27: ['gpt-a', 'gpt-b'] });
+  assert.deepEqual(JSON.parse(JSON.stringify(context.fetchGroupModelDemand())), { 27: ['gpt-a', 'gpt-b'] });
+  assert.match(sqls[0], /COALESCE\(NULLIF\(btrim\(requested_model\), ''\), model\)/, 'the model the customer asked for');
+  assert.match(sqls[0], /FROM usage_logs\s+WHERE created_at >= NOW\(\) - INTERVAL '7 days'/);
+  assert.match(sqls[0], /FROM ops_error_logs\s+WHERE created_at >= NOW\(\) - INTERVAL '7 days' AND group_id IS NOT NULL AND COALESCE\(status_code, 0\) <> 404/,
+    'a model nobody in the group serves is not demand');
+  assert.match(sqls[0], /ORDER BY n DESC/);
+  context.fetchGroupModelDemand();
+  assert.equal(sqls.length, 1, 'cached');
+
+  reply = JSON.stringify({ 260: { errors: 5, lastAt: 1000 } });
+  assert.equal(context.fetchRecentAccountErrors()['260'].errors, 5);
+  assert.match(sqls[1], /INTERVAL '6 hours' AND account_id IS NOT NULL/);
+  assert.match(sqls[1], /error_owner = 'provider' AND \(status_code >= 500 OR status_code IN \(401, 402, 403, 404, 429\)\)/,
+    'client mistakes and retried-then-successful requests do not count');
+  context.fetchRecentAccountErrors();
+  assert.equal(sqls.length, 2, 'cached');
+
+  // 查询出错：返回空、只记日志；客户模型统计 1 分钟后重试
+  vm.runInContext('groupModelDemand = { at: 0, data: {} }; recentAccountErrors = { at: 0, data: {} }', context);
+  reply = new Error('column "requested_model" does not exist');
+  assert.deepEqual(JSON.parse(JSON.stringify(context.fetchGroupModelDemand())), {});
+  assert.deepEqual(JSON.parse(JSON.stringify(context.fetchRecentAccountErrors())), {});
+  assert.match(errors.join('\n'), /本组客户在用模型统计/);
+  assert.match(errors.join('\n'), /账号近 6 小时报错统计/);
+  assert.ok(Date.now() - vm.runInContext('groupModelDemand.at', context) >= 539000, 'demand retries a minute after a failure');
+});
+
+test('a 副调 that lacks only a model nobody uses takes over from a failing main', () => {
+  const now = Date.now();
+  const failures = [1, 2, 3].map(i => ({ at: now - i * 5000, model: 'gpt-a', type: 'api_error' }));
+  const run = demand => {
+    let switched = null;
+    const { context, state } = evaluator({
+      fetchRecentGroupRoutingFailures: () => ({ 1: { failures, lastSuccessAt: now - 120000 } }),
+      fetchGroupModelDemand: () => demand,
+      executeAutoSwitch: (from, to, reason, meta) => { switched = { from: String(from.id), to: String(to.id), trigger: meta.triggerType }; return { executed: true }; }
+    });
+    state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+    state.channels = [
+      fixChannel(1, { priority: 1, schedulable: true, configuredModels: ['gpt-a', 'gpt-rare'], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] }),
+      fixChannel(2, { configuredModels: ['gpt-a'], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] })
+    ];
+    state.failoverRuntime = { 1: { lastCurrentId: '1', currentSince: now - 600000 } };
+    context.evaluateAutoSwitch();
+    return switched;
+  };
+  // 以前：主调模型表里有个没人用的 gpt-rare，副调没有，整组卡住不切
+  assert.equal(run({}), null);
+  assert.deepEqual(run({ 1: ['gpt-a'] }), { from: '1', to: '2', trigger: 'routing_failures' });
+});
+
+test('with no usable backup the group is reported again every hour, naming what the 副调 lacks', () => {
+  const now = Date.now();
+  const failures = [1, 2, 3].map(i => ({ at: now - i * 5000, model: 'gpt-a', type: 'api_error' }));
+  const telegrams = [];
+  const { context, state } = evaluator({
+    fetchRecentGroupRoutingFailures: () => ({ 1: { failures, lastSuccessAt: now - 120000 } }),
+    fetchGroupModelDemand: () => ({ 1: ['gpt-a', 'gpt-b'] }),
+    telegram: { notifyAutoSwitch() {}, broadcastToAdmins: note => { telegrams.push(note); return Promise.resolve(); } }
+  });
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  state.channels = [
+    fixChannel(1, { priority: 1, schedulable: true, configuredModels: ['gpt-a', 'gpt-b', 'gpt-rare'], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] }),
+    fixChannel(2, { name: '副调乙', configuredModels: ['gpt-a'], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] })
+  ];
+  // 旧版留下的「已经提醒过」标记，不再让它一直不出声
+  state.failoverRuntime = { 1: { lastCurrentId: '1', currentSince: now - 600000, exhaustedNotified: true } };
+  context.evaluateAutoSwitch();
+  assert.equal(context.alerts.length, 1);
+  assert.match(context.alerts[0].note, /\[副调乙\] 缺客户在用的模型 gpt-b，所以顶不上/);
+  assert.match(context.alerts[0].note, /问题没解决前，每小时提醒一次/);
+  assert.equal(telegrams.length, 1);
+  assert.equal(state.failoverRuntime[1].exhaustedNotified, undefined);
+  // 一小时内不重复
+  context.evaluateAutoSwitch();
+  assert.equal(context.alerts.length, 1);
+  // 过了一小时还是没法切：再提醒
+  state.failoverRuntime[1].exhaustedNotifiedAt = now - 3600001;
+  context.evaluateAutoSwitch();
+  assert.equal(context.alerts.length, 2);
+  assert.equal(telegrams.length, 2);
+});
+
+test('a successful switch clears the reminder clock, so the next stuck moment is reported at once', () => {
+  const { context, state } = evaluator({ executeAutoSwitch: () => ({ executed: true }) });
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  state.channels = [
+    fixChannel(1, { priority: 1, schedulable: true, balance: 0, balanceStatus: 'empty', groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] }),
+    fixChannel(2, { groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] })
+  ];
+  state.failoverRuntime = { 1: { exhaustedNotifiedAt: Date.now() - 60000, exhaustedNotified: true } };
+  context.evaluateAutoSwitch();
+  assert.equal(state.failoverRuntime[1].exhaustedNotifiedAt, undefined);
+  assert.equal(state.failoverRuntime[1].exhaustedNotified, undefined);
+});
+
+test('the switch preview names the models a backup lacks and its recent real errors', () => {
+  const now = Date.now();
+  const { context, state } = evaluator({
+    fetchGroupModelDemand: () => ({ 1: ['gpt-a', 'gpt-b'] }),
+    fetchRecentAccountErrors: () => ({ 3: { errors: 4, lastAt: now - 60000 } })
+  });
+  context.autoSwitchConfig.groupPolicies = { 1: { autoRecoverLowestCost: true } };
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  state.channels = [
+    fixChannel(1, { priority: 1, schedulable: true, configuredModels: ['gpt-a', 'gpt-b'], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] }),
+    fixChannel(2, { configuredModels: ['gpt-a'], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] }),
+    fixChannel(3, { configuredModels: [], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 20 }] })
+  ];
+  const row = context.previewAutoSwitch(now).groups[0];
+  const lacking = row.accounts.find(a => a.id === '2');
+  assert.equal(lacking.candidate, false);
+  assert.deepEqual(lacking.missingModels, ['gpt-b']);
+  assert.ok(lacking.notes.includes('缺少客户在用的模型：gpt-b'));
+  const noisy = row.accounts.find(a => a.id === '3');
+  assert.equal(noisy.candidate, true, 'recent errors only stop a switch made to save money, not a failover');
+  assert.ok(noisy.notes.includes('最近 6 小时真实请求报错 4 次，暂不为省钱换过去'));
+});
+
+test('the protection overview says when a group\'s backups lack the models customers use', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const context = vm.createContext({});
+  vm.runInContext(app.slice(app.indexOf('function summarizeAutoSwitchCoverage('), app.indexOf('function renderAutoSwitchCoverage(')), context);
+  const summary = context.summarizeAutoSwitchCoverage({ groups: [{ groupName: 'A', action: 'exhausted', accounts: [
+    { isCurrent: true, candidate: false, notes: [] },
+    { isCurrent: false, candidate: false, notes: ['缺少客户在用的模型：gpt-b'] }
+  ] }] });
+  assert.equal(summary.exposed[0].why, '其余 1 个缺客户在用模型的账号');
+  assert.equal(summary.urgent.length, 1);
 });

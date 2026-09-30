@@ -8,7 +8,7 @@ const { execSync, execFileSync, fork } = require('child_process');
 const gateway = require('./gateway');
 const gatewayMetrics = new gateway.GatewayMetrics();
 const { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority, ROLE_PRIORITY, ROLE_LABELS, roleForPriority, groupRole } = require('./routing-policy');
-const { evaluateGroup, lowTrafficSuspect, resolveGroupPolicy, groupPolicyOverrides } = require('./auto-failover-policy');
+const { evaluateGroup, lowTrafficSuspect, missingModels, resolveGroupPolicy, groupPolicyOverrides } = require('./auto-failover-policy');
 const accountSplit = require('./account-split');
 const upstreamKeys = require('./upstream-keys');
 const { EventEmitter } = require('events');
@@ -6178,6 +6178,58 @@ function fetchRecentGroupRoutingFailures() {
   }
   return recentGroupRoutingFailures.data;
 }
+// 每个分组近 7 天客户真正请求过的模型（成功、失败都算；「本组没人支持这个模型」的 404 不算），
+// 按请求次数从多到少排。切号时替补只需支持其中当前主调也支持的模型，主调模型表里没人用的模型
+// 不再挡住副调。单独查询、缓存 10 分钟；出错时返回空（1 分钟后重试），切号退回按主调整张模型表判断。
+let groupModelDemand = { at: 0, data: {} };
+function fetchGroupModelDemand() {
+  if (Date.now() - groupModelDemand.at < 600000) return groupModelDemand.data;
+  try {
+    const output = execPsql(`WITH d AS (
+      SELECT group_id, COALESCE(NULLIF(btrim(requested_model), ''), model) AS m
+      FROM usage_logs
+      WHERE created_at >= NOW() - INTERVAL '7 days' AND group_id IS NOT NULL
+      UNION ALL
+      SELECT group_id, COALESCE(NULLIF(btrim(requested_model), ''), model) AS m
+      FROM ops_error_logs
+      WHERE created_at >= NOW() - INTERVAL '7 days' AND group_id IS NOT NULL AND COALESCE(status_code, 0) <> 404
+    ), c AS (
+      SELECT group_id, m, COUNT(*) AS n FROM d WHERE COALESCE(btrim(m), '') <> '' GROUP BY group_id, m
+    )
+    SELECT COALESCE(json_object_agg(x.group_id::text, x.models), '{}'::json)
+    FROM (SELECT group_id, json_agg(m ORDER BY n DESC, m) AS models FROM c GROUP BY group_id) x;`, true).trim() || '{}';
+    const parsed = JSON.parse(output);
+    groupModelDemand = { at: Date.now(), data: parsed && typeof parsed === 'object' ? parsed : {} };
+  } catch (error) {
+    groupModelDemand = { at: Date.now() - 540000, data: {} };
+    console.error('[本组客户在用模型统计]', error.message);
+  }
+  return groupModelDemand.data;
+}
+// 每个账号近 6 小时真实请求的上游报错次数：上游 5xx、429 限流、401/403 鉴权、402 欠费、404 模型不存在。
+// 客户自己的错（error_owner 不是 provider）和 Sub2API 重试后已成功的（200）不算。
+// 「更便宜的账号恢复后，自动换过去」据此避开最近出过错的账号。单独查询、缓存 3 分钟；
+// 出错时返回空，这条保护只剩塔台自己记下的故障时间。
+let recentAccountErrors = { at: 0, data: {} };
+function fetchRecentAccountErrors() {
+  if (Date.now() - recentAccountErrors.at < 180000) return recentAccountErrors.data;
+  try {
+    const output = execPsql(`SELECT COALESCE(json_object_agg(t.account_id::text, json_build_object('errors', t.n, 'lastAt', t.last_ms)), '{}'::json)
+    FROM (
+      SELECT account_id, COUNT(*) AS n, (EXTRACT(EPOCH FROM MAX(created_at)) * 1000)::bigint AS last_ms
+      FROM ops_error_logs
+      WHERE created_at >= NOW() - INTERVAL '6 hours' AND account_id IS NOT NULL
+        AND error_owner = 'provider' AND (status_code >= 500 OR status_code IN (401, 402, 403, 404, 429))
+      GROUP BY account_id
+    ) t;`, true).trim() || '{}';
+    const parsed = JSON.parse(output);
+    recentAccountErrors = { at: Date.now(), data: parsed && typeof parsed === 'object' ? parsed : {} };
+  } catch (error) {
+    recentAccountErrors = { at: Date.now(), data: {} };
+    console.error('[账号近 6 小时报错统计]', error.message);
+  }
+  return recentAccountErrors.data;
+}
 
 function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
   if (!autoSwitchConfig.enabled) return { executed: false, reason: '自动切号已关闭' };
@@ -6187,6 +6239,8 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
   // Isolated tests and degraded startup may not have the DB metric helper loaded.
   const productionMetrics = typeof fetchRecentFailoverMetrics === 'function' ? fetchRecentFailoverMetrics() : {};
   const groupRouting = typeof fetchRecentGroupRoutingFailures === 'function' ? fetchRecentGroupRoutingFailures() : {};
+  const groupDemand = typeof fetchGroupModelDemand === 'function' ? fetchGroupModelDemand() : {};
+  const recentErrors = typeof fetchRecentAccountErrors === 'function' ? fetchRecentAccountErrors() : {};
   const reasonNames = AUTO_SWITCH_REASON_NAMES;
   state.failoverRuntime = state.failoverRuntime || {};
   for (const group of groups || []) {
@@ -6202,14 +6256,15 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
       // assessment, while hiding shared backups from group-level promotion:
       // without verified group-scoped scheduler state, promoting one would
       // alter every other group that shares it.
-      const { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, isExclusiveToGroup } = buildGroupEvaluationInput(group, channels, productionMetrics, groupRouting);
+      const { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, demandModels, isExclusiveToGroup } = buildGroupEvaluationInput(group, channels, productionMetrics, groupRouting, groupDemand);
       if (groupCurrent && typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(groupCurrent)) {
         details.push(`${group.name}：当前主调 [${groupCurrent.name}] 为例外渠道，保持人工控制`);
         continue;
       }
       // 决策时的路由版本必须在评估前取：评估结果写回后再取，与写入层比较的是同一个值，闸门形同虚设。
       const decisionRuntimeAt = Number(state.failoverRuntime[key]?.lastSwitchAt) || 0;
-      const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, groupMetrics, config: { ...autoSwitchConfig, ...policy }, runtime: state.failoverRuntime[key] || {}, now });
+      const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, groupMetrics, demandModels, recentErrors,
+        config: { ...autoSwitchConfig, ...policy }, runtime: state.failoverRuntime[key] || {}, now });
       state.failoverRuntime[key] = decision.runtime;
       const current = channels.find(c => String(c.id) === String(decision.currentId)) || groupCurrent;
       if (decision.action === 'switch') {
@@ -6245,7 +6300,9 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
         }
         decision.runtime.lastSwitchAt = now;
         decision.runtime.lastTargetId = decision.targetId;
-        decision.runtime.exhaustedNotified = false;
+        // 切换成功：下次再没有能顶上的账号时马上提醒
+        delete decision.runtime.exhaustedNotifiedAt;
+        delete decision.runtime.exhaustedNotified;
         reports.push(result);
       } else if (decision.action === 'exhausted') {
         const active = channels.filter(c => c.schedulable);
@@ -6271,19 +6328,31 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
           invalidateSub2APIScheduler(ids);
           broadcastSSE('CHANNELS_UPDATED', state);
         }
-        if (!decision.runtime.exhaustedNotified) {
+        // 第一次马上提醒；一直没能切换、故障还在，就每小时再提醒一次。
+        // 以前只提醒一次、要等下次切换成功才会再提醒，隔天再出事就没人知道。
+        const lastNotifiedAt = Number(decision.runtime.exhaustedNotifiedAt) || 0;
+        delete decision.runtime.exhaustedNotified;
+        if (now - lastNotifiedAt >= EXHAUSTED_RENOTIFY_MS) {
           const sharedProtection = sharedActive.length
             ? ` 已保留 ${sharedActive.length} 条共享账号的全局调度状态，避免影响其他业务组。`
             : '';
           const degradedNote = keptDegraded.length
             ? ` 当前账号 [${keptDegraded.map(c => c.name).join('、')}] 仍在服务（${reasonNames[decision.reason] || decision.reason}），未关停以免整组断流。`
             : '';
-          const note = group.name + ' 没有能顶上的副调或备选（备用是关掉的，不会被换上），请检查余额并充值，或在分组里设一个副调；系统会继续探测并自动恢复。' + degradedNote + sharedProtection;
+          // 设了副调或备选、却缺客户在用的模型时点名缺什么，免得以为是没设副调
+          const lacking = channels.filter(c => String(c.id) !== String(decision.currentId) && ['sub', 'alt'].includes(groupRole(c, group.id)))
+            .map(c => ({ name: c.name, missing: missingModels(c, decision.required || []) }))
+            .filter(item => item.missing.length);
+          const missingNote = lacking.length
+            ? ` 本组的 ${lacking.map(item => `[${item.name}] 缺客户在用的模型 ${item.missing.join('、')}`).join('；')}，所以顶不上。`
+            : '';
+          const note = group.name + ' 没有能顶上的副调或备选（备用是关掉的，不会被换上），请检查余额并充值，或在分组里设一个副调；系统会继续探测并自动恢复。' +
+            degradedNote + missingNote + sharedProtection + ' 问题没解决前，每小时提醒一次。';
           alerts.unshift({ id: 'pool_' + key + '_' + now, type: 'pool_exhausted', groupId: group.id, timestamp: new Date(now).toISOString(), note });
           writeJSON(ALERTS_FILE, alerts);
           broadcastSSE('POOL_EXHAUSTED', { groupId: group.id, note });
           Promise.resolve(telegram.broadcastToAdmins(note.replace(/[&<>]/g, ''))).catch(error => console.error('[切号通知]', error.message));
-          decision.runtime.exhaustedNotified = true;
+          decision.runtime.exhaustedNotifiedAt = now;
         }
         details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason) + (sharedActive.length ? `（已保留 ${sharedActive.length} 条共享账号）` : ''));
       } else {
@@ -6299,6 +6368,8 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
 }
 
 
+// 本组没有能顶上的账号时，同一个分组最多每小时提醒一次
+const EXHAUSTED_RENOTIFY_MS = 3600000;
 const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', main_recharged: '原主调充值恢复上线', automation_disabled: '自动切号已关闭' };
 
 /**
@@ -6306,7 +6377,7 @@ const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_em
  * `schedulable` 与 priority 是账号级全局设置，而售价按分组：共享的当前主调保留以便评估健康，
  * 共享备选、例外渠道和在本组亏损的账号不允许被提升。
  */
-function buildGroupEvaluationInput(group, channels, productionMetrics = {}, groupRouting = {}) {
+function buildGroupEvaluationInput(group, channels, productionMetrics = {}, groupRouting = {}, groupDemand = {}) {
   const groupCurrent = [...channels].filter(channel => channel.schedulable).sort((a, b) => {
     const left = Number.isFinite(Number(a.priority)) ? Number(a.priority) : Number.MAX_SAFE_INTEGER;
     const right = Number.isFinite(Number(b.priority)) ? Number(b.priority) : Number.MAX_SAFE_INTEGER;
@@ -6332,7 +6403,10 @@ function buildGroupEvaluationInput(group, channels, productionMetrics = {}, grou
     return [String(c.id), production?.totalCalls ? production : observed];
   }));
   const groupMetrics = (groupRouting && groupRouting[String(group.id)]) || null;
-  return { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, isExclusiveToGroup, excluded };
+  // 客户最近在本组真正请求过的模型；没有数据时为 null，切号仍按当前账号的整张模型表
+  const demand = groupDemand && groupDemand[String(group.id)];
+  const demandModels = Array.isArray(demand) && demand.length ? demand : null;
+  return { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, demandModels, isExclusiveToGroup, excluded };
 }
 
 const PREVIEW_FAULT_NAMES = { disabled: '已停用/不可提升', balance_empty: '欠费', request_failures: '请求故障', probe_failures: '探活连续失败', routing_failures: '客户请求连续找不到账号接单' };
@@ -6351,18 +6425,21 @@ function previewAutoSwitch(now = Date.now()) {
   const groups = state.allGroups?.length ? state.allGroups : fetchAllSub2APIGroups();
   const productionMetrics = typeof fetchRecentFailoverMetrics === 'function' ? fetchRecentFailoverMetrics() : {};
   const groupRouting = typeof fetchRecentGroupRoutingFailures === 'function' ? fetchRecentGroupRoutingFailures() : {};
+  const groupDemand = typeof fetchGroupModelDemand === 'function' ? fetchGroupModelDemand() : {};
+  const recentErrors = typeof fetchRecentAccountErrors === 'function' ? fetchRecentAccountErrors() : {};
   const result = [];
   for (const group of groups || []) {
     const key = String(group.id);
     const channels = state.channels.filter(c => groupIds(c).includes(Number(group.id)));
     if (!channels.length) continue;
     const policy = autoSwitchConfig.groupPolicies?.[key] || {};
+    const config = { ...autoSwitchConfig, ...policy };
     const row = { groupId: group.id, groupName: group.name, accounts: [] };
     if (!autoSwitchConfig.enabled) row.skipped = '全局自动切号已关闭';
     else if (isExemptGroup(group) || policy.enabled === false) row.skipped = describeManualGroup(group, policy);
-    const { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, excluded } = buildGroupEvaluationInput(group, channels, productionMetrics, groupRouting);
+    const { groupCurrent, pricingEligibleChannels, metrics, groupMetrics, demandModels, excluded } = buildGroupEvaluationInput(group, channels, productionMetrics, groupRouting, groupDemand);
     if (!row.skipped && groupCurrent && typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(groupCurrent)) row.skipped = `当前主调 [${groupCurrent.name}] 为例外渠道，保持人工控制`;
-    const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, groupMetrics, config: { ...autoSwitchConfig, ...policy },
+    const decision = evaluateGroup({ group, channels: pricingEligibleChannels, metrics, groupMetrics, demandModels, recentErrors, config,
       runtime: JSON.parse(JSON.stringify(state.failoverRuntime?.[key] || {})), now });
     row.routingFailures = decision.routing?.count || 0;
     const byId = id => channels.find(c => String(c.id) === String(id));
@@ -6376,21 +6453,30 @@ function previewAutoSwitch(now = Date.now()) {
       const observation = decision.runtime.accounts?.[id] || {};
       const fault = decision.faults?.[id] || null;
       const notes = [];
+      const isCurrent = row.current?.id === id;
       if (excluded[id]) notes.push(excluded[id]);
       else if (fault) notes.push(PREVIEW_FAULT_NAMES[fault] || fault);
-      if (row.current?.id === id && row.routingFailures > 0 && fault !== 'routing_failures') {
+      if (isCurrent && row.routingFailures > 0 && fault !== 'routing_failures') {
         notes.push(`本组最近 ${row.routingFailures} 次请求找不到账号接单`);
+      }
+      // 顶上的账号要支持客户在本组用的模型；缺了就顶不上
+      const missing = !isCurrent && !excluded[id] ? missingModels(channel, decision.required || []) : [];
+      if (missing.length) notes.push(`缺少客户在用的模型：${missing.join('、')}`);
+      const trouble = !isCurrent ? decision.recentTrouble?.[id] : null;
+      if (trouble) {
+        notes.push((trouble.errors > 0 ? `最近 6 小时真实请求报错 ${trouble.errors} 次` : '最近 6 小时出过故障') +
+          (config.autoRecoverLowestCost !== false ? '，暂不为省钱换过去' : ''));
       }
       if (observation.needsRecovery && !fault) notes.push(observation.proofRequiredSince != null ? '等待真实生成成功后恢复' : '恢复观察中');
       if (channel.lastProbeStatus !== 'online') notes.push(channel.probeMode === 'generation' ? '无 /v1/models，等待生成探测' : `探活: ${channel.lastProbeStatus || '无'}`);
       if (channel.lastGenerationProbeStatus && channel.lastGenerationProbeStatus !== 'ok') notes.push(`生成探测: ${channel.lastGenerationProbeStatus}${channel.lastGenerationProbeError ? '（' + String(channel.lastGenerationProbeError).slice(0, 80) + '）' : ''}`);
       row.accounts.push({ id, name: channel.name, cost: channel.costMultiplier ?? channel.multiplier, priority: channel.priority,
-        schedulable: channel.schedulable === true, isCurrent: row.current?.id === id, isTarget: row.target?.id === id,
-        isCoCurrent: row.current?.id !== id && channel.schedulable === true,
+        schedulable: channel.schedulable === true, isCurrent, isTarget: row.target?.id === id,
+        isCoCurrent: !isCurrent && channel.schedulable === true,
         role: groupRole(channel, group.id),
         balance: channel.balance, balanceStatus: channel.balanceStatus, probe: channel.lastProbeStatus || null, probeMode: channel.probeMode || null,
-        debt: observation.debt === true, candidate: !excluded[id] && !fault && !observation.needsRecovery && channel.lastProbeStatus === 'online',
-        notes });
+        debt: observation.debt === true, candidate: !excluded[id] && !fault && !observation.needsRecovery && channel.lastProbeStatus === 'online' && !missing.length,
+        missingModels: missing, notes });
     }
     result.push(row);
   }

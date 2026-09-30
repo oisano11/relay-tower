@@ -6940,7 +6940,8 @@ function summarizeAutoSwitchCoverage(data) {
     const tally = {};
     for (const acc of others) {
       const notes = (acc.notes || []).join(' ');
-      const kind = /共享账号/.test(notes) ? '共享账号' : /备用（已关闭/.test(notes) ? '备用（关掉的）' : /售价|倍率未知/.test(notes) ? '进价高于售价' : /人工停用|例外渠道/.test(notes) ? '人工停用' : '暂时不可用';
+      const kind = /共享账号/.test(notes) ? '共享账号' : /备用（已关闭/.test(notes) ? '备用（关掉的）' : /售价|倍率未知/.test(notes) ? '进价高于售价' : /人工停用|例外渠道/.test(notes) ? '人工停用' :
+        /缺少客户在用的模型/.test(notes) ? '缺客户在用模型的账号' : '暂时不可用';
       tally[kind] = (tally[kind] || 0) + 1;
     }
     const why = others.length ? '其余 ' + Object.entries(tally).map(([kind, count]) => `${count} 个${kind}`).join('、') : '只有 1 个账号';
@@ -6959,7 +6960,7 @@ function renderAutoSwitchCoverage(data) {
     </div>` : '';
   const { covered, exposed, manual, urgent } = summarizeAutoSwitchCoverage(data);
   const hints = [];
-  if (exposed.length) hints.push('给这些分组各设一个副调（同类模型、进价不高于售价），出问题时就能自动切换。备用是关掉的，不会被换上；想让它顶上，就在分组里把它改成副调或备选。');
+  if (exposed.length) hints.push('给这些分组各设一个副调（支持客户在用的模型、进价不高于售价），出问题时就能自动切换。备用是关掉的，不会被换上；想让它顶上，就在分组里把它改成副调或备选。副调缺模型时，在 Sub2API 给它补上，或把主调模型表里没人用的模型删掉。');
   if (exposed.some(item => item.shared)) hints.push('共享账号不能当替补，可以点 <button type="button" class="btn-micro-edit" onclick="openSplitSharedModal()">🧩 拆分共享账号</button> 拆开。');
   box.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;">

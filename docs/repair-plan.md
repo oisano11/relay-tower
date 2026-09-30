@@ -288,3 +288,37 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - 缺模型被换下的主调，补上模型后才切回。
 - 查询只认 `error_phase='routing'`，会缓存，出错时返回空。
 
+
+## 替补只看客户在用的模型；没替补时每小时提醒；为省钱换号前看最近报错（2026-09-29）
+
+用户反馈：某个分组的主调上游出了故障，一整晚没有自动换号，也没收到提醒。我们只读核对了生产库和塔台数据，原因有三层：
+
+1. **分组里没有能用的替补。** 其余账号都是备用（关掉），自动切号不会用它们。这是配置问题，已经告诉运营者。
+2. **模型要求过严。** `requiredModels` 取当前主调的整张模型表（`configuredModels`，或 `modelMapping` 的键），候选账号必须支持其中每一个。主调表里有一个近 7 天没人请求过的模型，本组其他账号都没有。所以第二天上午副调已经设好、主调再出问题时，决策仍是 `exhausted`。
+3. **提醒只发一次。** `exhaustedNotified` 只在切换成功后才清掉。前一天已经提醒过一次，所以这一晚的故障在控制台和 Telegram 上都没有任何提醒。
+
+另外，这个分组开着 `autoRecoverLowestCost`。运营者手动把客户换走后，`cheaper_recovered` 几分钟后又把客户切回这个更便宜的主调。它的 `/v1/models` 探测和 1 token 生成探测都正常，但真实请求仍在报错：
+- 上游对其中一个模型回 404，Sub2API 就把这个模型在该账号上锁 30 分钟（`extra.model_rate_limits`），锁着的时候这个模型的请求全部返回 routing 503。
+- 另一个模型间歇性返回 502。
+
+改法：
+
+- **`fetchGroupModelDemand`：** 单独查询，缓存 10 分钟；出错时返回空，1 分钟后重试。按分组取近 7 天 `usage_logs` 和 `ops_error_logs` 里客户请求的模型，取法是 `COALESCE(NULLIF(btrim(requested_model), ''), model)`。`status_code = 404` 的不算，因为那是本组没人支持的模型。结果按请求次数从多到少排。
+- **`requiredModels(current, group, demand)`：** 分组声明了模型表时照旧。否则取当前账号模型表与 demand 的交集，按 demand 的顺序排。没有 demand 数据，或当前账号不限模型时，行为不变。`missingModels` 导出给预演和提醒用。
+- **`fetchRecentAccountErrors`：** 单独查询，缓存 3 分钟；出错时返回空。按账号统计近 6 小时 `ops_error_logs` 中符合两个条件的记录数：`error_owner = 'provider'`，并且 `status_code >= 500` 或属于 401/402/403/404/429。客户自己的错不算，重试后成功（200）的也不算。
+- **`evaluateGroup`：**
+  - 判出 `request_failures`、`probe_failures` 或 `routing_failures` 时，记下 `accounts[id].lastFaultAt`。
+  - `cheaper_recovered` 跳过 `recentTrouble` 的账号，也就是满足下面任一条件的：近 6 小时上游报错达到 `recentErrorLimit`（3）次；`lastFaultAt` 在 `recentErrorWindowMs`（6 小时）内。
+  - 故障换号和 `main_recharged`（原主调切回）不受这条限制。
+  - 决策结果新增 `required` 和 `recentTrouble`。
+- **`evaluateAutoSwitch`：**
+  - `exhaustedNotified` 改为 `exhaustedNotifiedAt`：距上次提醒满 `EXHAUSTED_RENOTIFY_MS`（1 小时）就再提醒一次，切换成功后清掉。
+  - 读到旧的 `exhaustedNotified` 字段就删掉，分组不会再因为它一直不提醒。
+  - 提醒里点名缺模型的副调和备选。
+- **预演：** 非当前账号缺模型时写明缺哪些，并且 `candidate` 设为假。有 `recentTrouble` 时写明报错次数；分组开了便宜优先时，再加一句「暂不为省钱换过去」。
+- **控制台：** 保护情况把缺模型的账号单独归类。说明文字同步更新，`app.js` 版本号改为 `20260929_failover_models`。
+
+验收：
+- `npm test` 217/217。新增 10 个用例；另按新规则改写 2 个旧用例，它们原来断言的是刚报过错的便宜账号几分钟后就会被换过去。这 12 个用例在改动前的代码上全部失败。
+- 两条新查询在生产库只读执行通过。
+- 用生产数据空跑决策：主调出问题时，原规则的结果是 `exhausted`，新规则会换到副调。把出问题的账号降为副调、开着便宜优先时，它的探测连续 15 分钟正常，也不会被换回去。

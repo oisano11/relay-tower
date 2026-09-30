@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { evaluateGroup } = require('../auto-failover-policy');
+const { evaluateGroup, missingModels } = require('../auto-failover-policy');
 
 const START = 1700000000000;
 const group = { id: 1, sale_rate: 1 };
@@ -165,7 +165,10 @@ test('recent production errors must expire before stable recovery observations a
     if (minute < 5) assert.equal(result.runtime.accounts['2'].successes, 0);
     runtime = result.runtime;
   }
-  assert.equal(result.reason, 'cheaper_recovered');
+  assert.equal(result.runtime.accounts['2'].needsRecovery, false, 'recovered once the errors stopped and a real generation succeeded');
+  // 刚出过请求故障：6 小时内不为省钱换过去（见下面「saving money never moves traffic…」）
+  assert.equal(result.reason, 'healthy');
+  assert.equal(result.recentTrouble['2'].lastFaultAt, START + 4 * 60000);
 });
 
 test('request-level faults never recover on /v1/models alone: a real generation proof is required', () => {
@@ -242,7 +245,8 @@ test('passive (OAuth / no API key) accounts recover from request faults without 
     runtime = result.runtime;
     if (result.action === 'switch') break;
   }
-  assert.equal(result.reason, 'cheaper_recovered');
+  assert.equal(result.runtime.accounts['2'].needsRecovery, false, 'recovered without any generation probe');
+  assert.equal(result.reason, 'healthy', 'but not moved onto for cost within 6 hours of its request fault');
 });
 
 test('failover never promotes a standby and goes 副调 before 备选, cheapest first within a role', () => {
@@ -546,4 +550,74 @@ test('a main switched away for a missing model is not switched back until its mo
   assert.equal(result.reason, 'main_recharged');
   assert.equal(result.targetId, 1);
   assert.equal(runtime.accounts['1'].routingModels, undefined);
+});
+
+// ====== 2026-09-29 替补只看客户在用的模型；为省钱换号前看最近真实请求 ======
+
+test('a 副调 only has to serve the models customers use in the group, not every model on the main\'s list', () => {
+  const debt = { balance: 0, balanceStatus: 'empty' };
+  const main = channel(1, { ...debt, configuredModels: ['gpt-a', 'gpt-b', 'gpt-rare'] });
+  const sub = channel(10, { configuredModels: ['gpt-a', 'gpt-b'] });
+  // 没有客户数据（查询失败或没流量）：仍按主调的整张模型表，副调缺 gpt-rare 顶不上
+  const blind = decide([main, sub]);
+  assert.equal(blind.action, 'exhausted');
+  assert.deepEqual(blind.required, ['gpt-a', 'gpt-b', 'gpt-rare']);
+  // 客户最近只用 gpt-b、gpt-a，还点过一个本组谁都不支持的 gpt-typo：副调能顶上
+  const known = decide([main, sub], { demandModels: ['gpt-b', 'gpt-a', 'gpt-typo'] });
+  assert.equal(known.action, 'switch');
+  assert.equal(known.targetId, 10);
+  assert.deepEqual(known.required, ['gpt-b', 'gpt-a'], 'in demand order, only models the main serves');
+  assert.deepEqual(known.runtime.requiredModels, ['gpt-b', 'gpt-a']);
+  // 客户真在用 gpt-rare：副调缺它就顶不上
+  assert.equal(decide([main, sub], { demandModels: ['gpt-a', 'gpt-rare'] }).action, 'exhausted');
+  // 主调不限模型（映射为空）：不要求替补支持什么
+  assert.deepEqual(decide([channel(1, { ...debt, configuredModels: [] }), sub], { demandModels: ['gpt-z'] }).required, []);
+  // 分组自己声明了模型表：按分组的
+  assert.equal(decide([main, sub], { demandModels: ['gpt-a'], group: { ...group, models: ['gpt-rare'] } }).action, 'exhausted');
+});
+
+test('missingModels names what an account lacks; wildcard and unrestricted mappings lack nothing', () => {
+  assert.deepEqual(missingModels({ configuredModels: ['gpt-a'] }, ['gpt-a', 'gpt-b']), ['gpt-b']);
+  assert.deepEqual(missingModels({ modelMapping: { 'gpt-*': 'gpt-x' } }, ['gpt-a', 'gpt-b']), []);
+  assert.deepEqual(missingModels({ configuredModels: [] }, ['gpt-a']), []);
+  assert.deepEqual(missingModels({}, ['gpt-a']), []);
+});
+
+test('saving money never moves traffic onto an account whose real requests failed in the last 6 hours', () => {
+  const run = (from, to, { runtime = {}, recentErrors = null } = {}) => {
+    let result;
+    for (let minute = from; minute <= to; minute++) {
+      const now = START + minute * 60000;
+      result = decide([channel(1, { costMultiplier: 0.5, lastProbeTime: now }), channel(2, { costMultiplier: 0.1, lastProbeTime: now })],
+        { now, runtime, recentErrors });
+      runtime = result.runtime;
+      if (result.action === 'switch') break;
+    }
+    return result;
+  };
+  // Sub2API 记下它最近 6 小时真实请求报错 3 次：探测一直正常也不换过去
+  const noisy = run(0, 15, { recentErrors: { 2: { errors: 3 } } });
+  assert.equal(noisy.action, 'hold');
+  assert.equal(noisy.runtime.accounts['2'].needsRecovery, false, 'healthy by probes');
+  assert.deepEqual(noisy.recentTrouble['2'], { errors: 3, lastFaultAt: null });
+  // 偶尔报错 2 次不算
+  assert.equal(run(0, 15, { recentErrors: { 2: { errors: 2 } } }).reason, 'cheaper_recovered');
+  // 塔台自己判过它故障：6 小时内不为省钱换过去，过了 6 小时才换
+  const faulted = { accounts: { 2: { lastFaultAt: START } } };
+  assert.equal(run(0, 15, { runtime: faulted }).action, 'hold');
+  const later = run(360, 375, { runtime: faulted });
+  assert.equal(later.reason, 'cheaper_recovered');
+  assert.equal(later.targetId, 2);
+});
+
+test('real faults are remembered for the cost guard; debt and manual closing are not', () => {
+  const failing = decide([channel(1), channel(2)], { metrics: { 1: { consecutiveFailures: 5 } } });
+  assert.equal(failing.runtime.accounts['1'].lastFaultAt, START);
+  assert.equal(decide([channel(1, { balance: 0, balanceStatus: 'empty' }), channel(2)]).runtime.accounts['1'].lastFaultAt, undefined);
+  assert.equal(decide([channel(1, { autoSwitchDisabled: true }), channel(2)]).runtime.accounts['1'].lastFaultAt, undefined);
+  // 客户请求连续找不到账号接单、算到主调头上时也记下
+  const failures = [1, 2, 3].map(i => ({ at: START - i * 10000, model: 'gpt-5', type: 'api_error' }));
+  const routed = decide([channel(1), channel(10)], { runtime: { lastCurrentId: 1, currentSince: START - 600000 }, groupMetrics: { failures } });
+  assert.equal(routed.reason, 'routing_failures');
+  assert.equal(routed.runtime.accounts['1'].lastFaultAt, START);
 });
