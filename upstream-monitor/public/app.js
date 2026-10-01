@@ -7972,6 +7972,7 @@ let currentUsageRange = '7d';
 let currentUsageScope = 'customers'; // 'customers' | 'all'
 let currentUsageSort = 'profit_desc';
 let currentUsageSearch = '';
+let currentUsageGroup = 'all'; // 'all' | 'none'（未记录分组）| 分组编号（字符串）
 let usageRequestSeq = 0; // 只认最后一次请求的结果：快速切换时间范围时，旧结果不会盖掉新的
 const expandedUsageUsers = new Set();
 
@@ -8045,10 +8046,35 @@ function sortUsageUsers(users, sortKey) {
   return (users || []).slice().sort((a, b) => compare(a, b) || num(b.spent) - num(a.spent) || a.userId - b.userId);
 }
 
+// 只看某个分组：每个客户只留下他在这个分组里的用量，合计、模型和占比都换成这个分组里的数字
+//（服务端已经按分组算好，放在每个客户的 groups 里），没在这个分组里用过的客户不显示。
+function applyUsageGroupFilter(users, groupKey) {
+  if (!groupKey || groupKey === 'all') return users || [];
+  const result = [];
+  for (const user of users || []) {
+    const group = (user.groups || []).find(item => item.groupKey === groupKey);
+    if (!group) continue;
+    const only = { groupKey: group.groupKey, groupId: group.groupId, groupName: group.groupName, groupDeleted: group.groupDeleted };
+    result.push({
+      ...user,
+      requests: group.requests, inputTokens: group.inputTokens, outputTokens: group.outputTokens,
+      cacheReadTokens: group.cacheReadTokens, cacheWriteTokens: group.cacheWriteTokens, totalTokens: group.totalTokens,
+      spent: group.spent, cost: group.cost, profit: group.profit, marginPercent: group.marginPercent,
+      lastUsedAt: group.lastUsedAt,
+      modelCount: group.modelCount,
+      models: group.models.map(model => ({ ...model, groupCount: 1, groups: [{ ...only, requests: model.requests, spent: model.spent, profit: model.profit, sharePercent: 100 }] })),
+      groupCount: 1,
+      groups: [{ ...group, sharePercent: 100 }]
+    });
+  }
+  return result;
+}
+
 // 页面上正在显示的这些客户合计
 function summarizeUsageUsers(users) {
   const total = { userCount: users.length, requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, spent: 0, cost: 0, profit: 0 };
   const models = new Set();
+  const groups = new Set();
   for (const user of users) {
     total.requests += user.requests;
     total.inputTokens += user.inputTokens;
@@ -8060,8 +8086,9 @@ function summarizeUsageUsers(users) {
     total.cost += user.cost;
     total.profit += user.profit;
     for (const model of user.models) models.add(model.model);
+    for (const group of user.groups || []) groups.add(group.groupKey);
   }
-  return { ...total, modelCount: models.size, marginPercent: total.spent > 0 ? total.profit / total.spent * 100 : null };
+  return { ...total, modelCount: models.size, groupCount: groups.size, marginPercent: total.spent > 0 ? total.profit / total.spent * 100 : null };
 }
 
 function usageTokenBreakdown(item) {
@@ -8085,19 +8112,48 @@ function usageProfitHtml(profit, margin) {
   return '<span class="usage-zero">¥0.00</span>';
 }
 
-// 占比按消费算；这个客户一分钱没花时是按请求次数算的，文字上要说清楚
-function usageShareBasis(user) {
-  return user.spent > 0 ? '消费' : '请求次数';
+// 占比按消费算；一分钱没花时是按请求次数算的，文字上要说清楚
+function usageShareBasis(item) {
+  return item.spent > 0 ? '消费' : '请求次数';
 }
 
-function usageChipsHtml(user, limit = 3) {
-  const chips = user.models.slice(0, limit).map(model => {
-    const tip = `${model.model}：占这个客户${usageShareBasis(user)}的 ${model.sharePercent}%${model.profit < 0 ? '，这个模型在亏本' : ''}`;
-    return `<span class="usage-model-chip${model.profit < 0 ? ' is-loss' : ''}" title="${escapeHtml(tip)}"><span class="name">${escapeHtml(model.model)}</span><span class="pct">${model.sharePercent}%</span></span>`;
-  });
-  const more = user.models.length - chips.length;
-  if (more > 0) chips.push(`<span class="usage-model-chip is-more" title="还有 ${more} 个模型，点「展开」查看">+${more} 个</span>`);
+// 分组的显示名：已删除的分组历史用量还在，名字后面标出来
+function usageGroupLabel(group) {
+  return `${group.groupName}${group.groupDeleted ? '（已删除）' : ''}`;
+}
+
+// 一排小标签：名字 + 占比。每一项要有 name、percent，可选 loss（亏本标红）、tip（鼠标放上去的说明）
+function usageChipListHtml(items, className, limit, moreTip) {
+  const chips = items.slice(0, limit).map(item =>
+    `<span class="${className}${item.loss ? ' is-loss' : ''}" title="${escapeHtml(item.tip || item.name)}"><span class="name">${escapeHtml(item.name)}</span><span class="pct">${item.percent}%</span></span>`);
+  const more = items.length - chips.length;
+  if (more > 0) chips.push(`<span class="${className} is-more" title="${escapeHtml(moreTip(more))}">+${more} 个</span>`);
   return chips.length ? chips.join('') : '<span class="usage-zero">-</span>';
+}
+
+// 客户这一行里的「用了哪些模型」
+function usageChipsHtml(user, limit = 3) {
+  const basis = usageShareBasis(user);
+  return usageChipListHtml(user.models.map(model => ({
+    name: model.model, percent: model.sharePercent, loss: model.profit < 0,
+    tip: `${model.model}：占这个客户${basis}的 ${model.sharePercent}%${model.profit < 0 ? '，这个模型在亏本' : ''}`
+  })), 'usage-model-chip', limit, more => `还有 ${more} 个模型，点「展开」查看`);
+}
+
+// 客户这一行里的「使用的分组」
+function usageGroupChipsHtml(user, limit = 3) {
+  const basis = usageShareBasis(user);
+  return usageChipListHtml((user.groups || []).map(group => ({
+    name: usageGroupLabel(group), percent: group.sharePercent, loss: group.profit < 0,
+    tip: `${usageGroupLabel(group)}：占这个客户${basis}的 ${group.sharePercent}%${group.profit < 0 ? '，在这个分组里亏本' : ''}`
+  })), 'usage-group-chip', limit, more => `还有 ${more} 个分组，点「展开」查看`);
+}
+
+// 工具栏上「分组」下拉框的选项：这段时间所有被用到的分组
+function usageGroupOptionsHtml(groups) {
+  const list = groups || [];
+  return [`<option value="all">全部分组${list.length ? `（共 ${list.length} 个）` : ''}</option>`]
+    .concat(list.map(group => `<option value="${escapeHtml(group.groupKey)}">${escapeHtml(usageGroupLabel(group))}</option>`)).join('');
 }
 
 function usageIdentityHtml(user) {
@@ -8111,28 +8167,73 @@ function usageIdentityHtml(user) {
     + `<div class="usage-sub"><span class="uid-badge">#${user.userId}</span>${username} · 最近用过 ${escapeHtml(formatTimeAgo(user.lastUsedAt))}</div>`;
 }
 
-function usageModelDetailHtml(user) {
+// 展开明细里每一行共用的数字格：请求次数、输入、输出、缓存、客户消费、采购成本、产生利润
+function usageNumberCellsHtml(item) {
+  return `<td class="usage-num">${formatCount(item.requests)}</td>
+        <td class="usage-num" title="${escapeHtml(formatCount(item.inputTokens))} tokens">${formatTokenCount(item.inputTokens)}</td>
+        <td class="usage-num" title="${escapeHtml(formatCount(item.outputTokens))} tokens">${formatTokenCount(item.outputTokens)}</td>
+        <td class="usage-num" title="${escapeHtml(`缓存读取 ${formatCount(item.cacheReadTokens)}，缓存写入 ${formatCount(item.cacheWriteTokens)}`)}">${formatTokenCount(item.cacheReadTokens + item.cacheWriteTokens)}</td>
+        <td class="usage-num">${formatYuan(item.spent)}</td>
+        <td class="usage-num usage-cost">${formatYuan(item.cost)}</td>
+        <td class="usage-num">${usageProfitHtml(item.profit, item.marginPercent)}</td>`;
+}
+
+function usageShareCellHtml(percent) {
+  return `<td class="usage-num"><span class="usage-share-bar"><span style="width: ${Math.max(0, Math.min(100, Number(percent) || 0))}%;"></span></span>${percent}%</td>`;
+}
+
+const USAGE_DETAIL_HEAD = '<th>请求次数</th><th>输入</th><th>输出</th><th title="缓存读取 + 缓存写入">缓存</th><th>客户消费</th><th>采购成本</th><th>产生利润 (毛利率)</th>';
+
+// 展开后的「按分组」表：这个客户在每个分组里用了多少；分组名下面是他在这个分组里用的模型
+function usageGroupTableHtml(user) {
+  const basis = usageShareBasis(user);
+  const rows = (user.groups || []).map(group => `
+      <tr>
+        <td class="usage-name-cell">
+          <div class="usage-name-line" title="${escapeHtml(usageGroupLabel(group))}"><strong>${escapeHtml(group.groupName)}</strong>${group.groupDeleted ? '<span class="usage-deleted-tag">已删除</span>' : ''}</div>
+          <div class="usage-chip-row">${usageChipListHtml(group.models.map(model => ({
+            name: model.model, percent: model.sharePercent, loss: model.profit < 0,
+            tip: `${model.model}：占这个分组${usageShareBasis(group)}的 ${model.sharePercent}%${model.profit < 0 ? '，这个模型在这个分组里亏本' : ''}`
+          })), 'usage-model-chip', 4, more => `还有 ${more} 个模型`)}</div>
+        </td>
+        ${usageNumberCellsHtml(group)}
+        ${usageShareCellHtml(group.sharePercent)}
+      </tr>`).join('');
+  return `<table class="usage-model-table">
+      <thead><tr><th style="text-align: left;">分组</th>${USAGE_DETAIL_HEAD}<th title="占这个客户${basis}的比例">占比</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+// 展开后的「按模型」表：这个客户每个模型用了多少；模型名下面是这个模型走过的分组
+function usageModelTableHtml(user) {
   const basis = usageShareBasis(user);
   const rows = user.models.map(model => `
       <tr>
-        <td class="usage-model-name" title="${escapeHtml(model.model)}"><strong>${escapeHtml(model.model)}</strong></td>
-        <td class="usage-num">${formatCount(model.requests)}</td>
-        <td class="usage-num" title="${escapeHtml(formatCount(model.inputTokens))} tokens">${formatTokenCount(model.inputTokens)}</td>
-        <td class="usage-num" title="${escapeHtml(formatCount(model.outputTokens))} tokens">${formatTokenCount(model.outputTokens)}</td>
-        <td class="usage-num" title="${escapeHtml(`缓存读取 ${formatCount(model.cacheReadTokens)}，缓存写入 ${formatCount(model.cacheWriteTokens)}`)}">${formatTokenCount(model.cacheReadTokens + model.cacheWriteTokens)}</td>
-        <td class="usage-num">${formatYuan(model.spent)}</td>
-        <td class="usage-num usage-cost">${formatYuan(model.cost)}</td>
-        <td class="usage-num">${usageProfitHtml(model.profit, model.marginPercent)}</td>
-        <td class="usage-num"><span class="usage-share-bar"><span style="width: ${Math.max(0, Math.min(100, Number(model.sharePercent) || 0))}%;"></span></span>${model.sharePercent}%</td>
+        <td class="usage-name-cell">
+          <div class="usage-name-line" title="${escapeHtml(model.model)}"><strong>${escapeHtml(model.model)}</strong></div>
+          <div class="usage-chip-row">${usageChipListHtml((model.groups || []).map(group => ({
+            name: usageGroupLabel(group), percent: group.sharePercent, loss: group.profit < 0,
+            tip: `${usageGroupLabel(group)}：这个模型有 ${group.sharePercent}% 走了这个分组${group.profit < 0 ? '，在这个分组里亏本' : ''}`
+          })), 'usage-group-chip', 4, more => `还有 ${more} 个分组`)}</div>
+        </td>
+        ${usageNumberCellsHtml(model)}
+        ${usageShareCellHtml(model.sharePercent)}
       </tr>`).join('');
-  return `<tr class="usage-detail-row"><td colspan="9">
-    <table class="usage-model-table">
-      <thead><tr>
-        <th style="text-align: left;">模型</th><th>请求次数</th><th>输入</th><th>输出</th><th title="缓存读取 + 缓存写入">缓存</th>
-        <th>客户消费</th><th>采购成本</th><th>产生利润 (毛利率)</th><th title="占这个客户${basis}的比例">占比</th>
-      </tr></thead>
+  return `<table class="usage-model-table">
+      <thead><tr><th style="text-align: left;">模型</th>${USAGE_DETAIL_HEAD}<th title="占这个客户${basis}的比例">占比</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table>
+    </table>`;
+}
+
+const USAGE_COLUMN_COUNT = 10;
+
+function usageDetailRowHtml(user) {
+  return `<tr class="usage-detail-row"><td colspan="${USAGE_COLUMN_COUNT}">
+    <div class="usage-detail-title">按分组：这个客户在每个分组里用了多少<span class="usage-detail-hint">分组名下面是他在这个分组里用的模型，标签上的百分比是这个模型占该分组的比例</span></div>
+    ${usageGroupTableHtml(user)}
+    <div class="usage-detail-title">按模型：这个客户每个模型用了多少<span class="usage-detail-hint">模型名下面是这个模型走过的分组，标签上的百分比是这个模型有多少走了该分组</span></div>
+    ${usageModelTableHtml(user)}
   </td></tr>`;
 }
 
@@ -8144,12 +8245,13 @@ function usageRowHtml(user, rank, expanded) {
       <td>${usageIdentityHtml(user)}</td>
       <td class="usage-num" style="text-align: right;">${formatCount(user.requests)}</td>
       <td style="text-align: right;">${usageTokensHtml(user)}</td>
+      <td><div class="usage-chip-row">${usageGroupChipsHtml(user)}</div></td>
       <td><div class="usage-chip-row">${usageChipsHtml(user)}</div></td>
       <td class="usage-num" style="text-align: right;">${user.spent > 0 ? formatYuan(user.spent) : '<span class="usage-zero">-</span>'}</td>
       <td class="usage-num usage-cost" style="text-align: right;">${user.cost > 0 ? formatYuan(user.cost) : '<span class="usage-zero">-</span>'}</td>
       <td style="text-align: right;">${usageProfitHtml(user.profit, user.marginPercent)}</td>
       <td style="text-align: center;"><button class="btn-micro-action usage-toggle-btn" data-usage-toggle="${user.userId}" aria-expanded="${expanded ? 'true' : 'false'}">${expanded ? '收起 ▴' : '展开 ▾'}</button></td>
-    </tr>${expanded ? usageModelDetailHtml(user) : ''}`;
+    </tr>${expanded ? usageDetailRowHtml(user) : ''}`;
 }
 
 function usageStatHtml(label, value, sub, tone = '') {
@@ -8159,7 +8261,7 @@ function usageStatHtml(label, value, sub, tone = '') {
 function usageSummaryHtml(summary) {
   const marginText = summary.marginPercent == null ? '毛利率 --' : `毛利率 ${summary.marginPercent.toFixed(1)}%`;
   return [
-    usageStatHtml('有用量的客户', `${formatCount(summary.userCount)} 位`, `用了 ${formatCount(summary.modelCount)} 种模型`),
+    usageStatHtml('有用量的客户', `${formatCount(summary.userCount)} 位`, `用了 ${formatCount(summary.modelCount)} 种模型 · 走了 ${formatCount(summary.groupCount || 0)} 个分组`),
     usageStatHtml('请求次数', `${formatCount(summary.requests)} 次`, '成功计费的请求'),
     usageStatHtml('用量', `${formatTokenCount(summary.totalTokens)} tokens`, usageTokenBreakdown(summary)),
     usageStatHtml('客户消费', formatYuan(summary.spent), `采购成本 ${formatYuan(summary.cost)}`),
@@ -8181,6 +8283,7 @@ async function loadUserUsage(force = false) {
     if (seq !== usageRequestSeq) return;
     if (!res.ok || !data.success) throw new Error(data.error || '读取客户用量失败');
     userUsageData = data;
+    refreshUsageGroupSelect();
     renderUserUsage();
     if (force) showToast('客户用量已刷新', 'success');
   } catch (err) {
@@ -8200,23 +8303,46 @@ function setUsageStatus(text, isError) {
   el.classList.toggle('is-error', Boolean(isError));
 }
 
+// 记住见过的分组：换了时间范围、新时间里没人用已选的分组时，下拉框里仍然保留它，页面写明「没有客户用过」
+const usageKnownGroups = new Map();
+
+// 用最新数据重建「分组」下拉框
+function refreshUsageGroupSelect() {
+  const groups = ((userUsageData && userUsageData.groups) || []).slice();
+  for (const group of groups) usageKnownGroups.set(group.groupKey, group);
+  if (currentUsageGroup !== 'all' && !groups.some(group => group.groupKey === currentUsageGroup)) {
+    const known = usageKnownGroups.get(currentUsageGroup);
+    if (known) groups.push(known);
+    else currentUsageGroup = 'all';
+  }
+  const select = document.getElementById('usageGroupSelect');
+  if (!select) return;
+  select.innerHTML = usageGroupOptionsHtml(groups);
+  select.value = currentUsageGroup;
+}
+
 function renderUserUsage() {
   const body = document.getElementById('usageTableBody');
   const summaryEl = document.getElementById('usageSummary');
   if (!body) return;
   if (!userUsageData) {
     if (summaryEl) summaryEl.innerHTML = '';
-    body.innerHTML = '<tr><td colspan="9" style="text-align: center; padding: 1.5rem; color: #94a3b8;">正在统计…</td></tr>';
+    body.innerHTML = `<tr><td colspan="${USAGE_COLUMN_COUNT}" style="text-align: center; padding: 1.5rem; color: #94a3b8;">正在统计…</td></tr>`;
     return;
   }
-  const visible = sortUsageUsers(filterUsageUsers(userUsageData.users, currentUsageScope, currentUsageSearch), currentUsageSort);
+  const inGroup = applyUsageGroupFilter(userUsageData.users, currentUsageGroup);
+  const visible = sortUsageUsers(filterUsageUsers(inGroup, currentUsageScope, currentUsageSearch), currentUsageSort);
   if (summaryEl) summaryEl.innerHTML = usageSummaryHtml(summarizeUsageUsers(visible));
   const updated = new Date(userUsageData.generatedAt);
   const updatedText = isNaN(updated.getTime()) ? '' : ` · 数据更新于 ${updated.toLocaleTimeString('zh-CN', { hour12: false })}`;
-  setUsageStatus(`统计范围：${userUsageData.rangeLabel}（${USAGE_RANGE_HINTS[userUsageData.range] || ''}）${updatedText}`, false);
+  const pickedGroup = currentUsageGroup === 'all' ? null : usageKnownGroups.get(currentUsageGroup);
+  const groupText = pickedGroup ? ` · 只看分组：${usageGroupLabel(pickedGroup)}` : '';
+  setUsageStatus(`统计范围：${userUsageData.rangeLabel}（${USAGE_RANGE_HINTS[userUsageData.range] || ''}）${groupText}${updatedText}`, false);
   if (visible.length === 0) {
-    const why = (userUsageData.users || []).length === 0 ? '这段时间没有任何用量记录。' : '没有符合条件的客户，可以试试「全部用户」或清空搜索。';
-    body.innerHTML = `<tr><td colspan="9" style="text-align: center; padding: 1.5rem; color: #94a3b8;">${why}</td></tr>`;
+    let why = '没有符合条件的客户，可以试试「全部用户」、「全部分组」或清空搜索。';
+    if ((userUsageData.users || []).length === 0) why = '这段时间没有任何用量记录。';
+    else if (inGroup.length === 0) why = '这段时间没有客户用过这个分组。';
+    body.innerHTML = `<tr><td colspan="${USAGE_COLUMN_COUNT}" style="text-align: center; padding: 1.5rem; color: #94a3b8;">${why}</td></tr>`;
     return;
   }
   body.innerHTML = visible.map((user, index) => usageRowHtml(user, index + 1, expandedUsageUsers.has(user.userId))).join('');
@@ -8230,6 +8356,8 @@ function syncUsageToolbar() {
   if (search && search.value !== currentUsageSearch) search.value = currentUsageSearch;
   const sort = document.getElementById('usageSortSelect');
   if (sort) sort.value = currentUsageSort;
+  const group = document.getElementById('usageGroupSelect');
+  if (group && [...group.options].some(option => option.value === currentUsageGroup)) group.value = currentUsageGroup;
 }
 
 // 从「用户收支明细」某一行的「用量」按钮跳过来：切到用量页签，只看这个客户并展开他的模型明细
@@ -8238,6 +8366,7 @@ function openUserUsageFor(userId) {
   const user = ((userFinancesData && userFinancesData.users) || []).find(u => u.id === id);
   currentUsageSearch = user ? (user.email || user.username || String(id)) : String(id);
   if (!user || !usageIsCustomer({ role: user.role, userId: user.id, isTestAccount: user.isTestAccount })) currentUsageScope = 'all';
+  currentUsageGroup = 'all';
   expandedUsageUsers.add(id);
   syncUsageToolbar();
   const tab = document.querySelector('.fin-tab-btn[data-fintab="usage"]');
@@ -8271,6 +8400,13 @@ function initUserUsageEvents() {
   if (sortSelect) {
     sortSelect.addEventListener('change', (e) => {
       currentUsageSort = e.target.value;
+      renderUserUsage();
+    });
+  }
+  const groupSelect = document.getElementById('usageGroupSelect');
+  if (groupSelect) {
+    groupSelect.addEventListener('change', (e) => {
+      currentUsageGroup = e.target.value;
       renderUserUsage();
     });
   }

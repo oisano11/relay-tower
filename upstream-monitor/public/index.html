@@ -9,7 +9,7 @@
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=relay-tower-2026">
   <link rel="shortcut icon" href="favicon.ico?v=relay-tower-2026">
-  <link rel="stylesheet" href="style.css?v=20260930_user_usage">
+  <link rel="stylesheet" href="style.css?v=20261001_usage_group">
 </head>
 <body>
   <div class="app-layout">
@@ -1663,6 +1663,10 @@
                   <button class="usage-seg-btn active" data-scope="customers">仅看外部客户</button>
                   <button class="usage-seg-btn" data-scope="all">全部用户 (含测试号与管理员)</button>
                 </div>
+                <label for="usageGroupSelect" style="font-size: 0.78rem; color: #64748b; font-weight: 600;">分组</label>
+                <select id="usageGroupSelect" class="form-input" title="只看某个分组里的用量：每个客户只算他在这个分组里的部分" style="font-size: 0.78rem; padding: 0.3rem 0.6rem; width: 200px;">
+                  <option value="all">全部分组</option>
+                </select>
               </div>
               <div class="usage-toolbar-group">
                 <div class="search-box" style="position: relative; width: 220px;">
@@ -1689,10 +1693,11 @@
                 <thead>
                   <tr>
                     <th style="width: 44px; text-align: center;">排名</th>
-                    <th style="min-width: 176px; text-align: left;">客户</th>
+                    <th style="min-width: 168px; text-align: left;">客户</th>
                     <th style="width: 76px; text-align: right;" title="成功计费的请求次数">请求次数</th>
                     <th style="width: 150px; text-align: right;" title="输入 + 输出 + 缓存读写的 tokens 总数">用量 (tokens)</th>
-                    <th style="min-width: 176px; text-align: left;" title="按客户消费从多到少排，百分比是这个模型占该客户消费的比例">用了哪些模型</th>
+                    <th style="min-width: 150px; text-align: left;" title="这个客户的请求实际走的分组，按客户消费从多到少排，百分比是这个分组占该客户消费的比例">使用的分组</th>
+                    <th style="min-width: 150px; text-align: left;" title="按客户消费从多到少排，百分比是这个模型占该客户消费的比例">用了哪些模型</th>
                     <th style="width: 88px; text-align: right;" title="客户实际被扣的钱">客户消费</th>
                     <th style="width: 88px; text-align: right;" title="上游的进价：用量原价 × 账号倍率">采购成本</th>
                     <th style="width: 112px; text-align: right;" title="客户消费 − 采购成本">产生利润 (毛利率)</th>
@@ -1705,7 +1710,7 @@
               </table>
             </div>
             <p class="usage-note">
-              产生利润 = 客户消费 − 采购成本，算法和「核心收支大盘」完全一样，两边的数字对得上。只统计成功计费的请求；用量 tokens 含缓存读写。点某个客户的「展开」，看他每个模型各用了多少、赚了多少。
+              产生利润 = 客户消费 − 采购成本，算法和「核心收支大盘」完全一样，两边的数字对得上。只统计成功计费的请求；用量 tokens 含缓存读写。分组是每次请求实际走的分组，已删除的分组历史用量还在，会标出「已删除」。点某个客户的「展开」，看他每个分组、每个模型各用了多少、赚了多少；上面的「分组」下拉框可以只看某一个分组。
             </p>
           </div>
 
@@ -2256,6 +2261,6 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=20260930_row_sale_edit"></script>
+  <script src="app.js?v=20261001_usage_group"></script>
 </body>
 </html>

@@ -5142,7 +5142,8 @@ body {
   flex-wrap: wrap;
   gap: 0.25rem;
 }
-.usage-model-chip {
+.usage-model-chip,
+.usage-group-chip {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
@@ -5155,25 +5156,77 @@ body {
   font-size: 0.7rem;
   line-height: 1.5;
 }
-.usage-model-chip .name {
+.usage-model-chip .name,
+.usage-group-chip .name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.usage-model-chip .pct {
+.usage-model-chip .pct,
+.usage-group-chip .pct {
   flex-shrink: 0;
   font-weight: 700;
   color: #64748b;
 }
-.usage-model-chip.is-more {
+.usage-group-chip {
+  border-color: #ddd6fe;
+  background: #f5f3ff;
+  color: #5b21b6;
+}
+.usage-model-chip.is-more,
+.usage-group-chip.is-more {
   background: #f1f5f9;
   border-color: #cbd5e1;
   color: #475569;
 }
-.usage-model-chip.is-loss {
+.usage-model-chip.is-loss,
+.usage-group-chip.is-loss {
   background: #fef2f2;
   border-color: #fecaca;
   color: #991b1b;
+}
+/* 客户这一行里的标签窄一点，名字太长的截断（鼠标放上去看全名）；展开明细里可以宽一些 */
+.usage-user-row .usage-model-chip,
+.usage-user-row .usage-group-chip { max-width: 128px; }
+/* 这张表有 10 列，左右留白收窄一点，免得在 1120 宽的窗口里出现横向滚动条 */
+.usage-table th,
+.usage-table td { padding-left: 0.5rem; padding-right: 0.5rem; }
+.usage-model-table .usage-model-chip,
+.usage-model-table .usage-group-chip { max-width: 260px; }
+.usage-detail-title {
+  margin: 0.55rem 0 0.3rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #334155;
+}
+.usage-detail-title:first-child { margin-top: 0; }
+.usage-detail-hint {
+  margin-left: 0.6rem;
+  font-size: 0.7rem;
+  font-weight: 400;
+  color: #94a3b8;
+}
+.usage-name-cell { text-align: left; min-width: 180px; }
+.usage-name-line {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.2rem;
+}
+.usage-name-line strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+.usage-deleted-tag {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border-radius: 3px;
+  border: 1px solid #fed7aa;
+  background: #fff7ed;
+  color: #9a3412;
+  font-size: 0.66rem;
 }
 .usage-detail-row > td {
   padding: 0.55rem 0.9rem 0.85rem 2.6rem;
@@ -5202,12 +5255,6 @@ body {
   color: #1e293b;
 }
 .usage-model-table tbody tr:last-child td { border-bottom: none; }
-.usage-model-name {
-  max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .usage-share-bar {
   display: inline-block;
   width: 56px;

@@ -12,6 +12,37 @@ const serverSource = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8
 const squash = sql => sql.replace(/\s+/g, ' ').trim();
 const plain = value => JSON.parse(JSON.stringify(value));
 
+// 同一批用量从三个角度看，加起来都必须等于同一个总数：客户下面的分组、客户下面的模型、每个分组里的模型、每个模型走的分组，
+// 以及顶层的分组合计。
+function assertAddsUp(report, label = '') {
+  const close = (a, b, what) => assert.ok(Math.abs(a - b) <= 0.001, `${label} ${what}: ${a} vs ${b}`);
+  const sum = (list, key) => list.reduce((total, item) => total + item[key], 0);
+  for (const user of report.users) {
+    for (const key of ['requests', 'totalTokens']) {
+      assert.equal(sum(user.models, key), user[key], `${label} user ${user.userId} models ${key}`);
+      assert.equal(sum(user.groups, key), user[key], `${label} user ${user.userId} groups ${key}`);
+    }
+    for (const key of ['spent', 'cost', 'profit']) {
+      close(sum(user.models, key), user[key], `user ${user.userId} models ${key}`);
+      close(sum(user.groups, key), user[key], `user ${user.userId} groups ${key}`);
+    }
+    for (const group of user.groups) {
+      assert.equal(sum(group.models, 'requests'), group.requests, `${label} user ${user.userId} group ${group.groupKey} requests`);
+      close(sum(group.models, 'spent'), group.spent, `user ${user.userId} group ${group.groupKey} spent`);
+      close(sum(group.models, 'profit'), group.profit, `user ${user.userId} group ${group.groupKey} profit`);
+    }
+    for (const model of user.models) {
+      close(sum(model.groups, 'spent'), model.spent, `user ${user.userId} model ${model.model} groups spent`);
+      assert.equal(sum(model.groups, 'requests'), model.requests, `${label} user ${user.userId} model ${model.model} groups requests`);
+    }
+  }
+  assert.equal(sum(report.users, 'requests'), report.totals.requests, `${label} totals requests`);
+  assert.equal(sum(report.groups, 'requests'), report.totals.requests, `${label} group totals requests`);
+  assert.equal(sum(report.groups, 'totalTokens'), report.totals.totalTokens, `${label} group totals tokens`);
+  close(sum(report.groups, 'spent'), report.totals.spent, 'group totals spent');
+  close(sum(report.groups, 'profit'), report.totals.profit, 'group totals profit');
+}
+
 test('time ranges are a fixed whitelist and never reach SQL as free text', () => {
   assert.equal(userUsage.normalizeRange(undefined), '7d');
   assert.equal(userUsage.normalizeRange(''), '7d');
@@ -81,8 +112,68 @@ test('report groups models under each customer, totals add up and profit-losing 
 
   assert.deepEqual(plain(report.totals), {
     requests: 4 + 4 + 8, inputTokens: 500, outputTokens: 250, cacheReadTokens: 1000, cacheWriteTokens: 50,
-    totalTokens: 1800, spent: 12, cost: 6.5, profit: 5.5, marginPercent: 45.8, userCount: 3, modelCount: 5
+    totalTokens: 1800, spent: 12, cost: 6.5, profit: 5.5, marginPercent: 45.8, userCount: 3, modelCount: 5, groupCount: 1
   });
+  assert.deepEqual(plain(report.groups.map(g => [g.groupKey, g.groupName, g.userCount])), [['none', '未记录分组', 3]]);
+  assertAddsUp(report);
+});
+
+test('report adds the group dimension: groups per customer, groups per model and group totals, all adding up', () => {
+  const row = (userId, groupId, groupName, model, requests, spent, cost, extra = {}) => ({
+    userId, email: `u${userId}@corp.com`, username: `u${userId}`, role: 'user', isTestAccount: false, deleted: false,
+    groupId, groupName, groupDeleted: false, model, requests, inputTokens: requests * 10, outputTokens: requests * 20, cacheReadTokens: requests * 5, cacheWriteTokens: 0,
+    spent, cost, profit: spent - cost, lastUsedAt: '2026-09-30T10:00:00+08:00', ...extra
+  });
+  const report = userUsage.buildUserUsageReport([
+    row(7, 5, 'Main', 'm1', 2, 4, 1),
+    row(7, 5, 'Main', 'm2', 1, 1, 0.5),
+    row(7, 6, 'Old | pool', 'm1', 1, 6, 3, { groupDeleted: true, lastUsedAt: '2026-09-30T12:00:00+08:00' }),
+    row(7, null, null, 'm3', 1, 0, 0),
+    row(8, 6, 'Old | pool', 'm1', 1, 2, 1, { groupDeleted: true })
+  ], '7d', new Date(0));
+  const seven = report.users.find(u => u.userId === 7);
+
+  // 客户 7：分组按消费从高到低，占比是占这个客户消费的比例
+  assert.deepEqual(plain(seven.groups.map(g => [g.groupKey, g.groupName, g.groupDeleted, g.requests, g.spent, g.cost, g.profit, g.sharePercent, g.modelCount])), [
+    ['6', 'Old | pool', true, 1, 6, 3, 3, 54.5, 1],
+    ['5', 'Main', false, 3, 5, 1.5, 3.5, 45.5, 2],
+    ['none', '未记录分组', false, 1, 0, 0, 0, 0, 1]
+  ]);
+  assert.equal(seven.groupCount, 3);
+  assert.equal(seven.requests, 5);
+  assert.equal(seven.spent, 11);
+  // 分组里的模型：占比是占这个分组的比例
+  const main = seven.groups.find(g => g.groupName === 'Main');
+  assert.deepEqual(plain(main.models.map(m => [m.model, m.requests, m.spent, m.sharePercent])), [['m1', 2, 4, 80], ['m2', 1, 1, 20]]);
+  assert.equal(main.totalTokens, 3 * (10 + 20 + 5), 'tokens per group are summed too');
+  // 模型（跨分组合并）：m1 在两个分组里用过，占比是占这个模型消费的比例
+  assert.deepEqual(plain(seven.models.map(m => [m.model, m.requests, m.spent, m.sharePercent])), [['m1', 3, 10, 90.9], ['m2', 1, 1, 9.1], ['m3', 1, 0, 0]]);
+  assert.deepEqual(plain(seven.models[0].groups.map(g => [g.groupName, g.spent, g.sharePercent])), [['Old | pool', 6, 60], ['Main', 4, 40]]);
+  assert.equal(seven.models[0].groupCount, 2);
+  // 一分钱没花的模型，走哪个分组按请求次数算
+  assert.deepEqual(plain(seven.models[2].groups.map(g => [g.groupName, g.sharePercent])), [['未记录分组', 100]]);
+  assert.equal(seven.groups[0].lastUsedAt, '2026-09-30T12:00:00+08:00', 'last used time is kept per group');
+  assert.equal(seven.groups[1].lastUsedAt, '2026-09-30T10:00:00+08:00');
+
+  // 顶层：所有被用到的分组，按消费从高到低，写明几位客户用过
+  assert.deepEqual(plain(report.groups.map(g => [g.groupKey, g.groupName, g.groupDeleted, g.userCount, g.requests, g.spent])), [
+    ['6', 'Old | pool', true, 2, 2, 8], ['5', 'Main', false, 1, 3, 5], ['none', '未记录分组', false, 1, 1, 0]
+  ]);
+  assert.deepEqual([report.totals.userCount, report.totals.modelCount, report.totals.groupCount], [2, 3, 3]);
+  assertAddsUp(report);
+});
+
+test('group names fall back to something readable and a deleted flag needs a real group', () => {
+  const base = { userId: 1, model: 'm', requests: 1, spent: 1, cost: 0.5, profit: 0.5 };
+  const names = rows => plain(userUsage.buildUserUsageReport(rows, 'all', new Date(0)).groups.map(g => [g.groupKey, g.groupId, g.groupName, g.groupDeleted]));
+  assert.deepEqual(names([{ ...base, groupId: 7 }]), [['7', 7, '分组 #7', false]], 'a group without a name is shown by its number');
+  assert.deepEqual(names([{ ...base, groupId: 7, groupName: '  Spaced  ', groupDeleted: true }]), [['7', 7, 'Spaced', true]]);
+  for (const missing of [null, undefined, 0, -3, 'abc', '']) {
+    assert.deepEqual(names([{ ...base, groupId: missing, groupName: 'ignored', groupDeleted: true }]), [['none', null, 'ignored', false]],
+      `group id ${String(missing)} means no group, so it cannot be a deleted group`);
+  }
+  assert.deepEqual(names([{ ...base }]), [['none', null, '未记录分组', false]]);
+  assert.equal(userUsage.NO_GROUP_NAME, '未记录分组');
 });
 
 test('report tolerates empty and odd rows without producing NaN or negative zero', () => {
@@ -285,6 +376,10 @@ CREATE TABLE usage_logs (
   rate_multiplier numeric(10,4) NOT NULL DEFAULT 1, account_rate_multiplier numeric(10,4),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE groups (
+  id bigserial PRIMARY KEY, name varchar(100) NOT NULL, platform varchar(50) NOT NULL DEFAULT 'openai',
+  rate_multiplier numeric(10,4) NOT NULL DEFAULT 1.0, deleted_at timestamptz
+);
 CREATE TABLE redeem_codes (
   id bigserial PRIMARY KEY, code varchar(64), type varchar(30), value numeric(20,8), status varchar(20),
   used_by bigint, used_at timestamptz, notes text, validity_days int, created_at timestamptz DEFAULT now()
@@ -301,29 +396,31 @@ INSERT INTO users (id, email, username, role, balance) VALUES
   (8, 'boss2@relay.local', 'boss2', 'admin', 0);
 UPDATE users SET deleted_at = now() - interval '2 days' WHERE id = 5;
 INSERT INTO accounts (id, name, rate_multiplier) VALUES (10, 'a-full', 1.0), (11, 'a-half', 0.5), (12, 'a-fifth', 0.2);
-INSERT INTO usage_logs (user_id, account_id, model, requested_model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_cost, actual_cost, account_rate_multiplier, created_at) VALUES
-  (2, 11, 'gpt-5.1-upstream', 'gpt-5.1', 1000, 200, 50, 4000, 1, 1.5, 1.0, CURRENT_DATE),
-  (2, 11, 'gpt-5.1-upstream', 'gpt-5.1', 2000, 400, 0, 0, 2, 3, NULL, CURRENT_DATE),
-  (2, 12, 'claude-sonnet', 'claude-sonnet', 500, 100, 10, 900, 4, 5, 0.3, CURRENT_DATE),
-  (2, 10, 'claude-sonnet', '  ', 100, 10, 0, 0, 1, 1.2, 1.0, CURRENT_DATE - interval '1 second'),
-  (2, 10, 'claude-sonnet', NULL, 100, 10, 0, 0, 1, 1.2, 1.0, CURRENT_DATE - interval '1 day'),
-  (2, 10, 'claude-sonnet', NULL, 100, 10, 0, 0, 1, 1.2, 1.0, CURRENT_DATE - interval '1 day' - interval '1 second'),
-  (2, 11, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '6 days'),
-  (2, 11, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '8 days'),
-  (2, 11, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '29 days'),
-  (2, 11, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '31 days'),
-  (2, 11, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '400 days'),
-  (3, 10, 'gpt-5.1', 'gpt-5.1', 7, 3, 0, 0, 1, 0.9, 1.0, date_trunc('month', now())),
-  (3, 10, 'gpt-5.1', 'gpt-5.1', 7, 3, 0, 0, 1, 0.9, 1.0, date_trunc('month', now()) - interval '1 second'),
-  (3, NULL, 'gemini-x', 'gemini-x', 5, 5, 0, 0, 2, 2.5, 1.0, CURRENT_DATE),
-  (3, NULL, 'gemini-x', 'gemini-x', 5, 5, 0, 0, 2, 2.5, NULL, CURRENT_DATE),
-  (1, 10, 'gpt-5.1', 'gpt-5.1', 1, 1, 0, 0, 1, 1, 1.0, CURRENT_DATE),
-  (4, 10, 'gpt-5.1', 'gpt-5.1', 1, 1, 0, 0, 1, 1, 1.0, CURRENT_DATE),
-  (5, 12, 'claude-sonnet', 'claude-sonnet', 100, 100, 0, 0, 1, 2, 0.2, CURRENT_DATE),
-  (8, 10, 'gpt-5.1', 'gpt-5.1', 1, 1, 0, 0, 1, 1, 1.0, CURRENT_DATE),
-  (6, 10, 'free-model', 'free-model', 10, 10, 0, 0, 0, 0, 1.0, CURRENT_DATE),
-  (6, 10, 'free-model', 'free-model', 10, 10, 0, 0, 0, 0, 1.0, CURRENT_DATE),
-  (6, 10, 'other-free', 'other-free', 10, 10, 0, 0, 0, 0, 1.0, CURRENT_DATE);
+INSERT INTO groups (id, name, platform, rate_multiplier, deleted_at) VALUES
+  (1, 'G-main', 'openai', 1.0, NULL), (2, 'G | sub', 'openai', 0.5, NULL), (3, 'G-old', 'anthropic', 0.2, now() - interval '3 days');
+INSERT INTO usage_logs (user_id, account_id, group_id, model, requested_model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_cost, actual_cost, account_rate_multiplier, created_at) VALUES
+  (2, 11, 1, 'gpt-5.1-upstream', 'gpt-5.1', 1000, 200, 50, 4000, 1, 1.5, 1.0, CURRENT_DATE),
+  (2, 11, 2, 'gpt-5.1-upstream', 'gpt-5.1', 2000, 400, 0, 0, 2, 3, NULL, CURRENT_DATE),
+  (2, 12, 1, 'claude-sonnet', 'claude-sonnet', 500, 100, 10, 900, 4, 5, 0.3, CURRENT_DATE),
+  (2, 10, 3, 'claude-sonnet', '  ', 100, 10, 0, 0, 1, 1.2, 1.0, CURRENT_DATE - interval '1 second'),
+  (2, 10, 3, 'claude-sonnet', NULL, 100, 10, 0, 0, 1, 1.2, 1.0, CURRENT_DATE - interval '1 day'),
+  (2, 10, 3, 'claude-sonnet', NULL, 100, 10, 0, 0, 1, 1.2, 1.0, CURRENT_DATE - interval '1 day' - interval '1 second'),
+  (2, 11, 1, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '6 days'),
+  (2, 11, 1, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '8 days'),
+  (2, 11, 2, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '29 days'),
+  (2, 11, 1, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '31 days'),
+  (2, 11, NULL, 'gpt-5.1', 'gpt-5.1', 10, 1, 0, 0, 1, 1.1, 1.0, now() - interval '400 days'),
+  (3, 10, 2, 'gpt-5.1', 'gpt-5.1', 7, 3, 0, 0, 1, 0.9, 1.0, date_trunc('month', now())),
+  (3, 10, 2, 'gpt-5.1', 'gpt-5.1', 7, 3, 0, 0, 1, 0.9, 1.0, date_trunc('month', now()) - interval '1 second'),
+  (3, NULL, 1, 'gemini-x', 'gemini-x', 5, 5, 0, 0, 2, 2.5, 1.0, CURRENT_DATE),
+  (3, NULL, NULL, 'gemini-x', 'gemini-x', 5, 5, 0, 0, 2, 2.5, NULL, CURRENT_DATE),
+  (1, 10, 1, 'gpt-5.1', 'gpt-5.1', 1, 1, 0, 0, 1, 1, 1.0, CURRENT_DATE),
+  (4, 10, 1, 'gpt-5.1', 'gpt-5.1', 1, 1, 0, 0, 1, 1, 1.0, CURRENT_DATE),
+  (5, 12, 3, 'claude-sonnet', 'claude-sonnet', 100, 100, 0, 0, 1, 2, 0.2, CURRENT_DATE),
+  (8, 10, 1, 'gpt-5.1', 'gpt-5.1', 1, 1, 0, 0, 1, 1, 1.0, CURRENT_DATE),
+  (6, 10, 1, 'free-model', 'free-model', 10, 10, 0, 0, 0, 0, 1.0, CURRENT_DATE),
+  (6, 10, 1, 'free-model', 'free-model', 10, 10, 0, 0, 0, 0, 1.0, CURRENT_DATE),
+  (6, 10, 2, 'other-free', 'other-free', 10, 10, 0, 0, 0, 0, 1.0, CURRENT_DATE);
 `;
 
 function dashboardSqlFromServer() {
@@ -406,12 +503,38 @@ test('against a real database: per-range numbers are right and match the finance
   await t.test('time ranges cut exactly at the boundaries', () => {
     assert.deepEqual(money(user('today', 2)), [3, 9.5, 2.7, 6.8]);
     assert.deepEqual(money(user('yesterday', 2)), [2, 2.4, 2, 0.4], '昨天 0 点整算，前天最后一秒不算');
-    assert.deepEqual(reports.yesterday.users.map(u => u.userId), [2]);
+    // 只在今天有记录的客户不会出现在「昨天」里。（客户 3 的「上月最后一秒」那条在每月 1 号恰好就是昨天，所以不比较完整名单）
+    for (const id of [1, 4, 5, 6, 8]) assert.equal(user('yesterday', id), undefined, `user ${id} only has rows from today`);
     assert.deepEqual(money(user('7d', 2)), [7, 14.2, 6.2, 8]);
     assert.deepEqual(money(user('30d', 2)), [9, 16.4, 7.2, 9.2]);
     // 本月：1 号 0 点整算，上个月最后一秒不算；下面这些不依赖今天是几号
     assert.deepEqual(money(user('month', 3)), [3, 5.9, 3, 2.9]);
     assert.deepEqual(user('month', 3).models.map(m => [m.model, m.requests, m.profit]), [['gemini-x', 2, 3], ['gpt-5.1', 1, -0.1]]);
+  });
+
+  await t.test('which group each customer used: per-group numbers, deleted and missing groups, and everything adds up', () => {
+    const alice = user('all', 2);
+    assert.deepEqual(plain(alice.groups.map(g => [g.groupName, g.groupDeleted, g.requests, g.totalTokens, g.spent, g.cost, g.profit, g.sharePercent])), [
+      ['G-main', false, 5, 6793, 9.8, 3.2, 6.6, 52.7],
+      ['G | sub', false, 2, 2411, 4.1, 1.5, 2.6, 22],
+      ['G-old', true, 3, 330, 3.6, 3, 0.6, 19.4],
+      ['未记录分组', false, 1, 11, 1.1, 0.5, 0.6, 5.9]
+    ], '分组取每条请求记下的 group_id；已删除的分组照样列出并标记；分组为空的归「未记录分组」');
+    assert.deepEqual(plain(alice.groups[0].models.map(m => [m.model, m.requests, m.spent, m.profit, m.sharePercent])), [['claude-sonnet', 1, 5, 3.8, 51], ['gpt-5.1', 4, 4.8, 2.8, 49]]);
+    assert.deepEqual(plain(alice.models.find(m => m.model === 'gpt-5.1').groups.map(g => [g.groupName, g.spent, g.sharePercent])),
+      [['G-main', 4.8, 48], ['G | sub', 4.1, 41], ['未记录分组', 1.1, 11]], '同一个模型走了三个分组');
+    assert.deepEqual(plain(alice.models.find(m => m.model === 'claude-sonnet').groups.map(g => [g.groupName, g.spent, g.sharePercent])),
+      [['G-main', 5, 58.1], ['G-old', 3.6, 41.9]]);
+    assert.deepEqual(plain(user('yesterday', 2).groups.map(g => [g.groupName, g.requests, g.spent])), [['G-old', 2, 2.4]]);
+    assert.deepEqual(plain(user('7d', 2).groups.map(g => [g.groupName, g.requests, g.spent])), [['G-main', 3, 7.6], ['G-old', 3, 3.6], ['G | sub', 1, 3]]);
+    // 本月 1 号 0 点整那条、今天的两条；分组并列时的先后不固定，所以按名字对号入座
+    const bobMonth = Object.fromEntries(user('month', 3).groups.map(g => [g.groupName, [g.requests, g.spent, g.cost, g.profit]]));
+    assert.deepEqual(plain(bobMonth), { 'G | sub': [1, 0.9, 1, -0.1], 'G-main': [1, 2.5, 2, 0.5], '未记录分组': [1, 2.5, 0, 2.5] });
+    assert.deepEqual(plain(reports.all.groups.map(g => [g.groupName, g.groupDeleted, g.userCount, g.requests, g.spent])), [
+      ['G-main', false, 6, 11, 15.3], ['G | sub', false, 3, 5, 5.9], ['G-old', true, 2, 4, 5.6], ['未记录分组', false, 2, 2, 3.6]
+    ]);
+    assert.equal(reports.all.totals.groupCount, 4);
+    for (const range of ranges) assertAddsUp(reports[range], range);
   });
 
   await t.test('no-account rows, losses, deleted and internal users', () => {
@@ -477,11 +600,24 @@ function usagePageHarness() {
   return context;
 }
 
+const pageGroupRef = (id, name, extra = {}) => ({ groupKey: String(id), groupId: id, groupName: name, groupDeleted: false, requests: 1, spent: 1, profit: 0.5, sharePercent: 100, ...extra });
+const pageModel = (name, extra = {}) => ({
+  model: name, requests: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 2,
+  spent: 1, cost: 0.5, profit: 0.5, marginPercent: 50, sharePercent: 25, groupCount: 1, groups: [pageGroupRef(5, 'Main')], ...extra
+});
+const pageGroup = (id, name, extra = {}) => ({
+  groupKey: String(id), groupId: id, groupName: name, groupDeleted: false,
+  requests: 10, inputTokens: 1000, outputTokens: 500, cacheReadTokens: 2000, cacheWriteTokens: 100, totalTokens: 3600,
+  spent: 10, cost: 4, profit: 6, marginPercent: 60, lastUsedAt: '2026-09-30T10:00:00+08:00', sharePercent: 100, modelCount: 1,
+  models: [{ ...pageModel('gpt-5.1'), requests: 10, inputTokens: 1000, outputTokens: 500, cacheReadTokens: 2000, cacheWriteTokens: 100, totalTokens: 3600, spent: 10, cost: 4, profit: 6, marginPercent: 60, sharePercent: 100 }],
+  ...extra
+});
 const pageUser = (userId, extra = {}) => ({
   userId, email: `u${userId}@corp.com`, username: `u${userId}`, role: 'user', isTestAccount: false, deleted: false,
   requests: 10, inputTokens: 1000, outputTokens: 500, cacheReadTokens: 2000, cacheWriteTokens: 100, totalTokens: 3600,
   spent: 10, cost: 4, profit: 6, marginPercent: 60, lastUsedAt: new Date().toISOString(), modelCount: 1,
-  models: [{ model: 'gpt-5.1', requests: 10, inputTokens: 1000, outputTokens: 500, cacheReadTokens: 2000, cacheWriteTokens: 100, totalTokens: 3600, spent: 10, cost: 4, profit: 6, marginPercent: 60, sharePercent: 100 }],
+  models: [{ ...pageModel('gpt-5.1'), requests: 10, inputTokens: 1000, outputTokens: 500, cacheReadTokens: 2000, cacheWriteTokens: 100, totalTokens: 3600, spent: 10, cost: 4, profit: 6, marginPercent: 60, sharePercent: 100 }],
+  groupCount: 1, groups: [pageGroup(5, 'Main')],
   ...extra
 });
 
@@ -539,54 +675,126 @@ test('the summary adds up exactly the customers on screen', () => {
   const page = usagePageHarness();
   const summary = plain(page.summarizeUsageUsers([
     pageUser(1, { requests: 4, inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 5, totalTokens: 65, spent: 5, cost: 2, profit: 3,
-      models: [{ model: 'a' }, { model: 'b' }] }),
+      models: [{ model: 'a' }, { model: 'b' }], groups: [pageGroup(5, 'Main'), pageGroup(6, 'Other')] }),
     pageUser(2, { requests: 6, inputTokens: 1, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, totalTokens: 10, spent: 5, cost: 6, profit: -1,
-      models: [{ model: 'b' }, { model: 'c' }] })
+      models: [{ model: 'b' }, { model: 'c' }], groups: [pageGroup(6, 'Other')] })
   ]));
   assert.deepEqual(summary, {
     userCount: 2, requests: 10, inputTokens: 11, outputTokens: 22, cacheReadTokens: 33, cacheWriteTokens: 9, totalTokens: 75,
-    spent: 10, cost: 8, profit: 2, modelCount: 3, marginPercent: 20
+    spent: 10, cost: 8, profit: 2, modelCount: 3, groupCount: 2, marginPercent: 20
   });
   assert.equal(page.summarizeUsageUsers([]).marginPercent, null);
   assert.equal(page.summarizeUsageUsers([]).modelCount, 0);
+  assert.equal(page.summarizeUsageUsers([]).groupCount, 0);
+  assert.equal(page.summarizeUsageUsers([{ ...pageUser(3), groups: undefined }]).groupCount, 0, 'an old-shaped customer without groups does not break the page');
 });
 
-test('customer emails and model names are shown as text, never as page code', () => {
+test('customer emails, model names and group names are shown as text, never as page code', () => {
   const page = usagePageHarness();
+  const evilGroup = '"><script>alert(4)</script>';
   const evil = pageUser(26, {
     email: '<img src=x onerror=alert(1)>@evil.io', username: 'x"><script>alert(2)</script>',
-    models: [{ model: '"><script>alert(3)</script>', requests: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 2, spent: 1, cost: 0.5, profit: 0.5, marginPercent: 50, sharePercent: 100 }]
+    models: [pageModel('"><script>alert(3)</script>', { groups: [pageGroupRef(9, evilGroup, { groupDeleted: true })] })],
+    groups: [pageGroup(9, evilGroup, { groupDeleted: true, models: [pageModel('<b>bold</b>')] })]
   });
-  for (const html of [page.usageRowHtml(evil, 1, true), page.usageIdentityHtml(evil), page.usageChipsHtml(evil), page.usageModelDetailHtml(evil)]) {
-    assert.doesNotMatch(html, /<img|<script/i);
+  const evilOptions = page.usageGroupOptionsHtml([{ groupKey: '9', groupName: evilGroup, groupDeleted: true }]);
+  for (const html of [page.usageRowHtml(evil, 1, true), page.usageIdentityHtml(evil), page.usageChipsHtml(evil), page.usageGroupChipsHtml(evil), page.usageDetailRowHtml(evil), evilOptions]) {
+    assert.doesNotMatch(html, /<img|<script|<b>/i);
     assert.doesNotMatch(html, /"><script/);
   }
   assert.match(page.usageIdentityHtml(evil), /&lt;img src=x onerror=alert\(1\)&gt;@evil\.io/);
   assert.match(page.usageChipsHtml(evil), /&quot;&gt;&lt;script&gt;/);
+  assert.match(page.usageGroupChipsHtml(evil), /&quot;&gt;&lt;script&gt;alert\(4\)&lt;\/script&gt;（已删除）/);
+  assert.match(evilOptions, /value="9">.*&lt;script&gt;.*（已删除）<\/option>/);
 });
 
-test('a customer row shows the top models, flags losses and expands into a per-model table', () => {
+test('a customer row shows the top models and groups, flags losses and expands into a per-group and a per-model table', () => {
   const page = usagePageHarness();
-  const model = (name, extra = {}) => ({ model: name, requests: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 2, spent: 1, cost: 0.5, profit: 0.5, marginPercent: 50, sharePercent: 25, ...extra });
-  const user = pageUser(7, { models: [model('m1'), model('m2', { profit: -0.2, marginPercent: -20 }), model('m3'), model('m4'), model('m5')] });
+  const model = (name, extra = {}) => pageModel(name, extra);
+  const user = pageUser(7, {
+    models: [model('m1', { groups: [pageGroupRef(5, 'Main', { sharePercent: 70 }), pageGroupRef(6, 'Old | pool', { groupDeleted: true, sharePercent: 30, profit: -0.1 })] }),
+      model('m2', { profit: -0.2, marginPercent: -20 }), model('m3'), model('m4'), model('m5')],
+    groupCount: 4,
+    groups: [pageGroup(5, 'Main', { sharePercent: 50, models: [model('m1'), model('m2', { profit: -0.2 })] }),
+      pageGroup(6, 'Old | pool', { groupDeleted: true, profit: -0.1, sharePercent: 20 }), pageGroup(7, 'Third', { sharePercent: 20 }), pageGroup(8, 'Fourth', { sharePercent: 10 })]
+  });
   const chips = page.usageChipsHtml(user);
   assert.equal((chips.match(/usage-model-chip"/g) || []).length + (chips.match(/usage-model-chip is-loss"/g) || []).length, 3, 'three models shown');
   assert.match(chips, /usage-model-chip is-loss[^>]*>.*m2/, 'the model that loses money is marked');
   assert.match(chips, /\+2 个/);
   assert.doesNotMatch(chips, /m4|m5/);
+
+  const groupChips = page.usageGroupChipsHtml(user);
+  assert.equal((groupChips.match(/usage-group-chip(?: is-loss)?"/g) || []).length, 3, 'three groups shown');
+  assert.match(groupChips, /usage-group-chip is-loss[^>]*>.*Old \| pool（已删除）/, 'a deleted group is labelled and a losing group is marked');
+  assert.match(groupChips, /\+1 个/);
+  assert.doesNotMatch(groupChips, /Fourth/);
+
   const closed = page.usageRowHtml(user, 4, false);
   assert.match(closed, /data-usage-user="7"/);
   assert.match(closed, /aria-expanded="false"[^>]*>展开/);
   assert.doesNotMatch(closed, /usage-detail-row/);
+  assert.equal((closed.match(/<td/g) || []).length, 10, 'one cell per column, the group column included');
   const open = page.usageRowHtml(user, 1, true);
   assert.match(open, /rank-badge rank-1/);
   assert.match(open, /aria-expanded="true"[^>]*>收起/);
-  assert.equal((open.match(/usage-model-name/g) || []).length, 5, 'every model gets a row when expanded');
+  assert.match(open, /<td colspan="10">/);
+  assert.match(open, /按分组：这个客户在每个分组里用了多少/);
+  assert.match(open, /按模型：这个客户每个模型用了多少/);
+  assert.equal((open.match(/class="usage-name-line"/g) || []).length, 4 + 5, 'every group and every model gets a row when expanded');
+  assert.match(open, /usage-deleted-tag">已删除/);
   assert.match(open, /-¥0\.20|¥0\.50/);
+  assert.match(open, /usage-group-chip[^>]*>.*Old \| pool/s, 'the model table shows which groups a model went through');
   // 只有一个模型、没有用量、没花钱的边界
-  const bare = pageUser(8, { requests: 0, totalTokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, spent: 0, cost: 0, profit: 0, marginPercent: null, models: [] });
+  const bare = pageUser(8, { requests: 0, totalTokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, spent: 0, cost: 0, profit: 0, marginPercent: null, models: [], groups: [], groupCount: 0 });
   assert.match(page.usageRowHtml(bare, 9, false), /usage-zero/);
   assert.match(page.usageChipsHtml(bare), /usage-zero/);
+  assert.match(page.usageGroupChipsHtml(bare), /usage-zero/);
+  assert.doesNotThrow(() => page.usageRowHtml({ ...bare, groups: undefined }, 9, true), 'an old-shaped customer without groups still renders');
+});
+
+test('only looking at one group swaps every customer to his own numbers inside that group', () => {
+  const page = usagePageHarness();
+  const alice = pageUser(2, {
+    requests: 5, spent: 10, cost: 4, profit: 6, models: [pageModel('gpt', { sharePercent: 60 }), pageModel('claude', { sharePercent: 40 })], groupCount: 2,
+    groups: [
+      pageGroup(5, 'Main', { requests: 3, inputTokens: 30, outputTokens: 10, cacheReadTokens: 5, cacheWriteTokens: 1, totalTokens: 46, spent: 7, cost: 3, profit: 4, marginPercent: 57.1,
+        sharePercent: 70, modelCount: 2, lastUsedAt: '2026-09-30T09:00:00+08:00', models: [pageModel('gpt', { sharePercent: 80 }), pageModel('claude', { sharePercent: 20 })] }),
+      pageGroup('none', '未记录分组', { groupKey: 'none', groupId: null, requests: 2, spent: 3, cost: 1, profit: 2, sharePercent: 30, models: [pageModel('gpt', { sharePercent: 100 })] })
+    ]
+  });
+  const bob = pageUser(3, { groups: [pageGroup(6, 'Other')] });
+  assert.equal(page.applyUsageGroupFilter([alice, bob], 'all').length, 2, 'all groups changes nothing');
+  assert.equal(page.applyUsageGroupFilter([alice, bob], undefined).length, 2);
+  const main = page.applyUsageGroupFilter([alice, bob], '5');
+  assert.deepEqual(plain(main.map(u => u.userId)), [2], 'a customer who never used the group is not shown');
+  const view = main[0];
+  assert.deepEqual(plain([view.requests, view.spent, view.cost, view.profit, view.totalTokens, view.marginPercent, view.modelCount, view.groupCount]), [3, 7, 3, 4, 46, 57.1, 2, 1]);
+  assert.equal(view.email, alice.email, 'who the customer is does not change');
+  assert.equal(view.lastUsedAt, '2026-09-30T09:00:00+08:00', 'last used time is the one inside the group');
+  assert.deepEqual(plain(view.models.map(m => [m.model, m.sharePercent, m.groupCount, m.groups.map(g => [g.groupName, g.sharePercent])])),
+    [['gpt', 80, 1, [['Main', 100]]], ['claude', 20, 1, [['Main', 100]]]], 'model shares are now shares of the group');
+  assert.deepEqual(plain(view.groups.map(g => [g.groupName, g.sharePercent])), [['Main', 100]]);
+  assert.equal(alice.requests, 5, 'the original customer object is left alone');
+  assert.deepEqual(plain(page.applyUsageGroupFilter([alice], 'none').map(u => [u.requests, u.spent])), [[2, 3]], 'the "no group recorded" bucket can be picked too');
+  assert.deepEqual(plain(page.applyUsageGroupFilter([alice, bob], '99')), [], 'a group nobody used leaves nothing');
+  assert.equal(page.summarizeUsageUsers(main).groupCount, 1);
+  // 筛完以后合计只是这个分组里的数
+  assert.equal(page.summarizeUsageUsers(page.applyUsageGroupFilter([alice, bob], '6')).spent, 10);
+});
+
+test('the group drop-down lists every group used in the range, deleted ones labelled', () => {
+  const page = usagePageHarness();
+  const html = page.usageGroupOptionsHtml([
+    { groupKey: '5', groupName: 'Main', groupDeleted: false }, { groupKey: '6', groupName: 'Old | pool', groupDeleted: true }, { groupKey: 'none', groupName: '未记录分组', groupDeleted: false }
+  ]);
+  assert.match(html, /^<option value="all">全部分组（共 3 个）<\/option>/);
+  assert.match(html, /<option value="5">Main<\/option>/);
+  assert.match(html, /<option value="6">Old \| pool（已删除）<\/option>/);
+  assert.match(html, /<option value="none">未记录分组<\/option>/);
+  assert.equal(page.usageGroupOptionsHtml([]), '<option value="all">全部分组</option>');
+  assert.equal(page.usageGroupOptionsHtml(undefined), '<option value="all">全部分组</option>');
+  assert.match(page.usageSummaryHtml(page.summarizeUsageUsers([pageUser(1)])), /用了 1 种模型 · 走了 1 个分组/);
 });
 
 test('profit is green when positive, red when negative and grey when nothing was earned', () => {
