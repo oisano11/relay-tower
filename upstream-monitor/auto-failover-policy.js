@@ -116,6 +116,14 @@ function supportsModel(channel, model) {
 }
 
 /**
+ * 记下的原主调是不是运营者亲手选的（手动设的主调，或确认过的切线）。没有这个标记的老记录
+ * 按运营者选的算：宁可少为省钱换一次号，也不把人工选的主调换走。
+ */
+function originalMainIsManual(runtime) {
+  return runtime.originalMainManual !== false;
+}
+
+/**
  * 本组「找不到账号接单」的报错里，哪些算到当前主调头上：只算它当上当前账号之后、
  * 本组最后一次成功请求之后、上次切换之后的。「模型不支持」只在主调不支持、而本组别的
  * 能顶上的账号支持这个模型时才算（否则是客户点了本组没有的模型，换号也没用）。
@@ -162,12 +170,17 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
     const originStillPresent = runtime.originalMainId != null && members.some(channel => String(channel.id) === String(runtime.originalMainId));
     if (!runtime.originalMainId || current.manualLocked === true || !originStillPresent) {
       next.originalMainId = current.id;
+      next.originalMainManual = current.manualLocked === true;
     } else {
       next.originalMainId = runtime.originalMainId;
+      next.originalMainManual = originalMainIsManual(runtime);
     }
   } else {
     next.currentSince = null;
-    if (runtime.originalMainId) next.originalMainId = runtime.originalMainId;
+    if (runtime.originalMainId) {
+      next.originalMainId = runtime.originalMainId;
+      next.originalMainManual = originalMainIsManual(runtime);
+    }
   }
   const reference = current || members.find(channel => String(channel.id) === String(runtime.lastCurrentId));
   const required = requiredModels(reference || { configuredModels: runtime.requiredModels || [] }, group, demandModels);
@@ -348,7 +361,18 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
     return health.get(String(channel.id)).recovered && !troubled.has(String(channel.id)) && cost < currentCost &&
       (currentCost - cost) / currentCost * 100 >= options.minSavingsPercent;
   });
-  return cheaper ? result('switch', 'cheaper_recovered', cheaper) : result('hold', 'healthy');
+  if (!cheaper) return result('hold', 'healthy');
+  const isOrigin = String(current.id) === String(next.originalMainId);
+  // 运营者亲手选的主调（或出故障后又换回来的那个）不为省钱换走，只有它自己出故障才由上面的故障切换接管。
+  // 探测正常的账号可能其实用不了（比如上游坏了、没有客户请求暴露出来），人工的判断比省钱重要。
+  if (isOrigin && next.originalMainManual === true) return result('hold', 'manual_main');
+  // 为省钱从原主调换到更便宜的账号，就是运营者开着这个设置的意思：新主调成了本组要回去的账号。
+  // 不然冷却一过，上面的「原主调回切」又把它换回原来那个，两条规则来回倒。
+  if (isOrigin) {
+    next.originalMainId = cheaper.id;
+    next.originalMainManual = false;
+  }
+  return result('switch', 'cheaper_recovered', cheaper);
 }
 
 // 分组可以单独覆盖的设置。没覆盖的项一律跟随全站：全站改了，分组自动跟着变。

@@ -621,3 +621,91 @@ test('real faults are remembered for the cost guard; debt and manual closing are
   assert.equal(routed.reason, 'routing_failures');
   assert.equal(routed.runtime.accounts['1'].lastFaultAt, START);
 });
+
+// ====== 2026-10-02 人工选的主调不为省钱换走；省钱换号和原主调回切不再来回倒 ======
+
+// 按塔台实际落地切号的方式回放几十分钟：新主调开接单、优先级 1，原主调关掉降成副调并清掉人工锁定，
+// 切号成功后记下 lastSwitchAt；每分钟探活一次，账号没出故障就一直健康。
+function replay(initial, minutes, { runtime = {}, config, patch = () => ({}) } = {}) {
+  let channels = initial;
+  const switches = [];
+  let last;
+  for (let minute = 0; minute <= minutes; minute++) {
+    const now = START + minute * 60000;
+    const live = channels.map(c => ({ ...c, lastProbeTime: now, balanceUpdated: now, ...patch(minute, c) }));
+    last = decide(live, { now, runtime, config });
+    runtime = last.runtime;
+    if (last.action !== 'switch') continue;
+    switches.push([minute, last.reason, last.targetId]);
+    runtime = { ...runtime, lastSwitchAt: now, lastTargetId: last.targetId };
+    channels = channels.map(c => c.id === last.targetId ? { ...c, schedulable: true, priority: 1, manualLocked: false }
+      : c.id === last.currentId ? { ...c, schedulable: false, priority: 10, manualLocked: false } : c);
+  }
+  return { switches, last, runtime };
+}
+const pricierMain = overrides => channel(1, { costMultiplier: 0.5, ...overrides });
+const cheaperSub = overrides => channel(2, { costMultiplier: 0.1, schedulable: false, priority: 10, ...overrides });
+
+test('a main the operator picked by hand is not swapped out just because a cheaper account looks healthy', () => {
+  const held = replay([pricierMain({ manualLocked: true }), cheaperSub()], 40);
+  assert.deepEqual(held.switches, []);
+  assert.equal(held.last.action, 'hold');
+  assert.equal(held.last.reason, 'manual_main');
+  assert.equal(held.runtime.originalMainId, 1);
+  assert.equal(held.runtime.originalMainManual, true);
+  // 对照：主调不是人工选的，照常为省钱换过去
+  const free = replay([pricierMain(), cheaperSub()], 40);
+  assert.equal(free.switches[0][1], 'cheaper_recovered');
+  assert.equal(free.switches[0][2], 2);
+  // 没有更便宜的账号可换时，原因不写「人工选的」，照常是运行稳定
+  assert.equal(replay([channel(1, { costMultiplier: 0.1, manualLocked: true }), channel(2, { costMultiplier: 0.5, schedulable: false, priority: 10 })], 40).last.reason, 'healthy');
+});
+
+test('a hand-picked main still fails over when it really fails', () => {
+  const result = decide([pricierMain({ manualLocked: true }), cheaperSub()], { metrics: { 1: { consecutiveFailures: 5 } } });
+  assert.equal(result.action, 'switch');
+  assert.equal(result.reason, 'request_failures');
+  assert.equal(result.targetId, 2);
+});
+
+test('after a failover and the return of the hand-picked main, saving money does not pull traffic away again', () => {
+  // 手选的主调 1（比 2 贵）欠费 → 换到 2；充值后塔台把它换回来（自动换回的账号不带人工锁定）；
+  // 以前这时 10 分钟冷却一过又为省钱换去 2，再过 10 分钟「原主调回切」又换回 1，一直来回倒
+  const run = replay([pricierMain({ manualLocked: true }), cheaperSub()], 60,
+    { patch: (minute, c) => (c.id === 1 && minute < 3 ? { balance: 0, balanceStatus: 'empty' } : {}) });
+  assert.deepEqual(run.switches.map(([, reason, to]) => [reason, to]), [['balance_empty', 2], ['main_recharged', 1]]);
+  assert.equal(run.last.reason, 'manual_main');
+  assert.equal(run.runtime.originalMainManual, true);
+});
+
+test('moving to a cheaper account is not undone by the return-to-origin rule', () => {
+  // 主调不是人工选的：为省钱换到 2 之后，2 就是本组要回去的账号，不会 10 分钟后又被「原主调回切」换回 1
+  const run = replay([pricierMain(), cheaperSub()], 90);
+  assert.deepEqual(run.switches.map(([, reason, to]) => [reason, to]), [['cheaper_recovered', 2]]);
+  assert.equal(run.runtime.originalMainId, 2);
+  assert.equal(run.runtime.originalMainManual, false);
+  // 换到 2 之后 2 要是欠费了，照常故障切换，换回 1
+  const failing = replay([pricierMain(), cheaperSub()], 90, { patch: (minute, c) => (c.id === 2 && minute >= 30 ? { balance: 0, balanceStatus: 'empty' } : {}) });
+  assert.deepEqual(failing.switches.map(([, reason, to]) => [reason, to]), [['cheaper_recovered', 2], ['balance_empty', 1]]);
+});
+
+test('an origin recorded before the manual flag existed counts as the operator\'s choice', () => {
+  const run = replay([pricierMain(), cheaperSub()], 40, { runtime: { originalMainId: 1, accounts: {} } });
+  assert.deepEqual(run.switches, []);
+  assert.equal(run.last.reason, 'manual_main');
+  assert.equal(run.runtime.originalMainManual, true);
+  // 老记录里的原主调不是现在的主调（欠费，2 在顶班）：照旧可以为省钱换到更便宜的账号，原主调的记录不动
+  const substitute = replay([channel(1, { schedulable: false, priority: 10, costMultiplier: 0.3 }), channel(2, { costMultiplier: 0.5, schedulable: true, priority: 1 }),
+    channel(3, { costMultiplier: 0.1, schedulable: false, priority: 10 })], 40,
+    { runtime: { originalMainId: 1, accounts: {} }, patch: (minute, c) => (c.id === 1 ? { balance: 0, balanceStatus: 'empty' } : {}) });
+  assert.deepEqual(substitute.switches.map(([, reason, to]) => [reason, to]), [['cheaper_recovered', 3]]);
+  assert.equal(substitute.runtime.originalMainId, 1);
+});
+
+test('picking a new main by hand replaces the recorded origin and is protected too', () => {
+  const run = replay([channel(1, { schedulable: false, priority: 10, costMultiplier: 0.3 }), channel(2, { costMultiplier: 0.5, schedulable: true, priority: 1, manualLocked: true }),
+    channel(3, { costMultiplier: 0.1, schedulable: false, priority: 10 })], 40, { runtime: { originalMainId: 1, accounts: {} } });
+  assert.deepEqual(run.switches, []);
+  assert.equal(run.runtime.originalMainId, 2);
+  assert.equal(run.runtime.originalMainManual, true);
+});

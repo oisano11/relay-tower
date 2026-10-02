@@ -3348,6 +3348,33 @@ test('the switch preview names the models a backup lacks and its recent real err
   assert.ok(noisy.notes.includes('最近 6 小时真实请求报错 4 次，暂不为省钱换过去'));
 });
 
+test('the switch preview says a hand-picked main is not swapped out just to save money', () => {
+  const now = Date.now();
+  const stamp = new Date(now).toISOString();
+  const { context, state } = evaluator({});
+  context.autoSwitchConfig.groupPolicies = { 1: { autoRecoverLowestCost: true } };
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  const build = manualLocked => [
+    fixChannel(1, { priority: 1, schedulable: true, costMultiplier: 0.5, manualLocked, lastProbeTime: stamp, balanceUpdated: stamp, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] }),
+    fixChannel(2, { costMultiplier: 0.1, lastProbeTime: stamp, balanceUpdated: stamp, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] })
+  ];
+  // 更便宜的副调探测一直正常、早就稳定了
+  const runtime = () => ({ 1: { lastCurrentId: '1', currentSince: now - 3600000, accounts: { 2: { successes: 9, failures: 0, healthySince: now - 1800000, probeAt: now } } } });
+  state.channels = build(true);
+  state.failoverRuntime = runtime();
+  const held = context.previewAutoSwitch(now).groups[0];
+  assert.equal(held.action, 'hold');
+  assert.equal(held.reason, '主调是你亲手选的，不为省钱换号');
+  assert.equal(held.target, null);
+  // 对照：主调不是人工选的，同样的情况会换过去
+  state.channels = build(false);
+  state.failoverRuntime = runtime();
+  const free = context.previewAutoSwitch(now).groups[0];
+  assert.equal(free.action, 'switch');
+  assert.equal(free.reason, '低价账号已稳定恢复');
+  assert.equal(free.target.id, '2');
+});
+
 test('the protection overview says when a group\'s backups lack the models customers use', () => {
   const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
   const context = vm.createContext({});

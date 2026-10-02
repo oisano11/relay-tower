@@ -6494,7 +6494,7 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
 
 // 本组没有能顶上的账号时，同一个分组最多每小时提醒一次
 const EXHAUSTED_RENOTIFY_MS = 3600000;
-const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', main_recharged: '原主调充值恢复上线', automation_disabled: '自动切号已关闭' };
+const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', manual_main: '主调是你亲手选的，不为省钱换号', main_recharged: '原主调充值恢复上线', automation_disabled: '自动切号已关闭' };
 
 /**
  * 评估一个业务分组所需的输入（真实切号与只读预演共用，保证预演看到的就是实际决策）。
