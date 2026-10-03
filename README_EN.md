@@ -54,7 +54,7 @@
 </p>
 <p align="center"><sub>Auto-failover: when the primary fails the console switches to the standby, then switches back once the primary is recharged and verified</sub></p>
 
-<sub>The console UI is in Chinese. All screenshots use demo data and contain no real accounts or customers. Table column widths in the overview were adjusted for readability.</sub>
+<sub>The console UI is in Chinese. All screenshots use demo data and contain no real accounts or customers.</sub>
 
 ---
 
