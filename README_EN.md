@@ -37,6 +37,25 @@
 | You cannot tell which customer or model makes or loses money | Usage and profit per customer and per model (requests, tokens, profit). Loss-making routes are highlighted |
 | Splitting traffic across accounts lowers Prompt Cache hits | One primary per group serves traffic and the rest stay cold, which reduces cross-channel routing |
 
+### 🖥️ The Console at a Glance
+
+<p align="center">
+  <img src="assets/screenshot-console-overview.png" alt="Relay Tower console overview: primary and standby accounts per group with upstream cost, sale price, margin and first-token speed" width="100%" />
+</p>
+<p align="center"><sub>Overview: every account per business group with its role (primary or standby), cost, sale price, margin, balance and first-token speed</sub></p>
+
+<p align="center">
+  <img src="assets/screenshot-usage-profit.png" alt="Usage and model profit: per customer requests, tokens, models, groups and profit" width="82%" />
+</p>
+<p align="center"><sub>Usage and model profit: what each customer used, which models and groups, and how much you made or lost</sub></p>
+
+<p align="center">
+  <img src="assets/screenshot-auto-switch.png" alt="Auto-failover log: out of balance, first-token timeout, upstream errors and recharge switch-back" width="60%" />
+</p>
+<p align="center"><sub>Auto-failover: when the primary fails the console switches to the standby, then switches back once the primary is recharged and verified</sub></p>
+
+<sub>The console UI is in Chinese. All screenshots use demo data and contain no real accounts or customers. Table column widths in the overview were adjusted for readability.</sub>
+
 ---
 
 ## 📖 Introduction

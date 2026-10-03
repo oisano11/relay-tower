@@ -37,6 +37,25 @@
 | 不知道哪个客户、哪个模型在赚钱还是在亏钱 | 「用户财务」按客户和模型统计请求数、Token 和利润；亏损通道标红 |
 | 多个账号来回分流，Prompt Cache 命中率掉下来 | 每个分组只让一个主调接单，其余冷备，减少跨通道分流 |
 
+### 🖥️ 控制台一览
+
+<p align="center">
+  <img src="assets/screenshot-console-overview.png" alt="中转塔台控制台总览：按业务分组查看主调、副调、上游进价、对外售价、毛利和首字速度" width="100%" />
+</p>
+<p align="center"><sub>总览：按业务分组看每个账号是主调还是副调，进价、售价、毛利、余额和首字速度一目了然</sub></p>
+
+<p align="center">
+  <img src="assets/screenshot-usage-profit.png" alt="用户财务·用量与模型利润：每个客户用了多少量、哪些模型和分组、赚了多少" width="82%" />
+</p>
+<p align="center"><sub>用量与模型利润：每个客户请求了多少次、用了哪些模型和分组、赚了或亏了多少</sub></p>
+
+<p align="center">
+  <img src="assets/screenshot-auto-switch.png" alt="自动切号：最近的切号记录，包含余额耗尽、首字超时、上游报错和充值回切" width="60%" />
+</p>
+<p align="center"><sub>自动切号：主调出故障时自动切到副调，充值恢复、验证通过后再切回</sub></p>
+
+<sub>以上均为演示数据，不含任何真实账号或客户。总览截图为方便阅读，调整了表格列宽。</sub>
+
 ---
 
 ## 📖 项目简介
