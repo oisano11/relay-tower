@@ -8,16 +8,18 @@
   <link rel="shortcut icon" href="favicon.ico?v=20261003-tower">
   <style>
     :root {
-      --bg-gradient: linear-gradient(135deg, #f8fafc 0%, #edf2f7 50%, #e2e8f0 100%);
+      --bg-gradient: linear-gradient(135deg, #faf9f5 0%, #f0eee6 50%, #e8e6dc 100%);
       --card-bg: #ffffff;
-      --text-main: #0f172a;
-      --text-muted: #64748b;
-      --primary: #2563eb;
-      --primary-hover: #1d4ed8;
-      --primary-shadow: rgba(37, 99, 235, 0.25);
+      --text-main: #141413;
+      --text-muted: #73726c;
+      --primary: #1f1e1d;
+      --primary-hover: #3d3d3a;
+      --primary-shadow: rgba(20, 20, 19, 0.18);
+      --focus: #c96442;
+      --focus-ring: rgba(201, 100, 66, 0.18);
       --danger: #ef4444;
       --danger-bg: #fef2f2;
-      --border-color: #e2e8f0;
+      --border-color: #e8e6dc;
       --radius: 16px;
     }
 
@@ -82,7 +84,8 @@
       font-size: 22px;
       font-weight: 700;
       color: var(--text-main);
-      letter-spacing: -0.5px;
+      letter-spacing: 0.02em;
+      font-family: "Songti SC", "STSong", "Noto Serif SC", "Source Han Serif SC", Georgia, serif;
       margin-bottom: 6px;
     }
 
@@ -117,7 +120,7 @@
       display: block;
       font-size: 13px;
       font-weight: 600;
-      color: #334155;
+      color: #3d3d3a;
       margin-bottom: 8px;
     }
 
@@ -131,7 +134,7 @@
       position: absolute;
       left: 14px;
       font-size: 16px;
-      color: #94a3b8;
+      color: #9c9a92;
       pointer-events: none;
     }
 
@@ -142,16 +145,16 @@
       font-size: 14px;
       border: 1.5px solid var(--border-color);
       border-radius: 10px;
-      background: #f8fafc;
+      background: #faf9f5;
       color: var(--text-main);
       outline: none;
       transition: all 0.2s ease;
     }
 
     .form-input:focus {
-      border-color: var(--primary);
+      border-color: var(--focus);
       background: #fff;
-      box-shadow: 0 0 0 3.5px var(--primary-shadow);
+      box-shadow: 0 0 0 3.5px var(--focus-ring);
     }
 
     .toggle-pwd {
@@ -161,7 +164,7 @@
       border: none;
       cursor: pointer;
       font-size: 16px;
-      color: #94a3b8;
+      color: #9c9a92;
       padding: 4px;
       display: flex;
       align-items: center;
@@ -170,7 +173,7 @@
     }
 
     .toggle-pwd:hover {
-      color: #475569;
+      color: #5e5d59;
     }
 
     .form-row {
@@ -179,7 +182,7 @@
       justify-content: space-between;
       margin-bottom: 24px;
       font-size: 13px;
-      color: #475569;
+      color: #5e5d59;
     }
 
     .checkbox-label {
@@ -193,7 +196,7 @@
     .checkbox-label input[type="checkbox"] {
       width: 16px;
       height: 16px;
-      accent-color: var(--primary);
+      accent-color: var(--focus);
       border-radius: 4px;
       cursor: pointer;
     }
@@ -236,7 +239,7 @@
       padding-top: 20px;
       border-top: 1px solid var(--border-color);
       font-size: 12px;
-      color: #94a3b8;
+      color: #9c9a92;
       display: flex;
       align-items: center;
       justify-content: center;

@@ -405,7 +405,7 @@ function renderOverviewMetrics() {
     const lossNames = channelsData.filter(c => c.isLoss).map(c => c.name).join(', ');
     if (elLossFooter) {
       elLossFooter.textContent = `隐患通道: ${lossNames} (停用中)`;
-      elLossFooter.style.color = '#a1a1aa';
+      elLossFooter.style.color = '#9c9a92';
     }
   } else {
     if (cardLoss) {
@@ -424,7 +424,7 @@ function renderOverviewMetrics() {
     if (elLossDesc) elLossDesc.textContent = '所有上游进价均低于销售价，定价结构健康。';
     if (elLossFooter) {
       elLossFooter.textContent = '全部通道均处于盈利空间';
-      elLossFooter.style.color = '#71717a';
+      elLossFooter.style.color = '#73726c';
     }
   }
 
@@ -659,7 +659,7 @@ function getVendorTheme(vendor) {
       pillClass: 'pill-vendor-grok',
       label: '⚫ Grok (xAI)',
       shortLabel: 'Grok',
-      color: '#0f172a'
+      color: '#141413'
     };
   }
   if (v.includes('国模') || v.includes('deepseek') || v.includes('qwen') || false) {
@@ -676,7 +676,7 @@ function getVendorTheme(vendor) {
     pillClass: 'pill-vendor-other',
     label: '⚡ 通用模型',
     shortLabel: '通用',
-    color: '#64748b'
+    color: '#73726c'
   };
 }
 
@@ -1070,7 +1070,7 @@ function renderChannels() {
             <button class="btn btn-secondary" onclick="resolveChannelErrors('${firstProb.id}')" style="font-size: 0.76rem; padding: 0.25rem 0.65rem; color: #16a34a; border-color: #bbf7d0; background: #f0fdf4;" title="将此通道过去的历史报错标记为已解决并消除警报">
               ✓ 消除报错
             </button>
-            <button class="btn btn-secondary" onclick="dismissWarningBanner('${firstProb.id}')" style="font-size: 0.85rem; padding: 0.25rem 0.55rem; color: #64748b;" title="在当前页面会话中隐藏此警报">
+            <button class="btn btn-secondary" onclick="dismissWarningBanner('${firstProb.id}')" style="font-size: 0.85rem; padding: 0.25rem 0.55rem; color: #73726c;" title="在当前页面会话中隐藏此警报">
               ✕ 忽略
             </button>
           </div>
@@ -1156,7 +1156,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
 
     const otherGroups = sortedGroups.filter(g => g !== activeGroupName);
     const secondaryGroupsHtml = otherGroups.length > 0 
-      ? `<span style="font-size: 0.68rem; color: #64748b;">兼跨:</span> ` + otherGroups.map(g => `<span class="strip-group-badge" title="同时兼跨分组: ${g}">${g}</span>`).join('')
+      ? `<span style="font-size: 0.68rem; color: #73726c;">兼跨:</span> ` + otherGroups.map(g => `<span class="strip-group-badge" title="同时兼跨分组: ${g}">${g}</span>`).join('')
       : '';
 
     let profitBadgeHtml = '';
@@ -1197,7 +1197,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
     if (onlineCount > 0) {
       userBadgeHtml = `<span class="user-active-badge online" title="${escapeHtml(userTooltip)}"><span class="user-pulse-dot"></span>${onlineCount}人使用中${callsText}</span>`;
     } else if (dauCount > 0) {
-      userBadgeHtml = `<span class="user-active-badge idle" title="${escapeHtml(userTooltip)}">👥 今日${dauCount}人${callsText} <span style="font-size: 0.65rem; color: #64748b; font-weight: normal;">(${lastUsedStr})</span></span>`;
+      userBadgeHtml = `<span class="user-active-badge idle" title="${escapeHtml(userTooltip)}">👥 今日${dauCount}人${callsText} <span style="font-size: 0.65rem; color: #73726c; font-weight: normal;">(${lastUsedStr})</span></span>`;
     } else {
       userBadgeHtml = `<span class="user-active-badge none" title="${escapeHtml(userTooltip)}">⚪ 0人使用</span>`;
     }
@@ -2256,28 +2256,28 @@ async function openRoleMismatchModal() {
   }
   const items = plan.items || [];
   const rows = items.length ? items.map(item => {
-    const head = `<b>${escapeHtml(item.accountName)}</b> <span style="color: #64748b;">#${escapeHtml(item.accountId)} · 【${escapeHtml(item.groupName)}】标着${escapeHtml(item.roleLabel)}</span>`;
+    const head = `<b>${escapeHtml(item.accountName)}</b> <span style="color: #73726c;">#${escapeHtml(item.accountId)} · 【${escapeHtml(item.groupName)}】标着${escapeHtml(item.roleLabel)}</span>`;
     const detail = item.fixable
-      ? `<div style="padding-left: 1.4rem; color: #334155;">关掉后本组由 ${item.servingMains.map(name => `「${escapeHtml(name)}」`).join('、')} 接单</div>`
+      ? `<div style="padding-left: 1.4rem; color: #3d3d3a;">关掉后本组由 ${item.servingMains.map(name => `「${escapeHtml(name)}」`).join('、')} 接单</div>`
       : `<div style="padding-left: 1.4rem; color: #b45309;">⚠️ 先不关：${escapeHtml(item.blockedReason)}</div>`;
     const box = item.fixable
       ? `<label style="display: flex; gap: 0.45rem; align-items: center; cursor: pointer;"><input type="checkbox" class="role-fix-checkbox" value="${escapeHtml(item.accountId)}" checked /> ${head}</label>`
-      : `<div style="display: flex; gap: 0.45rem; align-items: center; color: #94a3b8;"><input type="checkbox" disabled /> ${head}</div>`;
-    return `<div style="padding: 0.45rem 0.55rem; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 0.2rem;">${box}${detail}</div>`;
+      : `<div style="display: flex; gap: 0.45rem; align-items: center; color: #9c9a92;"><input type="checkbox" disabled /> ${head}</div>`;
+    return `<div style="padding: 0.45rem 0.55rem; background: #fff; border: 1px solid #e8e6dc; border-radius: 6px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 0.2rem;">${box}${detail}</div>`;
   }).join('') : '<div style="padding: 1rem; text-align: center; color: #16a34a; font-size: 0.8rem;">✅ 没有问题：每个分组都只有主调在接单。</div>';
   const html = `
     <div id="roleMismatchModalBackdrop" class="modal-backdrop open" style="z-index: 1050;">
       <div class="modal-dialog" style="max-width: 600px;">
         <div class="dialog-content">
           <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.2rem;">
-            <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a;">按角色关掉不该接单的账号</div>
+            <div style="font-size: 1.05rem; font-weight: 700; color: #141413;">按角色关掉不该接单的账号</div>
             <button type="button" onclick="document.getElementById('roleMismatchModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
-          <p style="font-size: 0.74rem; color: #64748b; margin: 0 0 0.5rem;">
+          <p style="font-size: 0.74rem; color: #73726c; margin: 0 0 0.5rem;">
             只有主调接单。下面这些账号标着副调、备选或备用，接单开关却还开着，所以还在分到请求。勾选的会关掉接单开关，角色不变：
             副调、备选继续当替补（主调出问题时自动切号按顺序换上），备用就一直关着。关掉后，这些账号上的请求（包括进行中的对话）都会转给本组主调，请先确认主调能正常接单。
           </p>
-          <div style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 340px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">${rows}</div>
+          <div style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 340px; overflow-y: auto; background: #faf9f5; padding: 0.4rem; border: 1px solid #e8e6dc; border-radius: 6px;">${rows}</div>
           <div class="dialog-actions" style="margin-top: 0.7rem; display: flex; gap: 0.5rem;">
             <button id="btnConfirmRoleFix" class="btn btn-primary" style="flex: 1; justify-content: center; font-weight: 600;" ${plan.fixableCount ? '' : 'disabled'}>关掉勾选的账号</button>
             <button onclick="document.getElementById('roleMismatchModalBackdrop').remove()" class="btn btn-secondary">取消</button>
@@ -2553,8 +2553,8 @@ function renderAlertsDrawer() {
     container.innerHTML = `
       <div style="text-align: center; color: var(--text-muted); padding: 2.5rem 1rem;">
         <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">📭</div>
-        <div style="font-size: 0.88rem; font-weight: 600; color: #475569;">暂无报错与告警记录</div>
-        <div style="font-size: 0.74rem; color: #94a3b8; margin-top: 0.25rem;">上游调价、自动熔断切线与报错流水将自动归集在此</div>
+        <div style="font-size: 0.88rem; font-weight: 600; color: #5e5d59;">暂无报错与告警记录</div>
+        <div style="font-size: 0.74rem; color: #9c9a92; margin-top: 0.25rem;">上游调价、自动熔断切线与报错流水将自动归集在此</div>
       </div>
     `;
     return;
@@ -2608,7 +2608,7 @@ function renderAlertsDrawer() {
       badgeHtml = `<span style="color: ${isUp ? 'var(--color-red)' : 'var(--color-green)'}; font-weight: 700;">${isUp ? '↗ 进货倍率上涨' : '↘ 进货倍率下调'}</span>`;
     } else {
       cardClass = 'is-channel-switch';
-      badgeHtml = `<span style="color: #64748b; font-weight: 700;">ℹ️ 运行提示</span>`;
+      badgeHtml = `<span style="color: #73726c; font-weight: 700;">ℹ️ 运行提示</span>`;
     }
 
     if (isUnread) cardClass += ' is-unread';
@@ -2859,7 +2859,7 @@ function renderLinesModalContent() {
 
   const lines = ch.backupLines || [];
   if (lines.length === 0) {
-    container.innerHTML = '<div style="text-align: center; padding: 1rem; color: #94a3b8;">暂无备选线路</div>';
+    container.innerHTML = '<div style="text-align: center; padding: 1rem; color: #9c9a92;">暂无备选线路</div>';
     return;
   }
 
@@ -2870,7 +2870,7 @@ function renderLinesModalContent() {
       const lClass = line.latency < 450 ? 'lat-good' : (line.latency < 900 ? 'lat-warn' : 'lat-bad');
       latHtml = `<span class="line-latency-pill ${lClass}">⚡ ${line.latency} ms</span>`;
     } else {
-      latHtml = `<span class="line-latency-pill" style="background: #f1f5f9; color: #64748b;">未测速</span>`;
+      latHtml = `<span class="line-latency-pill" style="background: #f5f4ed; color: #73726c;">未测速</span>`;
     }
 
     return `
@@ -3101,10 +3101,10 @@ async function loadUpstreamPanelsList() {
 
     if (upstreamPanelsList.length === 0) {
       container.innerHTML = `
-        <div style="text-align: center; color: #64748b; padding: 2rem 1rem; border: 1px dashed #cbd5e1; border-radius: 8px;">
+        <div style="text-align: center; color: #73726c; padding: 2rem 1rem; border: 1px dashed #d1cfc5; border-radius: 8px;">
           <div style="font-size: 1.8rem; margin-bottom: 0.4rem;">🔑</div>
-          <div style="font-size: 0.88rem; font-weight: 600; color: #334155;">暂无已接入的上游供应商后台</div>
-          <div style="font-size: 0.75rem; margin-top: 0.2rem; color: #94a3b8;">
+          <div style="font-size: 0.88rem; font-weight: 600; color: #3d3d3a;">暂无已接入的上游供应商后台</div>
+          <div style="font-size: 0.75rem; margin-top: 0.2rem; color: #9c9a92;">
             点击右上角「➕ 添加新上游」接入各类 New-API / One-API 平台
           </div>
         </div>
@@ -3165,7 +3165,7 @@ async function loadUpstreamPanelsList() {
         ? '<span style="color:#059669;font-weight:700;">♾️ 无限额度</span>'
         : ((p.balanceUSD !== null && p.balanceUSD !== undefined)
           ? `$${Number(p.balanceUSD || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`
-          : '<span style="color:#64748b;font-size:0.75rem;">未开放查额</span>');
+          : '<span style="color:#73726c;font-size:0.75rem;">未开放查额</span>');
 
       const cardStyle = isDead ? 'border-color: #fca5a5; background: #fffaf0;' : '';
       const sub2Badge = isSub2API
@@ -3179,7 +3179,7 @@ async function loadUpstreamPanelsList() {
               <span>${isDead ? '⚠️' : '🌐'}</span>
               <span>${escapeHtml(p.name || '未命名平台')}</span>
               ${sub2Badge}
-              <span style="font-size: 0.72rem; font-weight: normal; color: #64748b; font-family: var(--font-mono);">${escapeHtml(p.backendUrl)}</span>
+              <span style="font-size: 0.72rem; font-weight: normal; color: #73726c; font-family: var(--font-mono);">${escapeHtml(p.backendUrl)}</span>
             </div>
             <div class="upstream-status-badge ${statusClass}" ${isDead ? 'style="background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;font-weight:600;"' : ''}>
               <span>●</span> ${escapeHtml(statusText)}
@@ -3494,7 +3494,7 @@ async function syncBackendChannels() {
 }
 
 // ====== 切号预演（只读） ======
-const AUTO_SWITCH_PREVIEW_ACTIONS = { switch: ['⚡ 将切换', '#b45309'], exhausted: ['🚨 没有能顶上的副调或备选', '#dc2626'], hold: ['✅ 保持', '#16a34a'], skip: ['⏸ 不参与', '#64748b'] };
+const AUTO_SWITCH_PREVIEW_ACTIONS = { switch: ['⚡ 将切换', '#b45309'], exhausted: ['🚨 没有能顶上的副调或备选', '#dc2626'], hold: ['✅ 保持', '#16a34a'], skip: ['⏸ 不参与', '#73726c'] };
 let lastAutoSwitchPreview = null;
 
 async function fetchAutoSwitchPreview() {
@@ -3516,35 +3516,35 @@ function autoSwitchPreviewMetaHtml(data) {
 
 function autoSwitchPreviewGroupsHtml(data, changedIds = new Set()) {
   return (data.groups || []).map(group => {
-    const [label, color] = AUTO_SWITCH_PREVIEW_ACTIONS[group.action] || [group.action, '#334155'];
+    const [label, color] = AUTO_SWITCH_PREVIEW_ACTIONS[group.action] || [group.action, '#3d3d3a'];
     const changed = changedIds.has(String(group.groupId));
     const accounts = group.accounts.map(acc => {
       const tag = acc.isCurrent ? '<span style="color:#2563eb;font-weight:700;">当前</span>' : acc.isTarget ? '<span style="color:#b45309;font-weight:700;">→ 目标</span>'
         : acc.isCoCurrent ? '<span style="color:#2563eb;" title="接单开关开着，Sub2API 会一起给它分配请求">同时在接单</span>'
         : acc.candidate ? `<span style="color:#16a34a;">可以顶上${acc.role === 'alt' ? '（备选）' : acc.role === 'sub' ? '（副调）' : ''}</span>`
-        : acc.role === 'standby' ? '<span style="color:#94a3b8;">备用·关掉</span>' : '<span style="color:#94a3b8;">不可用</span>';
+        : acc.role === 'standby' ? '<span style="color:#9c9a92;">备用·关掉</span>' : '<span style="color:#9c9a92;">不可用</span>';
       const balanceNames = { unknown: '查不到', unlimited: '不限额', empty: '0', pending: '待查询' };
       const bal = acc.balance == null ? (balanceNames[acc.balanceStatus] || acc.balanceStatus || '-') : acc.balance;
-      return `<tr style="border-top:1px solid #f1f5f9;">
+      return `<tr style="border-top:1px solid #f5f4ed;">
         <td style="padding:3px 6px;">${tag}</td>
-        <td style="padding:3px 6px;">${escapeHtml(acc.name || '')} <span style="color:#94a3b8;">#${escapeHtml(acc.id)}</span></td>
+        <td style="padding:3px 6px;">${escapeHtml(acc.name || '')} <span style="color:#9c9a92;">#${escapeHtml(acc.id)}</span></td>
         <td style="padding:3px 6px;" class="mono">${acc.cost ?? '-'}x</td>
         <td style="padding:3px 6px;" class="mono">${escapeHtml(String(bal))}</td>
-        <td style="padding:3px 6px;color:#64748b;">${escapeHtml(acc.notes.join('；') || '正常')}</td>
+        <td style="padding:3px 6px;color:#73726c;">${escapeHtml(acc.notes.join('；') || '正常')}</td>
       </tr>`;
     }).join('');
-    return `<div style="background:${changed ? '#fffbeb' : '#fff'};border:1px solid ${changed ? '#f59e0b' : '#e2e8f0'};border-radius:6px;padding:0.5rem 0.6rem;">
+    return `<div style="background:${changed ? '#fffbeb' : '#fff'};border:1px solid ${changed ? '#f59e0b' : '#e8e6dc'};border-radius:6px;padding:0.5rem 0.6rem;">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;font-size:0.8rem;">
         <b>${escapeHtml(group.groupName || '')}${changed ? ' <span style="color:#b45309;font-size:0.7rem;">· 有变化</span>' : ''}</b>
         <span style="color:${color};font-weight:700;">${label}</span>
       </div>
-      <div style="font-size:0.72rem;color:#475569;margin:0.15rem 0 0.3rem;">原因：${escapeHtml(group.reason || '')}${group.target ? `；${escapeHtml(group.current?.name || '无')} → ${escapeHtml(group.target.name || '')}` : ''}</div>
+      <div style="font-size:0.72rem;color:#5e5d59;margin:0.15rem 0 0.3rem;">原因：${escapeHtml(group.reason || '')}${group.target ? `；${escapeHtml(group.current?.name || '无')} → ${escapeHtml(group.target.name || '')}` : ''}</div>
       <table style="width:100%;font-size:0.7rem;border-collapse:collapse;">
-        <tr style="color:#94a3b8;text-align:left;"><th style="padding:2px 6px;">状态</th><th style="padding:2px 6px;">账号</th><th style="padding:2px 6px;">进价</th><th style="padding:2px 6px;">余额</th><th style="padding:2px 6px;">说明</th></tr>
+        <tr style="color:#9c9a92;text-align:left;"><th style="padding:2px 6px;">状态</th><th style="padding:2px 6px;">账号</th><th style="padding:2px 6px;">进价</th><th style="padding:2px 6px;">余额</th><th style="padding:2px 6px;">说明</th></tr>
         ${accounts}
       </table>
     </div>`;
-  }).join('') || '<div style="padding:1rem;text-align:center;color:#64748b;">没有需要评估的分组</div>';
+  }).join('') || '<div style="padding:1rem;text-align:center;color:#73726c;">没有需要评估的分组</div>';
 }
 
 async function openAutoSwitchPreviewModal() {
@@ -3563,11 +3563,11 @@ async function openAutoSwitchPreviewModal() {
       <div class="modal-dialog" style="max-width: 760px;">
         <div class="dialog-content">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.2rem;">
-            <div style="font-size:1.05rem;font-weight:700;color:#0f172a;">🧭 切号预演（只读）</div>
+            <div style="font-size:1.05rem;font-weight:700;color:#141413;">🧭 切号预演（只读）</div>
             <button type="button" onclick="document.getElementById('autoSwitchPreviewBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
-          <p id="autoSwitchPreviewMeta" style="font-size:0.74rem;color:#64748b;margin:0 0 0.5rem;">${autoSwitchPreviewMetaHtml(data)}</p>
-          <div id="autoSwitchPreviewList" style="display:flex;flex-direction:column;gap:0.45rem;max-height:460px;overflow-y:auto;background:#f8fafc;padding:0.4rem;border:1px solid #e2e8f0;border-radius:6px;">${autoSwitchPreviewGroupsHtml(data)}</div>
+          <p id="autoSwitchPreviewMeta" style="font-size:0.74rem;color:#73726c;margin:0 0 0.5rem;">${autoSwitchPreviewMetaHtml(data)}</p>
+          <div id="autoSwitchPreviewList" style="display:flex;flex-direction:column;gap:0.45rem;max-height:460px;overflow-y:auto;background:#faf9f5;padding:0.4rem;border:1px solid #e8e6dc;border-radius:6px;">${autoSwitchPreviewGroupsHtml(data)}</div>
           <div id="autoSwitchPreviewStatus" style="font-size:0.74rem;margin-top:0.45rem;min-height:1.1em;"></div>
           <div class="dialog-actions" style="margin-top:0.5rem;display:flex;gap:0.5rem;">
             <button id="btnRefreshAutoSwitchPreview" class="btn btn-secondary" style="flex:1;justify-content:center;">重新推演</button>
@@ -3588,7 +3588,7 @@ async function refreshAutoSwitchPreview() {
   if (!btn || !list || !status || btn.disabled) return;
   btn.disabled = true;
   btn.textContent = '推演中…';
-  status.style.color = '#64748b';
+  status.style.color = '#73726c';
   status.textContent = '正在按最新数据重新推演…';
   try {
     const data = await fetchAutoSwitchPreview();
@@ -3637,14 +3637,14 @@ async function openSplitSharedModal() {
   const items = plan.items || [];
   const rows = items.length ? items.map(item => {
     const outcome = (role, serving) => serving ? '主调，接单' : `${ROLE_LABELS_CN[role] || '备用'}，不接单`;
-    const copies = item.copies.map(copy => `<div style="padding-left: 1.4rem; color: #334155;">＋ 新建 <b>${escapeHtml(copy.name)}</b> → 只挂「${escapeHtml(copy.groupName)}」（${outcome(copy.role, copy.schedulable)}）</div>`).join('');
+    const copies = item.copies.map(copy => `<div style="padding-left: 1.4rem; color: #3d3d3a;">＋ 新建 <b>${escapeHtml(copy.name)}</b> → 只挂「${escapeHtml(copy.groupName)}」（${outcome(copy.role, copy.schedulable)}）</div>`).join('');
     const head = item.splittable
-      ? `<label style="display: flex; gap: 0.45rem; align-items: center; cursor: pointer;"><input type="checkbox" class="split-acc-checkbox" value="${escapeHtml(item.accountId)}" checked /> <b>${escapeHtml(item.name)}</b> <span style="color: #64748b;">#${escapeHtml(item.accountId)}</span></label>`
-      : `<div style="display: flex; gap: 0.45rem; align-items: center; color: #94a3b8;"><input type="checkbox" disabled /> <b>${escapeHtml(item.name)}</b> <span>#${escapeHtml(item.accountId)}</span></div>`;
+      ? `<label style="display: flex; gap: 0.45rem; align-items: center; cursor: pointer;"><input type="checkbox" class="split-acc-checkbox" value="${escapeHtml(item.accountId)}" checked /> <b>${escapeHtml(item.name)}</b> <span style="color: #73726c;">#${escapeHtml(item.accountId)}</span></label>`
+      : `<div style="display: flex; gap: 0.45rem; align-items: center; color: #9c9a92;"><input type="checkbox" disabled /> <b>${escapeHtml(item.name)}</b> <span>#${escapeHtml(item.accountId)}</span></div>`;
     const detail = item.splittable
-      ? `<div style="padding-left: 1.4rem; color: #334155;">原账号保留在「${escapeHtml(item.keepGroupName)}」（${outcome(item.keepRole, item.keepSchedulable)}）</div>${copies}`
+      ? `<div style="padding-left: 1.4rem; color: #3d3d3a;">原账号保留在「${escapeHtml(item.keepGroupName)}」（${outcome(item.keepRole, item.keepSchedulable)}）</div>${copies}`
       : `<div style="padding-left: 1.4rem; color: #b45309;">⚠️ ${escapeHtml(item.blockedReason)}</div>`;
-    return `<div style="padding: 0.45rem 0.55rem; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 0.2rem;">${head}${detail}</div>`;
+    return `<div style="padding: 0.45rem 0.55rem; background: #fff; border: 1px solid #e8e6dc; border-radius: 6px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 0.2rem;">${head}${detail}</div>`;
   }).join('') : '<div style="padding: 1rem; text-align: center; color: #16a34a; font-size: 0.8rem;">✅ 当前没有共享账号，每个账号都只属于一个分组。</div>';
 
   const html = `
@@ -3652,16 +3652,16 @@ async function openSplitSharedModal() {
       <div class="modal-dialog" style="max-width: 600px;">
         <div class="dialog-content">
           <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.2rem;">
-            <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a;">🧩 拆分共享账号（一个分组一个账号）</div>
+            <div style="font-size: 1.05rem; font-weight: 700; color: #141413;">🧩 拆分共享账号（一个分组一个账号）</div>
             <button type="button" onclick="document.getElementById('splitSharedModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
-          <p style="font-size: 0.74rem; color: #64748b; margin: 0 0 0.5rem;">
+          <p style="font-size: 0.74rem; color: #73726c; margin: 0 0 0.5rem;">
             共 ${plan.sharedCount || 0} 个共享账号，可拆 ${plan.splittableCount || 0} 个，将新建 ${plan.newAccountCount || 0} 个账号。
             新账号完整复制原账号的 Key、模型映射、倍率、代理、<b>并发上限（照抄原值）</b>；接单开关按它在各分组的角色来：只有主调接单，副调、备选、备用关着（分组里只有它在接单时，拆开后仍接单并当主调）。余额仍是同一个上游钱包。
             ${plan.synced === false ? '<br><span style="color:#dc2626;">⚠️ 未能连接 Sub2API，以下为缓存数据，执行时会再次校验。</span>' : ''}
           </p>
-          <div style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 340px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">${rows}</div>
-          <p style="font-size: 0.7rem; color: #94a3b8; margin: 0.4rem 0 0;">写入在单个事务内执行；若账号分组在预览后被改动，将整体中止、不做任何修改。</p>
+          <div style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 340px; overflow-y: auto; background: #faf9f5; padding: 0.4rem; border: 1px solid #e8e6dc; border-radius: 6px;">${rows}</div>
+          <p style="font-size: 0.7rem; color: #9c9a92; margin: 0.4rem 0 0;">写入在单个事务内执行；若账号分组在预览后被改动，将整体中止、不做任何修改。</p>
           <div class="dialog-actions" style="margin-top: 0.7rem; display: flex; gap: 0.5rem;">
             <button id="btnConfirmSplitShared" class="btn btn-primary" style="flex: 1; justify-content: center; font-weight: 600;" ${plan.splittableCount ? '' : 'disabled'}>确认拆分选中账号</button>
             <button onclick="document.getElementById('splitSharedModalBackdrop').remove()" class="btn btn-secondary">取消</button>
@@ -3723,7 +3723,7 @@ async function loadUpstreamKeys(refresh = false) {
 }
 
 const UPSTREAM_KEY_PANEL_STATUS = {
-  ok: ['✅', '#16a34a'], token_invalid: ['⚠️', '#b45309'], unsupported: ['⏸', '#64748b'], error: ['❌', '#dc2626'], skipped: ['⏸', '#94a3b8']
+  ok: ['✅', '#16a34a'], token_invalid: ['⚠️', '#b45309'], unsupported: ['⏸', '#73726c'], error: ['❌', '#dc2626'], skipped: ['⏸', '#9c9a92']
 };
 
 // 「待接入」只数能接的 Key；一个分组都放不进的（connectable 为 false）另算，不计入数字
@@ -3746,12 +3746,12 @@ function recountUpstreamKeyPanels() {
 
 function upstreamKeysPanelsHtml(data) {
   return (data.panels || []).map(p => {
-    const [icon, color] = UPSTREAM_KEY_PANEL_STATUS[p.status] || ['•', '#334155'];
+    const [icon, color] = UPSTREAM_KEY_PANEL_STATUS[p.status] || ['•', '#3d3d3a'];
     const detail = p.status === 'ok'
       ? `上游共 ${p.total} 个 Key，已接入 ${p.connected} 个${p.pending ? `，<b style="color:#2563eb;">待接入 ${p.pending} 个</b>` : ''}${p.blocked ? `，<span style="color:#b45309;">暂时接不进 ${p.blocked} 个</span>` : ''}`
       : escapeHtml(p.message || '');
-    return `<div style="font-size:0.74rem;color:#334155;"><span style="color:${color};">${icon}</span> <b>${escapeHtml(p.name || p.host)}</b> <span style="color:#94a3b8;">${escapeHtml(p.host || '')}</span> · ${detail}</div>`;
-  }).join('') || '<div style="font-size:0.74rem;color:#64748b;">还没有登记上游供应商。</div>';
+    return `<div style="font-size:0.74rem;color:#3d3d3a;"><span style="color:${color};">${icon}</span> <b>${escapeHtml(p.name || p.host)}</b> <span style="color:#9c9a92;">${escapeHtml(p.host || '')}</span> · ${detail}</div>`;
+  }).join('') || '<div style="font-size:0.74rem;color:#73726c;">还没有登记上游供应商。</div>';
 }
 
 function upstreamKeyRowHtml(item) {
@@ -3770,13 +3770,13 @@ function upstreamKeyRowHtml(item) {
     : `${stuck
         ? '<button type="button" class="btn btn-primary" disabled title="现在接不进，原因见上面的说明" style="font-size:0.74rem;padding:0.25rem 0.7rem;opacity:0.45;cursor:not-allowed;">接入</button>'
         : `<button type="button" class="btn btn-primary" style="font-size:0.74rem;padding:0.25rem 0.7rem;" onclick="connectUpstreamKeyItem('${escapeHtml(item.uid)}', this)">接入</button>`}
-       <button type="button" class="btn btn-secondary" style="font-size:0.74rem;padding:0.25rem 0.6rem;color:#64748b;" title="不接这个 Key，以后不再提示（可以恢复）" onclick="dismissUpstreamKeyItem('${escapeHtml(item.uid)}', false)">删除</button>`;
-  return `<div class="upstream-key-row" data-uid="${escapeHtml(item.uid)}" style="background:${item.dismissed ? '#f8fafc' : '#fff'};border:1px solid #e2e8f0;border-radius:6px;padding:0.5rem 0.6rem;display:flex;flex-direction:column;gap:0.35rem;${item.dismissed ? 'opacity:0.7;' : ''}">
+       <button type="button" class="btn btn-secondary" style="font-size:0.74rem;padding:0.25rem 0.6rem;color:#73726c;" title="不接这个 Key，以后不再提示（可以恢复）" onclick="dismissUpstreamKeyItem('${escapeHtml(item.uid)}', false)">删除</button>`;
+  return `<div class="upstream-key-row" data-uid="${escapeHtml(item.uid)}" style="background:${item.dismissed ? '#faf9f5' : '#fff'};border:1px solid #e8e6dc;border-radius:6px;padding:0.5rem 0.6rem;display:flex;flex-direction:column;gap:0.35rem;${item.dismissed ? 'opacity:0.7;' : ''}">
     <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:baseline;flex-wrap:wrap;">
-      <div style="font-size:0.8rem;"><b>${escapeHtml(item.panelName || item.host)}</b> · ${escapeHtml(item.keyName || '(未命名)')} <span class="mono" style="color:#94a3b8;">${escapeHtml(item.keyTail || '')}</span></div>
-      <div style="font-size:0.72rem;color:#475569;">上游分组「${escapeHtml(g.name || '-')}」· ${escapeHtml(g.platform || '-')} · 进价 <b class="mono">${g.rate ?? '?'}x</b></div>
+      <div style="font-size:0.8rem;"><b>${escapeHtml(item.panelName || item.host)}</b> · ${escapeHtml(item.keyName || '(未命名)')} <span class="mono" style="color:#9c9a92;">${escapeHtml(item.keyTail || '')}</span></div>
+      <div style="font-size:0.72rem;color:#5e5d59;">上游分组「${escapeHtml(g.name || '-')}」· ${escapeHtml(g.platform || '-')} · 进价 <b class="mono">${g.rate ?? '?'}x</b></div>
     </div>
-    <div style="font-size:0.7rem;color:#94a3b8;">${created ? `${created} 创建` : ''}${used}</div>
+    <div style="font-size:0.7rem;color:#9c9a92;">${created ? `${created} 创建` : ''}${used}</div>
     ${stuck ? `<div class="upstream-key-problem" style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:6px;padding:0.35rem 0.5rem;font-size:0.74rem;line-height:1.55;">⚠️ 现在接不进：${escapeHtml(item.problem || '本站没有能放这把 Key 的分组。')}</div>` : ''}
     ${item.dismissed || stuck ? '' : `<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;">
       <select class="form-input upstream-key-group" style="flex:2;min-width:220px;font-size:0.76rem;">
@@ -3801,9 +3801,9 @@ function renderUpstreamKeysModal() {
   if (panelsBox) panelsBox.innerHTML = upstreamKeysPanelsHtml(upstreamKeysData);
   if (meta) meta.textContent = upstreamKeysData.checkedAt ? `上次检查：${new Date(upstreamKeysData.checkedAt).toLocaleString()}` : '';
   const shown = upstreamKeysShowDismissed ? [...active, ...dismissed] : active;
-  box.innerHTML = (stuckCount > 0 ? `<div style="font-size:0.74rem;color:#64748b;">${connectableCount ? `${connectableCount} 把可以接入` : '现在没有能接入的 Key'}；${stuckCount} 把暂时接不进，原因和办法写在各自的卡片上。</div>` : '')
+  box.innerHTML = (stuckCount > 0 ? `<div style="font-size:0.74rem;color:#73726c;">${connectableCount ? `${connectableCount} 把可以接入` : '现在没有能接入的 Key'}；${stuckCount} 把暂时接不进，原因和办法写在各自的卡片上。</div>` : '')
     + (shown.length ? shown.map(upstreamKeyRowHtml).join('') : '<div style="padding:1rem;text-align:center;color:#16a34a;font-size:0.8rem;">✅ 没有待接入的新 Key。</div>')
-    + (dismissed.length ? `<div style="text-align:center;font-size:0.72rem;color:#64748b;"><a href="#" onclick="toggleDismissedUpstreamKeys(event)">${upstreamKeysShowDismissed ? '收起已删除的' : `已删除 ${dismissed.length} 个 · 显示`}</a></div>` : '');
+    + (dismissed.length ? `<div style="text-align:center;font-size:0.72rem;color:#73726c;"><a href="#" onclick="toggleDismissedUpstreamKeys(event)">${upstreamKeysShowDismissed ? '收起已删除的' : `已删除 ${dismissed.length} 个 · 显示`}</a></div>` : '');
 }
 
 async function openUpstreamKeysModal() {
@@ -3814,17 +3814,17 @@ async function openUpstreamKeysModal() {
       <div class="modal-dialog" style="max-width: 760px;">
         <div class="dialog-content">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.2rem;">
-            <div style="font-size:1.05rem;font-weight:700;color:#0f172a;">🆕 接入上游新 Key</div>
+            <div style="font-size:1.05rem;font-weight:700;color:#141413;">🆕 接入上游新 Key</div>
             <button type="button" onclick="document.getElementById('upstreamKeysModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
-          <p style="font-size:0.74rem;color:#64748b;margin:0 0 0.5rem;line-height:1.55;">
+          <p style="font-size:0.74rem;color:#73726c;margin:0 0 0.5rem;line-height:1.55;">
             你在上游网站（Sub2API 搭的站）新建的 Key 会自动出现在这里，塔台每 10 分钟检查一次。选好放进本站哪个分组，点「接入」：
             塔台照着这家上游已有的账号，在 Sub2API 里新建一个账号，只换 Key、名称和进价。分组里已有账号时，新账号先当备用（关着，不接单，要用时在分组里改成主调、副调或备选）；空分组直接当主调。进价不低于分组售价的不能接；接不进的 Key，卡片上会写明原因和怎么办。
           </p>
-          <div id="upstreamKeysPanels" style="display:flex;flex-direction:column;gap:0.2rem;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:0.45rem 0.6rem;margin-bottom:0.5rem;">正在读取…</div>
+          <div id="upstreamKeysPanels" style="display:flex;flex-direction:column;gap:0.2rem;background:#faf9f5;border:1px solid #e8e6dc;border-radius:6px;padding:0.45rem 0.6rem;margin-bottom:0.5rem;">正在读取…</div>
           <div id="upstreamKeysList" style="display:flex;flex-direction:column;gap:0.45rem;max-height:420px;overflow-y:auto;"></div>
           <div style="margin-top:0.6rem;display:flex;justify-content:space-between;align-items:center;gap:0.5rem;">
-            <span id="upstreamKeysMeta" style="font-size:0.72rem;color:#94a3b8;"></span>
+            <span id="upstreamKeysMeta" style="font-size:0.72rem;color:#9c9a92;"></span>
             <div style="display:flex;gap:0.5rem;white-space:nowrap;">
               <button id="btnRefreshUpstreamKeys" type="button" class="btn btn-secondary" title="马上去各家上游重新读取 Key 列表">⟳ 重新检查</button>
               <button type="button" onclick="document.getElementById('upstreamKeysModalBackdrop').remove()" class="btn btn-primary">关闭</button>
@@ -4646,10 +4646,10 @@ function openChannelGroupsModal(channelId) {
     const isLoss = spread < 0;
 
     return `
-      <label class="group-checkbox-row ${isChecked ? 'is-selected' : ''}" style="display: flex; align-items: center; justify-content: space-between; padding: 0.45rem 0.65rem; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; cursor: pointer; transition: all 0.15s;">
+      <label class="group-checkbox-row ${isChecked ? 'is-selected' : ''}" style="display: flex; align-items: center; justify-content: space-between; padding: 0.45rem 0.65rem; background: #ffffff; border: 1px solid #e8e6dc; border-radius: 6px; cursor: pointer; transition: all 0.15s;">
         <div style="display: flex; align-items: center; gap: 0.5rem;">
           <input type="checkbox" value="${g.id}" class="channel-group-checkbox" ${isChecked ? 'checked' : ''} onchange="this.closest('label').classList.toggle('is-selected', this.checked)" />
-          <span style="font-size: 0.82rem; font-weight: 600; color: #1e293b;">${g.name}</span>
+          <span style="font-size: 0.82rem; font-weight: 600; color: #262624;">${g.name}</span>
         </div>
         <div style="display: flex; align-items: center; gap: 0.4rem;">
           <span class="mono" style="font-size: 0.75rem; color: #2563eb; font-weight: 600;">售 ${formatRate(saleRate)}x</span>
@@ -4719,13 +4719,13 @@ function switchGroupConsoleTab(mode) {
   if (mode === 'existing') {
     if (tabExisting) {
       tabExisting.style.background = '#ffffff';
-      tabExisting.style.color = '#0f172a';
+      tabExisting.style.color = '#141413';
       tabExisting.style.fontWeight = '700';
       tabExisting.style.boxShadow = '0 1px 2px rgba(0,0,0,0.05)';
     }
     if (tabNew) {
       tabNew.style.background = 'transparent';
-      tabNew.style.color = '#64748b';
+      tabNew.style.color = '#73726c';
       tabNew.style.fontWeight = '600';
       tabNew.style.boxShadow = 'none';
     }
@@ -4737,13 +4737,13 @@ function switchGroupConsoleTab(mode) {
   } else {
     if (tabNew) {
       tabNew.style.background = '#ffffff';
-      tabNew.style.color = '#0f172a';
+      tabNew.style.color = '#141413';
       tabNew.style.fontWeight = '700';
       tabNew.style.boxShadow = '0 1px 2px rgba(0,0,0,0.05)';
     }
     if (tabExisting) {
       tabExisting.style.background = 'transparent';
-      tabExisting.style.color = '#64748b';
+      tabExisting.style.color = '#73726c';
       tabExisting.style.fontWeight = '600';
       tabExisting.style.boxShadow = 'none';
     }
@@ -4862,8 +4862,8 @@ function updateNewGroupSelectedCount() {
       }
     } else {
       if (label) {
-        label.style.background = '#f8fafc';
-        label.style.borderColor = '#e2e8f0';
+        label.style.background = '#faf9f5';
+        label.style.borderColor = '#e8e6dc';
       }
     }
   });
@@ -4876,7 +4876,7 @@ function renderNewGroupChannelSelector() {
   if (!container) return;
   const list = (typeof channelsData !== 'undefined' && Array.isArray(channelsData)) ? channelsData : [];
   if (!list || list.length === 0) {
-    container.innerHTML = `<span style="color: #94a3b8; font-size: 0.75rem; grid-column: 1/-1;">暂无通道数据</span>`;
+    container.innerHTML = `<span style="color: #9c9a92; font-size: 0.75rem; grid-column: 1/-1;">暂无通道数据</span>`;
     updateNewGroupSelectedCount();
     return;
   }
@@ -4895,7 +4895,7 @@ function renderNewGroupChannelSelector() {
   });
 
   if (filteredList.length === 0) {
-    container.innerHTML = `<span style="color: #94a3b8; font-size: 0.75rem; grid-column: 1/-1; text-align: center; padding: 0.6rem;">当前筛选条件下暂无通道</span>`;
+    container.innerHTML = `<span style="color: #9c9a92; font-size: 0.75rem; grid-column: 1/-1; text-align: center; padding: 0.6rem;">当前筛选条件下暂无通道</span>`;
     updateNewGroupSelectedCount();
     return;
   }
@@ -4913,24 +4913,24 @@ function renderNewGroupChannelSelector() {
       : (isLow ? `<span style="font-size: 0.62rem; color: #e11d48; background: #ffe4e6; border: 1px solid #fda4af; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 告急</span>` : '');
     const hasGroup = (c.groupsDetail && c.groupsDetail.length > 0) || (c.groups && c.groups.length > 0 && !c.groups.includes('未分配分组'));
     const groupBadge = hasGroup 
-      ? `<span style="font-size: 0.62rem; color: #475569; background: #e2e8f0; padding: 0 4px; border-radius: 3px;">已有组</span>`
+      ? `<span style="font-size: 0.62rem; color: #5e5d59; background: #e8e6dc; padding: 0 4px; border-radius: 3px;">已有组</span>`
       : `<span style="font-size: 0.62rem; color: #d97706; background: #fef3c7; padding: 0 4px; border-radius: 3px; font-weight: bold;">待分配</span>`;
     const isChecked = currentlyChecked.has(String(c.id));
-    const rowBg = isOut ? '#fff5f5' : (isLow ? '#fffafb' : (isChecked ? '#eff6ff' : '#f8fafc'));
-    const rowBorder = isOut ? '#fca5a5' : (isLow ? '#fecdd3' : (isChecked ? '#93c5fd' : '#e2e8f0'));
+    const rowBg = isOut ? '#fff5f5' : (isLow ? '#fffafb' : (isChecked ? '#eff6ff' : '#faf9f5'));
+    const rowBorder = isOut ? '#fca5a5' : (isLow ? '#fecdd3' : (isChecked ? '#93c5fd' : '#e8e6dc'));
 
     return `
       <label style="display: flex; align-items: center; gap: 0.35rem; background: ${rowBg}; border: 1px solid ${rowBorder}; border-radius: 4px; padding: 0.3rem 0.45rem; cursor: pointer; font-size: 0.74rem; user-select: none;">
         <input type="checkbox" name="newGroupChannel" value="${c.id}" ${isChecked ? 'checked' : ''} onchange="updateNewGroupSelectedCount()" style="cursor: pointer;" />
         <div style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
           <div style="display: flex; justify-content: space-between; align-items: center;">
-            <strong style="color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${c.name}</strong>
+            <strong style="color: #262624; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${c.name}</strong>
             <div style="display: flex; gap: 0.25rem; align-items: center;">
               ${balTag}
               ${groupBadge}
             </div>
           </div>
-          <div style="font-size: 0.68rem; color: #64748b; display: flex; gap: 0.35rem;">
+          <div style="font-size: 0.68rem; color: #73726c; display: flex; gap: 0.35rem;">
             <span>进价: ${cost}x</span>
             <span style="color: ${balColor}; font-weight: ${isOut || isLow ? '700' : 'normal'};">余额: ${balText}</span>
           </div>
@@ -4948,7 +4948,7 @@ function closeAllGroupsModal() {
 async function loadAllGroupsDetails() {
   const container = document.getElementById('allGroupsCardsContainer');
   if (!container) return;
-  container.innerHTML = `<div style="text-align: center; padding: 1.5rem; color: #64748b; font-size: 0.8rem;">正在从 Sub2API 数据库拉取各分组详情...</div>`;
+  container.innerHTML = `<div style="text-align: center; padding: 1.5rem; color: #73726c; font-size: 0.8rem;">正在从 Sub2API 数据库拉取各分组详情...</div>`;
 
   try {
     const res = await fetch('/api/groups/details');
@@ -4970,7 +4970,7 @@ function renderAllGroupsCards(groupsList) {
   if (countBadge) countBadge.textContent = `${(groupsList || []).length} 个`;
 
   if (!groupsList || groupsList.length === 0) {
-    container.innerHTML = `<div style="text-align: center; padding: 1.5rem; color: #64748b; font-size: 0.8rem;">暂无业务分组</div>`;
+    container.innerHTML = `<div style="text-align: center; padding: 1.5rem; color: #73726c; font-size: 0.8rem;">暂无业务分组</div>`;
     return;
   }
 
@@ -4978,18 +4978,18 @@ function renderAllGroupsCards(groupsList) {
     const accs = g.accounts || [];
     const accTags = accs.length > 0 
       ? accs.map(a => `<span class="group-acc-pill ${a.schedulable ? 'schedulable' : ''}">${a.name} (${formatRate(a.multiplier || 1)}x)</span>`).join('')
-      : `<span style="font-size: 0.72rem; color: #94a3b8; font-style: italic;">暂无关联上游渠道</span>`;
+      : `<span style="font-size: 0.72rem; color: #9c9a92; font-style: italic;">暂无关联上游渠道</span>`;
 
     return `
       <div class="all-group-card" data-group-id="${g.id}">
         <div style="display: flex; justify-content: space-between; align-items: center;">
           <div style="display: flex; align-items: center; gap: 0.45rem;">
             <span class="mono-badge">#${g.id}</span>
-            <strong style="font-size: 0.88rem; color: #1e293b;">${g.name}</strong>
+            <strong style="font-size: 0.88rem; color: #262624;">${g.name}</strong>
             <span class="group-platform-tag">${g.platform || 'openai'}</span>
           </div>
           <div style="display: flex; align-items: center; gap: 0.35rem;">
-            <span style="font-size: 0.75rem; color: #64748b;">售价倍率:</span>
+            <span style="font-size: 0.75rem; color: #73726c;">售价倍率:</span>
             <input type="number" step="0.0001" min="0.0001" max="100" value="${formatRate(g.sale_rate || 1.0)}" class="form-input mono input-group-sale-rate" style="width: 86px; font-size: 0.8rem; text-align: center; padding: 0.15rem 0.3rem;" />
             <button class="btn btn-secondary" onclick="saveGroupRateFromInput('${g.id}', this)" style="font-size: 0.72rem; padding: 0.2rem 0.45rem;" title="保存新倍率到生产环境">
               保存
@@ -5000,9 +5000,9 @@ function renderAllGroupsCards(groupsList) {
           </div>
         </div>
 
-        <div style="margin-top: 0.45rem; padding-top: 0.45rem; border-top: 1px dashed #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
+        <div style="margin-top: 0.45rem; padding-top: 0.45rem; border-top: 1px dashed #e8e6dc; display: flex; justify-content: space-between; align-items: center;">
           <div style="display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; flex: 1;">
-            <span style="font-size: 0.72rem; color: #64748b; margin-right: 0.2rem;">承接上游 (${accs.length}):</span>
+            <span style="font-size: 0.72rem; color: #73726c; margin-right: 0.2rem;">承接上游 (${accs.length}):</span>
             ${accTags}
           </div>
           <button class="btn btn-glass" onclick="openAssignAccountsModal('${g.id}', '${g.name}')" style="font-size: 0.72rem; padding: 0.18rem 0.5rem; white-space: nowrap; margin-left: 0.5rem;">
@@ -5190,17 +5190,17 @@ function openAssignAccountsModal(groupId, groupName) {
       ? `<span style="font-size: 0.62rem; color: #dc2626; background: #fee2e2; border: 1px solid #f87171; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 欠费</span>`
       : (isLow ? `<span style="font-size: 0.62rem; color: #e11d48; background: #ffe4e6; border: 1px solid #fda4af; padding: 0 4px; border-radius: 3px; font-weight: 700;">⚠️ 告急</span>` : '');
     const rowBg = isOut ? '#fff5f5' : (isLow ? '#fffafb' : '#ffffff');
-    const rowBorder = isOut ? '#fca5a5' : (isLow ? '#fecdd3' : '#e2e8f0');
+    const rowBorder = isOut ? '#fca5a5' : (isLow ? '#fecdd3' : '#e8e6dc');
 
     return `
       <label class="assign-acc-row" data-name="${(ch.name || '').toLowerCase()}" style="display: flex; align-items: center; justify-content: space-between; padding: 0.35rem 0.6rem; background: ${rowBg}; border: 1px solid ${rowBorder}; border-radius: 5px; cursor: pointer; user-select: none;">
         <div style="display: flex; align-items: center; gap: 0.45rem; flex: 1; overflow: hidden;">
           <input type="checkbox" value="${ch.id}" class="assign-acc-checkbox" ${isChecked ? 'checked' : ''} style="cursor: pointer;" />
-          <span style="font-size: 0.8rem; font-weight: 600; color: #1e293b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${ch.name}</span>
+          <span style="font-size: 0.8rem; font-weight: 600; color: #262624; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${ch.name}</span>
           ${balTag}
         </div>
         <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.72rem;">
-          <span class="mono" style="color: #64748b;">进价: ${cost}x</span>
+          <span class="mono" style="color: #73726c;">进价: ${cost}x</span>
           <span style="color: ${balColor}; font-weight: ${isOut || isLow ? '700' : 'normal'};">余额: ${balText}</span>
         </div>
       </label>
@@ -5212,10 +5212,10 @@ function openAssignAccountsModal(groupId, groupName) {
       <div class="modal-dialog" style="max-width: 520px;">
         <div class="dialog-content">
           <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.2rem;">
-            <div style="font-size: 1.05rem; font-weight: 700; color: #0f172a;">为分组 [${groupName}] 分配上游渠道</div>
+            <div style="font-size: 1.05rem; font-weight: 700; color: #141413;">为分组 [${groupName}] 分配上游渠道</div>
             <button type="button" onclick="document.getElementById('assignAccountsModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
           </div>
-          <p style="font-size: 0.75rem; color: #64748b; margin-bottom: 0.5rem;">勾选所有归属于此业务销售分组的上游渠道（共 ${list.length} 个通道可选）：</p>
+          <p style="font-size: 0.75rem; color: #73726c; margin-bottom: 0.5rem;">勾选所有归属于此业务销售分组的上游渠道（共 ${list.length} 个通道可选）：</p>
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; gap: 0.4rem;">
             <input type="text" id="filterAssignAccsInput" placeholder="🔍 快速搜索渠道名称..." class="form-input" style="font-size: 0.76rem; padding: 0.2rem 0.5rem; flex: 1;" />
             <div style="display: flex; gap: 0.35rem;">
@@ -5223,7 +5223,7 @@ function openAssignAccountsModal(groupId, groupName) {
               <button type="button" id="btnClearAllAssignAccs" class="btn btn-secondary" style="font-size: 0.68rem; padding: 1px 7px; height: 22px;">清空</button>
             </div>
           </div>
-          <div id="assignAccountsContainer" style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 280px; overflow-y: auto; background: #f8fafc; padding: 0.4rem; border: 1px solid #e2e8f0; border-radius: 6px;">
+          <div id="assignAccountsContainer" style="display: flex; flex-direction: column; gap: 0.35rem; max-height: 280px; overflow-y: auto; background: #faf9f5; padding: 0.4rem; border: 1px solid #e8e6dc; border-radius: 6px;">
             ${accountRowsHtml}
           </div>
           <div class="dialog-actions" style="margin-top: 0.8rem; display: flex; gap: 0.5rem;">
@@ -5565,7 +5565,7 @@ function renderOrchestrateSelectsAndCheckboxes(group, eligible, currentAssigned,
       : channelPool;
 
     if (displayPool.length === 0) {
-      listContainer.innerHTML = `<div style="text-align: center; color: #94a3b8; font-size: 0.78rem; padding: 1rem;">暂无匹配的通道数据</div>`;
+      listContainer.innerHTML = `<div style="text-align: center; color: #9c9a92; font-size: 0.78rem; padding: 1rem;">暂无匹配的通道数据</div>`;
     } else {
       listContainer.innerHTML = displayPool.map(c => {
         const isChecked = existingChecked.size > 0
@@ -5640,7 +5640,7 @@ function updateOrchestrateRoleTags() {
       if (cb.checked) {
         tag.innerHTML = `<span class="role-badge-standby">⚪ 备用</span>`;
       } else {
-        tag.innerHTML = `<span style="font-size: 0.68rem; color: #94a3b8;">未纳管</span>`;
+        tag.innerHTML = `<span style="font-size: 0.68rem; color: #9c9a92;">未纳管</span>`;
       }
     }
   });
@@ -6283,7 +6283,7 @@ function renderModalModelsTable(channel) {
   }
 
   if (filtered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; padding: 2.5rem; color: #94a3b8;">
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; padding: 2.5rem; color: #9c9a92;">
       ${allModels.length === 0 ? '该渠道暂无支持的模型列表，可点击右上角「同步上游模型」从上游探测拉取。' : '暂无符合筛选条件的模型。可清空搜索词，或点击「➕ 添加模型」手动补充。'}
     </td></tr>`;
     return;
@@ -6298,13 +6298,13 @@ function renderModalModelsTable(channel) {
     if (m.avgTtftMs) {
       ttftDisplay = `${m.avgTtftMs} ms`;
       if (m.minTtftMs && m.maxTtftMs) {
-        ttftSub = `<span style="font-size: 0.68rem; color: #94a3b8; display: block;">${m.minTtftMs}ms ~ ${(m.maxTtftMs / 1000).toFixed(1)}s</span>`;
+        ttftSub = `<span style="font-size: 0.68rem; color: #9c9a92; display: block;">${m.minTtftMs}ms ~ ${(m.maxTtftMs / 1000).toFixed(1)}s</span>`;
       }
     }
 
-    let liveHtml = '<span style="color: #94a3b8; font-size: 0.78rem;">未实测</span>';
+    let liveHtml = '<span style="color: #9c9a92; font-size: 0.78rem;">未实测</span>';
     if (m.liveTtftMs !== undefined && m.liveTtftMs !== null) {
-      liveHtml = `<span class="live-ttft-pill success" title="极简单 Token 实测首字时间">🟢 ${m.liveTtftMs}ms</span><span style="font-size: 0.68rem; color: #64748b; display: block;">${formatTime(m.liveTestedAt)}</span>`;
+      liveHtml = `<span class="live-ttft-pill success" title="极简单 Token 实测首字时间">🟢 ${m.liveTtftMs}ms</span><span style="font-size: 0.68rem; color: #73726c; display: block;">${formatTime(m.liveTestedAt)}</span>`;
     } else if (m.liveError) {
       liveHtml = `<span class="live-ttft-pill error" title="${escapeHtml(m.liveError)}">❌ 失败</span><span style="font-size: 0.68rem; color: #ef4444; display: block;">${escapeHtml((m.liveError || '').slice(0, 18))}</span>`;
     }
@@ -6378,7 +6378,7 @@ function renderModalModelsTable(channel) {
 
     return `
       <tr class="${m.enabled ? 'row-model-enabled' : 'row-model-disabled'}">
-        <td style="font-family: var(--font-mono); font-weight: 700; color: #0f172a; font-size: 0.85rem;">
+        <td style="font-family: var(--font-mono); font-weight: 700; color: #141413; font-size: 0.85rem;">
           <div style="display: flex; align-items: center; flex-wrap: wrap;">
             <span>${escapeHtml(m.model)}</span>
             ${sourceBadges}
@@ -6388,10 +6388,10 @@ function renderModalModelsTable(channel) {
           ${switchHtml}
         </td>
         <td style="text-align: center;">
-          <div style="font-size: 0.78rem; font-weight: 600; color: #334155;">${m.totalCalls} 次</div>
+          <div style="font-size: 0.78rem; font-weight: 600; color: #3d3d3a;">${m.totalCalls} 次</div>
           <span class="stab-rate-pill ${rateClass}" style="font-size: 0.7rem; padding: 0.1rem 0.35rem;">${rateText}</span>
         </td>
-        <td style="text-align: center; font-family: var(--font-mono); font-weight: 600; color: #0f172a; font-size: 0.82rem;">
+        <td style="text-align: center; font-family: var(--font-mono); font-weight: 600; color: #141413; font-size: 0.82rem;">
           ${ttftDisplay}
           ${ttftSub}
         </td>
@@ -6752,7 +6752,7 @@ async function probeModel(channelId, modelName) {
       if (liveCell) {
         liveCell.innerHTML = `
           <span class="live-ttft-pill success" title="实测首字生成时间">🟢 ${data.result.ttftMs}ms</span>
-          <span style="font-size: 0.68rem; color: #64748b; display: block;">刚刚实测</span>
+          <span style="font-size: 0.68rem; color: #73726c; display: block;">刚刚实测</span>
         `;
       }
       if (ch && ch.modelsStability) {
@@ -6978,7 +6978,7 @@ function renderAutoSwitchCoverage(data) {
   const name = group => escapeHtml(group.groupName || '');
   const line = (icon, color, count, title, detail) => count ? `<div style="margin-top:0.3rem;">
       <span style="color:${color};font-weight:700;">${icon} ${count} 个分组${title}</span>
-      <div style="color:#64748b;font-size:0.74rem;margin-left:1.35rem;">${detail}</div>
+      <div style="color:#73726c;font-size:0.74rem;margin-left:1.35rem;">${detail}</div>
     </div>` : '';
   const { covered, exposed, manual, urgent } = summarizeAutoSwitchCoverage(data);
   const hints = [];
@@ -6986,15 +6986,15 @@ function renderAutoSwitchCoverage(data) {
   if (exposed.some(item => item.shared)) hints.push('共享账号不能当替补，可以点 <button type="button" class="btn-micro-edit" onclick="openSplitSharedModal()">🧩 拆分共享账号</button> 拆开。');
   box.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;">
-      <strong style="color:#0f172a;">🛡️ 各分组的保护情况</strong>
-      <span style="font-size:0.7rem;color:#94a3b8;">${escapeHtml(new Date(data.generatedAt).toLocaleTimeString())} 检查</span>
+      <strong style="color:#141413;">🛡️ 各分组的保护情况</strong>
+      <span style="font-size:0.7rem;color:#9c9a92;">${escapeHtml(new Date(data.generatedAt).toLocaleTimeString())} 检查</span>
     </div>
     ${data.enabled ? `
       ${line('🚨', '#dc2626', urgent.length, '当前账号出了问题，而且没有副调或备选可切，请尽快充值或补充账号', urgent.map(name).join('、'))}
       ${line('✅', '#16a34a', covered.length, '有能顶上的副调或备选，出问题会自动切换', covered.map(item => `${name(item.group)}（${item.backups} 个能顶上）`).join('、'))}
       ${line('⚠️', '#b45309', exposed.length, '没有能顶上的副调或备选，出问题时无法自动切换', exposed.map(item => `${name(item.group)}（${escapeHtml(item.why)}）`).join('、'))}
-      ${line('⏸', '#64748b', manual.length, '由你人工管理，不自动切换', manual.map(group => `${name(group)}（${escapeHtml(String(group.reason || '').split('，')[0])}）`).join('、'))}
-      ${hints.length ? `<div style="margin-top:0.45rem;padding-top:0.4rem;border-top:1px dashed #cbd5e1;color:#475569;font-size:0.74rem;">💡 ${hints.join('')}</div>` : ''}`
+      ${line('⏸', '#73726c', manual.length, '由你人工管理，不自动切换', manual.map(group => `${name(group)}（${escapeHtml(String(group.reason || '').split('，')[0])}）`).join('、'))}
+      ${hints.length ? `<div style="margin-top:0.45rem;padding-top:0.4rem;border-top:1px dashed #d1cfc5;color:#5e5d59;font-size:0.74rem;">💡 ${hints.join('')}</div>` : ''}`
     : '<div style="color:#dc2626;font-weight:700;margin-top:0.3rem;">⏸ 自动切号总开关目前是关闭的，所有分组都不会自动切换。</div>'}
     <div style="margin-top:0.5rem;"><button type="button" class="btn-micro-edit" onclick="openAutoSwitchPreviewModal()">🧭 查看每个分组的详情（切号预演）</button></div>`;
 }
@@ -7002,7 +7002,7 @@ function renderAutoSwitchCoverage(data) {
 async function loadAutoSwitchCoverage() {
   const box = document.getElementById('autoSwitchCoverage');
   if (!box) return;
-  box.innerHTML = '<span style="color:#64748b;">正在检查各分组的保护情况…</span>';
+  box.innerHTML = '<span style="color:#73726c;">正在检查各分组的保护情况…</span>';
   try {
     renderAutoSwitchCoverage(await fetchAutoSwitchPreview());
   } catch (err) {
@@ -7125,7 +7125,7 @@ async function loadAutoSwitchLogs() {
     const res = await fetch('/api/auto-switch/logs');
     const data = await res.json();
     if (!data.success || !data.logs || data.logs.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #94a3b8; padding: 1.25rem 0.5rem;">暂无自动切线流水记录</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #9c9a92; padding: 1.25rem 0.5rem;">暂无自动切线流水记录</td></tr>';
       return;
     }
 
@@ -7160,21 +7160,21 @@ async function loadAutoSwitchLogs() {
 
       return `
         <tr>
-          <td style="font-size: 0.73rem; color: #64748b; white-space: nowrap;">
-            <div style="font-family: var(--font-mono); font-size: 0.7rem; color: #64748b;">📅 ${escapeHtml(dateStr)}</div>
-            <div style="font-family: var(--font-mono); font-weight: 700; color: #1e293b;">${escapeHtml(timeStr)}</div>
+          <td style="font-size: 0.73rem; color: #73726c; white-space: nowrap;">
+            <div style="font-family: var(--font-mono); font-size: 0.7rem; color: #73726c;">📅 ${escapeHtml(dateStr)}</div>
+            <div style="font-family: var(--font-mono); font-weight: 700; color: #262624;">${escapeHtml(timeStr)}</div>
           </td>
           <td>
             <div style="display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.2rem; flex-wrap: wrap;">
               <span class="as-tag ${badgeClass}">${tagText}</span>
               ${priceTagHtml}
-              <span style="font-size: 0.78rem; font-weight: 600; color: #1e293b;">${escapeHtml(log.fromName)} ➔ ${escapeHtml(log.toName)}</span>
+              <span style="font-size: 0.78rem; font-weight: 600; color: #262624;">${escapeHtml(log.fromName)} ➔ ${escapeHtml(log.toName)}</span>
             </div>
-            <div style="font-size: 0.72rem; color: #64748b; line-height: 1.35;">${escapeHtml(log.reason || '')}</div>
+            <div style="font-size: 0.72rem; color: #73726c; line-height: 1.35;">${escapeHtml(log.reason || '')}</div>
           </td>
           <td style="text-align: center; font-size: 0.75rem;">
-            <div style="font-weight: 600; color: #475569;">${escapeHtml(log.fromName)}</div>
-            <div class="mono" style="color: #64748b; font-size: 0.72rem;">${log.oldCost !== undefined ? log.oldCost + 'x' : '--'}</div>
+            <div style="font-weight: 600; color: #5e5d59;">${escapeHtml(log.fromName)}</div>
+            <div class="mono" style="color: #73726c; font-size: 0.72rem;">${log.oldCost !== undefined ? log.oldCost + 'x' : '--'}</div>
             ${log.oldTtft ? `<div class="mono" style="color: #ef4444; font-size: 0.7rem;">${log.oldTtft}ms</div>` : ''}
           </td>
           <td style="text-align: center; font-size: 0.75rem;">
@@ -7621,7 +7621,7 @@ function renderFinancialOverview(summary, dailyTrends) {
   if (!tbody) return;
 
   if (!dailyTrends || dailyTrends.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding: 1rem; color: #94a3b8;">暂无历史趋势数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding: 1rem; color: #9c9a92;">暂无历史趋势数据</td></tr>';
     return;
   }
 
@@ -7654,7 +7654,7 @@ function renderFinancialOverview(summary, dailyTrends) {
         <span style="font-size: 0.65rem; color: #dc2626; font-weight: 600;">透支存量</span>
       </div>`;
     } else {
-      diffDisplay = `<span class="mono" style="color: #94a3b8;">¥0.00</span>`;
+      diffDisplay = `<span class="mono" style="color: #9c9a92;">¥0.00</span>`;
     }
 
     let profitDisplay = '';
@@ -7663,29 +7663,29 @@ function renderFinancialOverview(summary, dailyTrends) {
     } else if (profit < 0) {
       profitDisplay = `<strong class="mono" style="color: #dc2626; font-weight: 700;">-¥${Math.abs(profit).toFixed(2)}</strong>`;
     } else {
-      profitDisplay = `<span class="mono" style="color: #cbd5e1;">-</span>`;
+      profitDisplay = `<span class="mono" style="color: #d1cfc5;">-</span>`;
     }
 
     return `
       <tr>
-        <td style="font-weight: 600; color: #334155; white-space: nowrap;">
+        <td style="font-weight: 600; color: #3d3d3a; white-space: nowrap;">
           ${escapeHtml(item.date)}
         </td>
         <td style="text-align: right;">
           ${recharge > 0 
             ? `<strong class="mono" style="color: #059669; font-weight: 700;">¥ ${recharge.toFixed(2)}</strong>
-               ${item.rechargeCount > 0 ? `<span style="font-size: 0.7rem; color: #64748b; margin-left: 2px;">(${item.rechargeCount}笔)</span>` : ''}`
-            : `<span class="mono" style="color: #cbd5e1;">-</span>`}
+               ${item.rechargeCount > 0 ? `<span style="font-size: 0.7rem; color: #73726c; margin-left: 2px;">(${item.rechargeCount}笔)</span>` : ''}`
+            : `<span class="mono" style="color: #d1cfc5;">-</span>`}
         </td>
         <td style="text-align: right;">
           ${spent > 0 
             ? `<strong class="mono" style="color: #2563eb; font-weight: 700;">¥ ${spent.toFixed(2)}</strong>` 
-            : `<span class="mono" style="color: #cbd5e1;">-</span>`}
+            : `<span class="mono" style="color: #d1cfc5;">-</span>`}
         </td>
         <td style="text-align: right;">
           ${cost > 0 
-            ? `<span class="mono" style="color: #64748b; font-weight: 600;">¥ ${cost.toFixed(2)}</span>` 
-            : `<span class="mono" style="color: #cbd5e1;">-</span>`}
+            ? `<span class="mono" style="color: #73726c; font-weight: 600;">¥ ${cost.toFixed(2)}</span>` 
+            : `<span class="mono" style="color: #d1cfc5;">-</span>`}
         </td>
         <td style="text-align: right;">
           ${profitDisplay}
@@ -7708,10 +7708,10 @@ function renderFinancialOverview(summary, dailyTrends) {
           ${diffDisplay}
         </td>
         <td style="text-align: center;" class="mono">
-          ${item.requestsCustomers > 0 ? `<span style="color: #475569; font-weight: 600;">${item.requestsCustomers}</span>` : '<span style="color: #cbd5e1;">0</span>'}
+          ${item.requestsCustomers > 0 ? `<span style="color: #5e5d59; font-weight: 600;">${item.requestsCustomers}</span>` : '<span style="color: #d1cfc5;">0</span>'}
         </td>
         <td style="text-align: center;" class="mono">
-          ${item.activeUsersCustomers > 0 ? `<strong style="color: #0284c7;">${item.activeUsersCustomers}</strong> 人` : '<span style="color: #cbd5e1;">0</span>'}
+          ${item.activeUsersCustomers > 0 ? `<strong style="color: #0284c7;">${item.activeUsersCustomers}</strong> 人` : '<span style="color: #d1cfc5;">0</span>'}
         </td>
       </tr>
     `;
@@ -7771,7 +7771,7 @@ function renderUserFinancesTable() {
   }
 
   if (list.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="13" style="text-align:center; padding: 1.5rem; color: #94a3b8;">未找到匹配的用户财务数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" style="text-align:center; padding: 1.5rem; color: #9c9a92;">未找到匹配的用户财务数据</td></tr>';
     return;
   }
 
@@ -7780,7 +7780,7 @@ function renderUserFinancesTable() {
     if (idx === 0) rankHtml = '<span class="rank-badge rank-1">1</span>';
     else if (idx === 1) rankHtml = '<span class="rank-badge rank-2">2</span>';
     else if (idx === 2) rankHtml = '<span class="rank-badge rank-3">3</span>';
-    else rankHtml = `<span style="font-size: 0.75rem; color: #94a3b8;">${idx + 1}</span>`;
+    else rankHtml = `<span style="font-size: 0.75rem; color: #9c9a92;">${idx + 1}</span>`;
 
     const isTest = user.isTestAccount || (user.email && (user.email.includes('test') || user.email.includes('example')));
     const isAdmin = user.role === 'admin' || user.id === 1;
@@ -7815,7 +7815,7 @@ function renderUserFinancesTable() {
     } else if (profit < 0) {
       profitHtml = `<strong class="mono" style="color: #dc2626; font-weight: 700;">-¥${Math.abs(profit).toFixed(2)}</strong>`;
     } else {
-      profitHtml = `<span class="mono" style="color: #cbd5e1;">-</span>`;
+      profitHtml = `<span class="mono" style="color: #d1cfc5;">-</span>`;
     }
 
     let yestHtml = '';
@@ -7825,7 +7825,7 @@ function renderUserFinancesTable() {
         <span class="mono" style="font-size: 0.68rem; color: #059669;">+¥${yesterdayProfit.toFixed(2)}</span>
       </div>`;
     } else {
-      yestHtml = `<span class="mono" style="color: #cbd5e1;">-</span>`;
+      yestHtml = `<span class="mono" style="color: #d1cfc5;">-</span>`;
     }
 
     return `
@@ -7840,14 +7840,14 @@ function renderUserFinancesTable() {
         </td>
         <td>
           <div style="display: flex; align-items: center; gap: 0.25rem; flex-wrap: wrap;">
-            <strong style="color: #0f172a; font-size: 0.82rem;">${escapeHtml(user.email || '未命名')}</strong>
+            <strong style="color: #141413; font-size: 0.82rem;">${escapeHtml(user.email || '未命名')}</strong>
             ${roleBadge}
             <span class="mono" style="font-size: 0.68rem; padding: 1px 5px; border-radius: 4px; background: #eff6ff; color: #0284c7; border: 1px solid #bae6fd;" title="最大并发限制: ${user.concurrency || 10} 路">⚡${user.concurrency || 10}路</span>
           </div>
-          <div style="font-size: 0.7rem; color: #64748b;" class="mono">${user.username ? `@${escapeHtml(user.username)} · ` : ''}<button type="button" class="usage-link-btn" onclick="openUserUsageFor(${Number(user.id)})" title="查看该用户用了多少量、用了哪些模型、产生了多少利润">📈 用量与模型</button></div>
+          <div style="font-size: 0.7rem; color: #73726c;" class="mono">${user.username ? `@${escapeHtml(user.username)} · ` : ''}<button type="button" class="usage-link-btn" onclick="openUserUsageFor(${Number(user.id)})" title="查看该用户用了多少量、用了哪些模型、产生了多少利润">📈 用量与模型</button></div>
         </td>
         <td style="text-align: right;">
-          <strong class="mono" style="color: ${balance > 10 ? '#059669' : (balance > 0 ? '#d97706' : '#94a3b8')}; font-weight: 700; font-size: 0.86rem;">
+          <strong class="mono" style="color: ${balance > 10 ? '#059669' : (balance > 0 ? '#d97706' : '#9c9a92')}; font-weight: 700; font-size: 0.86rem;">
             ¥ ${balance.toFixed(2)}
           </strong>
         </td>
@@ -7855,21 +7855,21 @@ function renderUserFinancesTable() {
           ${recharge > 0 
             ? `<div style="display: flex; flex-direction: column; align-items: flex-end;">
                  <strong class="mono" style="color: #059669; font-weight: 700;">¥ ${recharge.toFixed(2)}</strong>
-                 <span style="font-size: 0.68rem; color: #64748b;" title="卡密充值 ¥${Number(user.paidRecharge || 0).toFixed(2)} / 后台充值 ¥${Number(user.adminRecharge || 0).toFixed(2)}">
+                 <span style="font-size: 0.68rem; color: #73726c;" title="卡密充值 ¥${Number(user.paidRecharge || 0).toFixed(2)} / 后台充值 ¥${Number(user.adminRecharge || 0).toFixed(2)}">
                    卡密:${Number(user.paidRecharge || 0).toFixed(0)} | 赠送:${Number(user.adminRecharge || 0).toFixed(0)}
                  </span>
                </div>`
-            : `<span class="mono" style="color: #cbd5e1;">-</span>`}
+            : `<span class="mono" style="color: #d1cfc5;">-</span>`}
         </td>
         <td style="text-align: right;">
           ${spent > 0 
             ? `<strong class="mono" style="color: #2563eb; font-weight: 700; font-size: 0.86rem;">¥ ${spent.toFixed(2)}</strong>`
-            : `<span class="mono" style="color: #cbd5e1;">-</span>`}
+            : `<span class="mono" style="color: #d1cfc5;">-</span>`}
         </td>
         <td style="text-align: right;">
           ${cost > 0 
-            ? `<span class="mono" style="color: #64748b; font-weight: 600;">¥ ${cost.toFixed(2)}</span>`
-            : `<span class="mono" style="color: #cbd5e1;">-</span>`}
+            ? `<span class="mono" style="color: #73726c; font-weight: 600;">¥ ${cost.toFixed(2)}</span>`
+            : `<span class="mono" style="color: #d1cfc5;">-</span>`}
         </td>
         <td style="text-align: right;">
           ${profitHtml}
@@ -7878,13 +7878,13 @@ function renderUserFinancesTable() {
           ${yestHtml}
         </td>
         <td style="text-align: right;" class="mono">
-          ${past7dSpent > 0 ? `<span style="color: #475569; font-weight: 600;">¥${past7dSpent.toFixed(2)}</span>` : '<span style="color: #cbd5e1;">-</span>'}
+          ${past7dSpent > 0 ? `<span style="color: #5e5d59; font-weight: 600;">¥${past7dSpent.toFixed(2)}</span>` : '<span style="color: #d1cfc5;">-</span>'}
         </td>
         <td style="text-align: center;" class="mono">
-          ${user.totalRequests > 0 ? `<span style="color: #334155;">${user.totalRequests}</span>` : '<span style="color: #cbd5e1;">0</span>'}
+          ${user.totalRequests > 0 ? `<span style="color: #3d3d3a;">${user.totalRequests}</span>` : '<span style="color: #d1cfc5;">0</span>'}
         </td>
         <td style="text-align: center;" class="mono" title="${user.lastActiveAt ? formatDateTime(user.lastActiveAt) : ''}">
-          <span style="font-size: 0.74rem; color: #475569;">${relativeActive}</span>
+          <span style="font-size: 0.74rem; color: #5e5d59;">${relativeActive}</span>
         </td>
         <td style="text-align: center;">
           <div style="display: flex; gap: 0.3rem; justify-content: center;">
@@ -7907,7 +7907,7 @@ function renderRecentRecharges(recentList) {
   if (!tbody) return;
 
   if (!recentList || recentList.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 1.5rem; color: #94a3b8;">暂无充值流水记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 1.5rem; color: #9c9a92;">暂无充值流水记录</td></tr>';
     return;
   }
 
@@ -7934,14 +7934,14 @@ function renderRecentRecharges(recentList) {
 
     return `
       <tr>
-        <td class="mono" style="font-size: 0.74rem; color: #475569; white-space: nowrap;">
+        <td class="mono" style="font-size: 0.74rem; color: #5e5d59; white-space: nowrap;">
           ${formatDateTime(item.usedAt)}
         </td>
         <td>
-          <div style="font-weight: 600; color: #0f172a; font-size: 0.8rem;">
+          <div style="font-weight: 600; color: #141413; font-size: 0.8rem;">
             ${escapeHtml(item.userEmail || '未知用户')}
           </div>
-          <div style="font-size: 0.7rem; color: #94a3b8;" class="mono">
+          <div style="font-size: 0.7rem; color: #9c9a92;" class="mono">
             UID: ${item.userId || '--'}
           </div>
         </td>
@@ -7949,14 +7949,14 @@ function renderRecentRecharges(recentList) {
           ${typeBadge}
         </td>
         <td style="text-align: right;">
-          <strong class="mono" style="color: ${val > 0 ? (isConcurrency ? '#0284c7' : '#059669') : '#64748b'}; font-weight: 700; font-size: 0.86rem;">
+          <strong class="mono" style="color: ${val > 0 ? (isConcurrency ? '#0284c7' : '#059669') : '#73726c'}; font-weight: 700; font-size: 0.86rem;">
             ${val > 0 ? '+' : ''}${isConcurrency ? `${val} 并发` : `¥ ${val.toFixed(2)}`}
           </strong>
         </td>
-        <td style="text-align: center;" class="mono" style="font-size: 0.74rem; color: #64748b;">
+        <td style="text-align: center;" class="mono" style="font-size: 0.74rem; color: #73726c;">
           ${escapeHtml(item.code || '--')}
         </td>
-        <td style="font-size: 0.75rem; color: #475569;">
+        <td style="font-size: 0.75rem; color: #5e5d59;">
           ${escapeHtml(item.notes || (isConcurrency ? '管理员调整并发上限' : '—'))}
         </td>
       </tr>
@@ -8238,7 +8238,7 @@ function usageDetailRowHtml(user) {
 }
 
 function usageRowHtml(user, rank, expanded) {
-  const rankHtml = rank <= 3 ? `<span class="rank-badge rank-${rank}">${rank}</span>` : `<span style="font-size: 0.75rem; color: #94a3b8;">${rank}</span>`;
+  const rankHtml = rank <= 3 ? `<span class="rank-badge rank-${rank}">${rank}</span>` : `<span style="font-size: 0.75rem; color: #9c9a92;">${rank}</span>`;
   return `
     <tr class="usage-user-row${expanded ? ' is-open' : ''}" data-usage-user="${user.userId}">
       <td style="text-align: center;">${rankHtml}</td>
@@ -8327,7 +8327,7 @@ function renderUserUsage() {
   if (!body) return;
   if (!userUsageData) {
     if (summaryEl) summaryEl.innerHTML = '';
-    body.innerHTML = `<tr><td colspan="${USAGE_COLUMN_COUNT}" style="text-align: center; padding: 1.5rem; color: #94a3b8;">正在统计…</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${USAGE_COLUMN_COUNT}" style="text-align: center; padding: 1.5rem; color: #9c9a92;">正在统计…</td></tr>`;
     return;
   }
   const inGroup = applyUsageGroupFilter(userUsageData.users, currentUsageGroup);
@@ -8342,7 +8342,7 @@ function renderUserUsage() {
     let why = '没有符合条件的客户，可以试试「全部用户」、「全部分组」或清空搜索。';
     if ((userUsageData.users || []).length === 0) why = '这段时间没有任何用量记录。';
     else if (inGroup.length === 0) why = '这段时间没有客户用过这个分组。';
-    body.innerHTML = `<tr><td colspan="${USAGE_COLUMN_COUNT}" style="text-align: center; padding: 1.5rem; color: #94a3b8;">${why}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="${USAGE_COLUMN_COUNT}" style="text-align: center; padding: 1.5rem; color: #9c9a92;">${why}</td></tr>`;
     return;
   }
   body.innerHTML = visible.map((user, index) => usageRowHtml(user, index + 1, expandedUsageUsers.has(user.userId))).join('');
@@ -8895,14 +8895,14 @@ function renderUpstreamScanModal(data) {
             <div style="flex: 1; min-width: 260px;">
               <div style="display: flex; align-items: center; gap: 0.45rem; margin-bottom: 0.3rem; flex-wrap: wrap;">
                 <span style="background: #fef3c7; color: #b45309; font-size: 0.72rem; padding: 2px 7px; border-radius: 4px; font-weight: 700;">同价新通道待审</span>
-                <strong style="color: #0f172a; font-size: 0.95rem;">${escapeHtml(item.name || '新通道')}</strong>
-                <span style="font-size: 0.74rem; color: #64748b; background: #f8fafc; border: 1px solid #e2e8f0; padding: 1px 6px; border-radius: 4px;">🏢 ${escapeHtml(item.vendor || '通用供应商')}</span>
+                <strong style="color: #141413; font-size: 0.95rem;">${escapeHtml(item.name || '新通道')}</strong>
+                <span style="font-size: 0.74rem; color: #73726c; background: #faf9f5; border: 1px solid #e8e6dc; padding: 1px 6px; border-radius: 4px;">🏢 ${escapeHtml(item.vendor || '通用供应商')}</span>
               </div>
-              <div style="font-size: 0.76rem; color: #475569; line-height: 1.5; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+              <div style="font-size: 0.76rem; color: #5e5d59; line-height: 1.5; display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
                 <span>🌐 <b>API:</b> <code class="mono" style="color: #0284c7; font-size: 0.73rem;">${escapeHtml(item.baseUrl || '--')}</code></span>
-                <span style="color: #cbd5e1;">|</span>
+                <span style="color: #d1cfc5;">|</span>
                 <span>进价: <code class="mono" style="color: #d97706; font-weight: 700;">${item.costMultiplier}x</code></span>
-                <span style="color: #cbd5e1;">|</span>
+                <span style="color: #d1cfc5;">|</span>
                 <span>建议售价: <code class="mono" style="color: #059669; font-weight: 700;">${item.suggestedSaleMultiplier}x</code> (+20%)</span>
               </div>
             </div>
@@ -8938,26 +8938,26 @@ function renderUpstreamScanModal(data) {
                   <span style="background: #ede9fe; color: #6d28d9; font-size: 0.72rem; padding: 2px 7px; border-radius: 4px; font-weight: 700; display: inline-flex; align-items: center; gap: 3px;">
                     ⚡ 通道新模型待开启
                   </span>
-                  <strong style="color: #0f172a; font-size: 1rem; font-weight: 700; letter-spacing: -0.01em;">
+                  <strong style="color: #141413; font-size: 1rem; font-weight: 700; letter-spacing: -0.01em;">
                     ${escapeHtml(group.channelName)}
                   </strong>
-                  <span style="background: #f1f5f9; color: #475569; font-size: 0.74rem; padding: 2px 7px; border-radius: 4px; font-weight: 600; border: 1px solid #e2e8f0;">
+                  <span style="background: #f5f4ed; color: #5e5d59; font-size: 0.74rem; padding: 2px 7px; border-radius: 4px; font-weight: 600; border: 1px solid #e8e6dc;">
                     🏢 供应商: ${escapeHtml(group.vendor)}
                   </span>
                 </div>
                 <!-- 属性标注栏：API 地址与倍率 -->
-                <div style="display: flex; align-items: center; gap: 0.85rem; font-size: 0.76rem; color: #475569; flex-wrap: wrap;">
+                <div style="display: flex; align-items: center; gap: 0.85rem; font-size: 0.76rem; color: #5e5d59; flex-wrap: wrap;">
                   <span>🌐 <b>上游 API:</b> <code class="mono" style="color: #0284c7; background: #f0f9ff; padding: 1px 5px; border-radius: 3px; font-size: 0.73rem;">${escapeHtml(group.apiUrl || '未指定地址')}</code></span>
-                  <span style="color: #cbd5e1;">|</span>
+                  <span style="color: #d1cfc5;">|</span>
                   <span>💰 <b>通道倍率:</b> <code class="mono" style="color: #d97706; font-weight: 700; font-size: 0.82rem;">${group.multiplier}x</code></span>
-                  <span style="color: #cbd5e1;">|</span>
+                  <span style="color: #d1cfc5;">|</span>
                   <span>🆕 <b>新上模型:</b> <b style="color: #4f46e5; font-size: 0.82rem;">${group.models.length}</b> 项</span>
                 </div>
               </div>
 
               <!-- 操作按钮 (一键开启此通道对外服务) -->
               <div style="display: flex; gap: 0.45rem; align-items: center;">
-                <button type="button" class="btn btn-primary" onclick="resolvePendingActionsBatch(${actionIdsJson}, 'approve', '${safeChName}')" style="font-size: 0.78rem; padding: 0.42rem 0.9rem; background: #4f46e5; border-color: #4f46e5; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; box-shadow: 0 1px 2px rgba(79, 70, 229, 0.2);">
+                <button type="button" class="btn btn-primary" onclick="resolvePendingActionsBatch(${actionIdsJson}, 'approve', '${safeChName}')" style="font-size: 0.78rem; padding: 0.42rem 0.9rem; background: #1f1e1d; border-color: #1f1e1d; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; box-shadow: 0 1px 2px rgba(79, 70, 229, 0.2);">
                   🚀 立即开启对外服务 (${group.models.length}个新模型)
                 </button>
                 <button type="button" class="btn btn-secondary" onclick="resolvePendingActionsBatch(${actionIdsJson}, 'reject', '${safeChName}')" style="font-size: 0.78rem; padding: 0.42rem 0.65rem;">
@@ -8970,21 +8970,21 @@ function renderUpstreamScanModal(data) {
             </div>
 
             <!-- 新上的什么 (新模型标签列表) -->
-            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.55rem 0.75rem;">
-              <div style="font-size: 0.73rem; color: #64748b; font-weight: 600; margin-bottom: 0.35rem; display: flex; justify-content: space-between; align-items: center;">
+            <div style="background: #faf9f5; border: 1px solid #e8e6dc; border-radius: 6px; padding: 0.55rem 0.75rem;">
+              <div style="font-size: 0.73rem; color: #73726c; font-weight: 600; margin-bottom: 0.35rem; display: flex; justify-content: space-between; align-items: center;">
                 <span>📋 本通道检测到的新模型 (${group.models.length}):</span>
                 ${extraModels.length > 0 ? `<span id="toggleBtn_${safeKey}" style="font-size: 0.72rem; color: #4f46e5; cursor: pointer; font-weight: 600;" onclick="toggleModelPills('${safeKey}')">展开其余 ${extraModels.length} 个模型 ▾</span>` : ''}
               </div>
               <div style="display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center;">
                 ${initialModels.map(m => `
-                  <span class="mono" style="background: #ffffff; border: 1px solid #cbd5e1; color: #1e293b; padding: 2px 7px; border-radius: 4px; font-size: 0.73rem; font-weight: 500;">
+                  <span class="mono" style="background: #ffffff; border: 1px solid #d1cfc5; color: #262624; padding: 2px 7px; border-radius: 4px; font-size: 0.73rem; font-weight: 500;">
                     ${escapeHtml(m)}
                   </span>
                 `).join('')}
                 ${extraModels.length > 0 ? `
                   <div id="extraPills_${safeKey}" style="display: none; flex-wrap: wrap; gap: 0.35rem;">
                     ${extraModels.map(m => `
-                      <span class="mono" style="background: #ffffff; border: 1px solid #cbd5e1; color: #1e293b; padding: 2px 7px; border-radius: 4px; font-size: 0.73rem; font-weight: 500;">
+                      <span class="mono" style="background: #ffffff; border: 1px solid #d1cfc5; color: #262624; padding: 2px 7px; border-radius: 4px; font-size: 0.73rem; font-weight: 500;">
                         ${escapeHtml(m)}
                       </span>
                     `).join('')}
@@ -9050,7 +9050,7 @@ function renderUpstreamScanModal(data) {
 
     if (events.length === 0) {
       events.push(`
-        <div style="padding: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 0.78rem; color: #64748b; text-align: center;">
+        <div style="padding: 10px; background: #faf9f5; border: 1px solid #e8e6dc; border-radius: 6px; font-size: 0.78rem; color: #73726c; text-align: center;">
           ✅ 全网上游接口与探针连通良好，各业务组运行平稳，无异常停用或变动。
         </div>
       `);
@@ -9074,7 +9074,7 @@ function renderUpstreamGroupCatalog(groups) {
   const el = document.getElementById('upstreamGroupCatalogList');
   if (!el) return;
   if (!Array.isArray(groups) || !groups.length) { el.textContent = '暂无抓取记录'; return; }
-  el.innerHTML = groups.map(g => `<div style="display:flex;justify-content:space-between;gap:0.5rem;border-bottom:1px solid #f1f5f9;padding:0.25rem 0;"><span><b>${escapeHtml(g.panelName || g.panelId)}</b> · ${escapeHtml(g.name)} <span class="mono">(${escapeHtml(g.upstreamGroupId)})</span></span><span>${g.costMultiplier ? `${g.costMultiplier}x` : '价格未知'} · ${g.status === 'stale' ? '抓取失败，沿用旧记录' : '可用'}</span></div>`).join('');
+  el.innerHTML = groups.map(g => `<div style="display:flex;justify-content:space-between;gap:0.5rem;border-bottom:1px solid #f5f4ed;padding:0.25rem 0;"><span><b>${escapeHtml(g.panelName || g.panelId)}</b> · ${escapeHtml(g.name)} <span class="mono">(${escapeHtml(g.upstreamGroupId)})</span></span><span>${g.costMultiplier ? `${g.costMultiplier}x` : '价格未知'} · ${g.status === 'stale' ? '抓取失败，沿用旧记录' : '可用'}</span></div>`).join('');
 }
 
 async function scanUpstreamGroups() {
