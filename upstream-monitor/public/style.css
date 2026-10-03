@@ -1159,9 +1159,10 @@ body {
 }
 
 /* 【条状表头提示栏】 */
+/* 表头和每一行共用同一套列宽。第 1 列放「主调 / 副调」标签，第 4 列放余额和「告急」，第 9 列放时间，第 10 列在选中分组时放四个角色按钮 */
 .strips-header-bar {
   display: grid;
-  grid-template-columns: 16px minmax(280px, 1.3fr) 68px 76px minmax(110px, 0.7fr) minmax(115px, 0.7fr) minmax(85px, 0.6fr) minmax(115px, 0.7fr) 76px 208px;
+  grid-template-columns: 60px minmax(246px, 1.3fr) 60px 96px minmax(104px, 0.7fr) minmax(108px, 0.7fr) minmax(82px, 0.6fr) minmax(120px, 0.7fr) 92px 168px;
   align-items: center;
   gap: 0.5rem;
   padding: 0.6rem 0.85rem;
@@ -1171,7 +1172,7 @@ body {
   background: #f1f5f9;
   border: 1px solid var(--border);
   border-radius: 6px;
-  min-width: 1180px;
+  min-width: 1250px;
   width: 100%;
   box-sizing: border-box;
 }
@@ -1199,7 +1200,7 @@ body {
   border-radius: 7px;
   margin-top: 0.35rem;
   margin-bottom: 0.25rem;
-  min-width: 1120px;
+  min-width: 1250px;
   width: 100%;
   box-sizing: border-box;
 }
@@ -1240,7 +1241,7 @@ body {
   margin-top: 0.55rem;
   margin-bottom: 0.25rem;
   border-radius: 4px;
-  min-width: 1120px;
+  min-width: 1250px;
   width: 100%;
   box-sizing: border-box;
 }
@@ -1270,7 +1271,7 @@ body {
 /* 单条条状卡片：白底高质感，带有厂商专属左边框 */
 .channel-strip {
   display: grid;
-  grid-template-columns: 16px minmax(280px, 1.3fr) 68px 76px minmax(110px, 0.7fr) minmax(115px, 0.7fr) minmax(85px, 0.6fr) minmax(115px, 0.7fr) 76px 208px;
+  grid-template-columns: 60px minmax(246px, 1.3fr) 60px 96px minmax(104px, 0.7fr) minmax(108px, 0.7fr) minmax(82px, 0.6fr) minmax(120px, 0.7fr) 92px 168px;
   align-items: center;
   gap: 0.5rem;
   padding: 0.65rem 0.85rem;
@@ -1280,7 +1281,7 @@ body {
   box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03);
   transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
   position: relative;
-  min-width: 1180px;
+  min-width: 1250px;
   width: 100%;
   box-sizing: border-box;
 }
@@ -1366,11 +1367,35 @@ body {
   to { transform: scale(1.08); }
 }
 
-/* 列 1: 状态指示点 */
+/* 列 1: 状态指示点 + 主调 / 副调 / 备选 / 备用 标签（一行显示，不再被挤成竖排） */
 .strip-col-status {
   display: flex;
   align-items: center;
   justify-content: center;
+  white-space: nowrap;
+}
+
+.channel-status-badge {
+  display: inline-block;
+  font-size: 0.76rem;
+  font-weight: 700;
+  line-height: 1.25;
+  padding: 0.14rem 0.4rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.channel-status-badge.active {
+  color: #047857;
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.channel-status-badge.standby {
+  color: #475569;
+  background: #f1f5f9;
+  border-color: #e2e8f0;
 }
 
 .strip-status-dot {
@@ -1594,7 +1619,8 @@ body {
 .strip-price-main {
   display: flex;
   align-items: baseline;
-  gap: 0.35rem;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.35rem;
   white-space: nowrap;
 }
 
@@ -1747,7 +1773,18 @@ body {
   gap: 0.15rem;
   white-space: nowrap;
   min-width: 72px;
-  overflow: hidden;
+  overflow: visible;
+}
+
+/* 时间（例如 2026-10-03 10:22:48 (25秒前)）放不下一行时在列内换行 */
+.latency-time {
+  display: block;
+  max-width: 100%;
+  white-space: normal;
+  word-break: keep-all;
+  font-size: 0.66rem;
+  line-height: 1.25;
+  color: #94a3b8;
 }
 
 .strip-latency-text {
@@ -1769,8 +1806,10 @@ body {
   justify-content: flex-end;
   gap: 0.35rem;
   flex-shrink: 0;
+  flex-wrap: wrap;
+  row-gap: 0.3rem;
   white-space: nowrap;
-  min-width: 204px;
+  min-width: 0;
 }
 
 .group-channels-bracket {
@@ -2412,6 +2451,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.2rem;
 }
 
 .balance-badge {
@@ -2487,7 +2528,9 @@ body {
 .strip-bal-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.35rem;
 }
 
 .strip-bal-badge {
@@ -2540,6 +2583,7 @@ body {
   padding: 1px 5px;
   border-radius: 3px;
   line-height: 1.2;
+  white-space: nowrap;
 }
 
 .strip-bal-tag.tag-empty {
@@ -3073,7 +3117,8 @@ body {
 .stability-pill-row {
   display: flex;
   align-items: center;
-  gap: 0.35rem;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.35rem;
 }
 
 .ttft-pill {
@@ -3134,7 +3179,8 @@ body {
 .stability-sub-row {
   display: flex;
   align-items: center;
-  gap: 0.3rem;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.3rem;
 }
 
 /* 诊断责任小药丸按钮 */
