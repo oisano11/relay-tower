@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="assets/relay-tower-banner.png" alt="Relay Tower Banner" width="100%" style="border-radius: 12px; margin-bottom: 20px;" />
-
-<img src="assets/relay-tower-logo.png" alt="Relay Tower Logo" width="84" height="84" style="border-radius: 20px; box-shadow: 0 4px 20px rgba(0, 242, 254, 0.35); margin-top: 10px; margin-bottom: 6px;" />
+<img src="assets/relay-tower-banner.png" alt="中转塔台 Relay Tower" width="100%" />
 
 # 中转塔台 · Relay Tower
 
