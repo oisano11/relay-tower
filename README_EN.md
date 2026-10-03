@@ -6,7 +6,9 @@
 
 # Relay Tower (中转塔台)
 
-**AI Model Relay Router · Upstream Rate Monitor · Stable Gateway Endpoint · Prompt Cache Route Affinity · Telegram Remote Console**
+**Ops console for Sub2API / New-API relay-station operators: watch upstream rate multipliers, get price-hike alerts, auto-switch the primary account when it fails, switch lines from your phone via Telegram, and see profit per customer.**
+
+<sub>中转塔台 · 上游倍率监控与涨价预警 · 主调故障自动切换 · Telegram 手机一键切线 · 客户用量与利润统计</sub>
 
 [![CI](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml/badge.svg)](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -17,15 +19,23 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot%20Integrated-0088cc.svg?logo=telegram)](https://telegram.org)
 
-[English](README_EN.md) · [简体中文](README.md) · [Why Relay Tower?](#-why-relay-tower-comparison) · [Key Features](#-key-features-matrix) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [Client Setup](#-client-integration-guide) · [FAQ](#-faq) · [Changelog (中文)](CHANGELOG.md)
+[English](README_EN.md) · [简体中文](README.md) · [At a Glance](#-at-a-glance) · [Why Relay Tower?](#-why-relay-tower-comparison) · [Key Features](#-key-features-matrix) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [Client Setup](#-client-integration-guide) · [FAQ](#-faq) · [Changelog (中文)](CHANGELOG.md)
 
 </div>
 
 ---
 
-## 📌 GitHub Discoverability & Topics
+## 🎯 At a Glance
 
-> **Keywords:** `ai-gateway` `llm-proxy` `claude-code` `cursor-ai` `deepseek-api` `openai-proxy` `anthropic-proxy` `new-api` `one-api` `prompt-cache` `rate-limiter` `circuit-breaker` `load-balancer` `telegram-bot` `docker-compose` `reverse-proxy`
+**Who it is for:** operators of Sub2API / New-API relay stations with many upstream accounts, multipliers that change, and the occasional 3 a.m. outage, who want to keep watch from a phone.
+
+| Your problem | What Relay Tower does |
+| :--- | :--- |
+| An upstream silently raises prices overnight and you notice a day late | Compares upstream rate multipliers every 5 minutes. On a hike it pops an alert and pushes Telegram, with a one-tap switch to a cheaper standby account |
+| The primary account runs out of balance, gets banned or hangs, and customers see errors | Switches to the standby when the primary is out of balance, fails repeatedly or stalls on the first token. Clients keep the same endpoint and later requests use the new account |
+| You are away from your desk | Telegram bot: `/status` to check, `/switch` to change line with one tap. Works behind NAT, no public IP needed |
+| You cannot tell which customer or model makes or loses money | Usage and profit per customer and per model (requests, tokens, profit). Loss-making routes are highlighted |
+| Splitting traffic across accounts lowers Prompt Cache hits | One primary per group serves traffic and the rest stay cold, which reduces cross-channel routing |
 
 ---
 
@@ -361,3 +371,7 @@ Contributions are welcome!
 ## 📄 License
 
 Distributed under the [MIT License](LICENSE). Free for commercial and private use.
+
+---
+
+<sub>**Keywords:** Sub2API relay station operations · upstream rate multiplier monitor · price-hike alerts · automatic primary failover · Telegram bot line switching · New-API / One-API upstreams · Prompt Cache route affinity · Claude Code / Cursor single endpoint · LLM gateway failover</sub>

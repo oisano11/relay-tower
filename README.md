@@ -6,7 +6,9 @@
 
 # 中转塔台 · Relay Tower
 
-**AI 大模型聚合中转网关 · 上游倍率差分监控 · 统一入口切线 · Prompt Cache 路由亲和 · Telegram 移动端调度**
+**给 Sub2API / New-API 中转站站长用的运维面板：盯上游倍率、涨价预警、主调出故障自动切换、手机 Telegram 一键切线、算清每个客户的用量和利润**
+
+<sub>Upstream rate monitor & auto-failover console for Sub2API / New-API relay operators · Prompt Cache affinity · Telegram remote control</sub>
 
 [![CI](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml/badge.svg)](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -17,15 +19,23 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot%20Integrated-0088cc.svg?logo=telegram)](https://telegram.org)
 
-[English](README_EN.md) · [简体中文](README.md) · [为什么选择本项目？](#-为什么选择-relay-tower) · [核心特性](#-核心特性矩阵) · [系统架构](#-系统架构) · [快速开始](#-快速开始) · [客户端接入](#-客户端无缝接入指南) · [常见问题](#-常见问题-faq) · [更新日志](CHANGELOG.md)
+[English](README_EN.md) · [简体中文](README.md) · [一句话看懂](#-一句话看懂) · [为什么选择本项目？](#-为什么选择-relay-tower) · [核心特性](#-核心特性矩阵) · [系统架构](#-系统架构) · [快速开始](#-快速开始) · [客户端接入](#-客户端无缝接入指南) · [常见问题](#-常见问题-faq) · [更新日志](CHANGELOG.md)
 
 </div>
 
 ---
 
-## 📌 GitHub 检索与技术标签 (Topics & Tags)
+## 🎯 一句话看懂
 
-> **Keywords:** `ai-gateway` `llm-proxy` `claude-code` `cursor-ai` `deepseek-api` `openai-proxy` `anthropic-proxy` `new-api` `one-api` `prompt-cache` `rate-limiter` `circuit-breaker` `load-balancer` `telegram-bot` `docker-compose` `reverse-proxy`
+**适合谁：** 运营 **Sub2API / New-API 中转站** 的站长。上游账号多、倍率会变、半夜可能出故障，又想用手机随时盯着。
+
+| 您遇到的麻烦 | 中转塔台怎么帮您 |
+| :--- | :--- |
+| 上游半夜悄悄涨价，发现时已经亏了一天 | 每 5 分钟比对一次上游倍率；涨价立刻弹窗并推送 Telegram，可一键切到更低价的备选账号 |
+| 主调账号欠费、被封或假死，客户全在报错 | 主调欠费、连续失败或首字超时，自动切到副调；客户端地址不用改，后续请求直接走新账号 |
+| 人在外面，想用手机切线 | Telegram 机器人：`/status` 看状态，`/switch` 点按钮切换；内网、没有公网 IP 也能用 |
+| 不知道哪个客户、哪个模型在赚钱还是在亏钱 | 「用户财务」按客户和模型统计请求数、Token 和利润；亏损通道标红 |
+| 多个账号来回分流，Prompt Cache 命中率掉下来 | 每个分组只让一个主调接单，其余冷备，减少跨通道分流 |
 
 ---
 
@@ -375,3 +385,7 @@ curl http://localhost:3300/v1/chat/completions \
 ## 📄 开源许可证
 
 本项目基于 [MIT License](LICENSE) 开源发布。自由使用，商业与个人友好。
+
+---
+
+<sub>**关键词：** Sub2API 中转站运维 · 上游倍率监控 · 涨价预警 · 主调故障自动切换 · Telegram 机器人切线 · New-API / One-API 上游 · Prompt Cache 路由亲和 · Claude Code / Cursor 统一入口 · LLM gateway failover</sub>
