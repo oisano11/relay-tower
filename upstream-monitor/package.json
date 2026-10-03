@@ -1,6 +1,6 @@
 {
   "name": "relay-tower",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Relay Tower: Multi-Upstream LLM Monitor & Intelligent Dispatcher",
   "main": "server.js",
   "scripts": {
