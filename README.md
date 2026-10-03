@@ -19,7 +19,7 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot%20Integrated-0088cc.svg?logo=telegram)](https://telegram.org)
 
-[English](README_EN.md) · [简体中文](README.md) · [一句话看懂](#-一句话看懂) · [为什么选择本项目？](#-为什么选择-relay-tower) · [核心特性](#-核心特性矩阵) · [系统架构](#-系统架构) · [快速开始](#-快速开始) · [客户端接入](#-客户端无缝接入指南) · [常见问题](#-常见问题-faq) · [更新日志](CHANGELOG.md)
+[English](README_EN.md) · [简体中文](README.md) · [一句话看懂](#-一句话看懂) · [为什么选择本项目？](#️-为什么选择-中转塔台-relay-tower横向对比) · [核心特性](#-核心特性矩阵) · [系统架构](#️-系统架构) · [快速开始](#-快速开始) · [客户端接入](#-客户端无缝接入指南) · [常见问题](#-常见问题-faq) · [更新日志](CHANGELOG.md)
 
 </div>
 
