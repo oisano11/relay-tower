@@ -960,14 +960,37 @@ function checkLowBalanceAlerts(now = Date.now()) {
   const alive = new Set((state.channels || []).map(c => String(c.id)));
   Object.keys(marks).forEach(id => { if (!alive.has(id)) delete marks[id]; });
   if (!due.length) return due;
-  for (const ch of due) {
-    const groups = (ch.groupsDetail || []).filter(g => g && g.id !== undefined).map(g => ({ id: g.id, name: g.name || String(g.id) }));
+  // 同一家上游的几个账号共用一份余额：合成一条提醒，不要同一件事说好几遍
+  for (const batch of groupBySharedBalance(due)) {
+    const ids = new Set(batch.map(c => String(c.id)));
+    const groupMap = new Map();
+    batch.forEach(ch => (ch.groupsDetail || []).forEach(g => {
+      if (g && g.id !== undefined && !groupMap.has(String(g.id))) groupMap.set(String(g.id), { id: g.id, name: g.name || String(g.id) });
+    }));
+    const groups = [...groupMap.values()];
     const noBackupGroups = groups.filter(g => !(state.channels || []).some(c =>
-      String(c.id) !== String(ch.id) && ['sub', 'alt'].includes(groupRole(c, g.id))));
-    Promise.resolve(telegram.notifyLowBalance({ channel: ch, groups, noBackupGroups }))
+      !ids.has(String(c.id)) && ['sub', 'alt'].includes(groupRole(c, g.id))));
+    Promise.resolve(telegram.notifyLowBalance({ channels: batch, balance: batch[0].balance, unit: batch[0].balanceUnit, groups, noBackupGroups }))
       .catch(error => console.error('[余额提醒]', error.message));
   }
   return due;
+}
+
+// 余额来自上游网站的同一个账户时，几个账号的余额读数完全一样：按「上游地址 + 余额」分组
+function sharedBalanceKey(ch) {
+  let host = '';
+  try { host = new URL(ch.baseUrl).host; } catch (e) { host = String(ch.provider || ch.id); }
+  return `${host}|${Number(ch.balance).toFixed(2)}`;
+}
+
+function groupBySharedBalance(channels) {
+  const batches = new Map();
+  channels.forEach(ch => {
+    const key = sharedBalanceKey(ch);
+    if (!batches.has(key)) batches.set(key, []);
+    batches.get(key).push(ch);
+  });
+  return [...batches.values()];
 }
 
 // 每日简报：北京时间早上 9 点到 12 点之间发一次（服务那会儿刚好重启也不会漏，晚于 12 点就等第二天）
@@ -1014,9 +1037,14 @@ function buildDailyDigestData(now = Date.now()) {
     unresolved: !!(runtime[id] && (runtime[id].exhaustedSince || runtime[id].exhaustedNotifiedAt))
   }));
 
-  const lowBalance = (state.channels || [])
-    .filter(c => c.schedulable && (c.balanceStatus === 'low' || c.balanceStatus === 'empty') && Number.isFinite(Number(c.balance)))
-    .map(c => ({ name: c.name, balance: Number(c.balance), unit: c.balanceUnit }));
+  const lowBalance = groupBySharedBalance((state.channels || [])
+    .filter(c => c.schedulable && (c.balanceStatus === 'low' || c.balanceStatus === 'empty') && Number.isFinite(Number(c.balance))))
+    .map(batch => ({
+      name: batch.length <= 3 ? batch.map(c => c.name).join('、') : `${batch[0].name} 等 ${batch.length} 个账号`,
+      balance: Number(batch[0].balance),
+      unit: batch[0].balanceUnit,
+      shared: batch.length > 1
+    }));
 
   return {
     dateLabel: beijingClock(now).label,

@@ -1237,13 +1237,20 @@ class TelegramBotManager {
     return true;
   }
 
-  // 10. 正在接单的账号余额低于 5 美元：每一轮只提醒一次（server.js 记着提醒过谁）
-  async notifyLowBalance({ channel, groups = [], noBackupGroups = [] }) {
+  // 10. 正在接单的账号余额低于 5 美元：每一轮只提醒一次（server.js 记着提醒过谁）；
+  //     同一家上游的几个账号共用一份余额时，server.js 把它们合成一条传进来
+  async notifyLowBalance({ channel, channels, balance, unit, groups = [], noBackupGroups = [] }) {
     if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
-    const lines = [
-      '🔴 <b>正在接单的账号余额快用完了</b>',
-      `${escapeHtml(channel.name)}：还剩 <b>${fmtMoney(channel.balance, channel.balanceUnit)}</b>（低于 5 美元）`
-    ];
+    const list = (channels && channels.length ? channels : [channel]).filter(Boolean);
+    if (!list.length) return false;
+    const money = fmtMoney(balance ?? list[0].balance, unit ?? list[0].balanceUnit);
+    const lines = ['🔴 <b>正在接单的账号余额快用完了</b>'];
+    if (list.length === 1) {
+      lines.push(`${escapeHtml(list[0].name)}：还剩 <b>${money}</b>（低于 5 美元）`);
+    } else {
+      lines.push(`上游余额还剩 <b>${money}</b>（低于 5 美元），这 ${list.length} 个账号共用这份余额：`);
+      lines.push(escapeHtml(list.map(c => c.name).join('、')));
+    }
     if (groups.length) lines.push(`分组：${escapeHtml(groups.map(g => g.name).join('、'))}`);
     lines.push(noBackupGroups.length
       ? `${escapeHtml(noBackupGroups.map(g => g.name).join('、'))} 没有副调，余额用完后客户会开始报错，请尽快充值。`
@@ -1266,7 +1273,7 @@ class TelegramBotManager {
       items.push('🔴 没有账号能顶上：' + exhausted.map(e => `${escapeHtml(e.group)}（${e.unresolved ? '还没解决' : '已恢复'}）`).join('、'));
     }
     const low = d.lowBalance || [];
-    if (low.length) items.push('💰 余额偏低：' + low.map(c => `${escapeHtml(c.name)} ${fmtMoney(c.balance, c.unit)}`).join('、'));
+    if (low.length) items.push('💰 余额偏低：' + low.map(c => `${escapeHtml(c.name)}${c.shared ? '（共用余额）' : ''} ${fmtMoney(c.balance, c.unit)}`).join('；'));
     const prices = d.priceChanges || [];
     if (prices.length) {
       items.push(`📈 价格有变动的账号 ${prices.length} 个：`);

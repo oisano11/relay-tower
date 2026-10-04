@@ -124,6 +124,14 @@ test('no backup: short message with the reminder count; recovery is a quiet one-
   assert.equal(muted.sent.length, 0);
 });
 
+test('low balance: accounts sharing one upstream balance come as one message', async () => {
+  const { api, sent } = bot();
+  await api.notifyLowBalance({ channels: [{ name: '账号甲', balance: 2.39 }, { name: '账号乙', balance: 2.39 }, { name: '账号丙', balance: 2.39 }], balance: 2.39, unit: 'USD', groups: [{ id: 1, name: '组一' }] });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /上游余额还剩 <b>\$2\.39<\/b>（低于 5 美元），这 3 个账号共用这份余额：/);
+  assert.match(sent[0].text, /账号甲、账号乙、账号丙/);
+});
+
 test('low balance names the groups that have no backup', async () => {
   const { api, sent } = bot();
   await api.notifyLowBalance({ channel: { name: '账号甲', balance: 3.2, balanceUnit: 'USD' }, groups: [{ id: 1, name: '组一' }, { id: 2, name: '组二' }], noBackupGroups: [{ id: 2, name: '组二' }] });
@@ -148,6 +156,7 @@ test('daily digest: quiet, summarises the day, folds price flip-backs, and says 
   assert.match(text, /自动换号 1 次/);
   assert.match(text, /组二（还没解决）/);
   assert.match(text, /账号丙 \$3\.20/);
+  assert.doesNotMatch(text, /共用余额/);
   assert.match(text, /账号丁：来回变了 4 次，现在还是 0\.23（在接单）/);
   assert.match(text, /账号戊：0\.1 → 0\.12/);
   assert.match(text, /待你审批 1 项/);
@@ -184,7 +193,7 @@ function serverSlice(overrides = {}) {
   const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
   const pushed = [];
   const context = vm.createContext({
-    Date, JSON, Math, Number, String, Set, Map, Object, Array, Promise, console: { error() {}, log() {} },
+    Date, JSON, Math, Number, String, Set, Map, Object, Array, Promise, URL, console: { error() {}, log() {} },
     state: { channels: [], allGroups: [], failoverRuntime: {} }, alerts: [], autoSwitchLogs: [],
     groupRole: (channel, groupId) => (channel.roles || {})[groupId] || 'standby',
     telegram: {
@@ -211,7 +220,7 @@ test('low balance: only accounts taking orders, once per drop below $5, again on
   ];
   context.checkLowBalanceAlerts();
   assert.equal(pushed.length, 1);
-  assert.equal(pushed[0].channel.name, '账号甲');
+  assert.equal(pushed[0].channels[0].name, '账号甲');
   assert.deepEqual(JSON.parse(JSON.stringify(pushed[0].noBackupGroups.map(g => g.name))), ['组二']);
   context.checkLowBalanceAlerts();
   acc.balance = 5.5; acc.balanceStatus = 'ok';
@@ -224,6 +233,17 @@ test('low balance: only accounts taking orders, once per drop below $5, again on
   acc.balance = 3; acc.balanceStatus = 'low';
   context.checkLowBalanceAlerts();
   assert.equal(pushed.length, 2, 'a new drop after a top-up is reported again');
+});
+
+test('low balance: accounts on the same upstream with the same balance are one reminder; a different upstream is its own', () => {
+  const { context, pushed } = serverSlice();
+  const acc = (id, host, balance) => ({ id, name: '账号' + id, schedulable: true, balance, balanceStatus: 'low', baseUrl: `https://${host}/v1`, groupsDetail: [{ id: 1, name: '组一' }] });
+  context.state.channels = [acc('1', 'upstream-a.example.com', 2.39), acc('2', 'upstream-a.example.com', 2.39), acc('3', 'upstream-b.example.com', 1.2)];
+  context.checkLowBalanceAlerts();
+  assert.equal(pushed.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(pushed.map(p => p.channels.map(c => c.id)))), [['1', '2'], ['3']]);
+  const digest = JSON.parse(JSON.stringify(context.buildDailyDigestData(Date.now()).lowBalance));
+  assert.deepEqual(digest.map(d => [d.name, d.shared]), [['账号1、账号2', true], ['账号3', false]]);
 });
 
 test('daily digest data: 24 h of price changes per account, switches from the log, unresolved outages; sent once a day at 9', async () => {
