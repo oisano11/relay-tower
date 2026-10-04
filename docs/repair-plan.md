@@ -470,3 +470,22 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - 用假数据的演示环境在无头 Chrome 里量：宽度 1280 / 1440 / 1600 / 1920，视图「按业务分组」「选中一个分组」「按模型厂商」「按上游供应商」「按状态」。检查项：被 `overflow` 截断的文字、竖排（一个短标签占两行以上）、伸出格子的内容、表头每列和每一行对应列的左边缘是否对齐、行高。修改前所有宽度都有竖排的「主调 / 副调」和被截断的时间，选中分组时最右列伸出格子；修改后这些项全部为 0，列对齐，行高不变。
 - 1280 宽的窗口里表格仍要横向拖一点（修改前 1240px 对 1224px，修改后 1250px 对 1224px）；1440 及以上不需要。
 - 还没有部署到线上。
+
+## Telegram 首次连接总是失败（2026-10-04）
+
+部署时注意到：最近两次重启，日志都先是「❌ [Telegram] 初始化连接失败:」（后面是空字符串），10 秒后重试才连上。只读排查（容器内）：
+
+- 容器里是 Node v22.23.2，`net.getDefaultAutoSelectFamily()` 为 `true`，`getDefaultAutoSelectFamilyAttemptTimeout()` 为 250 毫秒。
+- `api.telegram.org` 同时有 A 和 AAAA 记录，`dns.lookup` 先给 IPv4。容器没有 IPv6：连 IPv6 地址直接 `ENETUNREACH`。
+- 平时到 IPv4 地址的 TCP 握手约 150 毫秒；第一次 HTTPS 请求约 490 毫秒，之后约 150 毫秒。
+- 复现：把 `autoSelectFamilyAttemptTimeout` 压到 10 毫秒，`https.request` 报 `AggregateError`，`code` 为 `ETIMEDOUT`，`message` 为空，内层是 `ETIMEDOUT`（IPv4）和 `ENETUNREACH`（IPv6），和线上日志一致。
+
+原因：服务刚启动时第一次握手超过 250 毫秒，happy eyeballs 放弃 IPv4 改试 IPv6，IPv6 立即失败，抛出 `message` 为空的 `AggregateError`；`start()` 只打印 `e.message`，所以日志冒号后面是空的。
+
+改法（`upstream-monitor/telegram.js`）：
+
+- `apiRequest` 的请求选项加 `autoSelectFamilyAttemptTimeout: 3000`。
+- `start()`：失败后按 3、6、12、24、48、60 秒重试（`telegramRetryDelayMs`），用 `isStarting` 防止并发启动；前两次失败记 `console.warn`，连续 3 次以上记 `console.error`；成功时注明是第几次尝试。`stop()` 清掉待执行的重试。
+- `describeNetError`：拼上 `code` 和 `AggregateError.errors` 里每个地址的错误码与地址。
+
+验收：`scripts/test-auth-telegram.js` 新增 2 个用例（请求选项里每个地址至少等 2 秒；启动遇到空消息的 `AggregateError` 时 3 秒后重试、日志写明各地址原因、只记提醒，第二次成功后开始轮询）。

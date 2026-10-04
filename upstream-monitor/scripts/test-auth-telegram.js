@@ -5,18 +5,19 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 // Modules see only in-memory files and denied networking; production data is never read.
-function isolated(name) {
+function isolated(name, overrides = {}) {
   const files = new Map(), logs = [];
   const chmods = [];
   const fakeFs = { existsSync: p => files.has(p), mkdirSync() {},
     readFileSync: p => { if (!files.has(p)) throw Error('No fixture'); return files.get(p); },
     writeFileSync: (p, body) => files.set(p, body),
     chmodSync: (p, mode) => chmods.push({ path: p, mode }) };
+  const noNetwork = { request() { throw Error('External networking forbidden'); } };
   const context = { module: { exports: {} }, __dirname: '/fixture', Buffer, URL,
     process: { env: { ADMIN_PASSWORD: 'fixture-password' } },
     console: Object.fromEntries(['log', 'warn', 'error'].map(k => [k, (...args) => logs.push(args.join(' '))])),
-    setInterval: () => ({ unref() {} }), setTimeout, clearTimeout,
-    require: name => name === 'fs' ? fakeFs : ['http', 'https'].includes(name) ? { request() { throw Error('External networking forbidden'); } } : require(name) };
+    setInterval: () => ({ unref() {} }), setTimeout: overrides.setTimeout || setTimeout, clearTimeout,
+    require: name => name === 'fs' ? fakeFs : name === 'https' ? (overrides.https || noNetwork) : name === 'http' ? noNetwork : require(name) };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', name), 'utf8'), context, { filename: name });
   return { api: context.module.exports, logs, files, chmods };
 }
@@ -40,6 +41,43 @@ test('malformed cookies do not break valid sessions', () => {
 test('whitespace-only gateway keys cannot be saved', () => {
   const { api } = isolated('auth.js');
   assert.equal(api.setGatewayApiKey('          ').success, false);
+});
+
+test('Telegram API requests give each address enough time to connect', async () => {
+  let seen;
+  const https = { request(options) { seen = options; throw Error('stop after capturing the options'); } };
+  const { api } = isolated('telegram.js', { https });
+  api.config.botToken = 'fixture-token';
+  await assert.rejects(api.apiRequest('getMe'));
+  assert.ok(seen.autoSelectFamilyAttemptTimeout >= 2000);
+});
+
+test('Telegram startup retries after 3 s and explains an empty AggregateError', async () => {
+  const timers = [];
+  const { api, logs } = isolated('telegram.js', { setTimeout: (fn, ms) => timers.push({ fn, ms }) });
+  api.config.enabled = true;
+  api.config.botToken = 'fixture-token';
+  let getMeCalls = 0;
+  api.apiRequest = async method => {
+    if (method === 'getMe' && ++getMeCalls === 1) {
+      const e = new Error('');
+      e.name = 'AggregateError';
+      e.code = 'ETIMEDOUT';
+      e.errors = [{ code: 'ETIMEDOUT', address: '192.0.2.1' }, { code: 'ENETUNREACH', address: '2001:db8::1' }];
+      throw e;
+    }
+    return method === 'getMe' ? { is_bot: true, first_name: 'Fixture', username: 'fixture_bot' } : true;
+  };
+  api.runPollingLoop = () => {};
+  await api.start();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 3000);
+  assert.match(logs.join('\n'), /第 1 次连接没连上（ETIMEDOUT，各地址：ETIMEDOUT 192\.0\.2\.1；ENETUNREACH 2001:db8::1）/);
+  assert.doesNotMatch(logs.join('\n'), /❌/);
+  timers[0].fn();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(api.isPolling, true);
+  assert.match(logs.join('\n'), /认证成功（第 2 次尝试）/);
 });
 
 test('Telegram first visitor, group membership and missing sender never authorize operations', async () => {

@@ -72,6 +72,23 @@ const DEFAULT_CONFIG = {
   proxy: '' // 如 http://127.0.0.1:7890
 };
 
+// 网络错误转成可读文字。Node 同时试 IPv4 / IPv6 都失败时抛 AggregateError，它的 message 是空字符串，
+// 只打印 e.message 会得到一行没有任何说明的日志，所以把错误码和每个地址各自的失败原因也带上。
+function describeNetError(e) {
+  if (!e) return '未知错误';
+  const parts = [];
+  if (e.message) parts.push(e.message);
+  if (e.code && !String(e.message || '').includes(e.code)) parts.push(e.code);
+  const head = parts.join(' ') || e.name || '未知错误';
+  if (!Array.isArray(e.errors) || !e.errors.length) return head;
+  return `${head}，各地址：` + e.errors.map(x => [x && x.code, x && x.address].filter(Boolean).join(' ')).join('；');
+}
+
+// 启动时连不上 Telegram 的重试间隔：3 秒起，每次翻倍，最多 60 秒
+function telegramRetryDelayMs(attempt) {
+  return Math.min(60000, 3000 * Math.pow(2, Math.max(0, attempt - 1)));
+}
+
 // 转义 HTML 特殊字符以适配 Telegram HTML 模式
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
@@ -149,13 +166,16 @@ class TelegramBotManager {
   }
 
   async start() {
-    if (this.isPolling) return;
+    if (this.isPolling || this.isStarting) return;
+    this.isStarting = true;
     try {
-      console.log('✈️ [Telegram] 正在连接 Telegram Bot API...');
+      if (!this.connectAttempts) console.log('✈️ [Telegram] 正在连接 Telegram Bot API...');
       const me = await this.apiRequest('getMe');
       if (me && me.is_bot) {
         this.botInfo = me;
-        console.log(`✅ [Telegram] 机器人认证成功: [${me.first_name}] (@${me.username})`);
+        const retried = this.connectAttempts ? `（第 ${this.connectAttempts + 1} 次尝试）` : '';
+        this.connectAttempts = 0;
+        console.log(`✅ [Telegram] 机器人认证成功${retried}: [${me.first_name}] (@${me.username})`);
 
         // 注册 Telegram 客户端原生命令菜单
         try {
@@ -182,17 +202,31 @@ class TelegramBotManager {
         console.error('❌ [Telegram] getMe 响应非 Bot 账号:', me);
       }
     } catch (e) {
-      console.error('❌ [Telegram] 初始化连接失败:', e.message);
-      // 10秒后重试
-      setTimeout(() => {
+      // 刚启动时偶尔一次连不上属于正常网络抖动，前两次只记提醒；连续 3 次以上才记成错误
+      this.connectAttempts = (this.connectAttempts || 0) + 1;
+      const delay = telegramRetryDelayMs(this.connectAttempts);
+      const reason = describeNetError(e);
+      if (this.connectAttempts < 3) {
+        console.warn(`⚠️ [Telegram] 第 ${this.connectAttempts} 次连接没连上（${reason}），${delay / 1000} 秒后重试`);
+      } else {
+        console.error(`❌ [Telegram] 已连续 ${this.connectAttempts} 次连不上 Telegram（${reason}），${delay / 1000} 秒后继续重试`);
+      }
+      clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
         if (this.config.enabled && !this.isPolling) {
           this.start();
         }
-      }, 10000);
+      }, delay);
+    } finally {
+      this.isStarting = false;
     }
   }
 
   stop() {
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.connectAttempts = 0;
     this.isPolling = false;
     if (this.pollAbortController) {
       this.pollAbortController.abort();
@@ -234,7 +268,10 @@ class TelegramBotManager {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(postData)
         },
-        timeout: method === 'getUpdates' ? 35000 : 10000
+        timeout: method === 'getUpdates' ? 35000 : 10000,
+        // Node 20 起同时试 IPv4 / IPv6，默认每个地址只等 250 毫秒。服务刚启动时第一次握手常超过这个时间，
+        // 容器里又没有 IPv6，结果第一次连接总是失败。每个地址放宽到 3 秒。
+        autoSelectFamilyAttemptTimeout: 3000
       };
 
       const req = https.request(options, (res) => {
