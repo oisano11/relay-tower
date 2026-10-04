@@ -7287,6 +7287,9 @@ function syncTelegramUI() {
 
   const chkOutage = document.getElementById('checkTgOutage');
   if (chkOutage) chkOutage.checked = d.notifyOnOutage !== false;
+
+  const chkDigest = document.getElementById('checkTgDailyDigest');
+  if (chkDigest) chkDigest.checked = d.notifyDailyDigest !== false;
 }
 
 function openTelegramModal() {
@@ -7313,6 +7316,7 @@ async function saveTelegramConfig() {
   const notifyOnActiveSurge = document.getElementById('checkTgActiveSurge')?.checked ?? true;
   const notifyOnAutoSwitch = document.getElementById('checkTgAutoSwitch')?.checked ?? true;
   const notifyOnOutage = document.getElementById('checkTgOutage')?.checked ?? true;
+  const notifyDailyDigest = document.getElementById('checkTgDailyDigest')?.checked ?? true;
 
   const saveBtn = document.getElementById('btnSaveTgConfig');
   if (saveBtn) {
@@ -7331,7 +7335,8 @@ async function saveTelegramConfig() {
         notifyOnRatioChange,
         notifyOnActiveSurge,
         notifyOnAutoSwitch,
-        notifyOnOutage
+        notifyOnOutage,
+        notifyDailyDigest
       })
     });
     const json = await res.json();

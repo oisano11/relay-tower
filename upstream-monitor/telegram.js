@@ -65,10 +65,11 @@ const DEFAULT_CONFIG = {
   enabled: Boolean(process.env.TELEGRAM_BOT_TOKEN),
   botToken: process.env.TELEGRAM_BOT_TOKEN || '',
   adminChatIds: [],
-  notifyOnRatioChange: true,
-  notifyOnActiveSurge: true,
-  notifyOnAutoSwitch: true,
-  notifyOnOutage: true,
+  notifyOnRatioChange: true, // 正在接单的账号降价（推送，不响）
+  notifyOnActiveSurge: true, // 正在接单的账号涨价（推送并响，带换号按钮）
+  notifyOnAutoSwitch: true, // 自动换号（故障换号响，换回来不响）
+  notifyOnOutage: true, // 没有账号能顶上、余额快用完（推送并响）
+  notifyDailyDigest: true, // 每天早上 9 点的简报（不响），不接单账号的价格变动只进这里
   proxy: '' // 如 http://127.0.0.1:7890
 };
 
@@ -87,6 +88,72 @@ function describeNetError(e) {
 // 启动时连不上 Telegram 的重试间隔：3 秒起，每次翻倍，最多 60 秒
 function telegramRetryDelayMs(attempt) {
   return Math.min(60000, 3000 * Math.pow(2, Math.max(0, attempt - 1)));
+}
+
+// 同一个账号 3 小时内最多马上推 2 次价格变动，再变就只进每日简报，价格来回跳时不会一直响
+const PRICE_PUSH_WINDOW_MS = 3 * 3600 * 1000;
+const PRICE_PUSH_LIMIT = 2;
+
+// 推送里的说法：不写「定性」「探活」这类词，直接说出了什么事
+const OUTAGE_REASON_TEXT = {
+  balance_empty: '余额用完了',
+  request_failures: '请求连续失败',
+  probe_failures: '检测连续失败',
+  routing_failures: '客户请求找不到账号接单',
+  disabled: '被停用了',
+  no_active_account: '没有在接单的账号'
+};
+
+function fmtRate(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? String(Number(n.toFixed(4))) : '--';
+}
+
+function fmtDuration(ms) {
+  const minutes = Math.max(1, Math.round(Number(ms || 0) / 60000));
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (!hours) return `${minutes} 分钟`;
+  return rest ? `${hours} 小时 ${rest} 分` : `${hours} 小时`;
+}
+
+function fmtMoney(balance, unit) {
+  const n = Number(balance);
+  if (!Number.isFinite(n)) return '--';
+  const u = String(unit || '').trim().toUpperCase();
+  return (!u || u === 'USD' || u === '$') ? `$${n.toFixed(2)}` : `${n.toFixed(2)} ${unit}`;
+}
+
+// 待审批事项的一键按钮：按通道合并，最多 2 行同价通道、3 行新模型，避免按钮刷屏
+function buildApprovalKeyboard(pendingActions = []) {
+  const keyboard = [];
+  if (!Array.isArray(pendingActions) || pendingActions.length === 0) return keyboard;
+  const channelGroups = {};
+  const samePriceList = [];
+  pendingActions.forEach(act => {
+    if (act.type === 'same_price_channel') {
+      samePriceList.push(act);
+    } else {
+      const chKey = act.channelName || act.provider || '默认通道';
+      (channelGroups[chKey] = channelGroups[chKey] || []).push(act);
+    }
+  });
+  samePriceList.slice(0, 2).forEach(act => {
+    keyboard.push([
+      { text: `✅ 同步同价: ${act.name} (${act.costMultiplier}x)`, callback_data: `scan_act:approve:${act.id}` },
+      { text: '❌ 忽略', callback_data: `scan_act:reject:${act.id}` }
+    ]);
+  });
+  Object.entries(channelGroups).slice(0, 3).forEach(([chName, acts]) => {
+    const firstAct = acts[0];
+    const mult = firstAct.costMultiplier || firstAct.suggestedMultiplier || 1.0;
+    const shortName = chName.length > 14 ? chName.slice(0, 12) + '..' : chName;
+    keyboard.push([
+      { text: `🚀 开启 [${shortName}] (${mult}x, ${acts.length}新模)`, callback_data: `scan_act:approve:${firstAct.id}` },
+      { text: '⏸️ 暂缓', callback_data: `scan_act:reject:${firstAct.id}` }
+    ]);
+  });
+  return keyboard;
 }
 
 // 转义 HTML 特殊字符以适配 Telegram HTML 模式
@@ -126,6 +193,7 @@ class TelegramBotManager {
     this.isPolling = false;
     this.pollAbortController = null;
     this.lastUpdateId = 0;
+    this.pricePushes = new Map(); // 账号 ID → 最近马上推过价格变动的时间
     this.context = {
       getState: () => ({ channels: [], activeChannelId: null }),
       getAutoSwitchConfig: () => ({ enabled: false }),
@@ -284,7 +352,10 @@ class TelegramBotManager {
             if (data.ok) {
               resolve(data.result);
             } else {
-              reject(new Error(data.description || `Telegram API Error (${data.error_code})`));
+              reject(Object.assign(new Error(data.description || `Telegram API Error (${data.error_code})`), {
+                errorCode: data.error_code,
+                retryAfter: data.parameters && data.parameters.retry_after
+              }));
             }
           } catch (err) {
             reject(new Error(`解析 Telegram 响应失败: ${err.message}`));
@@ -945,91 +1016,72 @@ class TelegramBotManager {
   // ====== 🔔 主动推送事件分发器 (Push Notification Emitters) ======
 
   // 1. 上游倍率变动告警
-  async notifyRatioChange({ channel, oldMultiplier, newMultiplier, direction, changePercent, isActiveChannel, reason }) {
-    if (!this.config.enabled || !this.config.notifyOnRatioChange) return;
-    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
-
-    const isSurge = direction === 'up';
-    const isHighRisk = isActiveChannel && isSurge;
-
-    let title = isHighRisk 
-      ? `🚨 <b>【高危预警！当前主力通道暴涨】</b>`
-      : (isSurge ? `🔺 <b>【上游进货倍率涨价提醒】</b>` : `🔻 <b>【上游进货倍率下调喜报】</b>`);
-
-    let message = 
-      `${title}\n` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `📅 <b>告警时间:</b> <code>${formatShanghaiDateTime()}</code>\n` +
-      `📡 <b>变动渠道:</b> <b>${channel.name}</b> (ID: <code>${channel.id}</code>)\n` +
-      `📊 <b>倍率调整:</b> <code>${Number(oldMultiplier).toFixed(4)}x</code> ➔ <b><code>${Number(newMultiplier).toFixed(4)}x</code></b> (<b>${isSurge ? '+' : '-'}${changePercent}%</b>)\n` +
-      `🏢 <b>供应商:</b> ${channel.provider || channel.vendor || '通用'}\n` +
-      `💡 <b>检测原因:</b> ${reason || '自动探活巡检感知'}\n` +
-      `${isActiveChannel ? `\n🔴 <b>警告：该渠道正是您当前出海的主力主调线路！</b>\n` : ''}` +
-      `━━━━━━━━━━━━━━━━━━`;
-
-    let reply_markup = null;
-
-    // 如果是主力线路涨价，智能推荐其它更便宜的备用线路，直接生成一键切换按钮！
-    if (isHighRisk) {
-      const state = this.context.getState();
-      const candidates = state.channels
-        .filter(c => String(c.id) !== String(channel.id) && c.schedulable && c.multiplier < newMultiplier)
-        .sort((a, b) => a.multiplier - b.multiplier)
-        .slice(0, 3);
-
-      if (candidates.length > 0) {
-        const switchButtons = candidates.map(c => ([{
-          text: `⚡ 一键切到 ${c.name.slice(0, 10)} (${c.multiplier}x)`,
-          callback_data: `switch:${c.id}`
-        }]));
-        switchButtons.push([{ text: '🔀 查看全部备用通道', callback_data: 'cmd:switch' }]);
-        reply_markup = { inline_keyboard: switchButtons };
-      }
-    } else {
-      reply_markup = {
-        inline_keyboard: [
-          [{ text: '🔀 前往换线', callback_data: 'cmd:switch' }, { text: '📊 查看大盘', callback_data: 'cmd:status' }]
-        ]
-      };
+  // 1. 价格变动：只有正在接单的账号才马上推（涨价响、降价不响），其余账号的变动只进每日简报。
+  //    同一个账号 3 小时内最多马上推 2 次，价格来回跳时不会一直响。
+  async notifyRatioChange({ channel, oldMultiplier, newMultiplier, direction, changePercent, isActiveChannel, isServing, groupNames = [] }) {
+    if (!this.config.enabled || !this.hasAdmins()) return { pushed: false, why: 'disabled' };
+    if (!(isServing ?? isActiveChannel)) return { pushed: false, why: 'not_serving' };
+    const isUp = direction === 'up';
+    if (isUp ? this.config.notifyOnActiveSurge === false : this.config.notifyOnRatioChange === false) {
+      return { pushed: false, why: 'muted' };
     }
 
-    await this.broadcastToAdmins(message, { reply_markup });
+    const key = String(channel.id);
+    const now = Date.now();
+    const recent = (this.pricePushes.get(key) || []).filter(at => now - at < PRICE_PUSH_WINDOW_MS);
+    if (recent.length >= PRICE_PUSH_LIMIT) {
+      this.pricePushes.set(key, recent);
+      return { pushed: false, why: 'flapping' };
+    }
+    recent.push(now);
+    this.pricePushes.set(key, recent);
+
+    const groups = (groupNames || []).filter(Boolean);
+    const lines = [
+      isUp ? '🔴 <b>正在接单的账号涨价了</b>' : '🟢 <b>正在接单的账号降价了</b>',
+      `${escapeHtml(channel.name)}：${fmtRate(oldMultiplier)} → <b>${fmtRate(newMultiplier)}</b>（${isUp ? '涨' : '降'} ${escapeHtml(changePercent)}%）`
+    ];
+    if (groups.length) lines.push(`分组：${escapeHtml(groups.slice(0, 3).join('、'))}${groups.length > 3 ? ` 等 ${groups.length} 个` : ''}`);
+    lines.push(isUp ? '每单利润变少了，可以换到更便宜的账号。' : '进货变便宜了，每单利润会变多。');
+    if (recent.length === PRICE_PUSH_LIMIT) lines.push('<i>这个账号价格变得频繁，接下来 3 小时的变化只汇总进每日简报。</i>');
+
+    let keyboard;
+    if (isUp) {
+      const state = this.context.getState();
+      const candidates = (state.channels || [])
+        .filter(c => String(c.id) !== String(channel.id) && c.schedulable && Number(c.multiplier) < Number(newMultiplier))
+        .sort((a, b) => a.multiplier - b.multiplier)
+        .slice(0, 3);
+      keyboard = candidates.map(c => ([{ text: `⚡ 换到 ${String(c.name).slice(0, 12)}（${fmtRate(c.multiplier)}）`, callback_data: `switch:${c.id}` }]));
+      keyboard.push([{ text: '🔀 查看全部账号', callback_data: 'cmd:switch' }]);
+    } else {
+      keyboard = [[{ text: '📊 查看大盘', callback_data: 'cmd:status' }]];
+    }
+    await this.broadcastToAdmins(lines.join('\n'), { reply_markup: { inline_keyboard: keyboard }, disable_notification: !isUp });
+    return { pushed: true };
   }
 
-  // 2. 自动切线触发通知 (包含改售价保毛利与断流应急)
+  // 2. 自动换号：故障换号马上推并响；原主调充值后换回、便宜账号恢复后换回，推送但不响
   async notifyAutoSwitch(logEntry, toChannel) {
-    if (!this.config.enabled || !this.config.notifyOnAutoSwitch) return;
-    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
-
-    const toAct = toChannel?.userActivity || {};
-    const toUsers = toAct.activeUsers15m || 0;
-    const toInflight = toAct.inflight || 0;
-
-    const safeFrom = escapeHtml(logEntry.fromName);
-    const safeTo = escapeHtml(logEntry.toName);
-    const safeReason = escapeHtml(logEntry.reason);
-    const safeGroup = escapeHtml(logEntry.groupName || '默认分组');
-
-    const recovered = logEntry.triggerType === 'auto_recover_lowest_cost';
-    const message =
-      `${recovered ? '🟢 <b>【账号稳定恢复，已自动回切】</b>' : '⚡ <b>【故障自动切号完成】</b>'}\n` +
-      `━━━━━━━━━━━━━━━━━━\n` +
-      `📅 <b>发生时间:</b> <code>${formatShanghaiDateTime(logEntry.timestamp || new Date())}</code>\n` +
-      `📁 <b>业务分组:</b> ${safeGroup}\n` +
-      `🔄 <b>切号:</b> [${safeFrom}] ➔ <b>[${safeTo}]</b>\n` +
-      `🎯 <b>原因:</b> ${safeReason}\n` +
-      `💸 <b>进货倍率:</b> <code>${escapeHtml(logEntry.oldCost ?? '--')}x</code> ➔ <code>${escapeHtml(logEntry.newCost ?? '--')}x</code>\n` +
-      `👥 <b>新账号负载:</b> ${toUsers} 人在线 · ${toInflight} 个并发\n` +
-      `✅ <i>对外售价未改动。故障账号继续检查恢复；欠费账号请充值。</i>`;
-
-    const reply_markup = {
-      inline_keyboard: [
-        [{ text: '👥 线路实时负载', callback_data: 'cmd:load' }, { text: '🔀 人工选其它线', callback_data: 'cmd:switch' }],
-        [{ text: '📊 查看大盘', callback_data: 'cmd:status' }]
-      ]
-    };
-
-    await this.broadcastToAdmins(message, { reply_markup });
+    if (!this.config.enabled || !this.config.notifyOnAutoSwitch || !this.hasAdmins()) return;
+    const trigger = logEntry.triggerType;
+    const recovered = trigger === 'main_recharged' || trigger === 'cheaper_recovered' || trigger === 'auto_recover_lowest_cost';
+    const from = escapeHtml(logEntry.fromName);
+    const to = escapeHtml(logEntry.toName);
+    const group = escapeHtml(logEntry.groupName || '默认分组');
+    // 常见原因用大白话；其余用记录里的原因（形如「分组名：原因」，分组已经单独写出来，这里只留原因）
+    const why = escapeHtml(OUTAGE_REASON_TEXT[trigger] || String(logEntry.reason || '').replace(/^[^：]*：/, ''));
+    const title = trigger === 'main_recharged' ? '🟢 <b>原主调充值后，已自动换回</b>'
+      : recovered ? '🟢 <b>便宜的账号恢复了，已自动换回去</b>'
+        : '⚡ <b>已自动换号，客户那边不用改设置</b>';
+    const lines = [title, `${group}：${from} → <b>${to}</b>`];
+    if (!recovered && why) lines.push(`原因：${why}`);
+    lines.push(`进价 ${fmtRate(logEntry.oldCost)} → ${fmtRate(logEntry.newCost)}，售价没变`);
+    if (trigger === 'balance_empty') lines.push(`${from} 充值后会自动换回来。`);
+    await this.broadcastToAdmins(lines.join('\n'), {
+      reply_markup: { inline_keyboard: [[{ text: '👥 查看负载', callback_data: 'cmd:load' }, { text: '🔀 手动换线', callback_data: 'cmd:switch' }]] },
+      disable_notification: recovered
+    });
   }
 
   // 3. 手动切线确认通知
@@ -1037,8 +1089,8 @@ class TelegramBotManager {
     if (!this.config.enabled) return;
     if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
 
-    // 如果操作者就是 Telegram Bot，自身已有交互回复，无需重复刷屏广播
-    if (operator && operator.includes('Telegram')) return;
+    // 在 Telegram 里操作的已经有回复；在控制台自己点的也不用再推一遍（控制台有记录）
+    if (operator && (operator.includes('Telegram') || operator.includes('控制台'))) return;
 
     const act = channel.userActivity || {};
     const u15m = act.activeUsers15m || 0;
@@ -1067,7 +1119,7 @@ class TelegramBotManager {
   async notifyRoleChange(channel, role, operator = '控制台') {
     if (!this.config.enabled) return;
     if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
-    if (operator && operator.includes('Telegram')) return;
+    if (operator && (operator.includes('Telegram') || operator.includes('控制台'))) return;
 
     // 只有主调接单；副调、备选平时不接单，按顺序替补；备用就是关掉
     const roleName = {
@@ -1142,92 +1194,153 @@ class TelegramBotManager {
     }
   }
 
-  // 7. 推送上游通道巡检报告与一键审批按钮
-  async notifyScanReport(report, pendingActions = []) {
-    if (!this.config.enabled) return;
-    if (!this.config.adminChatIds || this.config.adminChatIds.length === 0) return;
-
-    const keyboard = [];
-
-    // 为每个待处理项提供一键审批按钮 (按通道维度聚合，避免散碎模型刷屏)
-    if (Array.isArray(pendingActions) && pendingActions.length > 0) {
-      const channelGroups = {};
-      const samePriceList = [];
-
-      pendingActions.forEach(act => {
-        if (act.type === 'same_price_channel') {
-          samePriceList.push(act);
-        } else {
-          const chKey = act.channelName || act.provider || '默认通道';
-          if (!channelGroups[chKey]) {
-            channelGroups[chKey] = [];
-          }
-          channelGroups[chKey].push(act);
-        }
-      });
-
-      // 同价通道审批 (最多 2 个)
-      samePriceList.slice(0, 2).forEach(act => {
-        keyboard.push([
-          { text: `✅ 同步同价: ${act.name} (${act.costMultiplier}x)`, callback_data: `scan_act:approve:${act.id}` },
-          { text: `❌ 忽略`, callback_data: `scan_act:reject:${act.id}` }
-        ]);
-      });
-
-      // 通道新模型聚合审批 (最多 3 个通道)
-      Object.entries(channelGroups).slice(0, 3).forEach(([chName, acts]) => {
-        const firstAct = acts[0];
-        const mult = firstAct.costMultiplier || firstAct.suggestedMultiplier || 1.0;
-        const shortName = chName.length > 14 ? chName.slice(0, 12) + '..' : chName;
-        keyboard.push([
-          { text: `🚀 开启 [${shortName}] (${mult}x, ${acts.length}新模)`, callback_data: `scan_act:approve:${firstAct.id}` },
-          { text: `⏸️ 暂缓`, callback_data: `scan_act:reject:${firstAct.id}` }
-        ]);
-      });
-    }
-
+  // 7. 上游巡检：由巡检器决定要不要推（只有发现要审批的、或自动上了低价通道才推）；自动巡检不响，/scan 的回复照常响
+  async notifyScanReport(report, pendingActions = [], { silent = true } = {}) {
+    if (!this.config.enabled || !this.hasAdmins()) return;
+    const keyboard = buildApprovalKeyboard(pendingActions);
     keyboard.push([
-      { text: '🔄 再次扫描', callback_data: 'cmd:scan' },
+      { text: '🔄 再扫一次', callback_data: 'cmd:scan' },
       { text: '📊 查看大盘', callback_data: 'cmd:status' }
     ]);
-
-    await this.broadcastToAdmins(report.summaryText || '上游扫描巡检完成', {
-      reply_markup: { inline_keyboard: keyboard }
+    await this.broadcastToAdmins(report.summaryText || '上游巡检完成', {
+      reply_markup: { inline_keyboard: keyboard },
+      disable_notification: silent
     });
   }
 
-  // 发送给所有绑定的管理员
+  // 8. 本组没有账号能顶上：第一次马上推，之后 1 小时、3 小时各一次，再往后每 6 小时一次（节奏由 server.js 控制）
+  async notifyPoolExhausted({ groupName, reason, degraded = [], parked = [], lacking = [], count = 1, sinceMs = 0 }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const why = OUTAGE_REASON_TEXT[reason] || reason || '出了问题';
+    const lines = [`🔴 <b>${escapeHtml(groupName)} 没有账号能顶上了</b>`];
+    if (degraded.length) lines.push(`现在的账号 ${escapeHtml(degraded.join('、'))} ${escapeHtml(why)}，还在勉强接单。`);
+    else if (parked.length) lines.push(`${escapeHtml(parked.join('、'))} ${escapeHtml(why)}，已经停止接单，这个分组的客户现在会报错。`);
+    else lines.push(`原因：${escapeHtml(why)}。`);
+    if (lacking.length) {
+      lines.push(lacking.map(item => `${escapeHtml(item.name)} 缺客户在用的模型 ${escapeHtml(item.missing.join('、'))}，顶不上`).join('；') + '。');
+    }
+    lines.push('请充值，或者给这个分组设一个副调。恢复后会告诉你。');
+    if (count > 1 && sinceMs) lines.push(`已持续 ${fmtDuration(Date.now() - sinceMs)} · 第 ${count} 次提醒`);
+    await this.broadcastToAdmins(lines.join('\n'), {
+      reply_markup: { inline_keyboard: [[{ text: '👥 查看负载', callback_data: 'cmd:load' }, { text: '🔀 手动换线', callback_data: 'cmd:switch' }]] }
+    });
+    return true;
+  }
+
+  // 9. 没有账号能顶上的分组恢复了（没换号、原账号自己好了），补一条不响的消息
+  async notifyPoolRecovered({ groupName, currentName, durationMs }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const lines = [`✅ <b>${escapeHtml(groupName)} 已恢复</b>`];
+    if (currentName) lines.push(`现在由 ${escapeHtml(currentName)} 正常接单。`);
+    if (durationMs > 0) lines.push(`前后持续了 ${fmtDuration(durationMs)}。`);
+    await this.broadcastToAdmins(lines.join('\n'), { disable_notification: true });
+    return true;
+  }
+
+  // 10. 正在接单的账号余额低于 5 美元：每一轮只提醒一次（server.js 记着提醒过谁）
+  async notifyLowBalance({ channel, groups = [], noBackupGroups = [] }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const lines = [
+      '🔴 <b>正在接单的账号余额快用完了</b>',
+      `${escapeHtml(channel.name)}：还剩 <b>${fmtMoney(channel.balance, channel.balanceUnit)}</b>（低于 5 美元）`
+    ];
+    if (groups.length) lines.push(`分组：${escapeHtml(groups.map(g => g.name).join('、'))}`);
+    lines.push(noBackupGroups.length
+      ? `${escapeHtml(noBackupGroups.map(g => g.name).join('、'))} 没有副调，余额用完后客户会开始报错，请尽快充值。`
+      : '余额用完后会自动换到副调；想继续用这个账号就尽快充值。');
+    await this.broadcastToAdmins(lines.join('\n'));
+    return true;
+  }
+
+  // 11. 每日简报（每天早上 9 点，不响）：数据由 server.js 汇总，这里只负责写成一条消息
+  formatDailyDigest(d = {}) {
+    const items = [];
+    const switches = d.switches || [];
+    if (switches.length) {
+      items.push(`⚡ 自动换号 ${switches.length} 次：`);
+      switches.slice(0, 5).forEach(sw => items.push(`  · ${escapeHtml(sw.group)}：${escapeHtml(sw.from)} → ${escapeHtml(sw.to)}${sw.recovered ? '（换回）' : ''}`));
+      if (switches.length > 5) items.push(`  · 另外还有 ${switches.length - 5} 次，详见控制台`);
+    }
+    const exhausted = d.exhausted || [];
+    if (exhausted.length) {
+      items.push('🔴 没有账号能顶上：' + exhausted.map(e => `${escapeHtml(e.group)}（${e.unresolved ? '还没解决' : '已恢复'}）`).join('、'));
+    }
+    const low = d.lowBalance || [];
+    if (low.length) items.push('💰 余额偏低：' + low.map(c => `${escapeHtml(c.name)} ${fmtMoney(c.balance, c.unit)}`).join('、'));
+    const prices = d.priceChanges || [];
+    if (prices.length) {
+      items.push(`📈 价格有变动的账号 ${prices.length} 个：`);
+      prices.slice(0, 8).forEach(pc => {
+        const change = (pc.count > 1 && Number(pc.from) === Number(pc.to))
+          ? `来回变了 ${pc.count} 次，现在还是 ${fmtRate(pc.to)}`
+          : `${fmtRate(pc.from)} → ${fmtRate(pc.to)}${pc.count > 1 ? `（变了 ${pc.count} 次）` : ''}`;
+        items.push(`  · ${escapeHtml(pc.name)}：${change}${pc.serving ? '（在接单）' : ''}`);
+      });
+      if (prices.length > 8) items.push(`  · 另外还有 ${prices.length - 8} 个，详见控制台`);
+    }
+    if (d.newKeys) items.push(`🔑 发现 ${d.newKeys} 批还没接入的上游 Key，详见控制台`);
+    if (d.pendingCount) items.push(`📝 待你审批 ${d.pendingCount} 项，下方按钮可以直接处理`);
+    if (!items.length) items.push('一切正常，没有需要你处理的事。');
+    return [`☀️ <b>中转塔台 · 每日简报</b>（${escapeHtml(d.dateLabel || '')}）`, '过去 24 小时：', ...items].join('\n');
+  }
+
+  async sendDailyDigest(data, pendingActions = []) {
+    if (!this.config.enabled || this.config.notifyDailyDigest === false || !this.hasAdmins()) return false;
+    const pending = Array.isArray(pendingActions) ? pendingActions : [];
+    const keyboard = buildApprovalKeyboard(pending);
+    keyboard.push([{ text: '📊 查看大盘', callback_data: 'cmd:status' }]);
+    const sent = await this.broadcastToAdmins(this.formatDailyDigest({ ...data, pendingCount: pending.length }), {
+      reply_markup: { inline_keyboard: keyboard },
+      disable_notification: true
+    });
+    return sent > 0;
+  }
+
+  hasAdmins() {
+    return Array.isArray(this.config.adminChatIds) && this.config.adminChatIds.length > 0;
+  }
+
+  // 发送给所有绑定的管理员；返回成功发出的条数
   async broadcastToAdmins(text, options = {}) {
-    if (!this.config.adminChatIds || !Array.isArray(this.config.adminChatIds)) return;
+    if (!this.config.enabled || !this.hasAdmins()) return 0;
+    let sent = 0;
     for (const chatId of this.config.adminChatIds) {
       try {
         await this.sendMessage(chatId, text, options);
+        sent++;
       } catch (err) {
-        console.error(`[Telegram] 广播消息至 ${chatId} 失败:`, err.message);
+        console.error(`[Telegram] 广播消息至 ${chatId} 失败:`, describeNetError(err));
       }
+    }
+    return sent;
+  }
+
+  // 被 Telegram 限流（429）或网络抖了一下时，等一会儿再发一次，免得提醒丢掉
+  async apiRequestWithRetry(method, payload) {
+    try {
+      return await this.apiRequest(method, payload);
+    } catch (err) {
+      const retryAfter = Number(err.retryAfter) || 0;
+      const transient = retryAfter > 0 || err.name === 'AggregateError' ||
+        /超时|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|ECONNREFUSED|socket hang up/i.test(describeNetError(err));
+      if (!transient) throw err;
+      await new Promise(resolve => setTimeout(resolve, Math.min(30000, retryAfter > 0 ? retryAfter * 1000 : 3000)));
+      return this.apiRequest(method, payload);
     }
   }
 
   // 发送消息核心方法
   async sendMessage(chatId, text, options = {}) {
+    const payload = { chat_id: chatId, text, parse_mode: 'HTML', ...options };
+    if (payload.reply_markup == null) delete payload.reply_markup;
     try {
-      return await this.apiRequest('sendMessage', {
-        chat_id: chatId,
-        text: text,
-        parse_mode: 'HTML',
-        ...options
-      });
+      return await this.apiRequestWithRetry('sendMessage', payload);
     } catch (err) {
       if (err.message && (err.message.includes("can't parse entities") || err.message.includes('parse entities') || err.message.includes('Bad Request'))) {
         console.warn(`[Telegram] HTML解析失败，尝试降级为纯文本重试: ${err.message}`);
-        const plainText = text.replace(/<[^>]+>/g, '');
-        const fallbackOpts = { ...options };
-        delete fallbackOpts.parse_mode;
-        return await this.apiRequest('sendMessage', {
-          chat_id: chatId,
-          text: plainText,
-          ...fallbackOpts
-        });
+        const fallback = { ...payload, text: text.replace(/<[^>]+>/g, '') };
+        delete fallback.parse_mode;
+        return await this.apiRequestWithRetry('sendMessage', fallback);
       }
       throw err;
     }
@@ -1309,6 +1422,7 @@ class TelegramBotManager {
       notifyOnActiveSurge: this.config.notifyOnActiveSurge !== false,
       notifyOnAutoSwitch: this.config.notifyOnAutoSwitch !== false,
       notifyOnOutage: this.config.notifyOnOutage !== false,
+      notifyDailyDigest: this.config.notifyDailyDigest !== false,
       isPolling: this.isPolling
     };
   }

@@ -514,38 +514,37 @@ class UpstreamScanner {
       report.endTime = endTime.toISOString();
       report.durationMs = endTime.getTime() - startTime.getTime();
 
-      const pad = n => String(n).padStart(2, '0');
-      const scanDateStr = `${endTime.getFullYear()}-${pad(endTime.getMonth() + 1)}-${pad(endTime.getDate())} ${pad(endTime.getHours())}:${pad(endTime.getMinutes())}:${pad(endTime.getSeconds())}`;
+      // 推送用北京时间（服务器容器是 UTC，以前简报上的时间慢 8 小时）；停用通道、熔断分组两项从来没有统计过，不再显示 0
+      const scanDateStr = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
+      }).format(endTime).replace(',', '');
+      const esc = value => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const markup = Number(this.config.markupPercent) || 20;
+      const pendingCount = report.pendingSamePrice.length + report.pendingNewModels.length;
+      const found = report.autoSyncedChannels.length + pendingCount + report.closedGroups.length;
 
       const summaryLines = [
-        `📊 <b>中转塔台 · 上游通道巡检简报 (${triggerSource})</b>`,
-        `━━━━━━━━━━━━━━━━━━`,
-        `📅 <b>巡检时间:</b> <code>${scanDateStr}</code>`,
-        `⏱️ <b>巡检耗时:</b> ${(report.durationMs / 1000).toFixed(1)} 秒 · 共探测 <b>${report.totalProbed}</b> 个通道`,
-        `🛑 <b>停用通道:</b> <b>${report.deactivatedChannels.length}</b> 个`,
-        `⚠️ <b>熔断关停分组:</b> <b>${report.closedGroups.length}</b> 个 ${report.closedGroups.length > 0 ? '(孤岛空组已安全阻断)' : ''}`,
-        `🟢 <b>自动同步低价通道:</b> <b>${report.autoSyncedChannels.length}</b> 个 (+20%溢价自动上线)`,
-        `🟡 <b>待审批同价通道:</b> <b>${report.pendingSamePrice.length}</b> 项 (需人工确认)`,
-        `🟣 <b>待开启全新模型:</b> <b>${report.pendingNewModels.length}</b> 个 (需人工确认)`,
-        `━━━━━━━━━━━━━━━━━━`
+        found ? '🔎 <b>上游巡检有新发现</b>' : '🔎 <b>上游巡检完成，没有新发现</b>',
+        `${scanDateStr} · 查了 ${report.totalProbed} 个通道 · 用时 ${(report.durationMs / 1000).toFixed(1)} 秒`
       ];
 
       if (report.closedGroups.length > 0) {
-        summaryLines.push(`🚨 <b>【高危熔断】</b>: 以下分组因失去唯一通道已自动关停:`);
+        summaryLines.push('', '🚨 这些分组没有可用通道，已经关停：');
         report.closedGroups.forEach(g => {
-          summaryLines.push(`  • 分组 [<b>${g.groupName}</b>] (原通道: ${g.causedByChannel})`);
+          summaryLines.push(`  · ${esc(g.groupName)}（原来的通道：${esc(g.causedByChannel)}）`);
         });
       }
 
       if (report.autoSyncedChannels.length > 0) {
-        summaryLines.push(`\n💰 <b>【低价直通上线】</b>:`);
-        report.autoSyncedChannels.forEach(c => {
-          summaryLines.push(`  • [${c.name}]: 进价 <code>${c.costMultiplier}x</code> ➔ 售价 <code>${c.saleMultiplier}x</code> (+20%)`);
+        summaryLines.push('', `💰 自动上线了 ${report.autoSyncedChannels.length} 个更便宜的通道（售价 = 进价 + ${markup}%）：`);
+        report.autoSyncedChannels.slice(0, 8).forEach(c => {
+          summaryLines.push(`  · ${esc(c.name)}：进价 ${esc(c.costMultiplier)} → 售价 ${esc(c.saleMultiplier)}`);
         });
+        if (report.autoSyncedChannels.length > 8) summaryLines.push(`  · 另外还有 ${report.autoSyncedChannels.length - 8} 个，详见控制台`);
       }
 
-      if (report.pendingSamePrice.length > 0 || report.pendingNewModels.length > 0) {
-        summaryLines.push(`\n🔔 <b>【待您决策请示】</b>: 共 ${report.pendingSamePrice.length + report.pendingNewModels.length} 项，请前往 Web 中控台或直接在下方点击按钮审批！`);
+      if (pendingCount > 0) {
+        summaryLines.push('', `📝 有 ${pendingCount} 项等你决定（同价通道 ${report.pendingSamePrice.length} 个、新模型 ${report.pendingNewModels.length} 个），点下面的按钮或去控制台处理。`);
       }
 
       report.summaryText = summaryLines.join('\n');
@@ -569,10 +568,10 @@ class UpstreamScanner {
         allGroups: state.allGroups
       });
 
-      // (b) Telegram Bot 实时通知与交互按钮
-      if (this.config.notifyTelegram && this.context.telegram) {
+      // (b) Telegram：定时和控制台触发的巡检只有发现了要处理的事才推（不响）；在 Telegram 里发 /scan 的一定回复
+      if (this.config.notifyTelegram && this.context.telegram && this.shouldNotifyTelegram(report, triggerSource)) {
         try {
-          await this.context.telegram.notifyScanReport(report, this.getPendingActions());
+          await this.context.telegram.notifyScanReport(report, this.getPendingActions(), { silent: !this.isTelegramTrigger(triggerSource) });
         } catch (tgErr) {
           console.error('[UpstreamScanner] Telegram 通知失败:', tgErr.message);
         }
@@ -590,6 +589,17 @@ class UpstreamScanner {
   }
 
   // 探测通道连通性与存活
+  isTelegramTrigger(triggerSource) {
+    return /Telegram/i.test(String(triggerSource || ''));
+  }
+
+  // 一次巡检值不值得推 Telegram：以前每 3 小时推一条，大多写着「什么都没发现」
+  shouldNotifyTelegram(report = {}, triggerSource = '') {
+    if (this.isTelegramTrigger(triggerSource)) return true;
+    const count = list => (Array.isArray(list) ? list.length : 0);
+    return count(report.autoSyncedChannels) + count(report.pendingSamePrice) + count(report.pendingNewModels) + count(report.closedGroups) > 0;
+  }
+
   async probeChannelAlive(channel) {
     if (!channel.baseUrl) return false;
     const cleanUrl = channel.baseUrl.replace(/\/+$/, '');

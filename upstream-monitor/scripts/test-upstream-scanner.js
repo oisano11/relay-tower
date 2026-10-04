@@ -328,7 +328,8 @@ async function main() {
       assert.strictEqual(report.closedGroups.length, 0, '巡检不得永久关闭业务分组');
       assert.strictEqual(report.autoSyncedChannels.length, 1, '低价上游应被自动同步上线');
       assert.ok(!report.summaryText.includes('高危熔断'), '单次探活不触发分组熔断');
-      assert.ok(report.summaryText.includes('低价直通上线'), '总结必须包含低价直通上线信息');
+      assert.ok(report.summaryText.includes('自动上线了 1 个更便宜的通道'), '总结必须说明自动上线了哪些低价通道');
+      assert.ok(!/停用通道|熔断关停分组/.test(report.summaryText), '从没统计过的两项不再显示 0');
 
       // 验证 Telegram 通知有被调用
       assert.strictEqual(mockCtx._internal.telegramNotifications.length, 1, '必须向 Telegram 派发报告推送');

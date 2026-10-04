@@ -916,6 +916,11 @@ async function refreshAllBalances() {
     applyChannelBalanceInfo(ch, await fetchChannelBalance(ch));
   });
   await Promise.allSettled(promises);
+  try {
+    checkLowBalanceAlerts();
+  } catch (e) {
+    console.error('[余额提醒] 检查失败:', e.message);
+  }
   writeJSON(CHANNELS_FILE, state);
   broadcastSSE('CHANNELS_UPDATED', state);
   if (autoSwitchConfig.enabled) {
@@ -928,6 +933,125 @@ async function refreshAllBalances() {
   // 同步余额时各家上游刚登录过，顺便检查有没有新建的 Key（不等待，失败只记日志）
   discoverUpstreamKeys({ notify: true }).catch(err => console.error('[上游新 Key] 检查失败:', err.message));
   return state.channels;
+}
+
+// ====== 余额提醒与每日简报 ======
+// 正在接单的账号余额掉到 5 美元以下（balanceStatus = 'low'）时提醒一次；回到 6 美元以上才算这一轮结束，
+// 免得余额在 5 美元上下晃时反复提醒。余额用完以后由自动换号 / 「没有账号能顶上」接着提醒。
+const LOW_BALANCE_RESET_USD = 6;
+
+function checkLowBalanceAlerts(now = Date.now()) {
+  // 后台同步进程里没有 Telegram：不在那边做标记，免得主进程以为已经提醒过
+  if (!telegram || typeof telegram.notifyLowBalance !== 'function') return [];
+  state.lowBalanceAlerts = state.lowBalanceAlerts || {};
+  const marks = state.lowBalanceAlerts;
+  const due = [];
+  for (const ch of state.channels || []) {
+    const id = String(ch.id);
+    const balance = Number(ch.balance);
+    if (ch.balanceStatus === 'unlimited' || ch.balance === null || ch.balance === undefined || !Number.isFinite(balance)) continue;
+    if (marks[id] && balance >= LOW_BALANCE_RESET_USD) delete marks[id];
+    if (ch.balanceStatus === 'low' && ch.schedulable && !marks[id]) {
+      marks[id] = new Date(now).toISOString();
+      due.push(ch);
+    }
+  }
+  // 账号已经不在了的提醒记录顺手清掉
+  const alive = new Set((state.channels || []).map(c => String(c.id)));
+  Object.keys(marks).forEach(id => { if (!alive.has(id)) delete marks[id]; });
+  if (!due.length) return due;
+  for (const ch of due) {
+    const groups = (ch.groupsDetail || []).filter(g => g && g.id !== undefined).map(g => ({ id: g.id, name: g.name || String(g.id) }));
+    const noBackupGroups = groups.filter(g => !(state.channels || []).some(c =>
+      String(c.id) !== String(ch.id) && ['sub', 'alt'].includes(groupRole(c, g.id))));
+    Promise.resolve(telegram.notifyLowBalance({ channel: ch, groups, noBackupGroups }))
+      .catch(error => console.error('[余额提醒]', error.message));
+  }
+  return due;
+}
+
+// 每日简报：北京时间早上 9 点到 12 点之间发一次（服务那会儿刚好重启也不会漏，晚于 12 点就等第二天）
+const DAILY_DIGEST_HOUR = 9;
+const DAILY_DIGEST_WINDOW_HOURS = 3;
+
+function beijingClock(ms) {
+  const d = new Date(Number(ms) + 8 * 3600000);
+  return { date: d.toISOString().slice(0, 10), hour: d.getUTCHours(), label: `${d.getUTCMonth() + 1}月${d.getUTCDate()}日` };
+}
+
+function buildDailyDigestData(now = Date.now()) {
+  const since = now - 24 * 3600000;
+  const recent = (alerts || []).filter(a => a && Date.parse(a.timestamp) >= since && Date.parse(a.timestamp) <= now)
+    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+
+  // 价格：按账号合并成「从多少变到多少、变了几次」；在控制台自己改的不算
+  const byChannel = new Map();
+  recent.filter(a => a.type === 'ratio_change' && !String(a.reason || '').includes('中控台')).forEach(a => {
+    const key = String(a.channelId);
+    const entry = byChannel.get(key) || { name: a.channelName || key, from: a.oldMultiplier, to: a.newMultiplier, count: 0, serving: false };
+    entry.to = a.newMultiplier;
+    entry.count += 1;
+    entry.serving = entry.serving || !!(a.schedulable || a.isActiveChannel);
+    byChannel.set(key, entry);
+  });
+  const priceChanges = [...byChannel.values()].sort((a, b) => (b.serving - a.serving) || (b.count - a.count));
+
+  // 换号：直接用换号记录（有从谁换到谁、哪个分组、为什么）
+  const recoveredTriggers = ['main_recharged', 'cheaper_recovered', 'auto_recover_lowest_cost'];
+  const switches = (autoSwitchLogs || [])
+    .filter(log => log && Date.parse(log.timestamp) >= since && Date.parse(log.timestamp) <= now)
+    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
+    .map(log => ({ group: log.groupName || '默认分组', from: log.fromName || '', to: log.toName || '', recovered: recoveredTriggers.includes(log.triggerType) }));
+
+  const groupName = id => {
+    const g = (state.allGroups || []).find(x => String(x.id) === String(id));
+    return g ? g.name : `分组 ${id}`;
+  };
+  const exhaustedIds = [...new Set(recent.filter(a => a.type === 'pool_exhausted' && a.groupId !== undefined).map(a => String(a.groupId)))];
+  const runtime = state.failoverRuntime || {};
+  const exhausted = exhaustedIds.map(id => ({
+    group: groupName(id),
+    unresolved: !!(runtime[id] && (runtime[id].exhaustedSince || runtime[id].exhaustedNotifiedAt))
+  }));
+
+  const lowBalance = (state.channels || [])
+    .filter(c => c.schedulable && (c.balanceStatus === 'low' || c.balanceStatus === 'empty') && Number.isFinite(Number(c.balance)))
+    .map(c => ({ name: c.name, balance: Number(c.balance), unit: c.balanceUnit }));
+
+  return {
+    dateLabel: beijingClock(now).label,
+    priceChanges,
+    switches,
+    exhausted,
+    lowBalance,
+    newKeys: recent.filter(a => a.type === 'upstream_key').length
+  };
+}
+
+let dailyDigestSending = false;
+async function maybeSendDailyDigest(now = Date.now()) {
+  if (dailyDigestSending || !telegram || !telegram.config || !telegram.config.enabled) return false;
+  if (telegram.config.notifyDailyDigest === false) return false;
+  const clock = beijingClock(now);
+  if (clock.hour < DAILY_DIGEST_HOUR || clock.hour >= DAILY_DIGEST_HOUR + DAILY_DIGEST_WINDOW_HOURS) return false;
+  if (telegram.config.lastDailyDigestDate === clock.date) return false;
+  dailyDigestSending = true;
+  try {
+    const pending = upstreamScanner && typeof upstreamScanner.getPendingActions === 'function' ? upstreamScanner.getPendingActions() : [];
+    const sent = await telegram.sendDailyDigest(buildDailyDigestData(now), pending);
+    // 发出去了才记今天已发；没发出去（比如网络断了）下一分钟再试，窗口过了就算了
+    if (sent) telegram.saveConfig({ lastDailyDigestDate: clock.date });
+    return !!sent;
+  } finally {
+    dailyDigestSending = false;
+  }
+}
+
+function startDailyDigestTimer() {
+  const timer = setInterval(() => {
+    maybeSendDailyDigest().catch(err => console.error('[每日简报] 发送失败:', err.message));
+  }, 60000);
+  if (timer.unref) timer.unref();
 }
 
 // ====== 上游新 Key：发现 → 待接入 → 选分组一键建号 ======
@@ -1003,7 +1127,7 @@ function announceNewUpstreamKeys(fresh) {
   writeJSON(ALERTS_FILE, alerts);
   try {
     if (telegram && telegram.config && telegram.config.enabled) {
-      Promise.resolve(telegram.broadcastToAdmins(note.replace(/[&<>]/g, ''))).catch(error => console.error('[新 Key 通知]', error.message));
+      Promise.resolve(telegram.broadcastToAdmins(note.replace(/[&<>]/g, ''), { disable_notification: true })).catch(error => console.error('[新 Key 通知]', error.message));
     }
   } catch (err) {
     console.error('[新 Key 通知]', err.message);
@@ -2112,6 +2236,9 @@ function publishRatioChangeAlert(alert, channel, options = {}) {
       direction: alert.direction,
       changePercent: alert.changePercent,
       isActiveChannel: alert.isActiveChannel,
+      // 正在接单 = Sub2API 里接单开关开着；只有这种账号变价才马上推，其余进每日简报
+      isServing: !!(channel.schedulable || alert.isActiveChannel),
+      groupNames: (channel.groupsDetail || []).map(g => g && g.name).filter(Boolean),
       reason: alert.reason
     })).catch(error => console.error('[Telegram] notifyRatioChange 异常:', error.message));
   } catch (err) {
@@ -6424,9 +6551,8 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
         }
         decision.runtime.lastSwitchAt = now;
         decision.runtime.lastTargetId = decision.targetId;
-        // 切换成功：下次再没有能顶上的账号时马上提醒
-        delete decision.runtime.exhaustedNotifiedAt;
-        delete decision.runtime.exhaustedNotified;
+        // 切换成功：下次再没有能顶上的账号时马上提醒（换号消息本身就说明问题解决了，不再补「已恢复」）
+        clearExhaustedReminder(decision.runtime);
         reports.push(result);
       } else if (decision.action === 'exhausted') {
         const active = channels.filter(c => c.schedulable);
@@ -6452,11 +6578,12 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
           invalidateSub2APIScheduler(ids);
           broadcastSSE('CHANNELS_UPDATED', state);
         }
-        // 第一次马上提醒；一直没能切换、故障还在，就每小时再提醒一次。
-        // 以前只提醒一次、要等下次切换成功才会再提醒，隔天再出事就没人知道。
-        const lastNotifiedAt = Number(decision.runtime.exhaustedNotifiedAt) || 0;
+        // 第一次马上提醒；故障一直在，就 1 小时、3 小时后各提醒一次，之后每 6 小时一次（exhaustedReminderDue）。
+        // 以前每小时一条一模一样的消息，一天能刷十几条，真正要紧的反而容易被忽略。
         delete decision.runtime.exhaustedNotified;
-        if (now - lastNotifiedAt >= EXHAUSTED_RENOTIFY_MS) {
+        if (exhaustedReminderDue(decision.runtime, now)) {
+          const count = (Number(decision.runtime.exhaustedNotifyCount) || 0) + 1;
+          const since = Number(decision.runtime.exhaustedSince) || now;
           const sharedProtection = sharedActive.length
             ? ` 已保留 ${sharedActive.length} 条共享账号的全局调度状态，避免影响其他业务组。`
             : '';
@@ -6471,15 +6598,39 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
             ? ` 本组的 ${lacking.map(item => `[${item.name}] 缺客户在用的模型 ${item.missing.join('、')}`).join('；')}，所以顶不上。`
             : '';
           const note = group.name + ' 没有能顶上的副调或备选（备用是关掉的，不会被换上），请检查余额并充值，或在分组里设一个副调；系统会继续探测并自动恢复。' +
-            degradedNote + missingNote + sharedProtection + ' 问题没解决前，每小时提醒一次。';
+            degradedNote + missingNote + sharedProtection + ` 问题没解决前会继续提醒：1 小时、3 小时后各一次，之后每 6 小时一次（这是第 ${count} 次）。`;
           alerts.unshift({ id: 'pool_' + key + '_' + now, type: 'pool_exhausted', groupId: group.id, timestamp: new Date(now).toISOString(), note });
           writeJSON(ALERTS_FILE, alerts);
           broadcastSSE('POOL_EXHAUSTED', { groupId: group.id, note });
-          Promise.resolve(telegram.broadcastToAdmins(note.replace(/[&<>]/g, ''))).catch(error => console.error('[切号通知]', error.message));
+          if (telegram && typeof telegram.notifyPoolExhausted === 'function') {
+            Promise.resolve(telegram.notifyPoolExhausted({
+              groupName: group.name,
+              reason: decision.reason,
+              degraded: keptDegraded.map(c => c.name),
+              parked: toPark.map(c => c.name),
+              lacking,
+              count,
+              sinceMs: since
+            })).catch(error => console.error('[切号通知]', error.message));
+          }
+          decision.runtime.exhaustedSince = since;
+          decision.runtime.exhaustedNotifyCount = count;
           decision.runtime.exhaustedNotifiedAt = now;
         }
         details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason) + (sharedActive.length ? `（已保留 ${sharedActive.length} 条共享账号）` : ''));
       } else {
+        // 之前提醒过「没有账号能顶上」、现在原账号自己好了（没换号）：补一条不响的「已恢复」。
+        // cooldown 可能发生在故障中（同一目标 3 分钟内不重复切），不算恢复。
+        const recoveredInPlace = ['healthy', 'manual_main'].includes(decision.reason);
+        if (recoveredInPlace && (decision.runtime.exhaustedSince || decision.runtime.exhaustedNotifiedAt)) {
+          const since = Number(decision.runtime.exhaustedSince || decision.runtime.exhaustedNotifiedAt) || now;
+          const current = channels.find(c => String(c.id) === String(decision.currentId));
+          clearExhaustedReminder(decision.runtime);
+          if (telegram && typeof telegram.notifyPoolRecovered === 'function') {
+            Promise.resolve(telegram.notifyPoolRecovered({ groupName: group.name, currentName: current ? current.name : '', durationMs: now - since }))
+              .catch(error => console.error('[切号通知]', error.message));
+          }
+        }
         details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason));
       }
     } catch (error) {
@@ -6492,8 +6643,32 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
 }
 
 
-// 本组没有能顶上的账号时，同一个分组最多每小时提醒一次
-const EXHAUSTED_RENOTIFY_MS = 3600000;
+// 本组没有能顶上的账号时的提醒节奏：第一次马上，之后距第一次 1 小时、3 小时各一次，再往后每 6 小时一次
+const EXHAUSTED_REMINDER_OFFSETS_MS = [0, 3600000, 3 * 3600000];
+const EXHAUSTED_REMINDER_EVERY_MS = 6 * 3600000;
+
+function exhaustedReminderDue(runtime, now) {
+  // 旧版本只记了「上次提醒时间」：当作已经提醒过一次，从那时开始算
+  if (!runtime.exhaustedSince && runtime.exhaustedNotifiedAt) {
+    runtime.exhaustedSince = Number(runtime.exhaustedNotifiedAt);
+    runtime.exhaustedNotifyCount = runtime.exhaustedNotifyCount || 1;
+  }
+  const count = Number(runtime.exhaustedNotifyCount) || 0;
+  const since = Number(runtime.exhaustedSince) || 0;
+  if (!count || !since) return true;
+  const last = EXHAUSTED_REMINDER_OFFSETS_MS.length - 1;
+  const offset = count <= last
+    ? EXHAUSTED_REMINDER_OFFSETS_MS[count]
+    : EXHAUSTED_REMINDER_OFFSETS_MS[last] + (count - last) * EXHAUSTED_REMINDER_EVERY_MS;
+  return now - since >= offset;
+}
+
+function clearExhaustedReminder(runtime) {
+  delete runtime.exhaustedNotifiedAt;
+  delete runtime.exhaustedNotified;
+  delete runtime.exhaustedSince;
+  delete runtime.exhaustedNotifyCount;
+}
 const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', manual_main: '主调是你亲手选的，不为省钱换号', main_recharged: '原主调充值恢复上线', automation_disabled: '自动切号已关闭' };
 
 /**
@@ -10359,6 +10534,7 @@ function initializeMainProcess() {
     startBalancePoller();
     startAnnouncementCleanup();
     startAutoSwitchPoller();
+    startDailyDigestTimer();
     refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
   });
 }

@@ -3280,14 +3280,14 @@ test('a 副调 that lacks only a model nobody uses takes over from a failing mai
   assert.deepEqual(run({ 1: ['gpt-a'] }), { from: '1', to: '2', trigger: 'routing_failures' });
 });
 
-test('with no usable backup the group is reported again every hour, naming what the 副调 lacks', () => {
+test('with no usable backup the group is reminded at once, after 1 h and 3 h, then every 6 h, naming what the 副调 lacks', () => {
   const now = Date.now();
   const failures = [1, 2, 3].map(i => ({ at: now - i * 5000, model: 'gpt-a', type: 'api_error' }));
   const telegrams = [];
   const { context, state } = evaluator({
     fetchRecentGroupRoutingFailures: () => ({ 1: { failures, lastSuccessAt: now - 120000 } }),
     fetchGroupModelDemand: () => ({ 1: ['gpt-a', 'gpt-b'] }),
-    telegram: { notifyAutoSwitch() {}, broadcastToAdmins: note => { telegrams.push(note); return Promise.resolve(); } }
+    telegram: { notifyAutoSwitch() {}, notifyPoolExhausted: payload => { telegrams.push(payload); return Promise.resolve(true); } }
   });
   state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
   state.channels = [
@@ -3299,17 +3299,45 @@ test('with no usable backup the group is reported again every hour, naming what 
   context.evaluateAutoSwitch();
   assert.equal(context.alerts.length, 1);
   assert.match(context.alerts[0].note, /\[副调乙\] 缺客户在用的模型 gpt-b，所以顶不上/);
-  assert.match(context.alerts[0].note, /问题没解决前，每小时提醒一次/);
+  assert.match(context.alerts[0].note, /问题没解决前会继续提醒：1 小时、3 小时后各一次，之后每 6 小时一次（这是第 1 次）/);
   assert.equal(telegrams.length, 1);
+  assert.equal(telegrams[0].groupName, 'A');
+  assert.equal(telegrams[0].count, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(telegrams[0].lacking)), [{ name: '副调乙', missing: ['gpt-b'] }]);
   assert.equal(state.failoverRuntime[1].exhaustedNotified, undefined);
-  // 一小时内不重复
+  assert.equal(state.failoverRuntime[1].exhaustedNotifyCount, 1);
+  // 把「第一次提醒」往前挪，模拟时间过去；没到点不提醒，到点提醒。
+  // 每轮评估都会换一个新的 runtime 对象，所以每次都重新从 state 里取。
+  const passed = hours => { state.failoverRuntime[1].exhaustedSince = now - hours * 3600000; context.evaluateAutoSwitch(); return context.alerts.length; };
+  assert.equal(passed(0.5), 1, 'not again within the first hour');
+  assert.equal(passed(1.01), 2, 'second reminder after 1 h');
+  assert.equal(passed(2.5), 2, 'third waits until 3 h');
+  assert.equal(passed(3.01), 3, 'third reminder at 3 h');
+  assert.equal(passed(8.5), 3, 'fourth waits until 9 h');
+  assert.equal(passed(9.01), 4, 'then every 6 h');
+  assert.equal(telegrams.length, 4);
+  assert.equal(telegrams[3].count, 4);
+});
+
+test('a group that was reminded and then recovers without a switch gets one quiet 已恢复; a cooldown hold is not a recovery', () => {
+  const now = Date.now();
+  const recovered = [];
+  const { context, state } = evaluator({
+    telegram: { notifyAutoSwitch() {}, notifyPoolRecovered: payload => { recovered.push(payload); return Promise.resolve(true); } }
+  });
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  state.channels = [fixChannel(1, { name: '主调甲', priority: 1, schedulable: true, groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] })];
+  state.activeChannelId = '1';
+  state.failoverRuntime = { 1: { lastCurrentId: '1', currentSince: now - 600000, exhaustedSince: now - 2 * 3600000, exhaustedNotifyCount: 2, exhaustedNotifiedAt: now - 3600000 } };
   context.evaluateAutoSwitch();
-  assert.equal(context.alerts.length, 1);
-  // 过了一小时还是没法切：再提醒
-  state.failoverRuntime[1].exhaustedNotifiedAt = now - 3600001;
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].groupName, 'A');
+  assert.equal(recovered[0].currentName, '主调甲');
+  assert.ok(recovered[0].durationMs >= 2 * 3600000 - 1000);
+  assert.equal(state.failoverRuntime[1].exhaustedSince, undefined);
+  assert.equal(state.failoverRuntime[1].exhaustedNotifyCount, undefined);
   context.evaluateAutoSwitch();
-  assert.equal(context.alerts.length, 2);
-  assert.equal(telegrams.length, 2);
+  assert.equal(recovered.length, 1, 'said once');
 });
 
 test('a successful switch clears the reminder clock, so the next stuck moment is reported at once', () => {
@@ -3319,10 +3347,11 @@ test('a successful switch clears the reminder clock, so the next stuck moment is
     fixChannel(1, { priority: 1, schedulable: true, balance: 0, balanceStatus: 'empty', groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] }),
     fixChannel(2, { groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 10 }] })
   ];
-  state.failoverRuntime = { 1: { exhaustedNotifiedAt: Date.now() - 60000, exhaustedNotified: true } };
+  state.failoverRuntime = { 1: { exhaustedNotifiedAt: Date.now() - 60000, exhaustedNotified: true, exhaustedSince: Date.now() - 120000, exhaustedNotifyCount: 2 } };
   context.evaluateAutoSwitch();
-  assert.equal(state.failoverRuntime[1].exhaustedNotifiedAt, undefined);
-  assert.equal(state.failoverRuntime[1].exhaustedNotified, undefined);
+  for (const key of ['exhaustedNotifiedAt', 'exhaustedNotified', 'exhaustedSince', 'exhaustedNotifyCount']) {
+    assert.equal(state.failoverRuntime[1][key], undefined, key);
+  }
 });
 
 test('the switch preview names the models a backup lacks and its recent real errors', () => {

@@ -489,3 +489,33 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - `describeNetError`：拼上 `code` 和 `AggregateError.errors` 里每个地址的错误码与地址。
 
 验收：`scripts/test-auth-telegram.js` 新增 2 个用例（请求选项里每个地址至少等 2 秒；启动遇到空消息的 `AggregateError` 时 3 秒后重试、日志写明各地址原因、只记提醒，第二次成功后开始轮询）。
+
+## Telegram 推送改版：分档、节奏、内容（2026-10-04）
+
+用户要求重新琢磨推送频率和内容。线上只读数据（`alerts.json` 约 11 天、`upstream_scan_reports.json` 最近 3 天）：
+
+- 价格变动 60 条：39 条发生在接单开关开着（`schedulable`）的账号上，其中涨价 18 条；`isActiveChannel`（全局唯一的 `activeChannelId`）只命中 3 条；3 小时内又变回原价的 12 条。以前每一条都马上推。
+- `pool_exhausted` 29 条，其中一天 15 条：同一个分组每小时一条一模一样的消息（`EXHAUSTED_RENOTIFY_MS = 3600000`）。
+- 巡检报告 3 天 19 条，全是定时巡检，没有一条有发现，但每条都推了；报告时间用的是容器本地时间（UTC）；「停用通道」「熔断关停分组」两个数组从没被写入，永远是 0。
+- `notifyAutoSwitch` 判断换回用的 `triggerType === 'auto_recover_lowest_cost'` 在别处从没出现过，`main_recharged`、`cheaper_recovered` 也被写成「故障自动切号完成」。
+- 控制台的 `notifyOnActiveSurge`、`notifyOnOutage` 只在 `getStatus()` 里读，不控制任何推送；「没有账号能顶上」直接调 `broadcastToAdmins`，不看 `enabled`。
+- 分组里改角色不推送（86 条 `role_change` 里只有 1 条是全局换主调、推了 Telegram）。
+
+改法：
+
+- `telegram.js`
+  - `notifyRatioChange`：只在 `isServing`（`server.js` 传 `channel.schedulable || isActiveChannel`）时推；涨价受 `notifyOnActiveSurge` 控制、响；降价受 `notifyOnRatioChange` 控制、`disable_notification`。按账号记最近推送时间（`pricePushes`），3 小时内满 2 次后不再推。正文写账号、旧价 → 新价、涨跌幅和所在分组，涨价附更便宜的接单账号按钮。
+  - `notifyAutoSwitch`：`main_recharged`、`cheaper_recovered` 有自己的标题并 `disable_notification`；常见原因用 `OUTAGE_REASON_TEXT` 写成大白话。
+  - 新增 `notifyPoolExhausted`、`notifyPoolRecovered`、`notifyLowBalance`（受 `notifyOnOutage` 控制）、`formatDailyDigest`/`sendDailyDigest`（受新开关 `notifyDailyDigest` 控制）；审批按钮抽成 `buildApprovalKeyboard`，巡检报告和每日简报共用。
+  - `notifyManualSwitch`、`notifyRoleChange`：操作者是控制台或 Telegram 时不推。
+  - `broadcastToAdmins` 检查 `enabled` 并返回发出的条数；`sendMessage` 去掉空的 `reply_markup`，经 `apiRequestWithRetry` 在 429（按 `retry_after`）或网络错误时重发一次；`apiRequest` 把 `error_code`、`retry_after` 带出来。
+- `server.js`
+  - `publishRatioChangeAlert` 传 `isServing` 和分组名。
+  - 「没有账号能顶上」：`exhaustedReminderDue` 按距第一次 0、1、3 小时，之后每 6 小时提醒（运行时记 `exhaustedSince`、`exhaustedNotifyCount`、`exhaustedNotifiedAt`；旧版只有 `exhaustedNotifiedAt` 的当作已提醒 1 次）；控制台告警保留详细说明，Telegram 用 `notifyPoolExhausted` 的短消息。换号成功或决策为 `healthy` / `manual_main` 时 `clearExhaustedReminder`；没换号就恢复时发 `notifyPoolRecovered`（`cooldown` 可能发生在故障中，不算恢复）。
+  - `checkLowBalanceAlerts`：每次 `refreshAllBalances` 后检查，接单账号 `balanceStatus === 'low'` 时提醒一次，记在 `state.lowBalanceAlerts`，余额回到 6 美元以上才清除；后台同步进程没有 Telegram，不做标记。
+  - 每日简报：`buildDailyDigestData` 从 `alerts`（价格按账号合并、去掉控制台直改）、`autoSwitchLogs`、`failoverRuntime`、当前余额汇总；`maybeSendDailyDigest` 每分钟检查一次，北京时间 9 点到 12 点之间、当天没发过才发，发出后把日期记进 Telegram 配置的 `lastDailyDigestDate`。
+  - 新上游 Key 的提醒加 `disable_notification`。
+- `upstream_scanner.js`：`shouldNotifyTelegram` 只在有自动上线、待审批或关停分组，或由 Telegram `/scan` 触发时推；定时和控制台触发的推送不响。报告用北京时间，去掉两个永远是 0 的数字，售价加成读 `markupPercent`，通道名转义。
+- 控制台 Telegram 设置：五个开关改成「接单账号降价」「接单账号涨价」「自动换号」「没有账号能顶上 · 余额快用完」「每日简报」。
+
+验收：`npm test` 284/284，巡检测试 16/16。新增 `scripts/test-telegram-push.js`（13 个用例：价格分档、限次、开关静音；换号标题与响不响；控制台操作不推；没有账号能顶上的短消息、恢复、静音；余额提醒；每日简报；限流重发；余额提醒只在掉到 5 美元以下时提醒一次、回到 6 美元以上才重新计；每日简报的数据汇总和发送时间窗；巡检什么时候推）；`test-regressions.js` 的提醒节奏用例改成 0、1、3、9 小时，新增「没换号就恢复时只发一次已恢复」；巡检报告用例改成新的说法。
