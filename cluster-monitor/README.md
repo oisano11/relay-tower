@@ -110,3 +110,4 @@ python3 -B -m unittest discover -s cluster-monitor/tests -p 'test_*.py'
 - Sub2API 健康检查地址和期望的容器名，要在配置里填对；填错了就一直显示「取不到」。
 - 运行账号在 docker 组里，等于 root 权限。所以 NoNewPrivileges 能防的范围有限。要彻底解决，需要只读的 docker 代理，以后再做。
 - 部署后要再看一次：健康检查请求会不会被计入请求数（现在的口径只数 `/v1/`，理论上不会）。
+- 「近 1 分钟客户请求」只读 Sub2API 日志末尾 5000 行。一分钟内的日志超过 5000 行时，显示「取不到」，不显示数不全的数字。

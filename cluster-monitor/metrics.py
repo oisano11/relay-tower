@@ -16,6 +16,9 @@ SYSFS_NET = '/sys/class/net'
 # 客户调用的接口都在 /v1/ 下。控制台和网页自己的请求也写进同一份日志，不能算进客户请求。
 # 每条请求的日志行里 path 字段出现两次，所以数「行」，不数「出现次数」。
 CUSTOMER_PATH_MARK = '"path": "/v1/'
+# 只读日志末尾这么多行。docker logs 只带 --since 时会从头扫整份日志：
+# 线上 700 多 MB 的日志要 17 秒，还会占满一个 CPU 核。带上 --tail 就只读末尾，0.1 秒左右。
+REQUEST_TAIL_LINES = 5000
 
 # 读取失败时可能抛出的异常，都只表示“这一项取不到”
 READ_ERRORS = (OSError, ValueError, KeyError, IndexError, ZeroDivisionError, subprocess.SubprocessError)
@@ -114,14 +117,18 @@ def read_containers(expected, run=subprocess.run):
     return [{'name': name, 'state': states.get(name, 'missing')} for name in expected]
 
 
-def count_requests(container, since='60s', run=subprocess.run):
-    """最近一段时间里，客户调用（路径以 /v1/ 开头）的请求条数。"""
-    done = run(['docker', 'logs', '--since', since, container],
+def count_requests(container, since='60s', run=subprocess.run, tail=REQUEST_TAIL_LINES):
+    """最近一段时间里，客户调用（路径以 /v1/ 开头）的请求条数。
+    只读日志末尾 tail 行，再按时间筛出这段时间的。筛完还剩满 tail 行，
+    说明这段时间的日志比 tail 还多、数不全，当成取不到（抛错，由 safe 变成 None）。"""
+    done = run(['docker', 'logs', '--tail', str(tail), '--since', since, container],
                capture_output=True, text=True, timeout=10)
     if done.returncode != 0:
         raise OSError('docker logs 失败')
-    text = done.stdout + done.stderr
-    return sum(1 for line in text.splitlines() if CUSTOMER_PATH_MARK in line)
+    lines = done.stdout.splitlines() + done.stderr.splitlines()
+    if len(lines) >= tail:
+        raise ValueError('这段时间的日志太多，只读末尾会数不全')
+    return sum(1 for line in lines if CUSTOMER_PATH_MARK in line)
 
 
 def probe_http(url, timeout=2.0, opener=_LOCAL_OPENER):

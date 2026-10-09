@@ -139,6 +139,27 @@ class CustomerRequestTests(unittest.TestCase):
             return completed(returncode=1)
         self.assertIsNone(metrics.safe(metrics.count_requests)('sub2api', run=run))
 
+    def test_only_the_end_of_the_log_is_read(self):
+        # 只带 --since 会从头扫整份日志（线上 700 多 MB 要 17 秒），必须带 --tail
+        seen = {}
+
+        def run(args, **kwargs):
+            seen['args'] = args
+            return completed(stdout='')
+        metrics.count_requests('sub2api', run=run)
+        self.assertEqual(seen['args'], ['docker', 'logs', '--tail', str(metrics.REQUEST_TAIL_LINES), '--since', '60s', 'sub2api'])
+
+    def test_a_window_with_more_lines_than_the_tail_is_unknown_not_a_partial_count(self):
+        def run(*args, **kwargs):
+            return completed(stdout='\n'.join(['{"path": "/v1/chat/completions"}'] * 3))
+        self.assertIsNone(metrics.safe(metrics.count_requests)('sub2api', run=run, tail=3))
+        self.assertEqual(metrics.count_requests('sub2api', run=run, tail=4), 3)
+
+    def test_lines_on_both_output_streams_are_counted(self):
+        def run(*args, **kwargs):
+            return completed(stdout='{"path": "/v1/messages"}', stderr='{"path": "/v1/chat/completions"}\n')
+        self.assertEqual(metrics.count_requests('sub2api', run=run), 2)
+
 
 class ProbeTcpTests(unittest.TestCase):
     def test_a_listening_port_is_up(self):
