@@ -784,3 +784,22 @@ test('an origin taken out before this rule existed is held from its recorded fau
   // 没有任何故障记录的老账号：照旧马上换回
   assert.equal(decide(at(START), { runtime: old(START, { lastFaultAt: undefined }) }).reason, 'main_recharged');
 });
+
+// ====== 2026-10-09 出字太慢看中位数：零星几个特别慢的请求不再触发换号 ======
+
+test('a few very slow first tokens do not move traffic; most requests being slow still does', () => {
+  const busy = { totalCalls: 35, providerErrCount: 0, consecutiveFailures: 0 };
+  // 35 个请求大多 4 秒出字，有几个等了两三分钟：平均 31 秒，中位数 6 秒，不算故障
+  const spikes = decide(flakyMain(), { metrics: { 1: { ...busy, avgTtftMs: 31000, medianTtftMs: 6000 } } });
+  assert.equal(spikes.action, 'hold');
+  assert.equal(spikes.faults['1'], null);
+  // 一半以上的请求都等过了 30 秒：照常换号
+  const slow = decide(flakyMain(), { metrics: { 1: { ...busy, avgTtftMs: 54000, medianTtftMs: 64000 } } });
+  assert.equal(slow.action, 'switch');
+  assert.equal(slow.reason, 'request_failures');
+  // 请求太少（不到最少样本数）不按出字时间判
+  assert.equal(decide(flakyMain(), { metrics: { 1: { totalCalls: 5, medianTtftMs: 90000 } } }).action, 'hold');
+  // 统计里没有中位数（老的数据来源）时仍按平均值
+  assert.equal(decide(flakyMain(), { metrics: { 1: { ...busy, avgTtftMs: 31000 } } }).action, 'switch');
+  assert.equal(decide(flakyMain(), { metrics: { 1: { ...busy, avgTtftMs: 31000, medianTtftMs: null } } }).action, 'switch');
+});

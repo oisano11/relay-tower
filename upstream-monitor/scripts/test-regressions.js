@@ -3667,3 +3667,18 @@ test('the auto-switch log labels each row by its real reason instead of calling 
   assert.equal(tag({ reason: '余额不足' }), '余额耗尽');
   assert.equal(tag({ triggerType: 'ttft_timeout' }), '首字超时');
 });
+
+test('first-token speed is judged by the median: the production query and the gateway both report it', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const sql = source.slice(source.indexOf('function fetchRecentFailoverMetrics('), source.indexOf('function evaluateAutoSwitch('));
+  assert.match(sql, /percentile_cont\(0\.5\) WITHIN GROUP \(ORDER BY ttft\) AS ttft_p50/);
+  assert.match(sql, /medianTtftMs: row\.ttft_p50 == null \? null : Number\(row\.ttft_p50\)/);
+  const metrics = new gateway.GatewayMetrics();
+  assert.equal(metrics.summary('x').medianTtftMs, null);
+  for (const ttftMs of [4000, 3000, 180000, 5000, 240000]) metrics.record('x', { ttftMs });
+  metrics.record('x', { providerFailure: true });
+  assert.equal(metrics.summary('x').medianTtftMs, 5000, 'failed requests have no first token and are left out');
+  assert.equal(Math.round(metrics.summary('x').avgTtftMs), 86400);
+  metrics.record('x', { ttftMs: 7000 });
+  assert.equal(metrics.summary('x').medianTtftMs, 6000, 'an even count takes the middle two');
+});

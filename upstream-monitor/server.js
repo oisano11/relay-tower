@@ -6451,6 +6451,7 @@ function fetchRecentFailoverMetrics() {
       SELECT account_id, COUNT(*) AS calls, COUNT(*) FILTER (WHERE failed) AS errors,
         COUNT(*) FILTER (WHERE quota_empty) AS quota_errors,
         AVG(ttft) AS ttft,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY ttft) AS ttft_p50,
         COALESCE(MIN(position) FILTER (WHERE NOT failed) - 1, COUNT(*)) AS consecutive,
         COALESCE(MIN(position) FILTER (WHERE NOT quota_empty) - 1, COUNT(*)) AS consecutive_quota
       FROM ranked WHERE account_id IS NOT NULL GROUP BY account_id
@@ -6458,7 +6459,8 @@ function fetchRecentFailoverMetrics() {
     recentFailoverMetrics = { at: Date.now(), data: Object.fromEntries(rows.map(row => [String(row.account_id), {
       totalCalls: Number(row.calls), providerErrCount: Number(row.errors),
       consecutiveFailures: Number(row.consecutive), consecutiveQuotaFailures: Number(row.consecutive_quota),
-      avgTtftMs: Number(row.ttft)
+      avgTtftMs: Number(row.ttft),
+      medianTtftMs: row.ttft_p50 == null ? null : Number(row.ttft_p50)
     }])) };
   } catch (error) {
     // Do not keep stale production errors alive when the database is unavailable.

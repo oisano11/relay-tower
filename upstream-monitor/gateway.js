@@ -106,9 +106,12 @@ class GatewayMetrics {
     let consecutiveQuotaFailures = 0;
     for (let i = events.length - 1; i >= 0 && events[i].quotaExhausted; i--) consecutiveQuotaFailures++;
     const timed = events.filter(e => Number.isFinite(e.ttftMs));
+    const sorted = timed.map(e => e.ttftMs).sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
     return { totalCalls: events.length, totalErr: events.filter(e => e.providerFailure).length,
       consecutiveFailures, consecutiveQuotaFailures, ttftTimeout: events.at(-1)?.ttftTimeout || false,
-      avgTtftMs: timed.length ? timed.reduce((sum, e) => sum + e.ttftMs, 0) / timed.length : null };
+      avgTtftMs: timed.length ? timed.reduce((sum, e) => sum + e.ttftMs, 0) / timed.length : null,
+      medianTtftMs: !sorted.length ? null : sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2 };
   }
 }
 

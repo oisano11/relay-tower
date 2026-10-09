@@ -245,8 +245,12 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
     const consecutive = Number(stats.consecutiveFailures) || 0;
     const consecutiveQuota = Number(stats.consecutiveQuotaFailures) || 0;
     const quotaFault = consecutiveQuota >= options.consecutiveQuotaThreshold;
+    // 出字太慢看中位数：一半以上的请求都等过了阈值才算。平均值会被零星几个特别慢的请求拉高，
+    // 而这种偶尔卡一下的情况两个账号都有，为它换号只会来回换，客户并不会因此快起来。
+    // 统计里没有中位数（老的数据来源）时才退回平均值。
+    const ttftMs = stats.medianTtftMs != null && Number.isFinite(Number(stats.medianTtftMs)) ? Number(stats.medianTtftMs) : Number(stats.avgTtftMs);
     const metricFault = quotaFault || consecutive >= options.consecutiveFailuresThreshold ||
-      (calls >= options.minSampleSize && (errors / calls * 100 >= options.failRateThreshold || Number(stats.avgTtftMs) > options.ttftThresholdMs));
+      (calls >= options.minSampleSize && (errors / calls * 100 >= options.failRateThreshold || ttftMs > options.ttftThresholdMs));
     // 请求少的账号：最近几次真实请求连续失败，并且刚做的真实生成探测也失败，才算请求故障。
     const verifiedLowTrafficFault = !quotaFault && lowTrafficSuspect(stats, options) &&
       fresh(genAt, now, options.suspectProbeMaxAgeMs) && channel.lastGenerationProbeStatus === 'fail';
