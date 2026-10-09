@@ -1061,7 +1061,7 @@ class TelegramBotManager {
     return { pushed: true };
   }
 
-  // 2. 自动换号：故障换号马上推并响；原主调充值后换回、便宜账号恢复后换回，推送但不响
+  // 2. 自动换号：故障换号马上推并响；原主调恢复后换回、便宜账号恢复后换回，推送但不响
   async notifyAutoSwitch(logEntry, toChannel) {
     if (!this.config.enabled || !this.config.notifyOnAutoSwitch || !this.hasAdmins()) return;
     const trigger = logEntry.triggerType;
@@ -1071,13 +1071,16 @@ class TelegramBotManager {
     const group = escapeHtml(logEntry.groupName || '默认分组');
     // 常见原因用大白话；其余用记录里的原因（形如「分组名：原因」，分组已经单独写出来，这里只留原因）
     const why = escapeHtml(OUTAGE_REASON_TEXT[trigger] || String(logEntry.reason || '').replace(/^[^：]*：/, ''));
-    const title = trigger === 'main_recharged' ? '🟢 <b>原主调充值后，已自动换回</b>'
+    // 原主调被换下不一定是因为余额（也可能是请求出错），标题不写「充值后」
+    const title = trigger === 'main_recharged' ? '🟢 <b>原主调恢复了，已自动换回</b>'
       : recovered ? '🟢 <b>便宜的账号恢复了，已自动换回去</b>'
         : '⚡ <b>已自动换号，客户那边不用改设置</b>';
     const lines = [title, `${group}：${from} → <b>${to}</b>`];
     if (!recovered && why) lines.push(`原因：${why}`);
     lines.push(`进价 ${fmtRate(logEntry.oldCost)} → ${fmtRate(logEntry.newCost)}，售价没变`);
     if (trigger === 'balance_empty') lines.push(`${from} 充值后会自动换回来。`);
+    // 原主调因为客户请求出错被换下：探测能过也先不换回，免得每过一个冷却就换回去再出错
+    else if (logEntry.returnAfter) lines.push(`${from} 先不换回：${formatShanghaiDateTime(logEntry.returnAfter).slice(5, 16)} 以后才会自动换回来；确认修好了，可以在控制台手动换回。`);
     await this.broadcastToAdmins(lines.join('\n'), {
       reply_markup: { inline_keyboard: [[{ text: '👥 查看负载', callback_data: 'cmd:load' }, { text: '🔀 手动换线', callback_data: 'cmd:switch' }]] },
       disable_notification: recovered

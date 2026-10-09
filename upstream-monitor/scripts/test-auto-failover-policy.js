@@ -626,14 +626,14 @@ test('real faults are remembered for the cost guard; debt and manual closing are
 
 // 按塔台实际落地切号的方式回放几十分钟：新主调开接单、优先级 1，原主调关掉降成副调并清掉人工锁定，
 // 切号成功后记下 lastSwitchAt；每分钟探活一次，账号没出故障就一直健康。
-function replay(initial, minutes, { runtime = {}, config, patch = () => ({}) } = {}) {
+function replay(initial, minutes, { runtime = {}, config, patch = () => ({}), metrics = () => ({}) } = {}) {
   let channels = initial;
   const switches = [];
   let last;
   for (let minute = 0; minute <= minutes; minute++) {
     const now = START + minute * 60000;
     const live = channels.map(c => ({ ...c, lastProbeTime: now, balanceUpdated: now, ...patch(minute, c) }));
-    last = decide(live, { now, runtime, config });
+    last = decide(live, { now, runtime, config, metrics: metrics(minute, live) });
     runtime = last.runtime;
     if (last.action !== 'switch') continue;
     switches.push([minute, last.reason, last.targetId]);
@@ -708,4 +708,79 @@ test('picking a new main by hand replaces the recorded origin and is protected t
   assert.deepEqual(run.switches, []);
   assert.equal(run.runtime.originalMainId, 2);
   assert.equal(run.runtime.originalMainManual, true);
+});
+
+// ====== 2026-10-09 原主调因为客户请求出错被换下：探测能过也不马上换回 ======
+
+// 原主调 1 只要在接单，客户的真实请求就连续失败；不接单时探活和 1 个字的生成探测都正常
+const failsWhileServing = (minute, live) => (live.find(c => c.id === 1).schedulable ? { 1: { consecutiveFailures: 5 } } : {});
+const tinyProbePasses = (minute, c) => (c.id === 1 ? { lastGenerationProbeAt: START + minute * 60000, lastGenerationProbeStatus: 'ok' } : {});
+const flakyMain = () => [channel(1), channel(2, { schedulable: false, priority: 10 })];
+
+test('an origin taken out for failed customer requests is not put back after every cooldown just because probes pass', () => {
+  // 以前：冷却 10 分钟一过就「原主调恢复」换回 1，客户请求又失败再换走，每 11 分钟来回一次
+  const twoHours = replay(flakyMain(), 120, { metrics: failsWhileServing, patch: tinyProbePasses });
+  assert.deepEqual(twoHours.switches, [[0, 'request_failures', 2]]);
+  assert.equal(twoHours.last.action, 'hold');
+  assert.equal(twoHours.last.reason, 'origin_recent_failures');
+  assert.deepEqual(twoHours.last.heldOrigin, { id: 1, until: START + 6 * 3600000 });
+  assert.equal(twoHours.runtime.accounts['1'].needsRecovery, false, 'healthy by probes, only the return waits');
+  // 换下原主调的那一次就告诉运营者它最早什么时候换回；欠费换下、或者出错的不是原主调，都没有这个时间
+  assert.equal(decide(flakyMain(), { metrics: { 1: { consecutiveFailures: 5 } } }).returnAfter, START + 6 * 3600000);
+  assert.equal(decide([channel(1, { balance: 0, balanceStatus: 'empty' }), channel(2, { schedulable: false, priority: 10 })]).returnAfter, null);
+  assert.equal(decide([channel(1, { schedulable: false, priority: 10 }), channel(2, { schedulable: true, priority: 1 })],
+    { runtime: { originalMainId: 1, accounts: {} }, metrics: { 2: { consecutiveFailures: 5 } } }).returnAfter, null);
+  // 最后一次出错满 6 小时才换回去试；还坏着就马上又被换下，再等 6 小时
+  const day = replay(flakyMain(), 800, { metrics: failsWhileServing, patch: tinyProbePasses });
+  assert.deepEqual(day.switches, [[0, 'request_failures', 2], [360, 'main_recharged', 1], [361, 'request_failures', 2],
+    [721, 'main_recharged', 1], [722, 'request_failures', 2]]);
+});
+
+test('the hold only delays the voluntary return: when the stand-in fails too, the origin still takes over', () => {
+  const run = replay(flakyMain(), 60, { patch: tinyProbePasses,
+    metrics: (minute, live) => ({ ...failsWhileServing(minute, live), ...(minute >= 30 ? { 2: { consecutiveFailures: 5 } } : {}) }) });
+  assert.deepEqual(run.switches.slice(0, 2), [[0, 'request_failures', 2], [30, 'request_failures', 1]]);
+});
+
+test('an origin taken out for its balance or for failed probes still comes back as soon as it recovers', () => {
+  // 余额不足：充值后照旧马上换回
+  const recharged = replay(flakyMain(), 30, { patch: (minute, c) => (c.id === 1 && minute < 3 ? { balance: 0, balanceStatus: 'empty' } : {}) });
+  assert.deepEqual(recharged.switches.map(([, reason, to]) => [reason, to]), [['balance_empty', 2], ['main_recharged', 1]]);
+  // 探活连续失败：探活恢复后照常换回，不用等 6 小时
+  const unreachable = replay(flakyMain(), 30,
+    { patch: (minute, c) => (c.id === 1 && minute < 3 ? { status: 'offline', lastProbeStatus: 'offline' } : {}) });
+  assert.deepEqual(unreachable.switches.map(([, reason, to]) => [reason, to]), [['probe_failures', 2], ['main_recharged', 1]]);
+  assert.equal(unreachable.runtime.accounts['1'].lastRequestFaultAt, null);
+});
+
+test('routing failures count as failed requests, a merely missing model does not', () => {
+  const runtime = { lastCurrentId: 1, currentSince: START - 600000 };
+  const busy = [1, 2, 3].map(i => ({ at: START - i * 10000, model: 'gpt-5', type: 'api_error' }));
+  const routed = decide([channel(1), channel(10, { costMultiplier: 0.5 })], { runtime, groupMetrics: { failures: busy } });
+  assert.equal(routed.reason, 'routing_failures');
+  assert.equal(routed.routing.otherCount, 3);
+  assert.equal(routed.runtime.accounts['1'].lastRequestFaultAt, START);
+  // 只是主调缺模型：补上模型就能换回（routingModels 管着），不用再等 6 小时
+  const missing = [1, 2, 3].map(i => ({ at: START - i * 10000, model: 'gpt-5-codex', type: 'model_not_found' }));
+  const lacking = decide([channel(1, { configuredModels: ['gpt-4o'] }), channel(10, { costMultiplier: 0.5, configuredModels: ['gpt-5-codex'] })],
+    { runtime, groupMetrics: { failures: missing } });
+  assert.equal(lacking.reason, 'routing_failures');
+  assert.equal(lacking.routing.otherCount, 0);
+  assert.equal(lacking.runtime.accounts['1'].lastRequestFaultAt, null);
+});
+
+test('an origin taken out before this rule existed is held from its recorded fault time', () => {
+  // 上线前被换下的原主调只有 lastFaultAt：按请求出错算，从那个时间起等 6 小时
+  const faultAt = START - 3600000;
+  const at = now => [channel(1, { schedulable: false, priority: 10, lastProbeTime: now, balanceUpdated: now }),
+    channel(2, { schedulable: true, priority: 1, lastProbeTime: now, balanceUpdated: now })];
+  const old = (now, account = { lastFaultAt: faultAt }) => ({ originalMainId: 1, originalMainManual: true, lastCurrentId: 2, currentSince: faultAt,
+    lastSwitchAt: faultAt, accounts: { 1: { needsRecovery: false, successes: 5, failures: 0, healthySince: faultAt + 600000, probeAt: now - 60000, ...account } } });
+  const held = decide(at(START), { runtime: old(START) });
+  assert.equal(held.reason, 'origin_recent_failures');
+  assert.equal(held.runtime.accounts['1'].lastRequestFaultAt, faultAt);
+  const later = faultAt + 6 * 3600000 + 60000;
+  assert.equal(decide(at(later), { runtime: old(later), now: later }).reason, 'main_recharged');
+  // 没有任何故障记录的老账号：照旧马上换回
+  assert.equal(decide(at(START), { runtime: old(START, { lastFaultAt: undefined }) }).reason, 'main_recharged');
 });

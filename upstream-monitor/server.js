@@ -6268,7 +6268,9 @@ UPDATE account_groups SET priority = ${handoverPriority} WHERE account_id = ${so
     newSaleRate: meta.newSaleRate || null,
     newMarginPercent: meta.newMarginPercent || null,
     // 换下去的账号现在的角色（关掉接单，等恢复后可被切回）
-    fromNewRole: demoteSource ? ROLE_LABELS[roleForPriority(handoverPriority)] : null
+    fromNewRole: demoteSource ? ROLE_LABELS[roleForPriority(handoverPriority)] : null,
+    // 换下的原主调因为客户请求出错：最早这个时间以后才会被自动换回（没有就是 null）
+    returnAfter: meta.returnAfter || null
   };
 
   autoSwitchLogs.unshift(logEntry);
@@ -6611,7 +6613,7 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
         const target = channels.find(c => String(c.id) === String(decision.targetId));
         // 把“决策时的路由版本”带进写入层：决策与写入之间若已有别的路径切过
         // 同一条线，这条过期决策会被幂等闸门丢弃，而不是再切一次。
-        const result = executeAutoSwitch(current || { id: 0, name: '无活动账号' }, target, group.name + '：' + (reasonNames[decision.reason] || decision.reason), { groupId: group.id, groupName: group.name, triggerType: decision.reason, decisionRuntimeAt });
+        const result = executeAutoSwitch(current || { id: 0, name: '无活动账号' }, target, group.name + '：' + (reasonNames[decision.reason] || decision.reason), { groupId: group.id, groupName: group.name, triggerType: decision.reason, decisionRuntimeAt, returnAfter: decision.returnAfter || null });
         // 幂等闸门判定为重复切线：路由已由其他路径推进，本次不再记账、不再
         // 刷新切线时间戳，避免把重复请求误当成一次真实容灾写进审计与冷却。
         // 这里刻意不改动 failoverRuntime：真正落地的那条路径已经写过自己的
@@ -6740,7 +6742,7 @@ function clearExhaustedReminder(runtime) {
   delete runtime.exhaustedSince;
   delete runtime.exhaustedNotifyCount;
 }
-const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', manual_main: '主调是你亲手选的，不为省钱换号', main_recharged: '原主调充值恢复上线', automation_disabled: '自动切号已关闭' };
+const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', manual_main: '主调是你亲手选的，不为省钱换号', main_recharged: '原主调恢复正常', origin_recent_failures: '原主调最近真实请求出过错，暂不换回', automation_disabled: '自动切号已关闭' };
 
 /**
  * 评估一个业务分组所需的输入（真实切号与只读预演共用，保证预演看到的就是实际决策）。
@@ -6838,6 +6840,10 @@ function previewAutoSwitch(now = Date.now()) {
           (config.autoRecoverLowestCost !== false ? '，暂不为省钱换过去' : ''));
       }
       if (observation.needsRecovery && !fault) notes.push(observation.proofRequiredSince != null ? '等待真实生成成功后恢复' : '恢复观察中');
+      if (decision.heldOrigin && String(decision.heldOrigin.id) === id) {
+        const until = new Date(Number(decision.heldOrigin.until) + 8 * 3600000); // 北京时间
+        notes.push(`真实请求最近出过错，${until.getUTCMonth() + 1}月${until.getUTCDate()}日 ${until.toISOString().slice(11, 16)} 以后才自动换回`);
+      }
       if (channel.lastProbeStatus !== 'online') notes.push(channel.probeMode === 'generation' ? '无 /v1/models，等待生成探测' : `探活: ${channel.lastProbeStatus || '无'}`);
       if (channel.lastGenerationProbeStatus && channel.lastGenerationProbeStatus !== 'ok') notes.push(`生成探测: ${channel.lastGenerationProbeStatus}${channel.lastGenerationProbeError ? '（' + String(channel.lastGenerationProbeError).slice(0, 80) + '）' : ''}`);
       row.accounts.push({ id, name: channel.name, cost: channel.costMultiplier ?? channel.multiplier, priority: channel.priority,

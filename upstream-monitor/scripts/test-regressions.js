@@ -3646,3 +3646,24 @@ test('every row has a 改售价 button: in the group view it edits the group bei
   context.renderStripsView([{ ...account, primaryGroupId: null, groupsDetail: [], groups: [] }], []);
   assert.doesNotMatch(container.innerHTML, /改售价<\/button>/);
 });
+
+test('the auto-switch log labels each row by its real reason instead of calling everything a first-token timeout', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const context = vm.createContext({});
+  vm.runInContext(source.slice(source.indexOf('const AUTO_SWITCH_LOG_TAGS'), source.indexOf('async function loadAutoSwitchLogs')) +
+    '\nthis.autoSwitchLogTag = autoSwitchLogTag;', context);
+  const tag = log => context.autoSwitchLogTag(log).tagText;
+  // 以前这几种都显示成「首字超时」
+  assert.equal(tag({ triggerType: 'request_failures', reason: '示例分组：连续请求失败或失败率超标' }), '请求出错');
+  assert.equal(tag({ triggerType: 'routing_failures' }), '找不到账号接单');
+  assert.equal(tag({ triggerType: 'probe_failures' }), '探活失败');
+  assert.equal(tag({ triggerType: 'main_recharged', reason: '示例分组：原主调恢复正常' }), '原主调换回');
+  assert.equal(context.autoSwitchLogTag({ triggerType: 'main_recharged' }).badgeClass, 'as-tag-recovery');
+  assert.equal(tag({ triggerType: 'cheaper_recovered' }), '省钱换回');
+  // 原来认得的照旧
+  assert.equal(tag({ triggerType: 'balance_empty' }), '余额耗尽');
+  assert.equal(tag({ triggerType: 'manual_test' }), '手动检查');
+  assert.equal(tag({ triggerType: 'cost_recovery' }), '充值回切');
+  assert.equal(tag({ reason: '余额不足' }), '余额耗尽');
+  assert.equal(tag({ triggerType: 'ttft_timeout' }), '首字超时');
+});

@@ -7117,6 +7117,31 @@ async function evaluateAutoSwitchNow() {
   }
 }
 
+// 换号流水的标签按记录里的换号原因（triggerType）写。以前只认得老版本的几种原因，
+// 其余一律显示「首字超时」，请求出错、原主调换回这些都被标错了。
+const AUTO_SWITCH_LOG_TAGS = {
+  balance_empty: ['as-tag-error', '余额耗尽'],
+  request_failures: ['as-tag-error', '请求出错'],
+  routing_failures: ['as-tag-error', '找不到账号接单'],
+  probe_failures: ['as-tag-error', '探活失败'],
+  disabled: ['as-tag-error', '账号停用'],
+  provider_error: ['as-tag-error', '上游报错'],
+  hard_down: ['as-tag-error', '上游报错'],
+  no_active_account: ['as-tag-recovery', '恢复接单'],
+  main_recharged: ['as-tag-recovery', '原主调换回'],
+  cheaper_recovered: ['as-tag-recovery', '省钱换回'],
+  cost_recovery: ['as-tag-recovery', '充值回切'],
+  auto_recover_lowest_cost: ['as-tag-recovery', '充值回切'],
+  manual_test: ['as-tag-manual', '手动检查']
+};
+
+function autoSwitchLogTag(log = {}) {
+  const known = AUTO_SWITCH_LOG_TAGS[log.triggerType];
+  if (known) return { badgeClass: known[0], tagText: known[1] };
+  if (log.reason && String(log.reason).includes('余额')) return { badgeClass: 'as-tag-error', tagText: '余额耗尽' };
+  return { badgeClass: 'as-tag-timeout', tagText: '首字超时' };
+}
+
 async function loadAutoSwitchLogs() {
   const tbody = document.getElementById('autoSwitchLogsTableBody');
   if (!tbody) return;
@@ -7135,21 +7160,7 @@ async function loadAutoSwitchLogs() {
       const dateStr = d && !isNaN(d.getTime()) ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` : '--';
       const timeStr = d && !isNaN(d.getTime()) ? `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` : '--';
 
-      let badgeClass = 'as-tag-timeout';
-      let tagText = '首字超时';
-      if (log.triggerType === 'balance_empty' || (log.reason && log.reason.includes('余额'))) {
-        badgeClass = 'as-tag-error';
-        tagText = '余额耗尽';
-      } else if (log.triggerType === 'provider_error' || log.triggerType === 'hard_down') {
-        badgeClass = 'as-tag-error';
-        tagText = '上游报错';
-      } else if (log.triggerType === 'cost_recovery' || log.triggerType === 'auto_recover_lowest_cost') {
-        badgeClass = 'as-tag-recovery';
-        tagText = '充值回切';
-      } else if (log.triggerType === 'manual_test') {
-        badgeClass = 'as-tag-manual';
-        tagText = '手动检查';
-      }
+      const { badgeClass, tagText } = autoSwitchLogTag(log);
 
       let priceTagHtml = '';
       if (log.priceAdjusted) {

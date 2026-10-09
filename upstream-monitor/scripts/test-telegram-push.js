@@ -86,10 +86,20 @@ test('auto switch: a fault switch rings and says why; switching back after a rec
   assert.match(sent[0].text, /账号甲 充值后会自动换回来/);
   assert.equal(sent[0].disable_notification, false);
 
-  await api.notifyAutoSwitch({ fromName: '账号乙', toName: '账号甲', groupName: '示例分组', reason: '示例分组：原主调充值恢复上线', triggerType: 'main_recharged', oldCost: 0.17, newCost: 0.12 });
-  assert.match(sent[1].text, /原主调充值后，已自动换回/);
+  await api.notifyAutoSwitch({ fromName: '账号乙', toName: '账号甲', groupName: '示例分组', reason: '示例分组：原主调恢复正常', triggerType: 'main_recharged', oldCost: 0.17, newCost: 0.12 });
+  assert.match(sent[1].text, /原主调恢复了，已自动换回/);
+  assert.doesNotMatch(sent[1].text, /充值/, 'it may have been taken out for failed requests, not for its balance');
   assert.doesNotMatch(sent[1].text, /故障/);
   assert.equal(sent[1].disable_notification, true);
+
+  // 原主调因为请求出错被换下：说清楚它什么时候才会自动换回（北京时间），没有这个时间就不提
+  const at = Date.parse('2026-10-09T12:51:00Z');
+  await api.notifyAutoSwitch({ fromName: '账号甲', toName: '账号乙', groupName: '示例分组', reason: '示例分组：连续请求失败或失败率超标', triggerType: 'request_failures', oldCost: 0.12, newCost: 0.17, returnAfter: at });
+  assert.match(sent[2].text, /原因：请求连续失败/);
+  assert.match(sent[2].text, /账号甲 先不换回：10-09 20:51 以后才会自动换回来；确认修好了，可以在控制台手动换回。/);
+  assert.equal(sent[2].disable_notification, false);
+  await api.notifyAutoSwitch({ fromName: '账号乙', toName: '账号丙', groupName: '示例分组', reason: '示例分组：连续请求失败或失败率超标', triggerType: 'request_failures', oldCost: 0.17, newCost: 0.2, returnAfter: null });
+  assert.doesNotMatch(sent[3].text, /先不换回|换回来/);
 });
 
 test('your own switch or role change in the console is not pushed back to you', async () => {

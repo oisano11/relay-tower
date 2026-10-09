@@ -543,3 +543,24 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - **测试：** `scripts/test-cluster.js`（42 项，覆盖取不到、过期、隧道与报警的联动、分流隐藏、Telegram 发送结果等）；`scripts/test-server-smoke.js` 新增 1 项（未登录 401，未配置时诚实显示，顶栏刷新不查业务数字）；`cluster-monitor/tests`（Python，55 项，含 TCP 探测的真实连接测试）。`npm test` 整体通过（Node 329 项，Python 55 项）。本机端到端：隧道正常时显示「能通」；隧道断（本机没有隧道地址）时，总览只说隧道不通，副节点只在卡片上标离线。
 - **未做（需要单独批准）：** 部署；副节点 agent 上线；删除反向代理里旧的集群转发；中转塔台的 `.env` 增加集群变量；中台与 agent 的服务启用；收回旧的 SSH 钥匙。
 - **还没验证：** Linux 上 TCP 检查的实际行为（`ECONNREFUSED` 的判断、`source_address` 绑定）只在本机验证过；副节点日志和数据库的对账；部署后健康检查请求会不会被计入请求数；外网访问旧路径的结果。
+
+## 原主调因为客户请求出错被换下后，每过一个冷却就被换回去（2026-10-09）
+
+只读核对线上换号记录：有的分组从前一天下午起每 10 到 40 分钟来回换一次。原主调接单就出错，`request_failures`（偶尔是 `routing_failures`）把它换下；它不接单之后没有客户请求，`/v1/models` 探测和 1 个字的生成探测都正常，3 分钟后判为 `recovered`，10 分钟冷却一过，`main_recharged` 又把它换回来。
+
+原因：`main_recharged` 只看原主调现在是否 `recovered`，不管它是为什么被换下的。欠费换下的账号，充值后探活正常就能证明恢复；请求出错换下的账号，探测通过证明不了客户的真实请求能成功。
+
+改法（`auto-failover-policy.js`）：
+
+- **`lastRequestFaultAt`：** 每个账号的运行时观察新增这一项。`request_failures` 时记下；`routing_failures` 只在算进去的报错里有不是「模型不支持」的（`routingEvidence` 新返回 `otherCount`）时记下。欠费、人工停用、`probe_failures` 不记。没有这个字段的旧记录用 `lastFaultAt` 补上（宁可晚点换回），之后字段一直存在（没有就是 `null`）。
+- **`originReturnHoldMs`（默认 6 小时）：** `main_recharged` 找到已恢复的原主调后，如果它的 `lastRequestFaultAt` 还不到这么久，不换回，记下 `heldOrigin = { id, until }`。后面的 `cheaper_recovered` 照常判断（它本来就避开 `recentTrouble` 的账号）；最后没有可换的，原因是 `origin_recent_failures`，不再写「运行稳定」。
+- **故障切换不变：** 顶班的账号自己出故障时，原主调只要 `available` 照常可以被换上来，这个限制只管主动换回。
+- **`returnAfter`：** 因为请求出错换下原主调的那一次决策，返回它最早什么时候会被自动换回（`now + originReturnHoldMs`），`server.js` 把它写进换号记录，Telegram 推送里据此写一句「几点以后才会自动换回」。
+- **文字：** `AUTO_SWITCH_REASON_NAMES.main_recharged` 改成「原主调恢复正常」，新增 `origin_recent_failures`；Telegram 换回标题改成「原主调恢复了，已自动换回」；自动切号预演里，被按住的原主调写明换回时间。
+- **换号流水标签（`public/app.js`）：** `autoSwitchLogTag` 按 `triggerType` 查表。以前只认 `balance_empty`、`provider_error`、`hard_down`、`cost_recovery`、`auto_recover_lowest_cost`、`manual_test`，现在的 `request_failures`、`routing_failures`、`probe_failures`、`main_recharged`、`cheaper_recovered` 都落到默认的「首字超时」。`app.js` 版本号改为 `20261009_switch_tags`。
+
+验收：
+
+- `test-auto-failover-policy.js` 新增 5 个用例，旧代码上全部失败：回放「原主调接单就出错、不接单时探测都正常」两小时只换走一次、按住原因和换回时间正确，800 分钟内只在 6 小时后各试一次；顶班账号也出错时照常换回原主调；欠费、探活失败换下的照旧马上换回；`routing_failures` 只有缺模型时不记请求出错；旧记录按 `lastFaultAt` 按住、满 6 小时换回、没有故障记录的照旧换回。另有 `returnAfter` 的断言（欠费换下、出错的不是原主调时为 `null`）。
+- `test-telegram-push.js`：换回标题不再含「充值」；请求出错换下原主调时写明换回时间，没有时间时不提。`test-regressions.js`：换号流水标签逐项核对。
+- 用线上数据只读空跑（把新规则通过标准输入送进容器、只在内存里算，不写任何文件）：一个正在来回换号的分组，往后模拟时旧规则在冷却结束时换回出错的原主调，新规则按住到最后一次出错满 6 小时；另一个分组当时正用着原主调，两个版本都不动。

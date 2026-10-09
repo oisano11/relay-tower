@@ -31,7 +31,11 @@ const DEFAULTS = Object.freeze({
   // 或者塔台判过它故障，就先不为省钱换过去。探活和 1 个字的生成探测只能说明它还活着，
   // 说明不了客户的真实请求能稳定成功。
   recentErrorWindowMs: 21600000,
-  recentErrorLimit: 3
+  recentErrorLimit: 3,
+  // 原主调因为客户的真实请求出错被换下（请求故障、找不到账号接单）：探活和 1 个字的生成探测能过，
+  // 说明不了客户的真实请求能成功。最后一次请求出错之后这么久才自动换回，免得每过一个冷却就换回去再出错。
+  // 余额不足、人工停用、探活连续失败被换下的不受影响：充值或探活恢复后照旧马上换回。故障切换也不受影响。
+  originReturnHoldMs: 21600000
 });
 
 function timestamp(value) {
@@ -129,7 +133,7 @@ function originalMainIsManual(runtime) {
  * 能顶上的账号支持这个模型时才算（否则是客户点了本组没有的模型，换号也没用）。
  */
 function routingEvidence({ groupMetrics, current, pool, since }) {
-  if (!current || !groupMetrics || !Array.isArray(groupMetrics.failures)) return { count: 0, models: [] };
+  if (!current || !groupMetrics || !Array.isArray(groupMetrics.failures)) return { count: 0, models: [], otherCount: 0 };
   const floor = Math.max(since || 0, timestamp(groupMetrics.lastSuccessAt) || 0);
   const counted = groupMetrics.failures.filter(failure => {
     const at = timestamp(failure && failure.at);
@@ -139,7 +143,9 @@ function routingEvidence({ groupMetrics, current, pool, since }) {
     }
     return true;
   });
-  return { count: counted.length, models: [...new Set(counted.filter(f => f.type === 'model_not_found').map(f => String(f.model)))] };
+  const modelFailures = counted.filter(f => f.type === 'model_not_found');
+  // otherCount：不是「模型不支持」的那些（主调被冷却、并发满等），说明上游真出了问题
+  return { count: counted.length, models: [...new Set(modelFailures.map(f => String(f.model)))], otherCount: counted.length - modelFailures.length };
 }
 
 /** Pure decision only. Persist returned runtime; set lastSwitchAt AFTER a successful write. */
@@ -185,17 +191,24 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
   const reference = current || members.find(channel => String(channel.id) === String(runtime.lastCurrentId));
   const required = requiredModels(reference || { configuredModels: runtime.requiredModels || [] }, group, demandModels);
   const health = new Map();
-  let routing = { count: 0, models: [] };
+  let routing = { count: 0, models: [], otherCount: 0 };
   let needed = required;
   let troubled = new Map();
+  // 原主调已经恢复、本该换回，但它最近真实请求出过错，先不换回：{ id, until }（until 之后才会自动换回）
+  let heldOrigin = null;
   const result = (action, reason, target) => ({ action, reason, currentId: current?.id ?? null, targetId: target?.id ?? null, runtime: next,
     faults: Object.fromEntries([...health].map(([id, value]) => [id, value.fault])), routing,
-    required: needed, recentTrouble: Object.fromEntries(troubled) });
+    required: needed, recentTrouble: Object.fromEntries(troubled), heldOrigin });
 
   for (const channel of members) {
     const id = String(channel.id);
     const previous = runtime.accounts?.[id] || {};
     const observation = { successes: 0, failures: 0, healthySince: null, ...previous };
+    // 老记录没有 lastRequestFaultAt：把以前记下的故障时间当成请求出错。宁可晚点换回，
+    // 也不把一个可能还坏着的原主调换回去（只影响上线前就被换下的账号，最多晚 6 小时）。
+    if (!Object.prototype.hasOwnProperty.call(observation, 'lastRequestFaultAt')) {
+      observation.lastRequestFaultAt = timestamp(observation.lastFaultAt);
+    }
     const probeAt = timestamp(channel.lastProbeTime);
     const probeFresh = fresh(probeAt, now, options.probeFreshnessMs);
     const balanceAt = timestamp(channel.balanceUpdated);
@@ -276,6 +289,8 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
     }
     // 记下真实出故障的时间（欠费和人工停用不算），为省钱换号前据此避开刚出过事的账号
     if (fault === 'request_failures' || fault === 'probe_failures') observation.lastFaultAt = now;
+    // 客户的真实请求出错另记一笔：原主调因此被换下后，要等 originReturnHoldMs 才自动换回
+    if (fault === 'request_failures') observation.lastRequestFaultAt = now;
     const proofRequiredSince = timestamp(observation.proofRequiredSince);
     const proofOk = channel.passiveHealth === true || options.requireGenerationProbe === false || proofRequiredSince == null ||
       (genAt != null && genAt > proofRequiredSince && channel.lastGenerationProbeStatus === 'ok');
@@ -307,6 +322,8 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
     observation.healthySince = null;
     observation.proofRequiredSince = now;
     observation.lastFaultAt = now;
+    // 只是缺模型的不算（补上模型后由 routingModels 放行）；主调被冷却、并发满这类才算请求出错
+    if (routing.otherCount > 0) observation.lastRequestFaultAt = now;
     if (routing.models.length) observation.routingModels = routing.models;
     health.set(String(current.id), { fault: 'routing_failures', available: false, recovered: false });
   }
@@ -331,12 +348,16 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
       return result('hold', 'cooldown');
     }
     next.lastTargetId = target.id;
-    return result('switch', currentFault, target);
+    // 换下的是原主调、而且是因为客户请求出错：它最早什么时候会被自动换回（推送里告诉运营者）
+    const origin = current && String(current.id) === String(next.originalMainId) ? next.accounts[String(current.id)] : null;
+    const returnAfter = origin && timestamp(origin.lastRequestFaultAt) === now ? now + options.originReturnHoldMs : null;
+    return { ...result('switch', currentFault, target), returnAfter };
   }
   const lastSwitchAt = timestamp(runtime.lastSwitchAt);
   if (lastSwitchAt != null && now - lastSwitchAt < options.cooldownMinutes * 60000) return result('hold', 'cooldown');
 
-  // 1. 原主调充值恢复上线 (main_recharged)：无需比当前副调更便宜，只要原主调探活健康且余额恢复，自动回切
+  // 1. 原主调恢复后换回 (main_recharged)：无需比当前副调更便宜，只要原主调探活健康且余额恢复，自动回切。
+  // 它要是因为客户的真实请求出错被换下的，最后一次出错满 originReturnHoldMs 才换回（见 DEFAULTS）。
   const originalMain = candidates.find(channel => {
     // The priority-1 fallback only applies when no origin was ever recorded;
     // otherwise a promoted backup would masquerade as the original main.
@@ -346,14 +367,20 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
       (current ? priority(channel, group) < priority(current, group) || String(channel.id) === String(next.originalMainId) : true);
   });
   if (originalMain && (!current || String(originalMain.id) !== String(current.id))) {
-    next.originalMainId = originalMain.id;
-    return result('switch', 'main_recharged', originalMain);
+    const requestFaultAt = timestamp(next.accounts[String(originalMain.id)]?.lastRequestFaultAt);
+    if (requestFaultAt != null && now - requestFaultAt < options.originReturnHoldMs) {
+      heldOrigin = { id: originalMain.id, until: requestFaultAt + options.originReturnHoldMs };
+    } else {
+      next.originalMainId = originalMain.id;
+      return result('switch', 'main_recharged', originalMain);
+    }
   }
+  const idle = heldOrigin ? 'origin_recent_failures' : 'healthy';
 
   // 2. 降本自动回切 (cheaper_recovered)：备选通道中有更便宜 5% 以上的通道稳定恢复。
   // autoRecoverLowestCost=false 只关闭“为省钱主动换线”，不影响上面的“原主调恢复后切回”：
   // 切回的是运营者自己选定的主调，正是“尊重人工调度”的含义。
-  if (options.autoRecoverLowestCost === false) return result('hold', 'healthy');
+  if (options.autoRecoverLowestCost === false) return result('hold', idle);
   const currentCost = Number(current.costMultiplier ?? current.multiplier);
   // 探测正常只说明它还活着；最近真实请求出过错的账号，不为省钱把客户换过去。
   const cheaper = candidates.find(channel => {
@@ -361,7 +388,7 @@ function evaluateGroup({ group, channels, metrics = {}, groupMetrics = null, dem
     return health.get(String(channel.id)).recovered && !troubled.has(String(channel.id)) && cost < currentCost &&
       (currentCost - cost) / currentCost * 100 >= options.minSavingsPercent;
   });
-  if (!cheaper) return result('hold', 'healthy');
+  if (!cheaper) return result('hold', idle);
   const isOrigin = String(current.id) === String(next.originalMainId);
   // 运营者亲手选的主调（或出故障后又换回来的那个）不为省钱换走，只有它自己出故障才由上面的故障切换接管。
   // 探测正常的账号可能其实用不了（比如上游坏了、没有客户请求暴露出来），人工的判断比省钱重要。
