@@ -1,10 +1,11 @@
 """双机集群中台（跑在主节点上）：采集两台机器的事实，通过一个只读接口提供。
 
 - 接口只有 GET /api/status，必须带 Authorization: Bearer 令牌。没有页面，没有 CORS，不接受 POST。
-- 默认只监听 127.0.0.1。中转塔台（Docker 容器）要来取数，就把 HUB_BIND 设成 Docker 网关地址：
-  这个地址只在本机和容器之间可达，外网访问不到。
+- HUB_BIND 必须设置，填中转塔台容器能访问的 Docker 网关地址，不能是 0.0.0.0。
+  中转塔台（Docker 容器）通过这个地址取数，外网访问不到。
 - 副节点的数据由它上面的 agent.py 提供，这里主动去拉。不 SSH，不用 root 账号。
   注意：运行账号要在 docker 组里才能读容器状态，而 docker 组本身等同于 root 权限。
+- 两台之间的隧道用 TCP 连一下副节点的 agent 端口判断（不用 ping，不需要特殊权限）。
 - 读不到的值是 null，绝不补默认值。
 """
 import json
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -33,9 +35,30 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 WORKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
+def link_settings(worker_url, env):
+    """隧道检查：连副节点 agent 的地址和端口。WG_LOCAL_IP 是主节点在隧道上的地址（填了就从它发出去）。"""
+    peer_ip, peer_port = '', None
+    if worker_url:
+        parts = urllib.parse.urlsplit(worker_url)
+        peer_ip = parts.hostname or ''
+        peer_port = parts.port or (443 if parts.scheme == 'https' else 80)
+    return {
+        'peer_ip': peer_ip,
+        'peer_port': peer_port,
+        'source_ip': (env.get('WG_LOCAL_IP') or '').strip(),
+        'iface': (env.get('WG_IFACE') or 'wg0').strip(),
+    }
+
+
 def load_settings(env=None):
     """所有地址、名字、令牌都来自环境变量，代码里不写任何真实地址。"""
     env = dict(os.environ if env is None else env)
+    token = common.require_token(env.get('HUB_TOKEN', ''), 'HUB_TOKEN')
+    bind = (env.get('HUB_BIND') or '').strip()
+    if not bind:
+        raise SystemExit('HUB_BIND 必须设置：填中转塔台容器能访问的 Docker 网关地址')
+    if bind in ('0.0.0.0', '::'):
+        raise SystemExit('HUB_BIND 不能是 0.0.0.0 或 ::，那样中台会暴露在所有网卡上')
     worker_url = (env.get('WORKER_AGENT_URL') or '').strip()
     worker_token = (env.get('WORKER_AGENT_TOKEN') or '').strip()
     if worker_url:
@@ -43,9 +66,9 @@ def load_settings(env=None):
             raise SystemExit('WORKER_AGENT_URL 要以 http:// 或 https:// 开头')
         common.require_token(worker_token, 'WORKER_AGENT_TOKEN')
     return {
-        'bind': (env.get('HUB_BIND') or '').strip() or '127.0.0.1',
+        'bind': bind,
         'port': int(env.get('HUB_PORT', '8899')),
-        'token': common.require_token(env.get('HUB_TOKEN', ''), 'HUB_TOKEN'),
+        'token': token,
         'interval': max(5, int(env.get('HUB_INTERVAL_SECONDS', '10'))),
         'master': {
             'label': env.get('MASTER_LABEL', '主节点'),
@@ -60,10 +83,7 @@ def load_settings(env=None):
             'agent_token': worker_token,
             'timeout': WORKER_TIMEOUT_SECONDS,
         },
-        'link': {
-            'peer_ip': env.get('WG_PEER_IP', ''),
-            'iface': env.get('WG_IFACE', 'wg0'),
-        },
+        'link': link_settings(worker_url, env),
     }
 
 
@@ -109,21 +129,18 @@ def fetch_worker(worker, now_ms, opener=WORKER_OPENER):
     return dict(node, label=label, reachable=True, collectedAt=now_ms - int(age))
 
 
-def read_link(link, now_ms, ping=metrics.ping_peer, iface_reader=metrics.read_iface_counters):
-    """两台之间的隧道：能 ping 通、往返毫秒数、网卡收发字节数。ping 本身不能用就是 None（取不到）。"""
-    if not link['peer_ip']:
-        return {'ok': None, 'rttMs': None, 'rxBytes': None, 'txBytes': None,
-                'collectedAt': now_ms, 'error': '未配置对端地址'}
-    peer = ping(link['peer_ip'])
+def read_link(link, now_ms, probe=metrics.probe_tcp, iface_reader=metrics.read_iface_counters):
+    """两台之间的隧道：TCP 连一下副节点的 agent 端口。检查本身出错就是 None（取不到）。"""
     counters = metrics.safe(iface_reader)(link['iface']) or {}
-    return {
-        'ok': None if peer is None else peer['ok'],
-        'rttMs': None if peer is None else peer['rttMs'],
-        'rxBytes': counters.get('rxBytes'),
-        'txBytes': counters.get('txBytes'),
-        'collectedAt': now_ms,
-        'error': None if peer is not None else '取不到（ping 命令不能用）',
-    }
+    base = {'rxBytes': counters.get('rxBytes'), 'txBytes': counters.get('txBytes'), 'collectedAt': now_ms}
+    if not link['peer_ip']:
+        return dict(base, ok=None, rttMs=None, error='未配置副节点地址')
+    result = probe(link['peer_ip'], link['peer_port'], link['source_ip'] or None)
+    if result is None:
+        return dict(base, ok=None, rttMs=None, error='取不到（检查本身出错）')
+    if not result['ok']:
+        return dict(base, ok=False, rttMs=None, error='连不上副节点的端口（隧道可能断了，或副节点不通）')
+    return dict(base, ok=True, rttMs=result['rttMs'], error=None)
 
 
 class Collector:

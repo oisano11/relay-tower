@@ -28,7 +28,7 @@ def fake_master_sources():
 
 
 def hub_env(**extra):
-    env = {'HUB_TOKEN': TOKEN, 'MASTER_LABEL': '主节点测试', 'MASTER_SUB2API_HEALTH_URL': 'http://probe.invalid/h',
+    env = {'HUB_TOKEN': TOKEN, 'HUB_BIND': '127.0.0.1', 'MASTER_LABEL': '主节点测试', 'MASTER_SUB2API_HEALTH_URL': 'http://probe.invalid/h',
            'MASTER_REQUEST_CONTAINER': 'sub2api', 'MASTER_EXPECT_CONTAINERS': 'sub2api,sub2api-redis'}
     env.update(extra)
     return env
@@ -69,14 +69,30 @@ class SettingsTests(unittest.TestCase):
             hub.load_settings({'HUB_TOKEN': ' ' * 40})
 
     def test_a_token_with_stray_spaces_is_trimmed_on_both_sides(self):
-        self.assertEqual(hub.load_settings({'HUB_TOKEN': TOKEN + '   '})['token'], TOKEN)
+        self.assertEqual(hub.load_settings({'HUB_TOKEN': TOKEN + '   ', 'HUB_BIND': '127.0.0.1'})['token'], TOKEN)
         self.assertEqual(agent.load_settings({'AGENT_TOKEN': '  ' + WORKER_TOKEN + ' '})['token'], WORKER_TOKEN)
 
-    def test_hub_listens_on_loopback_by_default_even_if_bind_is_blank(self):
-        settings = hub.load_settings({'HUB_TOKEN': TOKEN, 'HUB_BIND': '   '})
-        self.assertEqual(settings['bind'], '127.0.0.1')
+    def test_hub_bind_must_be_set_and_never_all_interfaces(self):
+        with self.assertRaises(SystemExit):
+            hub.load_settings({'HUB_TOKEN': TOKEN})
+        with self.assertRaises(SystemExit):
+            hub.load_settings({'HUB_TOKEN': TOKEN, 'HUB_BIND': '   '})
+        with self.assertRaises(SystemExit):
+            hub.load_settings({'HUB_TOKEN': TOKEN, 'HUB_BIND': '0.0.0.0'})
+        with self.assertRaises(SystemExit):
+            hub.load_settings({'HUB_TOKEN': TOKEN, 'HUB_BIND': '::'})
+        settings = hub.load_settings({'HUB_TOKEN': TOKEN, 'HUB_BIND': '172.22.0.1'})
+        self.assertEqual(settings['bind'], '172.22.0.1')
         self.assertEqual(settings['port'], 8899)
         self.assertEqual(settings['interval'], 10)
+
+    def test_the_tunnel_check_targets_the_worker_address_and_port(self):
+        env = hub_env(WORKER_AGENT_URL='http://192.0.2.2:8898', WORKER_AGENT_TOKEN=WORKER_TOKEN, WG_LOCAL_IP='192.0.2.1')
+        self.assertEqual(hub.load_settings(env)['link'], {
+            'peer_ip': '192.0.2.2', 'peer_port': 8898, 'source_ip': '192.0.2.1', 'iface': 'wg0'})
+        bare = hub.load_settings(hub_env(WORKER_AGENT_URL='https://192.0.2.2', WORKER_AGENT_TOKEN=WORKER_TOKEN))
+        self.assertEqual(bare['link']['peer_port'], 443)
+        self.assertEqual(bare['link']['source_ip'], '')
 
     def test_worker_url_needs_a_scheme_and_its_own_token(self):
         with self.assertRaises(SystemExit):
@@ -210,21 +226,36 @@ class RedirectTests(ServerCase):
 
 
 class LinkTests(unittest.TestCase):
-    def test_no_peer_configured_is_unknown(self):
+    def test_no_worker_configured_is_unknown(self):
         link = hub.load_settings(hub_env())['link']
         self.assertIsNone(hub.read_link(link, 1000)['ok'])
 
-    def test_ping_result_passes_through_and_missing_counters_stay_none(self):
-        link = hub.load_settings(hub_env(WG_PEER_IP='192.0.2.2'))['link']
+    def test_probe_results_pass_through_and_missing_counters_stay_none(self):
+        link = hub.load_settings(hub_env(WORKER_AGENT_URL='http://192.0.2.2:8898', WORKER_AGENT_TOKEN=WORKER_TOKEN))['link']
 
         def bad_iface(iface):
             raise OSError('no such interface')
-        result = hub.read_link(link, 1000, ping=lambda ip: {'ok': False, 'rttMs': None}, iface_reader=bad_iface)
+        result = hub.read_link(link, 1000, probe=lambda ip, port, src: {'ok': False, 'rttMs': None}, iface_reader=bad_iface)
         self.assertIs(result['ok'], False)
         self.assertIsNone(result['rxBytes'])
-        result = hub.read_link(link, 1000, ping=lambda ip: None, iface_reader=bad_iface)
+        self.assertIsNotNone(result['error'])
+        result = hub.read_link(link, 1000, probe=lambda ip, port, src: None, iface_reader=bad_iface)
         self.assertIsNone(result['ok'])
         self.assertIsNotNone(result['error'])
+        result = hub.read_link(link, 1000, probe=lambda ip, port, src: {'ok': True, 'rttMs': 1.5}, iface_reader=bad_iface)
+        self.assertIs(result['ok'], True)
+        self.assertEqual(result['rttMs'], 1.5)
+        self.assertIsNone(result['error'])
+
+    def test_the_probe_gets_the_worker_address_port_and_source(self):
+        seen = {}
+
+        def probe(ip, port, src):
+            seen.update(ip=ip, port=port, src=src)
+            return {'ok': True, 'rttMs': 1.0}
+        link = hub.load_settings(hub_env(WORKER_AGENT_URL='http://192.0.2.2:8898', WORKER_AGENT_TOKEN=WORKER_TOKEN, WG_LOCAL_IP='192.0.2.1'))['link']
+        hub.read_link(link, 1000, probe=probe, iface_reader=lambda i: {'rxBytes': 1, 'txBytes': 2})
+        self.assertEqual(seen, {'ip': '192.0.2.2', 'port': 8898, 'src': '192.0.2.1'})
 
 
 def make_collector(master_sources=None, fetch=None, link_reader=None):

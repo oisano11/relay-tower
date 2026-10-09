@@ -1,5 +1,7 @@
+import errno
 import http.client
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -49,6 +51,13 @@ class FakeOpener:
 
     def open(self, url, timeout=None):
         return self.fn(url, timeout)
+
+
+def fake_connect(error):
+    """假的连接函数：每次都抛出给定的异常，不发任何包。"""
+    def connect(address, timeout=None, source_address=None):
+        raise error
+    return connect
 
 
 class CpuTests(unittest.TestCase):
@@ -111,12 +120,19 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(metrics.read_containers([], run=run), [])
 
 
-class RequestTests(unittest.TestCase):
-    def test_counts_completed_request_lines_in_both_streams(self):
+class CustomerRequestTests(unittest.TestCase):
+    def test_only_customer_calls_are_counted_and_each_request_once(self):
+        # 真实日志里一条请求的 path 字段出现两次；控制台的管理接口（/api/v1）不算客户请求
+        log = '\n'.join([
+            'x http request completed\t{"path": "/v1/chat/completions", "method": "POST", "path": "/v1/chat/completions"}',
+            'x http request completed\t{"path": "/api/v1/auth/me", "method": "GET", "path": "/api/v1/auth/me"}',
+            'x http request completed\t{"path": "/v1/messages", "path": "/v1/messages"}',
+            'noise line without any request',
+        ])
+
         def run(*args, **kwargs):
-            return completed(stdout='x http request completed 200\nnoise\nhttp request completed 500\n',
-                             stderr='http request completed 200\n')
-        self.assertEqual(metrics.count_requests('sub2api', run=run), 3)
+            return completed(stdout=log)
+        self.assertEqual(metrics.count_requests('sub2api', run=run), 2)
 
     def test_failure_is_none(self):
         def run(*args, **kwargs):
@@ -124,31 +140,48 @@ class RequestTests(unittest.TestCase):
         self.assertIsNone(metrics.safe(metrics.count_requests)('sub2api', run=run))
 
 
-class PingTests(unittest.TestCase):
-    def test_reply_gives_round_trip_time(self):
-        def run(*args, **kwargs):
-            return completed(stdout='64 bytes from 192.0.2.2: icmp_seq=1 ttl=64 time=1.25 ms\n')
-        self.assertEqual(metrics.ping_peer('192.0.2.2', run=run), {'ok': True, 'rttMs': 1.25})
+class ProbeTcpTests(unittest.TestCase):
+    def test_a_listening_port_is_up(self):
+        with socket.socket() as server:
+            server.bind(('127.0.0.1', 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            result = metrics.probe_tcp('127.0.0.1', port, timeout=2)
+        self.assertIs(result['ok'], True)
+        self.assertIsNotNone(result['rttMs'])
 
-    def test_a_reply_in_another_language_still_counts_as_up(self):
-        def run(*args, **kwargs):
-            return completed(returncode=0, stdout='来自 192.0.2.2 的回复: 字节=64 时间=1ms TTL=64\n')
-        self.assertEqual(metrics.ping_peer('192.0.2.2', run=run), {'ok': True, 'rttMs': None})
+    def test_a_refused_connection_means_the_peer_answered_so_the_link_is_up(self):
+        # 本机一个没人监听的端口：对面回了 RST，说明包已经到了
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0))
+            port = s.getsockname()[1]
+        result = metrics.probe_tcp('127.0.0.1', port, timeout=2)
+        self.assertIs(result['ok'], True)
 
-    def test_no_reply_means_down_not_unknown(self):
-        def run(*args, **kwargs):
-            return completed(returncode=1)
-        self.assertEqual(metrics.ping_peer('192.0.2.2', run=run), {'ok': False, 'rttMs': None})
+    def test_a_timeout_is_down(self):
+        result = metrics.probe_tcp('192.0.2.2', 8898, connect=fake_connect(socket.timeout('timed out')))
+        self.assertEqual(result, {'ok': False, 'rttMs': None})
 
-    def test_ping_itself_failing_means_unknown(self):
-        def run(*args, **kwargs):
-            return completed(returncode=2)
-        self.assertIsNone(metrics.ping_peer('192.0.2.2', run=run))
+    def test_no_route_to_host_is_down(self):
+        result = metrics.probe_tcp('192.0.2.2', 8898, connect=fake_connect(OSError(errno.EHOSTUNREACH, 'No route to host')))
+        self.assertEqual(result, {'ok': False, 'rttMs': None})
 
-    def test_ping_not_installed_means_unknown(self):
-        def run(*args, **kwargs):
-            raise FileNotFoundError('ping')
-        self.assertIsNone(metrics.ping_peer('192.0.2.2', run=run))
+    def test_a_tunnel_address_this_machine_does_not_have_is_down(self):
+        # 真实的绑定失败：203.0.113.250 是文档保留地址，本机没有，bind 会直接失败，不会发出任何包
+        result = metrics.probe_tcp('127.0.0.1', 9, source_ip='203.0.113.250', timeout=2)
+        self.assertIs(result['ok'], False)
+
+    def test_a_name_that_does_not_resolve_is_unknown_not_down(self):
+        self.assertIsNone(metrics.probe_tcp('no-such-host.example', 8898, connect=fake_connect(socket.gaierror('no such host'))))
+
+    def test_the_source_address_is_passed_when_given(self):
+        seen = {}
+
+        def connect(address, timeout=None, source_address=None):
+            seen['source'] = source_address
+            raise ConnectionRefusedError()
+        metrics.probe_tcp('192.0.2.2', 8898, source_ip='192.0.2.1', connect=connect)
+        self.assertEqual(seen['source'], ('192.0.2.1', 0))
 
 
 class ProbeTests(unittest.TestCase):

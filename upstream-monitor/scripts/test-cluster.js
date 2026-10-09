@@ -150,8 +150,8 @@ test('healthy snapshot: both nodes online, numbers pass through, summary is ok',
   assert.equal(v.nodes.worker.state, 'online');
   assert.equal(v.summary.level, 'ok');
   assert.equal(v.nodes.master.memory.percent, 50);
-  assert.equal(v.split.masterPercent, 75);
-  assert.equal(v.split.workerPercent, 25);
+  assert.equal(v.split.verified, false, 'the split is not shown until the logs are reconciled');
+  assert.equal(v.split.masterPercent, null);
 });
 
 test('worker offline shows as offline with the reason, and the summary names it', () => {
@@ -197,14 +197,14 @@ test('an old snapshot is stale, not healthy', () => {
   assert.equal(v.summary.text, '数据过期，超过 1 分钟没有更新');
 });
 
-test('split: no requests is idle, unknown counts are unknown', () => {
+test('split: the arithmetic is right, but nothing is shown until the logs are verified', () => {
+  assert.equal(cluster.computeSplit(0, 0).idle, true);
+  assert.equal(cluster.computeSplit(30, 10).masterPercent, 75);
+  assert.equal(cluster.computeSplit(30, 10).workerPercent, 25);
   const idle = cluster.buildView(result(withNode(withNode(healthySnapshot(), 'master', { requests60s: 0 }), 'worker', { requests60s: 0 })), NOW);
-  assert.equal(idle.split.idle, true);
+  assert.equal(idle.split.verified, false);
   assert.equal(idle.split.masterPercent, null);
 });
-
-// ---------- 诊断 ----------
-
 test('diagnostics are computed, never a fixed all-green answer', () => {
   const down = cluster.diagnostics(cluster.buildView(failedResult(), NOW));
   assert.deepEqual(down.map(c => c.status), ['FAIL']);
@@ -227,18 +227,14 @@ test('diagnostics: no containers configured is said plainly, not reported as all
   assert.equal(row.detail, '没有配置要检查的容器');
 });
 
-test('diagnostics: a tunnel that cannot ping is FAIL, and one side taking all traffic is WARN', () => {
+test('diagnostics: a tunnel that cannot connect is FAIL; the split stays unknown until verified', () => {
   const snap = healthySnapshot({ link: { ok: false, rttMs: null, rxBytes: null, txBytes: null, collectedAt: NOW, error: null } });
   const checks = cluster.diagnostics(cluster.buildView(result(snap), NOW));
   assert.equal(checks.find(c => c.item === '两台之间的隧道').status, 'FAIL');
-
   const skewed = withNode(withNode(healthySnapshot(), 'master', { requests60s: 30 }), 'worker', { requests60s: 0 });
   const split = cluster.diagnostics(cluster.buildView(result(skewed), NOW)).find(c => c.item === '近 1 分钟分流');
-  assert.equal(split.status, 'WARN');
+  assert.equal(split.status, 'UNKNOWN');
 });
-
-// ---------- 报警 ----------
-
 test('alerts wait for two bad polls, fire once, and announce recovery once', () => {
   let state = null;
   const bad = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null })), NOW);
@@ -573,4 +569,34 @@ test('the status client never follows a redirect and trims the address and token
   assert.equal(seen.url, 'http://hub.invalid:8899/api/status');
   assert.equal(seen.options.redirect, 'error');
   assert.equal(seen.options.headers.Authorization, `Bearer ${TOKEN}`);
+});
+
+test('when the tunnel is down, only the tunnel alert fires; the worker-offline alert waits', () => {
+  let state = null;
+  const fired = [];
+  const tunnelDown = healthySnapshot({ link: { ok: false, rttMs: null, rxBytes: null, txBytes: null, collectedAt: NOW, error: null } });
+  const workerGone = withNode(tunnelDown, 'worker', { reachable: false, error: 'timed out', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null });
+  const bad = cluster.buildView(result(workerGone), NOW);
+  for (let i = 0; i < 3; i++) {
+    const out = cluster.evaluateAlerts(state, bad);
+    state = out.state;
+    fired.push(...out.alerts.map(a => a.title));
+  }
+  assert.deepEqual(fired, ['两台之间的隧道不通']);
+  assert.equal(bad.summary.text, '两台之间的隧道不通');
+});
+
+test('after the tunnel comes back, a worker that is still offline is reported on its own', () => {
+  let state = null;
+  const fired = [];
+  const offline = { reachable: false, error: 'timed out', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null };
+  const tunnelDown = healthySnapshot({ link: { ok: false, rttMs: null, rxBytes: null, txBytes: null, collectedAt: NOW, error: null } });
+  const down = cluster.buildView(result(withNode(tunnelDown, 'worker', offline)), NOW);
+  const back = cluster.buildView(result(withNode(healthySnapshot(), 'worker', offline)), NOW);
+  for (const view of [down, down, back, back]) {
+    const out = cluster.evaluateAlerts(state, view);
+    state = out.state;
+    fired.push(...out.alerts.map(a => a.title));
+  }
+  assert.deepEqual(fired, ['两台之间的隧道不通', '两台之间的隧道恢复了', '副节点离线']);
 });

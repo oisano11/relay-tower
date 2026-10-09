@@ -18,6 +18,8 @@ const DISK_RECOVER_PERCENT = 80;
 const MEM_ALERT_PERCENT = 90;
 const MEM_RECOVER_PERCENT = 85;
 const ROLE_NAMES = { master: '主节点', worker: '副节点' };
+// 副节点的日志和数据库还没对账，分流比例先不显示（对账通过后改成 true）
+const SPLIT_VERIFIED = false;
 const INTERNAL_USER_IDS = '1, 8';     // 和主看板一样：这两个是内部账号，客户消费不计入
 
 class HubError extends Error {}
@@ -184,14 +186,19 @@ function buildLink(raw, hub) {
 }
 
 // 近 60 秒两台各接了多少请求。取不到就是 null；总数为 0 是「没有请求」，不算分流。
-function buildSplit(master, worker) {
-  const a = master.requests60s;
-  const b = worker.requests60s;
-  if (a === null || b === null) return { total: null, idle: false, masterPercent: null, workerPercent: null };
+// 两台各自近 1 分钟的客户请求数 → 分流比例。纯计算，和是否显示无关。
+function computeSplit(a, b) {
   const total = a + b;
   if (total === 0) return { total: 0, idle: true, masterPercent: null, workerPercent: null };
   const masterPercent = Math.round((100 * a) / total);
   return { total, idle: false, masterPercent, workerPercent: 100 - masterPercent };
+}
+
+// 对账通过前（SPLIT_VERIFIED 为 false）不给出分流比例
+function buildSplit(master, worker) {
+  const base = { total: null, idle: false, masterPercent: null, workerPercent: null, verified: SPLIT_VERIFIED };
+  if (!SPLIT_VERIFIED || master.requests60s === null || worker.requests60s === null) return base;
+  return { ...base, ...computeSplit(master.requests60s, worker.requests60s) };
 }
 
 // 在线的节点里，有任何一项取不到
@@ -205,9 +212,10 @@ function summarize(view) {
   if (!view.hub.configured) return { level: 'unknown', text: '监控中台未配置' };
   if (!view.hub.ok) return { level: 'down', text: '监控中台连不上' };
   if (view.hub.stale) return { level: 'unknown', text: '数据过期，超过 1 分钟没有更新' };
+  // 隧道断了，副节点连不上就是同一件事：先说隧道
+  if (view.link.state === 'down') return { level: 'down', text: '两台之间的隧道不通' };
   const offline = nodes.filter(n => n.state === 'offline');
   if (offline.length) return { level: 'down', text: `${offline.map(n => n.label).join('、')}离线` };
-  if (view.link.state === 'down') return { level: 'down', text: '两台之间的隧道不通' };
   const degraded = nodes.filter(n => n.state === 'degraded');
   if (degraded.length) return { level: 'warn', text: `${degraded.map(n => n.label).join('、')}服务异常` };
   const unknown = nodes.filter(n => n.state === 'unknown');
@@ -305,10 +313,11 @@ function diagnostics(view) {
   }
   const link = view.link;
   if (link.state === 'ok') add('两台之间的隧道', 'PASS', link.rttMs !== null ? `能通，往返 ${roundTo(link.rttMs, 2)} 毫秒` : '能通');
-  else if (link.state === 'down') add('两台之间的隧道', 'FAIL', '对端 ping 不通');
+  else if (link.state === 'down') add('两台之间的隧道', 'FAIL', '连不上副节点的端口（隧道可能断了，或副节点不通）');
   else add('两台之间的隧道', 'UNKNOWN', link.error || '取不到');
   const split = view.split;
-  if (split.total === null) add('近 1 分钟分流', 'UNKNOWN', '取不到');
+  if (!split.verified) add('近 1 分钟分流', 'UNKNOWN', '暂不显示：副节点的日志还没和数据库对账');
+  else if (split.total === null) add('近 1 分钟分流', 'UNKNOWN', '取不到');
   else if (split.idle) add('近 1 分钟分流', 'PASS', '近 1 分钟没有请求');
   else if (split.total >= 10 && (split.masterPercent === 0 || split.workerPercent === 0)) {
     add('近 1 分钟分流', 'WARN', `只有一台在接请求（主 ${split.masterPercent}% / 副 ${split.workerPercent}%）`);
@@ -362,7 +371,8 @@ function evaluateAlerts(prevState, view) {
   for (const node of [view.nodes.master, view.nodes.worker]) {
     const L = node.label;
     const K = node.role;
-    if (node.reachable !== null) {
+    // 隧道断了的时候，副节点连不上是同一件事：只报隧道，副节点的离线状态先原地不动
+    if (node.reachable !== null && view.link.state !== 'down') {
       observe(`${K}.offline`, node.state === 'offline', {
         title: `${L}离线`,
         recoverTitle: `${L}恢复在线`,
@@ -503,6 +513,8 @@ function createBusinessReader({ load, now = Date.now, cacheMs = BUSINESS_CACHE_M
 }
 
 module.exports = {
+  SPLIT_VERIFIED,
+  computeSplit,
   CACHE_MS,
   STALE_AFTER_MS,
   BUSINESS_SQL,

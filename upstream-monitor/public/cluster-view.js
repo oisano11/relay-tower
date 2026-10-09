@@ -85,7 +85,7 @@
       ${renderMeter('内存', memory ? memory.percent : null, memory ? `${fmtMb(memory.usedMb)} / ${fmtMb(memory.totalMb)}` : '')}
       ${renderMeter('磁盘', disk ? disk.percent : null, disk ? `${fmtGb(disk.usedGb)} / ${fmtGb(disk.totalGb)}` : '')}
       ${renderKv('Sub2API', sub2api)}
-      ${renderKv('近 1 分钟请求', fmtNumber(node.requests60s))}
+      ${renderKv('近 1 分钟客户请求', fmtNumber(node.requests60s))}
       ${renderKv('负载（1/5/15 分钟）', load)}
       ${renderKv('上次采集', fmtClock(node.collectedAt))}
       <div class="cluster-chips">${chips}</div>
@@ -105,6 +105,7 @@
 
   function renderSplit(view) {
     const split = view.split;
+    if (!split.verified) return '近 1 分钟分流：暂不显示（副节点的日志还没和数据库对账）';
     if (split.total === null) return `近 1 分钟分流：${UNKNOWN}`;
     if (split.idle) return '近 1 分钟分流：没有请求';
     return `近 1 分钟分流：主 ${split.masterPercent}% / 副 ${split.workerPercent}%（${fmtNumber(split.total)} 次）`;
@@ -181,7 +182,11 @@
 (function (view) {
   if (typeof document === 'undefined' || !view) return;
   const $ = id => document.getElementById(id);
-  let open = false;
+  // 面板是不是真的在屏幕上：点背景关闭时只是把它藏起来，所以以显示状态为准
+  function isPanelOpen() {
+    const modal = $('clusterModal');
+    return Boolean(modal) && modal.style.display === 'flex';
+  }
   let latest = null;
 
   function paint() {
@@ -191,7 +196,7 @@
     const headerText = $('clusterHeaderText');
     if (dot) dot.className = `cluster-dot ${view.levelClass(data)}`;
     if (headerText) headerText.textContent = view.headerText(data);
-    if (!open) return;
+    if (!isPanelOpen()) return;
     $('clusterSummary').textContent = data.hub.configured ? data.summary.text : '监控中台还没有配置';
     $('clusterFreshness').textContent = view.renderFreshness(data);
     $('clusterNodes').innerHTML = view.renderNode(data.nodes.master) + view.renderNode(data.nodes.worker);
@@ -216,7 +221,7 @@
       if (headerText) headerText.textContent = '双机集群 · 面板读取失败';
       const dot = $('clusterHeaderDot');
       if (dot) dot.className = 'cluster-dot unknown';
-      if (open) {
+      if (isPanelOpen()) {
         $('clusterSummary').textContent = '读取失败，下面不显示旧数字';
         $('clusterFreshness').textContent = `原因：${error.message}（稍后会自动再试，也可以点刷新）`;
         $('clusterNodes').innerHTML = '';
@@ -227,13 +232,11 @@
   }
 
   function openPanel() {
-    open = true;
     $('clusterModal').style.display = 'flex';
     load();
   }
 
   function closePanel() {
-    open = false;
     $('clusterModal').style.display = 'none';
   }
 
@@ -269,9 +272,9 @@
     bind('btnRefreshCluster', () => load({ fresh: true }));
     bind('btnRunClusterChecks', runChecks);
     document.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && open) closePanel();
+      if (event.key === 'Escape' && isPanelOpen()) closePanel();
     });
     load();
-    setInterval(() => load({ lite: !open }), 30 * 1000);
+    setInterval(() => load({ lite: !isPanelOpen() }), 30 * 1000);
   });
 }(typeof window !== 'undefined' ? window.ClusterView : null));

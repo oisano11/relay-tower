@@ -5,15 +5,17 @@
 """
 import http.client
 import os
-import re
+import socket
 import subprocess
+import time
 import urllib.request
 
 PROC_STAT = '/proc/stat'
 PROC_MEMINFO = '/proc/meminfo'
 SYSFS_NET = '/sys/class/net'
-REQUEST_LOG_LINE = 'http request completed'
-PING_TIME = re.compile(r'time[=<]\s*([0-9.]+)\s*ms')
+# 客户调用的接口都在 /v1/ 下。控制台和网页自己的请求也写进同一份日志，不能算进客户请求。
+# 每条请求的日志行里 path 字段出现两次，所以数「行」，不数「出现次数」。
+CUSTOMER_PATH_MARK = '"path": "/v1/'
 
 # 读取失败时可能抛出的异常，都只表示“这一项取不到”
 READ_ERRORS = (OSError, ValueError, KeyError, IndexError, ZeroDivisionError, subprocess.SubprocessError)
@@ -113,13 +115,13 @@ def read_containers(expected, run=subprocess.run):
 
 
 def count_requests(container, since='60s', run=subprocess.run):
-    """最近一段时间里，容器日志里有多少条“请求完成”的记录。"""
+    """最近一段时间里，客户调用（路径以 /v1/ 开头）的请求条数。"""
     done = run(['docker', 'logs', '--since', since, container],
                capture_output=True, text=True, timeout=10)
     if done.returncode != 0:
         raise OSError('docker logs 失败')
     text = done.stdout + done.stderr
-    return sum(1 for line in text.splitlines() if REQUEST_LOG_LINE in line)
+    return sum(1 for line in text.splitlines() if CUSTOMER_PATH_MARK in line)
 
 
 def probe_http(url, timeout=2.0, opener=_LOCAL_OPENER):
@@ -132,19 +134,23 @@ def probe_http(url, timeout=2.0, opener=_LOCAL_OPENER):
         return False
 
 
-def ping_peer(ip, run=subprocess.run):
-    """ping 的退出码：0 = 有回复，1 = 没有回复（不通），其他 = ping 本身出错（参数、权限），返回 None。
-    有回复时，往返时间能解析就给出来，解析不出（比如系统是中文）也照样算通。"""
+def probe_tcp(host, port, source_ip=None, timeout=2.0, connect=socket.create_connection):
+    """用 TCP 连一下对端的端口，判断两台之间的隧道通不通。不需要任何特殊权限。
+    - 连上了，或者被对面明确拒绝（对面回了 RST）：包已经到了对面，返回 ok=True。
+    - 超时、主机或网络不可达、本机没有这个隧道地址：返回 ok=False。
+    - 地址解析失败（多半是配置写错）：返回 None，表示取不到。
+    source_ip 填本机在隧道上的地址：本机没有这个地址时，绑定就失败，判为不通。"""
+    started = time.monotonic()
     try:
-        done = run(['ping', '-c', '1', '-W', '2', ip], capture_output=True, text=True, timeout=6)
-    except READ_ERRORS:
+        sock = connect((host, port), timeout=timeout, source_address=(source_ip, 0) if source_ip else None)
+    except ConnectionRefusedError:
+        return {'ok': True, 'rttMs': round((time.monotonic() - started) * 1000, 2)}
+    except socket.gaierror:
         return None
-    if done.returncode == 0:
-        match = PING_TIME.search(done.stdout)
-        return {'ok': True, 'rttMs': float(match.group(1)) if match else None}
-    if done.returncode == 1:
+    except OSError:
         return {'ok': False, 'rttMs': None}
-    return None
+    sock.close()
+    return {'ok': True, 'rttMs': round((time.monotonic() - started) * 1000, 2)}
 
 
 def read_iface_counters(iface, base=SYSFS_NET):
