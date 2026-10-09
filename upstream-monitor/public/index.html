@@ -36,6 +36,11 @@
             <span class="mono-code" id="globalUserStatusText">👥 0 人在线</span>
           </div>
           <div class="capsule-divider"></div>
+          <div class="status-capsule-item" id="clusterHeaderBadge" style="cursor: pointer;" title="双机集群状态（点击查看两台机器的运行情况）">
+            <span class="cluster-dot unknown" id="clusterHeaderDot"></span>
+            <span class="mono-code" id="clusterHeaderText">双机集群 · 读取中</span>
+          </div>
+          <div class="capsule-divider"></div>
           <div class="status-capsule-item poller-mini" id="pollerBadge" title="自动巡检倒计时 (倍率5分钟/次，余额10分钟/次)">
             <span>⏱</span>
             <span id="pollerCountdown" class="mono-code">5分00秒</span>
@@ -62,6 +67,11 @@
             <span id="navDropdownPendingDot" class="nav-dropdown-pending-dot" style="display: none;"></span>
           </button>
           <div class="nav-dropdown-menu" id="navDropdownMenu">
+            <div class="dropdown-header">双机集群</div>
+            <button id="btnOpenClusterModal" class="dropdown-item" title="查看主节点与副节点的运行情况、两台之间的隧道和今日业务数字">
+              <span class="dropdown-item-icon">🖥️</span>
+              <span class="dropdown-item-label">双机集群状态</span>
+            </button>
             <div class="dropdown-header">自动切号</div>
             <button id="btnOpenAutoSwitchModal" class="dropdown-item" title="统一设置故障切号、充值后恢复与低价回切">
               <span class="dropdown-item-icon">⚡</span>
@@ -2269,6 +2279,35 @@
     <div id="toastContainer" class="toast-container"></div>
   </div>
 
+    <!-- 双机集群状态面板：数据来自 /api/cluster/status（需要登录），取不到的字段显示「取不到」 -->
+    <div id="clusterModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-dialog cluster-dialog">
+        <div class="dialog-content">
+          <div class="cluster-head">
+            <div>
+              <div class="cluster-title">双机集群</div>
+              <div id="clusterSummary" class="cluster-summary">读取中…</div>
+              <div id="clusterFreshness" class="cluster-freshness"></div>
+            </div>
+            <div class="cluster-head-actions">
+              <button id="btnRefreshCluster" class="btn btn-secondary" type="button">⟳ 刷新</button>
+              <button id="btnRunClusterChecks" class="btn btn-secondary" type="button">全链路检查</button>
+              <button id="btnCloseClusterModal" class="modal-close-btn" type="button" title="关闭">✕</button>
+            </div>
+          </div>
+          <div id="clusterNodes" class="cluster-nodes"></div>
+          <div id="clusterLink" class="cluster-link"></div>
+          <div class="cluster-section-title">今日业务（来自中转塔台的数据库）</div>
+          <div id="clusterBusiness" class="cluster-business"></div>
+          <div id="clusterChecksWrap" class="cluster-checks-wrap" style="display: none;">
+            <div class="cluster-section-title" id="clusterChecksTitle">全链路检查</div>
+            <div id="clusterChecks" class="cluster-checks"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   <script src="app.js?v=20261001_usage_group"></script>
+  <script src="cluster-view.js?v=20261009_cluster"></script>
 </body>
 </html>

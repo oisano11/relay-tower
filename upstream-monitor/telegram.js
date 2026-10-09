@@ -1237,6 +1237,17 @@ class TelegramBotManager {
     return true;
   }
 
+  // 双机集群：离线、中台连不上、隧道不通、Sub2API 没响应、容器不在运行、指标取不到，这些故障响铃；
+  // 磁盘或内存快满、恢复消息只推送不响。
+  // 文字全部转义：标题和原因里可能带着从机器上读来的字。
+  async notifyClusterAlert({ level = 'down', title, lines = [] }) {
+    if (!this.config.enabled || !this.hasAdmins()) return false;
+    const mark = level === 'down' ? '🔴' : (level === 'recovered' ? '✅' : '🟡');
+    const text = [`${mark} <b>${escapeHtml(title)}</b>`, ...lines.map(line => escapeHtml(line))].join('\n');
+    const sent = await this.broadcastToAdmins(text, { disable_notification: level !== 'down' });
+    return sent > 0;  // 一条都没发出去就返回 false，调用方会把这条报警退回去，下一轮重发
+  }
+
   // 10. 正在接单的账号余额低于 5 美元：每一轮只提醒一次（server.js 记着提醒过谁）；
   //     同一家上游的几个账号共用一份余额时，server.js 把它们合成一条传进来
   async notifyLowBalance({ channel, channels, balance, unit, groups = [], noBackupGroups = [] }) {

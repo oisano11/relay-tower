@@ -27,6 +27,8 @@ services:
       IS_VPS: "true"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
+      CLUSTER_HUB_URL: "${CLUSTER_HUB_URL:-}"
+      CLUSTER_HUB_TOKEN: "${CLUSTER_HUB_TOKEN:-}"
 
 volumes:
   upstream-monitor-data:

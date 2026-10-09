@@ -1,0 +1,22 @@
+# 主节点：双机集群中台。把 User 和路径改成你自己的；环境变量放在 0600 权限的文件里。
+[Unit]
+Description=Relay cluster monitor hub (read-only JSON API)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME_SERVICE_USER
+# 运行用户要在 docker 组里，才能读容器状态和日志
+WorkingDirectory=/opt/relay-tower/cluster-monitor
+EnvironmentFile=/etc/cluster-monitor/hub.env
+ExecStart=/usr/bin/python3 -u /opt/relay-tower/cluster-monitor/hub.py
+Restart=on-failure
+RestartSec=5
+# 只保留不会挡住 docker 访问的加固；ProtectSystem 之类的需要在目标机器上实测后再加
+# 注意：NoNewPrivileges 会让 ping 拿不到文件权限。隧道一直显示「取不到」时，删掉下面这一行再试。
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

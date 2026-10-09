@@ -255,6 +255,8 @@ services:
       - IS_VPS=true
       - ADMIN_PASSWORD=${MONITOR_ADMIN_PASSWORD:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - CLUSTER_HUB_URL=${CLUSTER_HUB_URL:-}
+      - CLUSTER_HUB_TOKEN=${CLUSTER_HUB_TOKEN:-}
     networks:
       - sub2api-network
     depends_on:

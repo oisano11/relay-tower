@@ -168,6 +168,23 @@ const SSH_USER = process.env.SSH_USER || 'root';
 // runtime-state writer.  Keep those modules out of the child entirely.
 const auth = IS_CONTROL_PLANE_WORKER ? null : require('./auth');
 const telegram = IS_CONTROL_PLANE_WORKER ? null : require('./telegram');
+const clusterStatus = require('./cluster-status');
+// 双机集群：中台地址和令牌只从环境变量来，没配置就显示「未配置」；浏览器拿不到它们
+const clusterClient = clusterStatus.createClusterClient({
+  url: process.env.CLUSTER_HUB_URL || '',
+  token: process.env.CLUSTER_HUB_TOKEN || '',
+});
+const clusterBusiness = clusterStatus.createBusinessReader({
+  load: async () => clusterStatus.parseBusinessOutput(await execPsqlAsync(clusterStatus.BUSINESS_SQL)),
+});
+// 等一件事最多 ms 毫秒，超时给备用值；计时器用完即清
+function withTimeout(promise, ms, fallback) {
+  let timer = null;
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 const upstreamScanner = IS_CONTROL_PLANE_WORKER ? null : require('./upstream_scanner');
 const IS_VPS = process.env.IS_VPS === 'true';
 
@@ -1073,6 +1090,32 @@ async function maybeSendDailyDigest(now = Date.now()) {
   } finally {
     dailyDigestSending = false;
   }
+}
+
+// 双机集群报警：每分钟看一次。连续几次异常才报，恢复时说一声。
+// 没配置中台时不跑，但会在启动日志里说清楚，免得悄悄没有报警。
+function startClusterAlertPoller() {
+  if (!telegram || typeof telegram.notifyClusterAlert !== 'function') return;
+  if (!clusterClient.configured) {
+    console.log('[双机集群] 没有设置 CLUSTER_HUB_URL 和 CLUSTER_HUB_TOKEN：集群面板显示「未配置」，报警也没有启动');
+    return;
+  }
+  let alertState = null;
+  const tick = async () => {
+    try {
+      const result = await clusterClient.getStatus({ force: true });
+      const evaluated = clusterStatus.evaluateAlerts(alertState, clusterStatus.buildView(result, Date.now()));
+      alertState = evaluated.state;
+      for (const alert of evaluated.alerts) {
+        const sent = await telegram.notifyClusterAlert(alert);
+        if (!sent) clusterStatus.revertAlert(alertState, alert);  // 没发出去：退回状态，下一轮再发
+      }
+    } catch (error) {
+      console.error('[双机集群报警]', error.message);
+    }
+  };
+  setTimeout(tick, 30 * 1000);
+  setInterval(tick, 60 * 1000);
 }
 
 function startDailyDigestTimer() {
@@ -10272,6 +10315,33 @@ COMMIT;`;
     return;
   }
 
+  // 双机集群状态：只给已登录的中控台。数据来自主节点上的中台，读不到的字段是 null（界面显示「取不到」）。
+  // lite=1 时不查业务数字（顶栏定时刷新用）。中台和数据库两边并行，各自最多等几秒。
+  if (pathname === '/api/cluster/status' && req.method === 'GET') {
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const fresh = params.get('fresh') === '1';
+    const wantBusiness = params.get('lite') !== '1';
+    const [result, business] = await Promise.all([
+      clusterClient.getStatus({ force: fresh }),
+      wantBusiness ? withTimeout(clusterBusiness.get(), 4000, null) : Promise.resolve(undefined),
+    ]);
+    const view = clusterStatus.buildView(result, Date.now());
+    const body = { success: true, configured: clusterClient.configured, view };
+    if (business !== undefined) body.business = business;
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(body));
+    return;
+  }
+
+  // 双机集群全链路检查：结果从同一份缓存数据算出来，连点也不会多去打中台
+  if (pathname === '/api/cluster/diagnostics/run' && req.method === 'POST') {
+    const result = await clusterClient.getStatus();
+    const view = clusterStatus.buildView(result, Date.now());
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ success: true, timestamp: new Date().toISOString(), checks: clusterStatus.diagnostics(view) }));
+    return;
+  }
+
   // 获取告警记录
   if (pathname === '/api/alerts' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -10563,6 +10633,7 @@ function initializeMainProcess() {
     startAnnouncementCleanup();
     startAutoSwitchPoller();
     startDailyDigestTimer();
+    startClusterAlertPoller();
     refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
   });
 }

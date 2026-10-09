@@ -83,3 +83,7 @@ Agent.md
 AGENTS.md
 GEMINI.md
 sub2api-luna-work/
+
+# Python 缓存（cluster-monitor 的测试会生成）
+__pycache__/
+*.pyc

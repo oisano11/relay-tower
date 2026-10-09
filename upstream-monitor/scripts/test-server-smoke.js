@@ -188,3 +188,24 @@ test('a generic "balance" mention in an error body is not proof of debt', () => 
   assert.equal(gateway.isDefiniteQuotaError('{"error":{"message":"余额不足"}}', 403), true);
   assert.equal(gateway.isDefiniteQuotaError('anything', 402), true);
 });
+
+test('cluster status needs a login, says when the hub is not configured, and never shows made-up numbers', async t => {
+  const server = await startIsolatedServer(t);
+  const request = (route, options = {}) => fetch(`http://127.0.0.1:${server.address().port}${route}`, options);
+  assert.equal((await request('/api/cluster/status')).status, 401, 'cluster numbers are behind the console login');
+  assert.equal((await request('/api/cluster/diagnostics/run', { method: 'POST' })).status, 401);
+  const login = await request('/api/login', { method: 'POST', body: JSON.stringify({ password: 'test-password' }) });
+  const headers = { Authorization: `Bearer ${(await login.json()).token}` };
+  const status = await request('/api/cluster/status?fresh=1', { headers });
+  assert.equal(status.status, 200);
+  const body = await status.json();
+  assert.equal(body.configured, false);
+  assert.equal(body.view.summary.text, '监控中台未配置');
+  assert.equal(body.view.nodes.master.cpuPercent, null);
+  assert.equal(body.business, null);
+  const lite = await (await request('/api/cluster/status?lite=1', { headers })).json();
+  assert.equal('business' in lite, false, 'the header refresh does not run the business queries');
+  const checks = await (await request('/api/cluster/diagnostics/run', { method: 'POST', headers })).json();
+  assert.equal(checks.success, true);
+  assert.equal(checks.checks[0].status, 'FAIL');
+});

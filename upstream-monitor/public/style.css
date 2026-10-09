@@ -5329,3 +5329,55 @@ body {
   cursor: pointer;
 }
 .usage-link-btn:hover { text-decoration: underline; }
+
+/* 双机集群面板（颜色沿用暖色调） */
+.cluster-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: #9c9a92; }
+.cluster-dot.ok { background: #4d7c5a; }
+.cluster-dot.warn { background: #c08a2b; }
+.cluster-dot.down { background: #b3261e; }
+.cluster-dot.unknown { background: #9c9a92; }
+.cluster-dialog { width: 100%; max-width: min(1100px, calc(100vw - 2rem)); max-height: calc(100vh - 2.5rem); overflow-y: auto; }
+.cluster-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; padding-bottom: 0.85rem; border-bottom: 1px solid #e8e6dc; }
+.cluster-title { font-size: 1.15rem; font-weight: 700; color: #1f1e1d; }
+.cluster-summary { margin-top: 0.25rem; font-size: 0.9rem; color: #3d3d3a; }
+.cluster-freshness { margin-top: 0.25rem; font-size: 0.75rem; color: #73726c; }
+.cluster-head-actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.cluster-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-top: 1rem; }
+.cluster-card { border: 1px solid #e8e6dc; border-radius: 12px; padding: 1rem; background: #faf9f5; }
+.cluster-card-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.6rem; }
+.cluster-card-head strong { font-size: 1rem; color: #1f1e1d; }
+.cluster-tag { font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid; }
+.cluster-tag.ok { color: #3a6b4a; border-color: #a9c9b1; background: #eef6f0; }
+.cluster-tag.warn { color: #8a5a12; border-color: #e5c58f; background: #fbf3e4; }
+.cluster-tag.down { color: #8e1f18; border-color: #e6aaa5; background: #fbeceb; }
+.cluster-tag.unknown { color: #5e5d59; border-color: #d1cfc5; background: #f5f4ed; }
+.cluster-meter-row { display: grid; grid-template-columns: 44px 1fr auto; gap: 0.5rem; align-items: center; margin: 0.35rem 0; font-size: 0.8rem; color: #3d3d3a; }
+.cluster-meter { height: 6px; background: #e8e6dc; border-radius: 999px; overflow: hidden; }
+.cluster-meter > span { display: block; height: 100%; background: #c96442; }
+.cluster-meter > span.hot { background: #b5532f; }
+.cluster-kv { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.8rem; color: #3d3d3a; padding: 0.2rem 0; border-top: 1px dashed #e8e6dc; }
+.cluster-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.5rem; }
+.cluster-chip { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 6px; background: #f5f4ed; color: #3d3d3a; border: 1px solid #e8e6dc; }
+.cluster-chip.bad { background: #fbeceb; color: #8e1f18; border-color: #e6aaa5; }
+.cluster-problem { font-size: 0.78rem; color: #8e1f18; margin-top: 0.4rem; }
+.cluster-warning { font-size: 0.78rem; color: #8a5a12; margin-top: 0.4rem; }
+.cluster-link { margin-top: 0.75rem; font-size: 0.85rem; color: #3d3d3a; }
+.cluster-section-title { margin: 1rem 0 0.4rem; font-size: 0.85rem; font-weight: 600; color: #3d3d3a; }
+.cluster-business { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.6rem; }
+.cluster-kpi { border: 1px solid #e8e6dc; border-radius: 10px; padding: 0.6rem 0.75rem; background: #faf9f5; }
+.cluster-kpi-label { font-size: 0.72rem; color: #73726c; }
+.cluster-kpi-value { font-size: 1.15rem; font-weight: 700; color: #1f1e1d; margin-top: 0.15rem; font-variant-numeric: tabular-nums; }
+.cluster-models { grid-column: 1 / -1; font-size: 0.8rem; color: #3d3d3a; }
+.cluster-models-row { display: flex; justify-content: space-between; gap: 0.5rem; padding: 0.2rem 0; border-top: 1px dashed #e8e6dc; }
+.cluster-checks { display: grid; gap: 0.35rem; }
+.cluster-check { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; font-size: 0.82rem; padding: 0.45rem 0.6rem; border: 1px solid #e8e6dc; border-radius: 8px; background: #fff; color: #3d3d3a; }
+.cluster-check-status { font-weight: 700; font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 6px; white-space: nowrap; }
+.cluster-check-status.pass { color: #3a6b4a; background: #eef6f0; }
+.cluster-check-status.warn { color: #8a5a12; background: #fbf3e4; }
+.cluster-check-status.fail { color: #8e1f18; background: #fbeceb; }
+.cluster-check-status.unknown { color: #5e5d59; background: #f5f4ed; }
+@media (max-width: 640px) {
+  .cluster-head { flex-direction: column; }
+  .cluster-meter-row { grid-template-columns: 44px 1fr; }
+  .cluster-meter-row > span:last-child { grid-column: 2; }
+}

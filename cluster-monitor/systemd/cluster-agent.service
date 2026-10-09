@@ -1,0 +1,19 @@
+# 副节点：只读快照 agent。只监听内网地址（AGENT_BIND），不要改成 0.0.0.0。
+[Unit]
+Description=Relay cluster monitor agent (read-only snapshot)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME_SERVICE_USER
+WorkingDirectory=/opt/relay-tower/cluster-monitor
+EnvironmentFile=/etc/cluster-monitor/agent.env
+ExecStart=/usr/bin/python3 -u /opt/relay-tower/cluster-monitor/agent.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
