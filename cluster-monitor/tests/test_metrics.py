@@ -134,6 +134,29 @@ class CustomerRequestTests(unittest.TestCase):
             return completed(stdout=log)
         self.assertEqual(metrics.count_requests('sub2api', run=run), 2)
 
+    def test_the_compact_json_log_format_is_counted_too(self):
+        # 另一台机器用 json 格式：冒号后面没有空格
+        log = '\n'.join([
+            '{"level":"info","msg":"http request completed","path":"/v1/responses","method":"POST","path":"/v1/responses"}',
+            '{"level":"info","msg":"http request completed","path":"/api/v1/auth/me","path":"/api/v1/auth/me"}',
+        ])
+
+        def run(*args, **kwargs):
+            return completed(stdout=log)
+        self.assertEqual(metrics.count_requests('sub2api', run=run), 1)
+
+    def test_other_log_lines_of_the_same_request_are_not_counted(self):
+        # 同一个请求转发上游时也会写带 path 的日志，只有「请求完成」那一行算数
+        log = '\n'.join([
+            'x WARN upstream request failed\t{"path": "/v1/chat/completions", "status": 502}',
+            'x INFO account selected\t{"path": "/v1/chat/completions"}',
+            'x INFO http request completed\t{"path": "/v1/chat/completions", "path": "/v1/chat/completions"}',
+        ])
+
+        def run(*args, **kwargs):
+            return completed(stdout=log)
+        self.assertEqual(metrics.count_requests('sub2api', run=run), 1)
+
     def test_failure_is_none(self):
         def run(*args, **kwargs):
             return completed(returncode=1)
@@ -151,13 +174,14 @@ class CustomerRequestTests(unittest.TestCase):
 
     def test_a_window_with_more_lines_than_the_tail_is_unknown_not_a_partial_count(self):
         def run(*args, **kwargs):
-            return completed(stdout='\n'.join(['{"path": "/v1/chat/completions"}'] * 3))
+            return completed(stdout='\n'.join(['http request completed {"path": "/v1/chat/completions"}'] * 3))
         self.assertIsNone(metrics.safe(metrics.count_requests)('sub2api', run=run, tail=3))
         self.assertEqual(metrics.count_requests('sub2api', run=run, tail=4), 3)
 
     def test_lines_on_both_output_streams_are_counted(self):
         def run(*args, **kwargs):
-            return completed(stdout='{"path": "/v1/messages"}', stderr='{"path": "/v1/chat/completions"}\n')
+            return completed(stdout='http request completed {"path": "/v1/messages"}',
+                             stderr='http request completed {"path": "/v1/chat/completions"}\n')
         self.assertEqual(metrics.count_requests('sub2api', run=run), 2)
 
 

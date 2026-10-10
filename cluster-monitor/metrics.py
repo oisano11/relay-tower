@@ -5,6 +5,7 @@
 """
 import http.client
 import os
+import re
 import socket
 import subprocess
 import time
@@ -13,9 +14,12 @@ import urllib.request
 PROC_STAT = '/proc/stat'
 PROC_MEMINFO = '/proc/meminfo'
 SYSFS_NET = '/sys/class/net'
-# 客户调用的接口都在 /v1/ 下。控制台和网页自己的请求也写进同一份日志，不能算进客户请求。
-# 每条请求的日志行里 path 字段出现两次，所以数「行」，不数「出现次数」。
-CUSTOMER_PATH_MARK = '"path": "/v1/'
+# 每个请求结束时，Sub2API 写一行「请求完成」，只数这一行。
+# 同一个请求还会写别的日志行（比如转发上游时），里面也带着 path，数它们会重复计数。
+REQUEST_DONE_MARK = 'http request completed'
+# 客户调用的接口都在 /v1/ 下。控制台和网页自己的请求（/api/v1/ 等）也写进同一份日志，不能算进客户请求。
+# 两种日志格式写法不同：console 格式是 "path": "/v1/…"（冒号后有空格），json 格式是 "path":"/v1/…"。
+CUSTOMER_PATH = re.compile(r'"path":\s?"/v1/')
 # 只读日志末尾这么多行。docker logs 只带 --since 时会从头扫整份日志：
 # 线上 700 多 MB 的日志要 17 秒，还会占满一个 CPU 核。带上 --tail 就只读末尾，0.1 秒左右。
 REQUEST_TAIL_LINES = 5000
@@ -118,7 +122,7 @@ def read_containers(expected, run=subprocess.run):
 
 
 def count_requests(container, since='60s', run=subprocess.run, tail=REQUEST_TAIL_LINES):
-    """最近一段时间里，客户调用（路径以 /v1/ 开头）的请求条数。
+    """最近一段时间里，客户调用（路径以 /v1/ 开头）的请求条数：每个请求只数它的「请求完成」那一行。
     只读日志末尾 tail 行，再按时间筛出这段时间的。筛完还剩满 tail 行，
     说明这段时间的日志比 tail 还多、数不全，当成取不到（抛错，由 safe 变成 None）。"""
     done = run(['docker', 'logs', '--tail', str(tail), '--since', since, container],
@@ -128,7 +132,7 @@ def count_requests(container, since='60s', run=subprocess.run, tail=REQUEST_TAIL
     lines = done.stdout.splitlines() + done.stderr.splitlines()
     if len(lines) >= tail:
         raise ValueError('这段时间的日志太多，只读末尾会数不全')
-    return sum(1 for line in lines if CUSTOMER_PATH_MARK in line)
+    return sum(1 for line in lines if REQUEST_DONE_MARK in line and CUSTOMER_PATH.search(line))
 
 
 def probe_http(url, timeout=2.0, opener=_LOCAL_OPENER):
