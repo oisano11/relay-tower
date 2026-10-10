@@ -1251,6 +1251,23 @@ class TelegramBotManager {
     return sent > 0;  // 一条都没发出去就返回 false，调用方会把这条报警退回去，下一轮重发
   }
 
+  // Sub2API 后台出现以前没见过的 IP 在做管理员操作：安全提醒，响铃。同一个 IP 只提醒一次（admin-watch.js 记着）。
+  // 文字全部转义：IP、操作、浏览器标识都是从数据库读来的。
+  async notifyAdminNewIp({ ip, count = 1, firstAt, auths = [], actors = [], actions = [], userAgent = '' }) {
+    if (!this.config.enabled || !this.hasAdmins()) return false;
+    const lines = ['🔴 <b>Sub2API 后台出现陌生 IP 的管理员操作</b>'];
+    lines.push(`IP：<b>${escapeHtml(ip)}</b>（以前的管理员操作里没出现过）`);
+    lines.push(`时间：${escapeHtml(formatShanghaiDateTime(firstAt))}${count > 1 ? ` 起，共 ${count} 次` : ''}`);
+    if (actors.length) lines.push(`管理员账号：${escapeHtml(actors.map(id => `#${id}`).join('、'))}`);
+    if (auths.length) lines.push(`登录方式：${escapeHtml(auths.join('、'))}`);
+    if (actions.length) lines.push(`做了什么：${escapeHtml(actions.join('、'))}`);
+    if (userAgent) lines.push(`浏览器：${escapeHtml(userAgent)}`);
+    lines.push('如果是你自己换了网络（开了代理、换了 Wi-Fi 或手机流量），可以忽略。');
+    lines.push('如果不是你：说明有人拿到了管理员权限，要马上换 Sub2API 的登录密钥、改管理员密码。');
+    const sent = await this.broadcastToAdmins(lines.join('\n'));
+    return sent > 0;  // 没发出去就返回 false，这条提醒留着，下一轮再发
+  }
+
   // 10. 正在接单的账号余额低于 5 美元：每一轮只提醒一次（server.js 记着提醒过谁）；
   //     同一家上游的几个账号共用一份余额时，server.js 把它们合成一条传进来
   async notifyLowBalance({ channel, channels, balance, unit, groups = [], noBackupGroups = [] }) {

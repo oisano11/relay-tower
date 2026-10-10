@@ -28,6 +28,7 @@ const UPSTREAM_PANELS_FILE = path.join(DATA_DIR, 'upstream_panels.json');
 const UPSTREAM_MODELS_CACHE_FILE = path.join(DATA_DIR, 'upstream_models_cache.json');
 const UPSTREAM_GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
 const UPSTREAM_KEY_STATE_FILE = path.join(DATA_DIR, 'upstream_key_state.json');
+const ADMIN_WATCH_FILE = path.join(DATA_DIR, 'admin_watch_state.json');
 const DATA_DIR_MODE = 0o700;
 const RUNTIME_DATA_FILE_MODE = 0o600;
 
@@ -169,6 +170,7 @@ const SSH_USER = process.env.SSH_USER || 'root';
 const auth = IS_CONTROL_PLANE_WORKER ? null : require('./auth');
 const telegram = IS_CONTROL_PLANE_WORKER ? null : require('./telegram');
 const clusterStatus = require('./cluster-status');
+const adminWatch = require('./admin-watch');
 // 双机集群：中台地址和令牌只从环境变量来，没配置就显示「未配置」；浏览器拿不到它们
 const clusterClient = clusterStatus.createClusterClient({
   url: process.env.CLUSTER_HUB_URL || '',
@@ -1115,6 +1117,49 @@ function startClusterAlertPoller() {
     }
   };
   setTimeout(tick, 30 * 1000);
+  setInterval(tick, 60 * 1000);
+}
+
+// Sub2API 后台登录提醒：每分钟读一次 Sub2API 的操作审计表（只读），
+// 管理员操作出现以前没见过的 IP，就发一条 Telegram。没发出去的留着下一轮再发。
+function startAdminWatchPoller() {
+  if (!telegram || typeof telegram.notifyAdminNewIp !== 'function') return;
+  let state;
+  try {
+    state = adminWatch.normalizeState(readJSON(ADMIN_WATCH_FILE, null));
+  } catch (error) {
+    console.error('[后台登录提醒] 读不了状态文件，从头开始：', error.message);
+    state = adminWatch.emptyState();
+  }
+  let running = false;
+  let lastError = '';
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      if (!state.ready) {
+        state = adminWatch.startFrom(adminWatch.parseBaseline(await execPsqlAsync(adminWatch.baselineSql())), Date.now());
+        console.log(`[后台登录提醒] 已记下 ${Object.keys(state.knownIps).length} 个以前做过管理员操作的 IP，之后出现新的 IP 会提醒`);
+      } else {
+        const found = adminWatch.parseActions(await execPsqlAsync(adminWatch.newActionsSql(state.lastId)));
+        state = adminWatch.evaluate(state, found.rows, { maxId: found.maxId, now: Date.now() }).state;
+      }
+      const unsent = [];
+      for (const alert of state.pending) {
+        if (!(await telegram.notifyAdminNewIp(alert))) unsent.push(alert);
+      }
+      state = adminWatch.afterSending(state, unsent, Date.now());
+      writeJSON(ADMIN_WATCH_FILE, state);
+      lastError = '';
+    } catch (error) {
+      // 同样的错误只记一次，免得每分钟刷一行
+      if (error.message !== lastError) console.error('[后台登录提醒]', error.message);
+      lastError = error.message;
+    } finally {
+      running = false;
+    }
+  };
+  setTimeout(tick, 45 * 1000);
   setInterval(tick, 60 * 1000);
 }
 
@@ -10642,6 +10687,7 @@ function initializeMainProcess() {
     startAutoSwitchPoller();
     startDailyDigestTimer();
     startClusterAlertPoller();
+    startAdminWatchPoller();
     refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
   });
 }

@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/test-upstream-scanner.js && node --test scripts/test-regressions.js scripts/test-auth-telegram.js scripts/test-gateway-integration.js scripts/test-role-plans.js scripts/test-server-smoke.js scripts/test-auto-failover-policy.js scripts/test-account-split.js scripts/test-upstream-keys.js scripts/test-upstream-tombstones.js scripts/test-user-usage.js scripts/test-telegram-push.js scripts/test-cluster.js && python3 -B -m unittest discover -s ../cluster-monitor/tests -p 'test_*.py'"
+    "test": "node scripts/test-upstream-scanner.js && node --test scripts/test-regressions.js scripts/test-auth-telegram.js scripts/test-gateway-integration.js scripts/test-role-plans.js scripts/test-server-smoke.js scripts/test-auto-failover-policy.js scripts/test-account-split.js scripts/test-upstream-keys.js scripts/test-upstream-tombstones.js scripts/test-user-usage.js scripts/test-telegram-push.js scripts/test-cluster.js scripts/test-admin-watch.js && python3 -B -m unittest discover -s ../cluster-monitor/tests -p 'test_*.py'"
   },
   "keywords": ["ai", "relay", "upstream", "monitor", "pricing", "switcher"],
   "author": "Relay Tower Community",
