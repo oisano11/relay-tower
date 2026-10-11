@@ -1122,6 +1122,109 @@ test('failed multi-step membership plan never advances the local cache', () => {
   assert.equal(JSON.stringify(state), before);
 });
 
+test('an enabled account leaves its last group only with a confirmed stop, in the same transaction', () => {
+  const state = {
+    allGroups: [{ id: 5, name: 'image', sale_rate: 1 }],
+    channels: [
+      { id: '17', name: 'leaving', schedulable: true, costMultiplier: 0.02, primaryGroupId: 5,
+        groupsDetail: [{ id: 5, name: 'image', sale_rate: 1, priority: 1 }] },
+      { id: '18', name: 'staying', schedulable: true, costMultiplier: 0.5, primaryGroupId: 5,
+        groupsDetail: [{ id: 5, name: 'image', sale_rate: 1, priority: 1 }] }
+    ]
+  };
+  const { context, remoteWrites, invalidations } = groupMutator(state);
+  const before = JSON.stringify(state);
+  // 旧页面不带 confirmStop：用大白话拦下，什么都不写
+  assert.throws(() => context.updateAccountGroups('17', []), /账号「leaving」正在接单，移出后一个分组都不剩.*请先刷新页面/);
+  assert.equal(remoteWrites.length, 0);
+  assert.equal(JSON.stringify(state), before);
+
+  context.updateAccountGroups('17', [], true);
+  assert.equal(remoteWrites.length, 1);
+  const sql = remoteWrites[0];
+  const stop = sql.indexOf('UPDATE accounts SET schedulable = false WHERE id = 17 AND deleted_at IS NULL;');
+  assert.ok(stop > 0, 'the leaving account is stopped');
+  assert.ok(stop < sql.indexOf('Scheduled account cannot be left without a priced group'), 'stopped before the no-group guard runs');
+  assert.ok(stop < sql.indexOf('DELETE FROM account_groups WHERE account_id = 17;'));
+  assert.doesNotMatch(sql, /\b18\b/, 'the account that stays is untouched');
+  assert.equal(state.channels[0].schedulable, false);
+  assert.equal(state.channels[0].groupsDetail.length, 0);
+  assert.equal(state.channels[1].schedulable, true);
+  assert.deepEqual([...invalidations[0]], [17]);
+});
+
+test('removing a group never stops an account that keeps other groups, and stopped accounts need no confirmation', () => {
+  const state = {
+    allGroups: [{ id: 1, name: 'leaving-group', sale_rate: 0.5 }, { id: 2, name: 'kept', sale_rate: 0.5 }],
+    channels: [
+      { id: '9', name: 'shared', schedulable: true, costMultiplier: 0.3, primaryGroupId: 1,
+        groupsDetail: [{ id: 1, name: 'leaving-group', sale_rate: 0.5 }, { id: 2, name: 'kept', sale_rate: 0.5 }] },
+      { id: '8', name: 'stopped', schedulable: false, costMultiplier: 0.3, primaryGroupId: 1,
+        groupsDetail: [{ id: 1, name: 'leaving-group', sale_rate: 0.5 }] }
+    ]
+  };
+  const { context, remoteWrites } = groupMutator(state);
+  context.updateAccountGroups('9', [2], true);
+  assert.doesNotMatch(remoteWrites[0], /schedulable = false/);
+  assert.equal(state.channels[0].schedulable, true);
+  assert.deepEqual([...state.channels[0].groupsDetail].map(group => group.id), [2]);
+  context.updateAccountGroups('8', []);
+  assert.doesNotMatch(remoteWrites[1], /UPDATE accounts/);
+  assert.match(remoteWrites[1], /Scheduled account cannot be left without a priced group/, 'the database still re-checks the switch');
+  assert.equal(state.channels[1].groupsDetail.length, 0);
+});
+
+test('console ✕ says an only-here serving account will be stopped and sends that confirmation', async () => {
+  const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const requests = [];
+  const dialogs = [];
+  const toasts = [];
+  const channelsData = [
+    { id: '17', name: '甲号', schedulable: true, groupsDetail: [{ id: 5, name: '示例分组' }] },
+    { id: '18', name: '乙号', schedulable: true, groupsDetail: [{ id: 5, name: '示例分组' }] },
+    { id: '19', name: '共享号', schedulable: true, groupsDetail: [{ id: 5, name: '示例分组' }, { id: 2, name: '通用' }] },
+    { id: '20', name: '备份唯一', schedulable: true, groupsDetail: [{ id: 7, name: '备份' }, { id: 8, name: '其他' }] }
+  ];
+  const context = vm.createContext({
+    channelsData,
+    fetch: async (url, options = {}) => {
+      requests.push({ url, body: JSON.parse(options.body) });
+      return { json: async () => ({ success: true }) };
+    },
+    confirm: text => { dialogs.push(text); return true; },
+    showToast: text => toasts.push(text),
+    escapeHtml: text => String(text),
+    loadChannels: async () => {},
+    renderFilterPills() {},
+    currentDimension: 'group',
+    currentFilterPill: '示例分组',
+    renderGroupControlBanner() {}
+  });
+  vm.runInContext(app.slice(app.indexOf('// 从当前业务分组中解绑移除单个通道'), app.indexOf('// ====== 🛡️ 系统安全中心与会话管理 ======')), context);
+
+  await context.removeChannelFromGroup('17', '5', '示例分组');
+  assert.deepEqual(requests[0], { url: '/api/channels/17/groups', body: { groupIds: [], confirmStop: true } });
+  assert.match(dialogs[0], /确定将 \[甲号\] 从业务分组【示例分组】中移除解绑？/);
+  assert.match(dialogs[0], /只在这个分组里，所以移出后会同时把它关掉，不再接单。账号本身不会删掉。/);
+  assert.doesNotMatch(dialogs[0], /唯一在接单/, 'another account still serves the group');
+  assert.match(toasts[0], /并已关掉 \[甲号\]/);
+
+  // 还在别的分组：不关，只移出
+  await context.removeChannelFromGroup('19', '5', '示例分组');
+  assert.deepEqual(requests[1].body, { groupIds: [2], confirmStop: false });
+  assert.doesNotMatch(dialogs[1], /关掉/);
+
+  // 移出后分组没人接单：确认框里要提醒
+  await context.removeChannelFromGroup('20', '7', '备份');
+  assert.deepEqual(requests[2].body, { groupIds: [8], confirmStop: false });
+  assert.match(dialogs[2], /⚠️ 它是【备份】里唯一在接单的账号/);
+
+  // 点「取消」什么都不发
+  context.confirm = () => false;
+  await context.removeChannelFromGroup('17', '5', '示例分组');
+  assert.equal(requests.length, 3);
+});
+
 test('creating a group and its initial bindings is one remote transaction before cache mutation', () => {
   const state = {
     allGroups: [{ id: 1, name: 'safe', sale_rate: 0.5 }],

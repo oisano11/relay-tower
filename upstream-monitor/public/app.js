@@ -5906,26 +5906,29 @@ async function submitGroupAutoSwitchPolicy() {
 }
 
 // 从当前业务分组中解绑移除单个通道
+// 正在接单、又只在这个分组里的账号，移出时一起关掉（和删除它唯一的分组一样），确认框里先说清楚
 async function removeChannelFromGroup(channelId, groupId, groupName) {
-  if (!confirm(`确定将该渠道从业务分组【${groupName}】中移除解绑？`)) return;
+  const ch = channelsData.find(c => String(c.id) === String(channelId));
+  const remainingGroupIds = ((ch && ch.groupsDetail) || [])
+    .map(g => parseInt(g.id, 10)).filter(gid => String(gid) !== String(groupId) && !isNaN(gid));
+  const serving = Boolean(ch && ch.schedulable === true);
+  const stop = serving && remainingGroupIds.length === 0;
+  const lastServing = serving && !(channelsData || []).some(c => String(c.id) !== String(channelId) && c.schedulable === true &&
+    (c.groupsDetail || []).some(g => String(g.id) === String(groupId)));
+  const lines = [`确定将${ch ? ` [${ch.name}] ` : '该渠道'}从业务分组【${groupName}】中移除解绑？`];
+  if (stop) lines.push('', '它现在正在接单，而且只在这个分组里，所以移出后会同时把它关掉，不再接单。账号本身不会删掉。');
+  if (lastServing) lines.push('', `⚠️ 它是【${groupName}】里唯一在接单的账号。移出后，这个分组有能用的副调或备选的话，自动切号会顶上（人工管理的分组除外）；没有的话，这个分组就没有账号接单了。`);
+  if (!confirm(lines.join('\n'))) return;
 
   try {
-    const ch = channelsData.find(c => String(c.id) === String(channelId));
-    let remainingGroupIds = [];
-    if (ch && ch.groupsDetail && ch.groupsDetail.length > 0) {
-      remainingGroupIds = ch.groupsDetail.map(g => parseInt(g.id, 10)).filter(gid => String(gid) !== String(groupId) && !isNaN(gid));
-    } else {
-      remainingGroupIds = [];
-    }
-
     const res = await fetch(`/api/channels/${channelId}/groups`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupIds: remainingGroupIds })
+      body: JSON.stringify({ groupIds: remainingGroupIds, confirmStop: stop })
     });
     const result = await res.json();
     if (result.success) {
-      showToast(`已从【${groupName}】中成功移除该渠道！`, 'success');
+      showToast(stop ? `已从【${groupName}】中移除，并已关掉 [${escapeHtml(ch.name)}]` : `已从【${groupName}】中成功移除该渠道！`, 'success');
       await loadChannels();
       renderFilterPills();
       if (currentDimension === 'group' && currentFilterPill !== 'all') {

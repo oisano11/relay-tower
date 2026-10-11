@@ -4210,13 +4210,21 @@ function prepareGroupSaleRatePlan(groupId, newSaleRate, operation) {
   return { group, saleRate, proposedGroup, affectedChannels };
 }
 
-function prepareAccountGroupsPlan(accountId, requestedGroupIds, operation) {
+// An enabled account taken out of its last group is stopped in the same
+// transaction, like deleting its only group does, but only once the console
+// has said so in the confirm box (confirmStop). An account that keeps other
+// groups is never stopped here.
+function prepareAccountGroupsPlan(accountId, requestedGroupIds, operation, confirmStop = false) {
   const id = normalizePositivePlanId(accountId, '账号 ID');
   const groupIds = normalizePositivePlanIds(requestedGroupIds, '分组 ID');
   const [channel] = getCachedChannelsForPlan([id], operation);
   const groups = resolveCachedGroupPlans(groupIds, operation);
-  assertPlannedChannelMembershipIsSafe(channel, groups, operation);
-  return { accountId: id, groupIds, channel, groups };
+  const stop = groupIds.length === 0 && confirmStop === true;
+  if (groupIds.length === 0 && !stop && channel.schedulable === true) {
+    throw new Error(`账号「${channel.name || channel.id}」正在接单，移出后一个分组都不剩，要同时把它关掉才行。这个页面可能是旧版本，请先刷新页面，再点一次 ✕，确认框里会写明。`);
+  }
+  if (!stop) assertPlannedChannelMembershipIsSafe(channel, groups, operation);
+  return { accountId: id, groupIds, channel, groups, stop };
 }
 
 function prepareAccountMultiplierPlan(accountId, requestedMultiplier) {
@@ -4552,8 +4560,9 @@ WHERE id = ${plan.group.id} AND deleted_at IS NULL;`;
 }
 
 // 调整指定上游渠道绑定的分组 (更新 account_groups)
-function updateAccountGroups(accountId, groupIds) {
-  const plan = prepareAccountGroupsPlan(accountId, groupIds, '调整账号分组');
+// confirmStop：用户在确认框里看过「移出后会一起关掉」，在用账号一个分组都不剩时才会用到
+function updateAccountGroups(accountId, groupIds, confirmStop = false) {
+  const plan = prepareAccountGroupsPlan(accountId, groupIds, '调整账号分组', confirmStop);
   const guards = [];
   if (plan.groupIds.length > 0) {
     guards.push(remoteGroupExistenceGuardSql(plan.groupIds));
@@ -4561,6 +4570,8 @@ function updateAccountGroups(accountId, groupIds) {
     guards.push(remoteProspectiveMembershipSafetyGuardSql([plan.accountId], plan.groupIds));
   } else {
     guards.push(remoteAccountExistenceGuardSql([plan.accountId]));
+    // Stopped before the no-group guard runs, so both commit or neither does.
+    if (plan.stop) guards.push(`UPDATE accounts SET schedulable = false WHERE id = ${plan.accountId} AND deleted_at IS NULL;`);
     guards.push(remoteNoGroupForScheduledAccountsGuardSql([plan.accountId]));
   }
   const statements = [
@@ -4572,6 +4583,7 @@ function updateAccountGroups(accountId, groupIds) {
   ].filter(Boolean);
   if (executeRemoteSQL(statements.join('\n')) !== true) throw new Error('远端账号分组写入未确认，本地状态未改变');
   applyCachedChannelMembership(plan.channel, plan.groups);
+  if (plan.stop) plan.channel.schedulable = false;
   confirmRemoteGroupMutation([plan.accountId]);
   return true;
 }
@@ -8517,7 +8529,7 @@ async function handleRequest(req, res) {
     const body = await getBody();
     const groupIds = Array.isArray(body.groupIds) ? body.groupIds : [];
     try {
-      const remoteOk = updateAccountGroups(targetId, groupIds);
+      const remoteOk = updateAccountGroups(targetId, groupIds, body.confirmStop === true);
       syncRealSub2APIAccounts();
       broadcastSSE('CHANNELS_UPDATED', state);
       const updatedCh = state.channels.find(c => String(c.id) === String(targetId));

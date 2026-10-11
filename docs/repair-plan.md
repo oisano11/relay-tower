@@ -609,3 +609,12 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
   - 拼进 SQL 的只有整数（编号、条数）。
 - **Telegram：** `notifyAdminNewIp` 响铃；IP、操作名、浏览器标识都来自数据库，全部转义。
 - **测试：** `scripts/test-admin-watch.js` 10 项（首次运行不报警、新 IP 只报一次、两种位置推进、SQL 只含整数、坏输出报错、待发队列、状态文件损坏时重来、操作名翻译、Telegram 转义和响铃）。用线上库只读试跑：历史 IP 记下 7 个，往回读最近 263 条管理员操作，0 条提醒。
+
+## 分组页 ✕ 移不出「只在本组、正在接单」的账号（2026-10-11）
+
+- **现象：** 在分组视图点账号行的 ✕，报「安全拦截：已开启调度的通道 [X] 在调整账号分组后没有可核验售价分组，拒绝写入」。
+- **原因：** ✕ 调用 `POST /api/channels/:id/groups`，传入剩下的分组。`prepareAccountGroupsPlan` 里的 `assertPlannedChannelMembershipIsSafe` 不允许开着接单（`schedulable = true`）的账号一个分组都不剩，数据库里也有同样的检查（`remoteNoGroupForScheduledAccountsGuardSql`）。只能先设「备用」关掉接单开关，再点 ✕，页面上却没有任何提示。
+- **改法：** 做法和删除分组（2026-09-25）一样：只在这个分组里的在用账号，移出时在同一个事务里一起关掉，前提是确认框里已经写明。
+  - 前端 `removeChannelFromGroup`：账号正在接单、移出后不剩分组时，确认框写明会一起关掉，请求带上 `confirmStop: true`。它是本组唯一在接单的账号时，确认框加一行提醒，和「关闭」按钮的提醒是同一句话。
+  - 后端 `prepareAccountGroupsPlan` / `updateAccountGroups`：带 `confirmStop`、又不剩分组时，先执行 `UPDATE accounts SET schedulable = false`，再跑「没有分组」的检查，然后删 `account_groups`，全在同一个事务里；缓存里同时把 `schedulable` 设为 false。旧页面不带 `confirmStop`，就用大白话拦下，提示刷新页面。还有别的分组的账号永远不会被关。
+- **测试：** 新增 3 项。① 确认后才关，关在「没有分组」检查之前，同组另一个账号不受影响。② 留在别的分组的账号不会被关，已停用的账号移出不用确认。③ 前端确认框的内容和发出的请求，点取消就不发请求。①③ 在旧代码上失败、在新代码上通过。
