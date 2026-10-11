@@ -279,6 +279,39 @@ class NetTests(unittest.TestCase):
             self.assertIsNone(metrics.safe(metrics.read_iface_counters)(bad), bad)
 
 
+class BackupListTests(unittest.TestCase):
+    def make_dir(self, files):
+        base = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(base, ignore_errors=True))
+        for name, size, mtime in files:
+            path = os.path.join(base, name)
+            with open(path, 'wb') as f:
+                f.write(b'x' * size)
+            os.utime(path, (mtime, mtime))
+        return base
+
+    def test_the_newest_backup_and_the_count_hidden_and_other_files_left_out(self):
+        base = self.make_dir([
+            ('sub2api-20261010T203000Z.dump', 100, 1791000000),
+            ('sub2api-20261011T203000Z.dump', 250, 1791086400),
+            ('.sub2api-20261012T203000Z.dump.partial', 999, 1791172800),   # 还在写的临时文件
+            ('.lock', 0, 1791172800),
+            ('notes.txt', 5, 1791172800),
+        ])
+        os.mkdir(os.path.join(base, 'old.dump'))  # 目录不算
+        self.assertEqual(metrics.read_backups(base), {'count': 2, 'latestAt': 1791086400000, 'latestBytes': 250})
+
+    def test_an_empty_directory_has_no_latest_backup(self):
+        self.assertEqual(metrics.read_backups(self.make_dir([])), {'count': 0, 'latestAt': None, 'latestBytes': None})
+
+    def test_a_pattern_narrows_the_files(self):
+        base = self.make_dir([('a.dump', 1, 1000), ('b.sql.gz', 2, 2000)])
+        self.assertEqual(metrics.read_backups(base, '*.sql.gz')['latestBytes'], 2)
+
+    def test_a_missing_directory_is_unknown_not_empty(self):
+        self.assertIsNone(metrics.safe(metrics.read_backups)('/nonexistent-backup-dir'))
+
+
 class ProbeTcpTests(unittest.TestCase):
     def test_a_listening_port_is_up(self):
         with socket.socket() as server:
@@ -348,6 +381,7 @@ class NodeFactsTests(unittest.TestCase):
             'probe': lambda url: False,
             'requests': lambda container: None,
             'net': lambda iface: None,
+            'backup': lambda directory, pattern: None,
         }
 
     def test_unreadable_values_stay_none_and_a_down_service_is_false(self):
@@ -365,6 +399,20 @@ class NodeFactsTests(unittest.TestCase):
         self.assertIsNone(node['sub2apiOk'])
         self.assertIsNone(node['requests'])
         self.assertIsNone(node['requests60s'])
+
+    def test_backups_are_only_looked_at_when_a_directory_is_configured(self):
+        seen = []
+
+        def backup(directory, pattern):
+            seen.append((directory, pattern))
+            return {'count': 1, 'latestAt': 5, 'latestBytes': 6}
+        sources = dict(self.failing_sources(), backup=backup)
+        node = metrics.node_facts({}, FakeCpu(1.0), 1000, sources)
+        self.assertEqual((node['backupConfigured'], node['backup']), (False, None))
+        node = metrics.node_facts({'backup_dir': '/var/backups/x'}, FakeCpu(1.0), 1000, sources)
+        self.assertEqual((node['backupConfigured'], node['backup']['count']), (True, 1))
+        metrics.node_facts({'backup_dir': '/b', 'backup_pattern': 'db-*.dump'}, FakeCpu(1.0), 1000, sources)
+        self.assertEqual(seen, [('/var/backups/x', '*.dump'), ('/b', 'db-*.dump')])
 
     def test_the_network_card_setting_is_passed_and_empty_means_automatic(self):
         seen = []

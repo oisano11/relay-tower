@@ -1,0 +1,6 @@
+# Sub2API 数据库每日备份。复制成副节点的 /etc/cron.d/sub2api-db-backup（root 所有，权限 644）。
+# 脚本放在 /usr/local/sbin/sub2api-db-backup（root 所有，权限 755）。
+# 时间按这台机器的时区算：这里假设是 UTC，20:30 就是北京时间 04:30，一天里请求最少的时候。
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+30 20 * * * root BACKUP_DIR=/var/backups/sub2api-db READER_GROUP=cluster-agent /usr/local/sbin/sub2api-db-backup >> /var/log/sub2api-db-backup.log 2>&1

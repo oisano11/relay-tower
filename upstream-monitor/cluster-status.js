@@ -24,6 +24,8 @@ const FAIL_MIN_COUNT = 5;
 const FAIL_MIN_RATE = 20;
 // 本月流量用到额度的这么多，提醒一次（不响铃）
 const TRAFFIC_ALERT_PERCENT = 80;
+// 数据库备份每天一次；最新一份超过这么久，就当成备份断了
+const BACKUP_STALE_MS = 26 * 3600 * 1000;
 const INTERNAL_USER_IDS = '1, 8';     // 和主看板一样：这两个是内部账号，客户消费不计入
 
 class HubError extends Error {}
@@ -59,6 +61,32 @@ function pickNet(raw) {
 
 function fmtGb(bytes) {
   return `${(bytes / 1e9).toFixed(1)} GB`;
+}
+
+function fmtSize(bytes) {
+  return bytes >= 1e9 ? fmtGb(bytes) : `${Math.round(bytes / 1e6)} MB`;
+}
+
+// 数据库备份：一共几份、最新一份的时间和大小。顺手算出离现在多久、是不是断了。
+function pickBackup(raw, nowMs) {
+  if (!isObject(raw)) return null;
+  const count = numberOrNull(raw.count);
+  if (count === null || count < 0) return null;
+  const latestAt = count > 0 ? numberOrNull(raw.latestAt) : null;
+  const ageMs = latestAt === null ? null : Math.max(0, nowMs - latestAt);
+  return {
+    count,
+    latestAt,
+    latestBytes: latestAt === null ? null : numberOrNull(raw.latestBytes),
+    ageMs,
+    stale: ageMs === null || ageMs > BACKUP_STALE_MS,
+  };
+}
+
+function backupProblem(backup) {
+  if (!backup || !backup.stale) return null;
+  if (backup.latestAt === null) return '还没有数据库备份';
+  return `数据库备份已经 ${Math.floor(backup.ageMs / 3600000)} 小时没有更新`;
 }
 
 // 近 5 分钟的客户请求：接了多少、失败多少、成功的一般多久回完。接了多少、失败多少缺一个，就整个当成取不到。
@@ -154,8 +182,11 @@ function buildNode(role, raw, hub, nowMs) {
     sub2apiOk: typeof node.sub2apiOk === 'boolean' ? node.sub2apiOk : null,
     requests: pickRequests(node.requests),
     net: pickNet(node.net),
+    backupConfigured: node.backupConfigured === true,
+    backup: pickBackup(node.backup, nowMs),
   } : {
     cpuPercent: null, memory: null, disk: null, loadAvg: null, containers: null, sub2apiOk: null, requests: null, net: null,
+    backupConfigured: node.backupConfigured === true, backup: null,
   };
 
   const notRunning = parsed.containers ? parsed.containers.filter(c => c.state !== 'running') : [];
@@ -175,6 +206,8 @@ function buildNode(role, raw, hub, nowMs) {
   if (parsed.memory && parsed.memory.percent !== null && parsed.memory.percent >= MEM_ALERT_PERCENT) {
     warnings.push(`内存占用 ${parsed.memory.percent}%`);
   }
+  const backupWarning = parsed.backupConfigured ? backupProblem(parsed.backup) : null;
+  if (backupWarning) warnings.push(backupWarning);
 
   let state;
   if (!hub.ok || hub.stale) state = 'unknown';
@@ -260,7 +293,8 @@ function markFailureGaps(nodes) {
 // 在线的节点里，有任何一项取不到
 function hasGaps(node) {
   return node.cpuPercent === null || node.memory === null || node.disk === null
-    || node.containers === null || node.sub2apiOk === null || node.requests === null || node.net === null;
+    || node.containers === null || node.sub2apiOk === null || node.requests === null || node.net === null
+    || (node.backupConfigured && node.backup === null);
 }
 
 function summarize(view) {
@@ -369,6 +403,13 @@ function diagnostics(view) {
     else if (node.failureGap) {
       add(requestItem, 'FAIL', `失败 ${r.failed} / ${r.total}（${node.failureGap.rate}%），明显比另一台（${node.failureGap.otherRate}%）多`);
     } else add(requestItem, 'PASS', r.total ? `接了 ${r.total} 个，失败 ${r.failed} 个` : '近 5 分钟没有请求');
+    if (node.backupConfigured) {
+      const b = node.backup;
+      const item = `${name} · 数据库备份`;
+      if (!b) add(item, 'UNKNOWN', '备份目录读不到');
+      else if (b.stale) add(item, 'WARN', backupProblem(b));
+      else add(item, 'PASS', `最近一份是 ${Math.floor(b.ageMs / 3600000)} 小时前的${b.latestBytes !== null ? `（${fmtSize(b.latestBytes)}）` : ''}，一共 ${b.count} 份`);
+    }
     const readings = [['CPU', node.cpuPercent], ['内存', node.memory && node.memory.percent], ['磁盘', node.disk && node.disk.percent]];
     const missing = readings.filter(([, v]) => v === null || v === undefined).map(([item]) => item);
     if (node.warnings.length) add(`${name} · 资源`, 'WARN', node.warnings.join('，'));
@@ -505,6 +546,23 @@ function evaluateAlerts(prevState, view) {
         title: `${L}有容器没在运行`,
         recoverTitle: `${L}的容器都在运行了`,
         lines: notRunning.map(c => `${c.name}：${c.state === 'missing' ? '不存在' : c.state}`),
+      });
+    }
+    if (node.backupConfigured) {
+      // 备份断了：提醒，不响铃（服务照常，但要尽快看一下）。备份目录读不到的那几轮原地不动，连续三次才另报
+      if (node.backup) {
+        observe(`${K}.backup`, node.backup.stale, {
+          level: 'warn',
+          title: `${L}的数据库备份断了`,
+          recoverTitle: `${L}的数据库备份恢复了`,
+          lines: node.backup.stale ? [backupProblem(node.backup), '客户的请求不受影响，但要尽快查一下为什么没备份上'] : [],
+        });
+      }
+      observe(`${K}.backupUnknown`, node.backup === null, {
+        confirm: UNKNOWN_CONFIRM_POLLS,
+        level: 'warn',
+        title: `${L}的备份目录读不到`,
+        recoverTitle: `${L}的备份目录恢复读取`,
       });
     }
     const allMissing = node.cpuPercent === null && node.memory === null && node.disk === null && node.containers === null;

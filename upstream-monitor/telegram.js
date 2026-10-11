@@ -122,7 +122,8 @@ function fmtTraffic(bytes) {
   const n = Number(bytes);
   if (!Number.isFinite(n)) return '?';
   if (n >= 1e12) return `${(n / 1e12).toFixed(2)} TB`;
-  return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  return `${Math.round(n / 1e6)} MB`;
 }
 
 function fmtMoney(balance, unit) {
@@ -1326,9 +1327,18 @@ class TelegramBotManager {
     }
     if (d.newKeys) items.push(`🔑 发现 ${d.newKeys} 批还没接入的上游 Key，详见控制台`);
     if (d.pendingCount) items.push(`📝 待你审批 ${d.pendingCount} 项，下方按钮可以直接处理`);
+    // 数据库备份：断了算「要处理的事」，正常只作为参考写在最后
+    const backupInfo = [];
+    for (const b of (d.cluster && d.cluster.backups) || []) {
+      const where = escapeHtml(b.label);
+      if (b.unknown) items.push(`💾 数据库备份：${where}的备份目录读不到，详见控制台`);
+      else if (b.latestAt === null || b.latestAt === undefined) items.push(`💾 数据库备份：${where}上还没有备份`);
+      else if (b.stale) items.push(`💾 数据库备份断了：${where}最新一份是 ${escapeHtml(formatShanghaiDateTime(b.latestAt))} 的`);
+      else backupInfo.push(`💾 数据库备份：最新一份 ${escapeHtml(formatShanghaiDateTime(b.latestAt))}（${fmtTraffic(b.latestBytes)}，存在${where}，一共 ${b.count} 份）`);
+    }
     if (!items.length) items.push('一切正常，没有需要你处理的事。');
     // 下面是只供参考的数字，不算「需要你处理的事」
-    const info = [];
+    const info = [...backupInfo];
     const traffic = (d.cluster && d.cluster.traffic) || [];
     if (traffic.length) {
       const used = traffic.map(t => `${escapeHtml(t.label)} ${fmtTraffic(t.yesterday)}${t.partial ? '（昨天中途才开始记）' : ''}`);

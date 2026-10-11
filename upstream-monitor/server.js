@@ -1117,18 +1117,25 @@ function buildDailyDigestData(now = Date.now()) {
   };
 }
 
-// 每日简报里的双机集群：昨天两台各用了多少流量，本月用了额度的百分之几。没配置中台就不写。
+// 每日简报里的双机集群：昨天两台各用了多少流量，本月用了额度的百分之几；数据库备份做上了没有。没配置中台就不写。
 function buildClusterDigest(now) {
   if (!clusterClient.configured) return null;
   const summary = clusterTrafficSummary(now);
   const nodes = clusterLatestView ? clusterLatestView.nodes : {};
+  const labelOf = role => (nodes[role] && nodes[role].label) || (role === 'master' ? '主节点' : '副节点');
   const traffic = ['master', 'worker'].map(role => {
     const t = summary.nodes[role];
     if (!t || !t.yesterday) return null;
-    const label = (nodes[role] && nodes[role].label) || (role === 'master' ? '主节点' : '副节点');
-    return { label, yesterday: t.yesterday.total, partial: t.yesterdayPartial, percent: t.percent };
+    return { label: labelOf(role), yesterday: t.yesterday.total, partial: t.yesterdayPartial, percent: t.percent };
   }).filter(Boolean);
-  return { traffic };
+  // 备份放在哪台，就看哪台（报警轮询最近一次读到的）；读不到就照实说读不到
+  const backups = ['master', 'worker'].filter(role => nodes[role] && nodes[role].backupConfigured).map(role => {
+    const b = nodes[role].backup;
+    return b
+      ? { label: labelOf(role), latestAt: b.latestAt, latestBytes: b.latestBytes, count: b.count, stale: b.stale }
+      : { label: labelOf(role), unknown: true };
+  });
+  return { traffic, backups };
 }
 
 let dailyDigestSending = false;

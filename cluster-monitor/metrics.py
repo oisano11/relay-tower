@@ -4,6 +4,7 @@
 页面显示「取不到」，报警逻辑把它当成问题处理（或者干脆跳过，绝不当成正常）。
 """
 import calendar
+import fnmatch
 import http.client
 import os
 import re
@@ -268,6 +269,29 @@ def read_net(iface=None, base=SYSFS_NET, route_path=PROC_NET_ROUTE, stat_path=PR
     return {'iface': name, 'rxBytes': counters['rxBytes'], 'txBytes': counters['txBytes'], 'bootAt': read_boot_time(stat_path)}
 
 
+def read_backups(directory, pattern='*.dump'):
+    """备份目录里一共几份、最新那份的时间（毫秒）和大小。只看文件名和属性，不读内容。
+    隐藏文件（备份到一半的临时文件、锁文件）不算。目录读不到就抛错（由 safe 变成 None，界面显示「取不到」）；
+    一份都没有时 count 是 0、latestAt 是 None。"""
+    newest = None
+    count = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.name.startswith('.') or not fnmatch.fnmatchcase(entry.name, pattern):
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            info = entry.stat(follow_symlinks=False)
+            count += 1
+            if newest is None or info.st_mtime > newest.st_mtime:
+                newest = info
+    return {
+        'count': count,
+        'latestAt': int(newest.st_mtime * 1000) if newest else None,
+        'latestBytes': newest.st_size if newest else None,
+    }
+
+
 def default_sources(run=subprocess.run):
     """真实的读取函数表。测试时换成假的。"""
     return {
@@ -278,6 +302,7 @@ def default_sources(run=subprocess.run):
         'probe': probe_http,
         'requests': lambda container: safe(request_stats)(container, run=run),
         'net': safe(read_net),
+        'backup': safe(read_backups),
     }
 
 
@@ -286,6 +311,7 @@ def node_facts(settings, cpu, now_ms, sources):
     health_url = settings.get('sub2api_health_url')
     container = settings.get('request_container')
     requests = sources['requests'](container) if container else None
+    backup_dir = settings.get('backup_dir')
     return {
         'reachable': True,
         'collectedAt': now_ms,
@@ -299,4 +325,7 @@ def node_facts(settings, cpu, now_ms, sources):
         # 老版本的中转塔台只认近 1 分钟的条数，先留着，两边不用同时升级
         'requests60s': requests['last60s'] if requests else None,
         'net': sources['net'](settings.get('net_iface') or None),
+        # 数据库备份放在哪台机器上，就由哪台报告。没配置备份目录就是 False，界面不显示这一项。
+        'backupConfigured': bool(backup_dir),
+        'backup': sources['backup'](backup_dir, settings.get('backup_pattern') or '*.dump') if backup_dir else None,
     }

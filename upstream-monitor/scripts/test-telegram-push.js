@@ -300,11 +300,17 @@ test('daily digest data: yesterday\'s traffic per server when the cluster hub is
   const { context } = serverSlice({
     clusterClient: { configured: true },
     clusterTrafficSummary: () => summary,
-    clusterLatestView: { nodes: { master: { label: '主机房' }, worker: { label: '副机房' } } },
+    clusterLatestView: { nodes: { master: { label: '主机房', backupConfigured: false, backup: null },
+      worker: { label: '副机房', backupConfigured: true, backup: { count: 7, latestAt: 5, latestBytes: 6, stale: false, ageMs: 1 } } } },
   });
   const data = JSON.parse(JSON.stringify(context.buildDailyDigestData(now)));
-  assert.deepEqual(data.cluster, { traffic: [{ label: '主机房', yesterday: 12.3e9, partial: false, percent: 3.2 }] },
+  assert.deepEqual(data.cluster.traffic, [{ label: '主机房', yesterday: 12.3e9, partial: false, percent: 3.2 }],
     'a server without a record for yesterday is left out; the tunnel is not a server');
+  assert.deepEqual(data.cluster.backups, [{ label: '副机房', latestAt: 5, latestBytes: 6, count: 7, stale: false }],
+    'only the server that keeps the backups is reported');
+  const unread = serverSlice({ clusterClient: { configured: true }, clusterTrafficSummary: () => summary,
+    clusterLatestView: { nodes: { master: {}, worker: { label: '副机房', backupConfigured: true, backup: null } } } });
+  assert.deepEqual(JSON.parse(JSON.stringify(unread.context.buildDailyDigestData(now))).cluster.backups, [{ label: '副机房', unknown: true }]);
   assert.equal(JSON.parse(JSON.stringify(serverSlice().context.buildDailyDigestData(now))).cluster, null);
 });
 

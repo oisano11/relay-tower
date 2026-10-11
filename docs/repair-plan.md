@@ -639,3 +639,13 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
   - 面板：隧道那一行去掉开机以来的累计 MB；新的「流量」一节，30 天柱状图（单一颜色、2px 间隔、今天的颜色浅一点、鼠标停在柱子上看当天的数）。
 - **线上读数核对（只读）：** 两台都自动认出 `eth0`，开机时间和 `uptime -s` 一致；`wg0` 两端的收发数互相对得上（一端的收 ≈ 另一端的发）。
 - **测试：** `scripts/test-cluster-traffic.js` 16 项（第一次只记起点、跨天按比例分、重启、计数变小、校时抖动、读不到的一轮、换网卡和离谱的差值、清理旧日子、坏文件、计费月边界、汇总、额度输入校验、取数）；`test-cluster.js` 新增 6 项；Python 新增 7 项（默认路由、开机时间、读网卡、指定网卡、坏网卡名、设置项）。
+
+## 数据库每天备份到副节点（2026-10-11）
+
+- **起因：** 只读检查发现，Sub2API 的数据库只有一份 8 月 30 日的手动备份；主节点没有定时任务，Sub2API 自带的备份功能（要另开 S3 存储）也没配置过（`settings` 表里没有 `backup_*`）。
+- **做法：**
+  - `cluster-monitor/backup/db-backup.sh`（POSIX sh，在副节点上以 root 跑）：用 `docker inspect` 读本机 Sub2API 容器的 `DATABASE_HOST/PORT/USER/DBNAME/PASSWORD`；`docker run --rm --network host -e PGPASSWORD -v 备份目录:/backup postgres:18-alpine sh -c 'umask 077 && exec pg_dump "$@"'`，`-Fc`，`--exclude-table-data=ops_system_logs`，写成隐藏的 `.partial` 文件（文件在容器里直接写，TOC 有偏移，以后可以并行恢复）；非空、`pg_restore --list` 读得出目录才改名，`chmod 600`。按修改时间只留最新 `KEEP` 份；`flock` 防重入；剩余空间不到 `MIN_FREE_MB` 就不做。变量后面紧跟中文一律写 `${VAR}`（macOS bash 3.2 在 UTF-8 环境下的老问题）。
+  - 副节点本来就装着同版本的 `postgres:18-alpine` 镜像，用不着下载；数据库只监听隧道地址，副节点的 Sub2API 本来就从隧道连它。
+  - agent：`metrics.read_backups(目录, 文件名样式)` 只看文件名和 `stat`，跳过隐藏文件和目录；`backupConfigured` 告诉塔台这台有没有配置备份目录。
+  - 塔台：`pickBackup` 算出离现在多久，超过 26 小时（或一份都没有）算断了：卡片警告、诊断 WARN、`<role>.backup` 连续 2 次发不响铃的提醒；配置了却读不到时，诊断 UNKNOWN，`<role>.backupUnknown` 连续 3 次另报。每日简报：正常时在最后写一行参考，断了或读不到算「要处理的事」。
+- **测试：** `cluster-monitor/tests/test_db_backup.py` 6 项（假的 docker 命令：正常一份、文件权限、密码不上命令行、按份数清理、导出失败/文件坏/空文件都不留半成品也不动旧备份、读不到数据库设置就不跑、空间不够就不跑、KEEP 不合法）；Python 读备份目录 4 项、节点数据 1 项；JS 4 项（卡片、过期、读不到、简报）。

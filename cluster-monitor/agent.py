@@ -30,6 +30,9 @@ def load_settings(env=None):
         'request_container': env.get('AGENT_REQUEST_CONTAINER', ''),
         # 统计流量的网卡；不填就用默认路由走的那块（连外网的）
         'net_iface': (env.get('AGENT_NET_IFACE') or '').strip(),
+        # 数据库备份存在这台机器上的话，填备份目录；面板显示最新一份的时间和大小（只看文件属性，不读内容）
+        'backup_dir': (env.get('AGENT_BACKUP_DIR') or '').strip(),
+        'backup_pattern': (env.get('AGENT_BACKUP_PATTERN') or '').strip(),
     }
 
 

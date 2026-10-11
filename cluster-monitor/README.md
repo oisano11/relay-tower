@@ -23,6 +23,8 @@
 | `common.py` | 令牌检查、只读 JSON 接口的通用部分 |
 | `config.example.env` | 配置示例（IP 是文档保留的示例地址） |
 | `systemd/` | 两个服务的模板，`User=` 要改成你自己的运行账号 |
+| `backup/db-backup.sh` | 数据库每日备份脚本，在副节点上跑（见下面「数据库备份」） |
+| `backup/db-backup.cron.example` | 备份的定时任务示例 |
 | `tests/` | Python 单元测试和本机 HTTP 测试 |
 
 中转塔台这一侧的代码在 `upstream-monitor/cluster-status.js`（取数、状态判断、报警判断）和
@@ -75,6 +77,44 @@ curl -s -H "Authorization: Bearer $HUB_TOKEN" http://172.22.0.1:8899/api/status 
 - 两台之间的隧道（主节点的 `wg0`）也记，只看，不算额度：隧道的流量本身也走外网网卡，已经算在两台的流量里了。
 - 记满一天以后，估算「照这个速度本月一共大约用多少」：本月已用 ÷ 已经记了多久 × 这个计费月的长度。
 
+## 数据库备份
+
+- **放在哪：** 备份脚本在副节点上跑，从主节点的数据库导出，存在副节点自己的硬盘上。主节点整台出事时，数据还在另一台机器上。
+- **什么时候：** 每天一次，示例里是北京时间凌晨 4:30（一天里请求最少的时候）。
+- **怎么导：** 用 postgres 官方镜像里的 `pg_dump`（要和数据库同一个大版本，用 `PG_IMAGE` 指定），导成 pg_dump 自己的压缩格式。系统日志表 `ops_system_logs` 只备份表结构、不备份内容（只是排错用的日志，占了数据库一半多），要改就设 `SKIP_DATA_TABLES`。
+- **密码：** 数据库的地址、库名、账号、密码，从副节点上 Sub2API 容器的环境变量里读。副节点的 Sub2API 本来就要连这个数据库，所以不新建任何存密码的文件。密码只经环境变量传给 `docker run`，不出现在命令行里。
+- **不留半成品：** 先写成隐藏的临时文件，`pg_restore --list` 读得出目录才改成正式的名字；失败了就删掉，旧的备份不动。
+- **留几份：** 只留最新的 7 份（`KEEP`）。按份数删，不按天数删：备份连续失败几天，也不会把好的备份删光。硬盘剩余不到 5 GB 就不做（`MIN_FREE_MB`）。
+- **谁能看：** 备份目录 root 所有、属组是 agent 的运行用户组、权限 750；备份文件 600，只有 root 能读。agent 只看文件名、时间和大小。
+- **面板和提醒：** agent 设了 `AGENT_BACKUP_DIR`，副节点的卡片上就显示最新一份的时间、大小和一共几份；早上 9 点的简报也写一行。超过 26 小时没有新的备份，发一条不响铃的提醒；备份目录连续三次读不到，另报一条。
+
+### 安装（在副节点上，用 root）
+
+```bash
+install -m 755 backup/db-backup.sh /usr/local/sbin/sub2api-db-backup
+install -m 644 backup/db-backup.cron.example /etc/cron.d/sub2api-db-backup
+BACKUP_DIR=/var/backups/sub2api-db READER_GROUP=cluster-agent /usr/local/sbin/sub2api-db-backup
+```
+
+最后一行是先手动做一份，确认能成功。然后让 agent 知道备份目录：在 `agent.env` 里加 `AGENT_BACKUP_DIR=/var/backups/sub2api-db`，
+或者用 systemd 的 drop-in（`/etc/systemd/system/cluster-agent.service.d/backup.conf`，内容是 `[Service]` 和
+`Environment=AGENT_BACKUP_DIR=/var/backups/sub2api-db` 两行），再 `systemctl daemon-reload && systemctl restart cluster-agent`。
+
+### 怎么恢复
+
+先确认备份是好的：在副节点上开一个临时数据库，把最新一份恢复进去，数一下表里的行数，再删掉临时库。这一步不碰正式的数据库。
+
+```bash
+docker run -d --name restore-check -e POSTGRES_PASSWORD=只在这里用的临时密码 postgres:18-alpine
+docker cp /var/backups/sub2api-db/<最新一份>.dump restore-check:/tmp/db.dump
+docker exec restore-check sh -c 'sleep 5 && createdb -U postgres sub2api && pg_restore -U postgres -d sub2api --no-owner /tmp/db.dump'
+docker exec restore-check psql -U postgres -d sub2api -c 'select count(*) from users'
+docker rm -f restore-check
+```
+
+真要恢复到正式的数据库时：先停掉两台的 Sub2API，确认没有别的程序在写数据库；用和数据库同版本的 `pg_restore --clean --if-exists --no-owner`
+以 Sub2API 的数据库账号恢复；再启动 Sub2API。恢复会覆盖数据库里现有的内容，备份时间之后的新数据（新的用量记录、充值）会丢，做之前先想清楚。
+
 ## 报警规则
 
 - 一次异常不报，连续两次（约 2 分钟）才报；恢复时说一声。
@@ -83,9 +123,10 @@ curl -s -H "Authorization: Bearer $HUB_TOKEN" http://172.22.0.1:8899/api/status 
 - 中台连不上或数据过期时，节点和隧道的报警原地不动，不会误发「恢复」。
 - **隧道断了的时候只报隧道。** 副节点连不上是同一件事，副节点的离线先不另报，等隧道恢复后仍然离线，再单独报。
 - 磁盘超过 85% 报一次，降到 80% 以下才算恢复；内存超过 90% 报一次，降到 85% 以下恢复。
+- 数据库备份超过 26 小时没有新的一份，报一次；备份目录连续三次读不到，另报一次。都不响铃。
 - 本月流量用到额度的 80% 报一次；回到 80% 以下（进了新的计费月，或者额度调高了）说一声。数字是中转塔台自己记的，中台暂时连不上也照样判断。没设额度就不报。
 - 响铃的：中台连不上、节点离线、隧道不通、Sub2API 没响应、容器不在运行、一台的请求失败明显比另一台多、指标或容器状态取不到。
-  不响的：磁盘、内存快满，流量快用完，以及所有恢复消息。
+  不响的：磁盘、内存快满，流量快用完，数据库备份断了，以及所有恢复消息。
 - 发送失败的消息，会在下一轮重新发送。
 - 报警状态只在内存里：重启后连续次数从零开始；停机期间已经恢复的项，不会补发恢复消息。
 

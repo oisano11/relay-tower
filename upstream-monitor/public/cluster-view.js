@@ -62,6 +62,20 @@
     return parts.length === 3 && parts.every(Number.isFinite) ? `${parts[1]}月${parts[2]}日` : String(date || '');
   }
 
+  function fmtDateTime(ms) {
+    if (!isNumber(ms)) return UNKNOWN;
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  // 数据库备份：最新一份什么时候、多大、一共几份
+  function fmtBackup(b) {
+    if (!b) return UNKNOWN;
+    if (b.latestAt === null) return '还没有备份';
+    return `${fmtDateTime(b.latestAt)} · ${fmtBytes(b.latestBytes)} · 一共 ${b.count} 份`;
+  }
+
   // 一个请求从进来到回完用了多久
   function fmtDuration(ms) {
     if (!isNumber(ms)) return UNKNOWN;
@@ -118,6 +132,7 @@
       ${renderMeter('磁盘', disk ? disk.percent : null, disk ? `${fmtGb(disk.usedGb)} / ${fmtGb(disk.totalGb)}` : '')}
       ${renderKv('Sub2API', sub2api)}
       ${renderKv('近 5 分钟客户请求', fmtRequests(node.requests))}
+      ${node.backupConfigured ? renderKv('数据库备份（最新一份）', fmtBackup(node.backup)) : ''}
       ${renderKv('负载（1/5/15 分钟）', load)}
       ${renderKv('上次采集', fmtClock(node.collectedAt))}
       <div class="cluster-chips">${chips}</div>
@@ -257,6 +272,7 @@
 
   return {
     escapeHtml,
+    fmtBackup,
     fmtBytes,
     fmtDay,
     fmtDuration,

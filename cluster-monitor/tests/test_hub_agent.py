@@ -25,6 +25,7 @@ def fake_master_sources():
         'probe': lambda url: True,
         'requests': lambda container: {'windowSeconds': 300, 'total': 31, 'failed': 1, 'medianLatencyMs': 2500, 'last60s': 7},
         'net': lambda iface: {'iface': 'eth0', 'rxBytes': 10, 'txBytes': 20, 'bootAt': 1600000000},
+        'backup': lambda directory, pattern: None,
     }
 
 
@@ -108,6 +109,8 @@ class SettingsTests(unittest.TestCase):
             agent.load_settings({})
         settings = agent.load_settings({'AGENT_TOKEN': WORKER_TOKEN})
         self.assertEqual(settings['net_iface'], '')
+        self.assertEqual(settings['backup_dir'], '')
+        self.assertEqual(agent.load_settings({'AGENT_TOKEN': WORKER_TOKEN, 'AGENT_BACKUP_DIR': '/var/backups/db '})['backup_dir'], '/var/backups/db')
         self.assertEqual(agent.load_settings({'AGENT_TOKEN': WORKER_TOKEN, 'AGENT_NET_IFACE': ' ens3 '})['net_iface'], 'ens3')
         self.assertEqual(settings['bind'], '127.0.0.1')
         self.assertEqual(settings['port'], 8898)
@@ -353,7 +356,8 @@ class HubHttpTests(ServerCase):
 
 class AgentTests(ServerCase):
     def make_source(self, sources=None):
-        settings = agent.load_settings({'AGENT_TOKEN': WORKER_TOKEN, 'AGENT_SUB2API_HEALTH_URL': 'http://probe.invalid/h'})
+        settings = agent.load_settings({'AGENT_TOKEN': WORKER_TOKEN, 'AGENT_SUB2API_HEALTH_URL': 'http://probe.invalid/h',
+                                        'AGENT_BACKUP_DIR': '/var/backups/db'})
         return agent.SnapshotSource(settings, clock=lambda: 1700000000.0, sources=sources or {
             'memory': lambda: None,
             'disk': lambda path: None,
@@ -362,6 +366,7 @@ class AgentTests(ServerCase):
             'probe': lambda url: True,
             'requests': lambda container: None,
             'net': lambda iface: None,
+            'backup': lambda directory, pattern: {'count': 3, 'latestAt': 1700000000000, 'latestBytes': 1234},
         })
 
     def test_snapshot_needs_the_token_and_returns_the_last_collected_node(self):
@@ -373,6 +378,7 @@ class AgentTests(ServerCase):
         status, headers, body = call(base, path='/snapshot', token=WORKER_TOKEN)
         self.assertEqual(status, 200)
         self.assertIs(body['node']['sub2apiOk'], True)
+        self.assertEqual(body['node']['backup'], {'count': 3, 'latestAt': 1700000000000, 'latestBytes': 1234})
         self.assertIn('servedAgeMs', body)
         self.assertIsNone(body['node']['memory'])
         self.assertNotIn('Access-Control-Allow-Origin', headers)
@@ -387,7 +393,7 @@ class AgentTests(ServerCase):
         source = self.make_source({
             'memory': lambda: None, 'disk': lambda path: None, 'load': lambda: None,
             'containers': lambda expected: None, 'probe': counting_probe, 'requests': lambda c: None,
-            'net': lambda iface: None,
+            'net': lambda iface: None, 'backup': lambda directory, pattern: None,
         })
         source.collect_once()
         base = self.serve(common.make_handler({'/snapshot': agent.snapshot_route(source)}, WORKER_TOKEN))

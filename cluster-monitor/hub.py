@@ -78,6 +78,9 @@ def load_settings(env=None):
             'request_container': env.get('MASTER_REQUEST_CONTAINER', ''),
             # 统计流量的网卡；不填就用默认路由走的那块（连外网的）
             'net_iface': (env.get('MASTER_NET_IFACE') or '').strip(),
+            # 数据库备份存在这台机器上的话，填备份目录；面板显示最新一份的时间和大小
+            'backup_dir': (env.get('MASTER_BACKUP_DIR') or '').strip(),
+            'backup_pattern': (env.get('MASTER_BACKUP_PATTERN') or '').strip(),
         },
         'worker': {
             'label': env.get('WORKER_LABEL', '副节点'),
@@ -105,6 +108,8 @@ def empty_node(label, reachable, error, now_ms):
         'requests': None,
         'requests60s': None,
         'net': None,
+        'backupConfigured': None,
+        'backup': None,
     }
 
 

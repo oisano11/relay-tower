@@ -764,3 +764,71 @@ test('the daily digest adds yesterday\'s traffic as a note, and an otherwise qui
   assert.match(text, /📶 昨天流量：主节点 12\.3 GB、副&lt;节点&gt; 8\.8 GB（昨天中途才开始记）；本月已用额度：主节点 3\.2%/);
   assert.doesNotMatch(api.formatDailyDigest({ dateLabel: 'x', cluster: null }), /流量/);
 });
+
+// ---------- 数据库备份 ----------
+
+function withBackup(backup, configured = true) {
+  return cluster.buildView(result(withNode(healthySnapshot(), 'worker', { backupConfigured: configured, backup })), NOW);
+}
+
+test('a fresh backup shows on the card with its time, size and count, and passes its check', () => {
+  const v = withBackup({ count: 7, latestAt: NOW - 5 * 3600000, latestBytes: 212e6 });
+  assert.equal(v.nodes.worker.backup.stale, false);
+  assert.deepEqual(v.nodes.worker.warnings, []);
+  assert.equal(v.summary.text, '运行正常');
+  assert.match(view.renderNode(v.nodes.worker), /数据库备份（最新一份）<\/span><span>\d+月\d+日 \d\d:\d\d · 212 MB · 一共 7 份/);
+  assert.doesNotMatch(view.renderNode(v.nodes.master), /数据库备份/, 'a node without backups shows no backup row');
+  const row = cluster.diagnostics(v).find(c => c.item === '副节点 · 数据库备份');
+  assert.equal(row.status, 'PASS');
+  assert.equal(row.detail, '最近一份是 5 小时前的（212 MB），一共 7 份');
+  assert.ok(!cluster.diagnostics(v).some(c => c.item === '主节点 · 数据库备份'));
+});
+
+test('a backup older than 26 hours is a warning on the card, in the summary, in the checks, and a quiet alert', () => {
+  const v = withBackup({ count: 7, latestAt: NOW - 30 * 3600000, latestBytes: 212e6 });
+  assert.deepEqual(v.nodes.worker.warnings, ['数据库备份已经 30 小时没有更新']);
+  assert.equal(v.summary.level, 'warn');
+  assert.equal(v.summary.text, '副节点数据库备份已经 30 小时没有更新');
+  assert.equal(cluster.diagnostics(v).find(c => c.item === '副节点 · 数据库备份').status, 'WARN');
+  let out = cluster.evaluateAlerts(null, v);
+  assert.deepEqual(out.alerts, []);
+  out = cluster.evaluateAlerts(out.state, v);
+  const alert = out.alerts.find(a => a.key === 'worker.backup');
+  assert.equal(alert.level, 'warn', 'a missed backup does not ring');
+  assert.equal(alert.title, '副节点的数据库备份断了');
+  assert.equal(alert.lines[0], '数据库备份已经 30 小时没有更新');
+  out = cluster.evaluateAlerts(out.state, withBackup({ count: 8, latestAt: NOW - 3600000, latestBytes: 213e6 }));
+  assert.deepEqual(out.alerts.map(a => a.title), ['副节点的数据库备份恢复了']);
+});
+
+test('no backup at all is said plainly; an unreadable backup folder is unknown and alerts after three polls', () => {
+  assert.deepEqual(withBackup({ count: 0, latestAt: null, latestBytes: null }).nodes.worker.warnings, ['还没有数据库备份']);
+  assert.match(view.renderNode(withBackup({ count: 0, latestAt: null }).nodes.worker), /还没有备份/);
+  const unreadable = withBackup(null);
+  assert.equal(unreadable.nodes.worker.backup, null);
+  assert.match(unreadable.summary.text, /副节点部分数据取不到/);
+  assert.equal(cluster.diagnostics(unreadable).find(c => c.item === '副节点 · 数据库备份').status, 'UNKNOWN');
+  let state = null;
+  const fired = [];
+  for (let i = 0; i < 3; i++) {
+    const out = cluster.evaluateAlerts(state, unreadable);
+    state = out.state;
+    fired.push(...out.alerts.map(a => a.title));
+  }
+  assert.deepEqual(fired, ['副节点的备份目录读不到']);
+  const notConfigured = withBackup(null, false);
+  assert.equal(notConfigured.summary.text, '运行正常', 'no backup folder configured is not a gap');
+});
+
+test('the daily digest: a good backup is a note at the end, a broken or unreadable one is something to act on', () => {
+  const { api } = telegramBot();
+  const at = Date.parse('2026-10-11T20:31:00Z');
+  const ok = api.formatDailyDigest({ dateLabel: 'x', cluster: { traffic: [], backups: [{ label: '副节点', latestAt: at, latestBytes: 212e6, count: 7, stale: false }] } });
+  assert.match(ok, /一切正常，没有需要你处理的事。/);
+  assert.match(ok, /💾 数据库备份：最新一份 2026-10-12 04:31:00（212 MB，存在副节点，一共 7 份）/);
+  const stale = api.formatDailyDigest({ dateLabel: 'x', cluster: { backups: [{ label: '副节点', latestAt: at, latestBytes: 1, count: 7, stale: true }] } });
+  assert.doesNotMatch(stale, /一切正常/);
+  assert.match(stale, /💾 数据库备份断了：副节点最新一份是 2026-10-12 04:31:00 的/);
+  assert.match(api.formatDailyDigest({ dateLabel: 'x', cluster: { backups: [{ label: '副<节点>', unknown: true }] } }), /副&lt;节点&gt;的备份目录读不到/);
+  assert.match(api.formatDailyDigest({ dateLabel: 'x', cluster: { backups: [{ label: '副节点', latestAt: null, count: 0, stale: true }] } }), /副节点上还没有备份/);
+});
