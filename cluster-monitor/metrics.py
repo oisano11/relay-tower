@@ -3,10 +3,12 @@
 读不到的值一律是 None，不编任何“看起来正常”的默认值：
 页面显示「取不到」，报警逻辑把它当成问题处理（或者干脆跳过，绝不当成正常）。
 """
+import calendar
 import http.client
 import os
 import re
 import socket
+import statistics
 import subprocess
 import time
 import urllib.request
@@ -20,9 +22,15 @@ REQUEST_DONE_MARK = 'http request completed'
 # 客户调用的接口都在 /v1/ 下。控制台和网页自己的请求（/api/v1/ 等）也写进同一份日志，不能算进客户请求。
 # 两种日志格式写法不同：console 格式是 "path": "/v1/…"（冒号后有空格），json 格式是 "path":"/v1/…"。
 CUSTOMER_PATH = re.compile(r'"path":\s?"/v1/')
+# 「请求完成」那一行里的状态码和耗时（毫秒）。两种日志格式冒号后面有没有空格都认。
+STATUS_CODE = re.compile(r'"status_code":\s?(\d{3})')
+LATENCY_MS = re.compile(r'"latency_ms":\s?(\d+)')
+# 客户请求看近 5 分钟：接了多少、失败多少、一般多久回完
+REQUEST_WINDOW_SECONDS = 300
 # 只读日志末尾这么多行。docker logs 只带 --since 时会从头扫整份日志：
-# 线上 700 多 MB 的日志要 17 秒，还会占满一个 CPU 核。带上 --tail 就只读末尾，0.1 秒左右。
-REQUEST_TAIL_LINES = 5000
+# 线上 700 多 MB 的日志要 17 秒，还会占满一个 CPU 核。带上 --tail 就只读末尾。
+# 先读 2000 行（平时 5 分钟的日志远少于这个数）；不够再读 20000 行；还不够就当成取不到。
+REQUEST_TAIL_STEPS = (2000, 20000)
 
 # 读取失败时可能抛出的异常，都只表示“这一项取不到”
 READ_ERRORS = (OSError, ValueError, KeyError, IndexError, ZeroDivisionError, subprocess.SubprocessError)
@@ -121,18 +129,65 @@ def read_containers(expected, run=subprocess.run):
     return [{'name': name, 'state': states.get(name, 'missing')} for name in expected]
 
 
-def count_requests(container, since='60s', run=subprocess.run, tail=REQUEST_TAIL_LINES):
-    """最近一段时间里，客户调用（路径以 /v1/ 开头）的请求条数：每个请求只数它的「请求完成」那一行。
-    只读日志末尾 tail 行，再按时间筛出这段时间的。筛完还剩满 tail 行，
-    说明这段时间的日志比 tail 还多、数不全，当成取不到（抛错，由 safe 变成 None）。"""
-    done = run(['docker', 'logs', '--tail', str(tail), '--since', since, container],
-               capture_output=True, text=True, timeout=10)
-    if done.returncode != 0:
-        raise OSError('docker logs 失败')
-    lines = done.stdout.splitlines() + done.stderr.splitlines()
-    if len(lines) >= tail:
-        raise ValueError('这段时间的日志太多，只读末尾会数不全')
-    return sum(1 for line in lines if REQUEST_DONE_MARK in line and CUSTOMER_PATH.search(line))
+def docker_log_time(line):
+    """docker logs --timestamps 加在每行开头的时间（UTC），换成秒。认不出来返回 None。"""
+    try:
+        return calendar.timegm(time.strptime(line[:19], '%Y-%m-%dT%H:%M:%S'))
+    except (ValueError, OverflowError):
+        return None
+
+
+def read_recent_log(container, window, run=subprocess.run, tails=REQUEST_TAIL_STEPS):
+    """近 window 秒的日志（每行开头带 docker 记下的时间）。只读末尾：先少读，不够再多读。
+    读满了还没读完这段时间，说明这段时间的日志太多、数不全，抛错（由 safe 变成 None）。"""
+    for tail in tails:
+        done = run(['docker', 'logs', '--timestamps', '--tail', str(tail), '--since', f'{window}s', container],
+                   capture_output=True, text=True, timeout=10)
+        if done.returncode != 0:
+            raise OSError('docker logs 失败')
+        lines = done.stdout.splitlines() + done.stderr.splitlines()
+        if len(lines) < tail:
+            return lines
+    raise ValueError('这段时间的日志太多，只读末尾会数不全')
+
+
+def request_stats(container, run=subprocess.run, now=time.time, window=REQUEST_WINDOW_SECONDS, tails=REQUEST_TAIL_STEPS):
+    """近 window 秒客户调用（路径以 /v1/ 开头）的情况，每个请求只数它的「请求完成」那一行：
+    - total：接了多少个；
+    - failed：失败多少个（状态码 5xx，服务器或上游出错；4xx 是客户自己的问题，比如 Key 不对，不算）；
+    - medianLatencyMs：成功的请求一般多久回完（中位数，毫秒）；一个成功的都没有就是 None；
+    - last60s：其中近 60 秒的条数（老版本的中转塔台只认这个数）。"""
+    lines = read_recent_log(container, window, run=run, tails=tails)
+    current = now()
+    total = failed = last60 = 0
+    undated = False
+    latencies = []
+    for line in lines:
+        if REQUEST_DONE_MARK not in line or not CUSTOMER_PATH.search(line):
+            continue
+        total += 1
+        at = docker_log_time(line)
+        if at is None:
+            undated = True
+        elif current - at <= 60:
+            last60 += 1
+        status = STATUS_CODE.search(line)
+        code = int(status.group(1)) if status else None
+        if code is None:
+            continue
+        if code >= 500:
+            failed += 1
+        elif code < 400:
+            latency = LATENCY_MS.search(line)
+            if latency:
+                latencies.append(int(latency.group(1)))
+    return {
+        'windowSeconds': window,
+        'total': total,
+        'failed': failed,
+        'medianLatencyMs': round(statistics.median(latencies)) if latencies else None,
+        'last60s': None if undated else last60,
+    }
 
 
 def probe_http(url, timeout=2.0, opener=_LOCAL_OPENER):
@@ -179,7 +234,7 @@ def default_sources(run=subprocess.run):
         'load': safe(read_load),
         'containers': lambda expected: safe(read_containers)(expected, run=run),
         'probe': probe_http,
-        'requests': lambda container: safe(count_requests)(container, run=run),
+        'requests': lambda container: safe(request_stats)(container, run=run),
     }
 
 
@@ -187,6 +242,7 @@ def node_facts(settings, cpu, now_ms, sources):
     """一台机器读到的事实：读到的是数字，读不到的是 None。settings 只用到下面几个键。"""
     health_url = settings.get('sub2api_health_url')
     container = settings.get('request_container')
+    requests = sources['requests'](container) if container else None
     return {
         'reachable': True,
         'collectedAt': now_ms,
@@ -196,5 +252,7 @@ def node_facts(settings, cpu, now_ms, sources):
         'loadAvg': sources['load'](),
         'containers': sources['containers'](settings.get('expect_containers') or []),
         'sub2apiOk': sources['probe'](health_url) if health_url else None,
-        'requests60s': sources['requests'](container) if container else None,
+        'requests': requests,
+        # 老版本的中转塔台只认近 1 分钟的条数，先留着，两边不用同时升级
+        'requests60s': requests['last60s'] if requests else None,
     }

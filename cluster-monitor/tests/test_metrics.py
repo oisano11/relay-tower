@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 
@@ -120,69 +121,115 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(metrics.read_containers([], run=run), [])
 
 
+NOW = 1700000000  # 测试里的「现在」（秒）
+
+
+def stamped(text, ago=10):
+    """模拟 docker logs --timestamps：每行开头是 docker 记下的 UTC 时间（纳秒精度）。"""
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(NOW - ago)) + '.123456789Z ' + text
+
+
+def done_line(path='/v1/chat/completions', status=200, latency=1000, compact=False):
+    if compact:
+        return '{"level":"info","msg":"http request completed","path":"%s","status_code":%d,"latency_ms":%d}' % (path, status, latency)
+    return 'x INFO http request completed\t{"path": "%s", "status_code": %d, "latency_ms": %d, "path": "%s"}' % (path, status, latency, path)
+
+
+def stats(log, **kwargs):
+    def run(*args, **kw):
+        return completed(stdout=log)
+    return metrics.request_stats('sub2api', run=run, now=lambda: NOW, **kwargs)
+
+
 class CustomerRequestTests(unittest.TestCase):
     def test_only_customer_calls_are_counted_and_each_request_once(self):
         # 真实日志里一条请求的 path 字段出现两次；控制台的管理接口（/api/v1）不算客户请求
         log = '\n'.join([
-            'x http request completed\t{"path": "/v1/chat/completions", "method": "POST", "path": "/v1/chat/completions"}',
-            'x http request completed\t{"path": "/api/v1/auth/me", "method": "GET", "path": "/api/v1/auth/me"}',
-            'x http request completed\t{"path": "/v1/messages", "path": "/v1/messages"}',
-            'noise line without any request',
+            stamped(done_line('/v1/chat/completions')),
+            stamped(done_line('/api/v1/auth/me')),
+            stamped(done_line('/v1/messages')),
+            stamped('noise line without any request'),
         ])
-
-        def run(*args, **kwargs):
-            return completed(stdout=log)
-        self.assertEqual(metrics.count_requests('sub2api', run=run), 2)
+        self.assertEqual(stats(log)['total'], 2)
 
     def test_the_compact_json_log_format_is_counted_too(self):
         # 另一台机器用 json 格式：冒号后面没有空格
         log = '\n'.join([
-            '{"level":"info","msg":"http request completed","path":"/v1/responses","method":"POST","path":"/v1/responses"}',
-            '{"level":"info","msg":"http request completed","path":"/api/v1/auth/me","path":"/api/v1/auth/me"}',
+            stamped(done_line('/v1/responses', status=502, compact=True)),
+            stamped(done_line('/api/v1/auth/me', compact=True)),
+            stamped(done_line('/v1/responses', latency=4000, compact=True)),
         ])
-
-        def run(*args, **kwargs):
-            return completed(stdout=log)
-        self.assertEqual(metrics.count_requests('sub2api', run=run), 1)
+        result = stats(log)
+        self.assertEqual((result['total'], result['failed'], result['medianLatencyMs']), (2, 1, 4000))
 
     def test_other_log_lines_of_the_same_request_are_not_counted(self):
         # 同一个请求转发上游时也会写带 path 的日志，只有「请求完成」那一行算数
         log = '\n'.join([
-            'x WARN upstream request failed\t{"path": "/v1/chat/completions", "status": 502}',
-            'x INFO account selected\t{"path": "/v1/chat/completions"}',
-            'x INFO http request completed\t{"path": "/v1/chat/completions", "path": "/v1/chat/completions"}',
+            stamped('x WARN upstream request failed\t{"path": "/v1/chat/completions", "status_code": 502}'),
+            stamped('x INFO account selected\t{"path": "/v1/chat/completions"}'),
+            stamped(done_line('/v1/chat/completions')),
         ])
+        result = stats(log)
+        self.assertEqual((result['total'], result['failed']), (1, 0))
 
-        def run(*args, **kwargs):
-            return completed(stdout=log)
-        self.assertEqual(metrics.count_requests('sub2api', run=run), 1)
+    def test_server_errors_fail_client_errors_do_not_and_the_typical_time_is_the_median(self):
+        log = '\n'.join([
+            stamped(done_line(status=200, latency=1000)),
+            stamped(done_line(status=200, latency=3000)),
+            stamped(done_line(status=200, latency=900000)),  # 一个特别慢的不会把「一般多久」拉上去
+            stamped(done_line(status=502, latency=25000)),
+            stamped(done_line(status=503, latency=100)),
+            stamped(done_line(status=401, latency=5)),       # Key 不对：客户自己的问题，不算失败，也不算进耗时
+            stamped(done_line(status=429, latency=7)),
+        ])
+        self.assertEqual(stats(log), {'windowSeconds': 300, 'total': 7, 'failed': 2, 'medianLatencyMs': 3000, 'last60s': 7})
+
+    def test_no_successful_request_means_no_typical_time(self):
+        result = stats(stamped(done_line(status=502)))
+        self.assertEqual((result['total'], result['failed'], result['medianLatencyMs']), (1, 1, None))
+        self.assertEqual(stats(''), {'windowSeconds': 300, 'total': 0, 'failed': 0, 'medianLatencyMs': None, 'last60s': 0})
+
+    def test_the_last_minute_is_told_apart_by_the_docker_timestamp(self):
+        log = '\n'.join([stamped(done_line(), ago=30), stamped(done_line(), ago=59), stamped(done_line(), ago=61), stamped(done_line(), ago=280)])
+        result = stats(log)
+        self.assertEqual((result['total'], result['last60s']), (4, 2))
+
+    def test_lines_without_a_timestamp_make_the_last_minute_unknown_not_zero(self):
+        result = stats(done_line())
+        self.assertEqual(result['total'], 1)
+        self.assertIsNone(result['last60s'])
 
     def test_failure_is_none(self):
         def run(*args, **kwargs):
             return completed(returncode=1)
-        self.assertIsNone(metrics.safe(metrics.count_requests)('sub2api', run=run))
+        self.assertIsNone(metrics.safe(metrics.request_stats)('sub2api', run=run))
 
-    def test_only_the_end_of_the_log_is_read(self):
+    def test_only_the_end_of_the_log_is_read_with_docker_timestamps(self):
         # 只带 --since 会从头扫整份日志（线上 700 多 MB 要 17 秒），必须带 --tail
-        seen = {}
+        seen = []
 
         def run(args, **kwargs):
-            seen['args'] = args
+            seen.append(args)
             return completed(stdout='')
-        metrics.count_requests('sub2api', run=run)
-        self.assertEqual(seen['args'], ['docker', 'logs', '--tail', str(metrics.REQUEST_TAIL_LINES), '--since', '60s', 'sub2api'])
+        metrics.request_stats('sub2api', run=run)
+        self.assertEqual(seen, [['docker', 'logs', '--timestamps', '--tail', '2000', '--since', '300s', 'sub2api']])
 
-    def test_a_window_with_more_lines_than_the_tail_is_unknown_not_a_partial_count(self):
-        def run(*args, **kwargs):
-            return completed(stdout='\n'.join(['http request completed {"path": "/v1/chat/completions"}'] * 3))
-        self.assertIsNone(metrics.safe(metrics.count_requests)('sub2api', run=run, tail=3))
-        self.assertEqual(metrics.count_requests('sub2api', run=run, tail=4), 3)
+    def test_a_busy_window_reads_more_and_a_window_too_big_for_every_step_is_unknown(self):
+        seen = []
+
+        def run(args, **kwargs):
+            seen.append(args[4])
+            return completed(stdout='\n'.join([stamped(done_line())] * 3))
+        # 第一次读 3 行就满了：再读 5 行，这次没满，3 个都数到
+        self.assertEqual(metrics.request_stats('sub2api', run=run, now=lambda: NOW, tails=(3, 5))['total'], 3)
+        self.assertEqual(seen, ['3', '5'])
+        # 每一步都读满了：数不全，宁可说取不到，也不给一个偏小的数
+        self.assertIsNone(metrics.safe(metrics.request_stats)('sub2api', run=run, tails=(2, 3)))
 
     def test_lines_on_both_output_streams_are_counted(self):
         def run(*args, **kwargs):
-            return completed(stdout='http request completed {"path": "/v1/messages"}',
-                             stderr='http request completed {"path": "/v1/chat/completions"}\n')
-        self.assertEqual(metrics.count_requests('sub2api', run=run), 2)
+            return completed(stdout=stamped(done_line('/v1/messages')), stderr=stamped(done_line('/v1/chat/completions')) + '\n')
+        self.assertEqual(metrics.request_stats('sub2api', run=run, now=lambda: NOW)['total'], 2)
 
 
 class ProbeTcpTests(unittest.TestCase):
@@ -260,7 +307,7 @@ class NodeFactsTests(unittest.TestCase):
                     'expect_containers': ['sub2api']}
         node = metrics.node_facts(settings, FakeCpu(None), 1000, self.failing_sources())
         self.assertTrue(node['reachable'])
-        for key in ('cpuPercent', 'memory', 'disk', 'loadAvg', 'containers', 'requests60s'):
+        for key in ('cpuPercent', 'memory', 'disk', 'loadAvg', 'containers', 'requests', 'requests60s'):
             self.assertIsNone(node[key], key)
         self.assertIs(node['sub2apiOk'], False)
 
@@ -268,7 +315,15 @@ class NodeFactsTests(unittest.TestCase):
         node = metrics.node_facts({}, FakeCpu(12.5), 1000, self.failing_sources())
         self.assertEqual(node['cpuPercent'], 12.5)
         self.assertIsNone(node['sub2apiOk'])
+        self.assertIsNone(node['requests'])
         self.assertIsNone(node['requests60s'])
+
+    def test_the_old_one_minute_count_comes_from_the_five_minute_reading(self):
+        sources = dict(self.failing_sources(), requests=lambda container: {
+            'windowSeconds': 300, 'total': 9, 'failed': 1, 'medianLatencyMs': 1200, 'last60s': 2})
+        node = metrics.node_facts({'request_container': 'sub2api'}, FakeCpu(1.0), 1000, sources)
+        self.assertEqual(node['requests']['total'], 9)
+        self.assertEqual(node['requests60s'], 2)
 
 
 if __name__ == '__main__':

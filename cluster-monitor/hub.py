@@ -100,6 +100,7 @@ def empty_node(label, reachable, error, now_ms):
         'loadAvg': None,
         'containers': None,
         'sub2apiOk': None,
+        'requests': None,
         'requests60s': None,
     }
 

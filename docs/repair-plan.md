@@ -618,3 +618,12 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
   - 前端 `removeChannelFromGroup`：账号正在接单、移出后不剩分组时，确认框写明会一起关掉，请求带上 `confirmStop: true`。它是本组唯一在接单的账号时，确认框加一行提醒，和「关闭」按钮的提醒是同一句话。
   - 后端 `prepareAccountGroupsPlan` / `updateAccountGroups`：带 `confirmStop`、又不剩分组时，先执行 `UPDATE accounts SET schedulable = false`，再跑「没有分组」的检查，然后删 `account_groups`，全在同一个事务里；缓存里同时把 `schedulable` 设为 false。旧页面不带 `confirmStop`，就用大白话拦下，提示刷新页面。还有别的分组的账号永远不会被关。
 - **测试：** 新增 3 项。① 确认后才关，关在「没有分组」检查之前，同组另一个账号不受影响。② 留在别的分组的账号不会被关，已停用的账号移出不用确认。③ 前端确认框的内容和发出的请求，点取消就不发请求。①③ 在旧代码上失败、在新代码上通过。
+
+## 双机集群：两台各自近 5 分钟的请求、失败和耗时（2026-10-11）
+
+- **起因：** Caddy 用 `round_robin` 把请求轮流分给两台，健康检查只看 `/health`；它只在连不上时换另一台重试，拿到回应后不会重试。一台的 Sub2API 如果对真实请求回 5xx、`/health` 却仍是 200，一半请求会失败，面板上只有两台合算的成功率，看不出是哪台。
+- **做法：**
+  - `metrics.request_stats` 取代 `count_requests`：`docker logs --timestamps --tail N --since 300s`，N 先 2000，读满了再 20000，还满就抛错（取不到）。只数 `http request completed` 且路径以 `/v1/` 开头的行；`status_code` ≥ 500 算失败，< 400 的 `latency_ms` 取中位数。docker 加的时间戳另数近 60 秒，填进 `requests60s` 给旧版塔台用；有一行没有时间戳就给 null。
+  - 塔台 `cluster-status.js`：`pickRequests` 校验（total、failed 缺一个或 failed > total 就当取不到）。`failureGap`：失败 ≥ 5、失败率 ≥ 20%、而且至少是另一台的 2 倍；`markFailureGaps` 写进问题列表，节点改成「服务异常」。报警 `<role>.failures` 连续 2 次、响铃，任一台读不到时原地不动。诊断加「客户请求（近 5 分钟）」一项。
+  - 分流比例去掉 `SPLIT_VERIFIED` 开关，改用两台近 5 分钟的 total。对账（只读，北京时间 10-11 13:00–14:00）：两台日志里状态 200 的 `/v1/responses` 和 `/v1/chat/completions` 合计比 `usage_logs` 多 0.5%，同一小时 `ops_error_logs` 里正好有同样多的上游 502（回答写到一半断掉，访问日志仍记 200）。两台各占约一半。
+- **测试：** Python 改写请求统计 11 项（时间戳、5xx/4xx、中位数、分两步读、读满当取不到等），节点数据 1 项；JS 新增 5 项（失败差距、两台一起高不算、报警和恢复、卡片文字、分流）。

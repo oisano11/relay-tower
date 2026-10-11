@@ -40,7 +40,7 @@ function healthySnapshot(overrides = {}) {
         disk: { totalGb: 60, usedGb: 20, percent: 33.3 },
         loadAvg: [0.1, 0.2, 0.3],
         containers: [{ name: 'sub2api', state: 'running' }],
-        sub2apiOk: true, requests60s: 30, error: null,
+        sub2apiOk: true, requests: { windowSeconds: 300, total: 150, failed: 1, medianLatencyMs: 9000 }, requests60s: 30, error: null,
       },
       worker: {
         label: '副节点', reachable: true, collectedAt: NOW - 5000, cpuPercent: 4.1,
@@ -48,7 +48,7 @@ function healthySnapshot(overrides = {}) {
         disk: { totalGb: 60, usedGb: 6, percent: 10 },
         loadAvg: [0.1, 0.1, 0.1],
         containers: [{ name: 'sub2api', state: 'running' }],
-        sub2apiOk: true, requests60s: 10, error: null,
+        sub2apiOk: true, requests: { windowSeconds: 300, total: 140, failed: 1, medianLatencyMs: 8000 }, requests60s: 10, error: null,
       },
     },
     link: { ok: true, rttMs: 1.2, rxBytes: 1024 * 1024, txBytes: 2 * 1024 * 1024, collectedAt: NOW - 5000, error: null },
@@ -150,14 +150,16 @@ test('healthy snapshot: both nodes online, numbers pass through, summary is ok',
   assert.equal(v.nodes.worker.state, 'online');
   assert.equal(v.summary.level, 'ok');
   assert.equal(v.nodes.master.memory.percent, 50);
-  assert.equal(v.split.verified, false, 'the split is not shown until the logs are reconciled');
-  assert.equal(v.split.masterPercent, null);
+  assert.deepEqual(v.nodes.master.requests, { windowSeconds: 300, total: 150, failed: 1, medianLatencyMs: 9000 });
+  assert.equal(v.split.total, 290, 'the split adds up both nodes over the last 5 minutes');
+  assert.equal(v.split.masterPercent, 52);
+  assert.equal(v.split.workerPercent, 48);
 });
 
 test('worker offline shows as offline with the reason, and the summary names it', () => {
   const snap = withNode(healthySnapshot(), 'worker', {
     reachable: false, error: 'timed out', cpuPercent: null, memory: null, disk: null, containers: null,
-    sub2apiOk: null, requests60s: null,
+    sub2apiOk: null, requests: null, requests60s: null,
   });
   const v = cluster.buildView(result(snap), NOW);
   assert.equal(v.nodes.worker.state, 'offline');
@@ -181,7 +183,7 @@ test('a dead Sub2API or a stopped container makes the node degraded with a clear
 
 test('readings that cannot be taken stay null and the node says its data is unavailable', () => {
   const snap = withNode(healthySnapshot(), 'master', {
-    cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null, loadAvg: null,
+    cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests: null, requests60s: null, loadAvg: null,
   });
   const v = cluster.buildView(result(snap), NOW);
   assert.equal(v.nodes.master.state, 'unknown');
@@ -197,19 +199,30 @@ test('an old snapshot is stale, not healthy', () => {
   assert.equal(v.summary.text, '数据过期，超过 1 分钟没有更新');
 });
 
-test('split: the arithmetic is right, but nothing is shown until the logs are verified', () => {
+const quiet = { windowSeconds: 300, total: 0, failed: 0, medianLatencyMs: null };
+
+test('split: the arithmetic is right, an idle pair is idle, and an unknown side makes it unknown', () => {
   assert.equal(cluster.computeSplit(0, 0).idle, true);
   assert.equal(cluster.computeSplit(30, 10).masterPercent, 75);
   assert.equal(cluster.computeSplit(30, 10).workerPercent, 25);
-  const idle = cluster.buildView(result(withNode(withNode(healthySnapshot(), 'master', { requests60s: 0 }), 'worker', { requests60s: 0 })), NOW);
-  assert.equal(idle.split.verified, false);
+  const idle = cluster.buildView(result(withNode(withNode(healthySnapshot(), 'master', { requests: quiet }), 'worker', { requests: quiet })), NOW);
+  assert.equal(idle.split.idle, true);
   assert.equal(idle.split.masterPercent, null);
+  const half = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { requests: null })), NOW);
+  assert.equal(half.split.total, null);
+});
+
+test('request readings that do not add up are treated as unknown, not shown', () => {
+  for (const requests of [{ total: 3, failed: 5 }, { total: -1, failed: 0 }, { total: 3 }, 'oops']) {
+    const v = cluster.buildView(result(withNode(healthySnapshot(), 'master', { requests })), NOW);
+    assert.equal(v.nodes.master.requests, null, JSON.stringify(requests));
+  }
 });
 test('diagnostics are computed, never a fixed all-green answer', () => {
   const down = cluster.diagnostics(cluster.buildView(failedResult(), NOW));
   assert.deepEqual(down.map(c => c.status), ['FAIL']);
 
-  const snap = withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', containers: null, sub2apiOk: null, cpuPercent: null, memory: null, disk: null, requests60s: null });
+  const snap = withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', containers: null, sub2apiOk: null, cpuPercent: null, memory: null, disk: null, requests: null, requests60s: null });
   const checks = cluster.diagnostics(cluster.buildView(result(snap, {}), NOW));
   const offline = checks.find(c => c.item === '副节点 · 是否在线');
   assert.equal(offline.status, 'FAIL');
@@ -231,13 +244,70 @@ test('diagnostics: a tunnel that cannot connect is FAIL; the split stays unknown
   const snap = healthySnapshot({ link: { ok: false, rttMs: null, rxBytes: null, txBytes: null, collectedAt: NOW, error: null } });
   const checks = cluster.diagnostics(cluster.buildView(result(snap), NOW));
   assert.equal(checks.find(c => c.item === '两台之间的隧道').status, 'FAIL');
-  const skewed = withNode(withNode(healthySnapshot(), 'master', { requests60s: 30 }), 'worker', { requests60s: 0 });
-  const split = cluster.diagnostics(cluster.buildView(result(skewed), NOW)).find(c => c.item === '近 1 分钟分流');
-  assert.equal(split.status, 'UNKNOWN');
+  const skewed = withNode(withNode(healthySnapshot(), 'master', { requests: { total: 30, failed: 0 } }), 'worker', { requests: quiet });
+  const split = cluster.diagnostics(cluster.buildView(result(skewed), NOW)).find(c => c.item === '近 5 分钟分流');
+  assert.equal(split.status, 'WARN');
+  assert.match(split.detail, /只有一台在接请求/);
+});
+
+// ---------- 两台各自的失败数 ----------
+
+function failing(masterFailed, masterTotal, workerFailed, workerTotal) {
+  return cluster.buildView(result(withNode(withNode(healthySnapshot(), 'master',
+    { requests: { total: masterTotal, failed: masterFailed, medianLatencyMs: 9000 } }), 'worker',
+  { requests: { total: workerTotal, failed: workerFailed, medianLatencyMs: 8000 } })), NOW);
+}
+
+test('a node that fails far more than the other is degraded, named in the summary, and FAILs its check', () => {
+  const v = failing(12, 40, 1, 40);
+  assert.deepEqual(v.nodes.master.failureGap, { rate: 30, otherRate: 2.5 });
+  assert.equal(v.nodes.master.state, 'degraded');
+  assert.equal(v.nodes.worker.state, 'online');
+  assert.ok(v.nodes.master.problems.includes('近 5 分钟失败 12 / 40（30%），明显比副节点（2.5%）多'), v.nodes.master.problems.join());
+  assert.equal(v.summary.text, '主节点服务异常');
+  const row = cluster.diagnostics(v).find(c => c.item === '主节点 · 客户请求（近 5 分钟）');
+  assert.equal(row.status, 'FAIL');
+  assert.equal(cluster.diagnostics(v).find(c => c.item === '副节点 · 客户请求（近 5 分钟）').status, 'PASS');
+});
+
+test('failures on both nodes at once, or only a handful, are not blamed on one machine', () => {
+  for (const v of [failing(12, 40, 10, 40), failing(4, 10, 0, 40), failing(6, 100, 0, 40), failing(5, 20, 0, 0)]) {
+    assert.equal(v.nodes.master.failureGap, null);
+    assert.equal(v.nodes.master.state, 'online');
+  }
+});
+
+test('the failure alert rings after two bad polls, names both numbers, and recovers once', () => {
+  let state = null;
+  const bad = failing(12, 40, 1, 40);
+  state = cluster.evaluateAlerts(state, bad).state;
+  let out = cluster.evaluateAlerts(state, bad);
+  state = out.state;
+  const alert = out.alerts.find(a => a.key === 'master.failures');
+  assert.equal(alert.level, 'down');
+  assert.equal(alert.title, '主节点的请求失败明显比副节点多');
+  assert.match(alert.lines[0], /主节点失败 12 \/ 40（30%），副节点失败 1 \/ 40（2.5%）/);
+  const unknown = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { requests: null })), NOW);
+  out = cluster.evaluateAlerts(state, unknown);
+  state = out.state;
+  assert.deepEqual(out.alerts, [], 'one side unknown is not a recovery');
+  out = cluster.evaluateAlerts(state, failing(1, 40, 1, 40));
+  assert.deepEqual(out.alerts.map(a => a.title), ['主节点的请求失败恢复正常']);
+});
+
+test('the node card shows the 5-minute numbers in plain words', () => {
+  const v = failing(3, 200, 0, 0);
+  assert.match(view.renderNode(v.nodes.master), /接了 200 个 · 失败 3 个（1\.5%） · 一般 9\.0 秒回完/);
+  assert.match(view.renderNode(v.nodes.worker), /近 5 分钟客户请求<\/span><span>没有请求/);
+  assert.match(view.renderNode(cluster.buildView(result(withNode(healthySnapshot(), 'master', { requests: null })), NOW).nodes.master), /近 5 分钟客户请求<\/span><span>取不到/);
+  assert.equal(view.fmtDuration(950), '0.9 秒');
+  assert.equal(view.fmtDuration(42000), '42 秒');
+  assert.equal(view.fmtDuration(150000), '2.5 分钟');
+  assert.equal(view.renderSplit(failing(0, 30, 0, 10)), '近 5 分钟分流：主 75% / 副 25%（40 次）');
 });
 test('alerts wait for two bad polls, fire once, and announce recovery once', () => {
   let state = null;
-  const bad = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null })), NOW);
+  const bad = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests: null, requests60s: null })), NOW);
   const good = cluster.buildView(result(healthySnapshot()), NOW);
 
   let out = cluster.evaluateAlerts(state, bad);
@@ -262,7 +332,7 @@ test('alerts wait for two bad polls, fire once, and announce recovery once', () 
 
 test('while the hub cannot be reached, node alerts are frozen instead of recovering by mistake', () => {
   let state = null;
-  const bad = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null })), NOW);
+  const bad = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests: null, requests60s: null })), NOW);
   state = cluster.evaluateAlerts(state, bad).state;
   state = cluster.evaluateAlerts(state, bad).state;
   const hubDown = cluster.buildView(failedResult(), NOW);
@@ -495,7 +565,7 @@ test('business success rate is unknown when the error count is missing, never 10
 
 test('a failed send is reverted so the next poll sends it again', () => {
   let state = null;
-  const offline = withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null });
+  const offline = withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests: null, requests60s: null });
   const bad = cluster.buildView(result(offline), NOW);
   const good = cluster.buildView(result(healthySnapshot()), NOW);
   state = cluster.evaluateAlerts(state, bad).state;
@@ -537,7 +607,7 @@ test('a node whose data goes old raises its own alert after three polls', () => 
 });
 
 test('an old offline reason is not shown once the data is stale', () => {
-  const snap = withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null });
+  const snap = withNode(healthySnapshot(), 'worker', { reachable: false, error: 'refused', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests: null, requests60s: null });
   const v = cluster.buildView(result(snap, { lastGoodAt: NOW }), NOW + 600000);
   assert.equal(v.hub.stale, true);
   assert.deepEqual(v.nodes.worker.problems, []);
@@ -575,7 +645,7 @@ test('when the tunnel is down, only the tunnel alert fires; the worker-offline a
   let state = null;
   const fired = [];
   const tunnelDown = healthySnapshot({ link: { ok: false, rttMs: null, rxBytes: null, txBytes: null, collectedAt: NOW, error: null } });
-  const workerGone = withNode(tunnelDown, 'worker', { reachable: false, error: 'timed out', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null });
+  const workerGone = withNode(tunnelDown, 'worker', { reachable: false, error: 'timed out', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests: null, requests60s: null });
   const bad = cluster.buildView(result(workerGone), NOW);
   for (let i = 0; i < 3; i++) {
     const out = cluster.evaluateAlerts(state, bad);
@@ -589,7 +659,7 @@ test('when the tunnel is down, only the tunnel alert fires; the worker-offline a
 test('after the tunnel comes back, a worker that is still offline is reported on its own', () => {
   let state = null;
   const fired = [];
-  const offline = { reachable: false, error: 'timed out', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests60s: null };
+  const offline = { reachable: false, error: 'timed out', cpuPercent: null, memory: null, disk: null, containers: null, sub2apiOk: null, requests: null, requests60s: null };
   const tunnelDown = healthySnapshot({ link: { ok: false, rttMs: null, rxBytes: null, txBytes: null, collectedAt: NOW, error: null } });
   const down = cluster.buildView(result(withNode(tunnelDown, 'worker', offline)), NOW);
   const back = cluster.buildView(result(withNode(healthySnapshot(), 'worker', offline)), NOW);

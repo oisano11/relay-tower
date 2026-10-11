@@ -47,6 +47,23 @@
     return isNumber(ms) ? new Date(ms).toLocaleTimeString('zh-CN', { hour12: false }) : UNKNOWN;
   }
 
+  // 一个请求从进来到回完用了多久
+  function fmtDuration(ms) {
+    if (!isNumber(ms)) return UNKNOWN;
+    if (ms < 10000) return `${(ms / 1000).toFixed(1)} 秒`;
+    if (ms < 120000) return `${Math.round(ms / 1000)} 秒`;
+    return `${(ms / 60000).toFixed(1)} 分钟`;
+  }
+
+  // 近 5 分钟的客户请求：接了多少、失败多少、成功的一般多久回完
+  function fmtRequests(r) {
+    if (!r) return UNKNOWN;
+    if (!r.total) return '没有请求';
+    const rate = ((100 * r.failed) / r.total).toFixed(1);
+    const typical = isNumber(r.medianLatencyMs) ? ` · 一般 ${fmtDuration(r.medianLatencyMs)}回完` : '';
+    return `接了 ${fmtNumber(r.total)} 个 · 失败 ${fmtNumber(r.failed)} 个（${rate}%）${typical}`;
+  }
+
   function renderMeter(label, percent, detail) {
     const value = isNumber(percent) ? Math.max(0, Math.min(100, percent)) : null;
     const hot = value !== null && value >= 85 ? ' hot' : '';
@@ -85,7 +102,7 @@
       ${renderMeter('内存', memory ? memory.percent : null, memory ? `${fmtMb(memory.usedMb)} / ${fmtMb(memory.totalMb)}` : '')}
       ${renderMeter('磁盘', disk ? disk.percent : null, disk ? `${fmtGb(disk.usedGb)} / ${fmtGb(disk.totalGb)}` : '')}
       ${renderKv('Sub2API', sub2api)}
-      ${renderKv('近 1 分钟客户请求', fmtNumber(node.requests60s))}
+      ${renderKv('近 5 分钟客户请求', fmtRequests(node.requests))}
       ${renderKv('负载（1/5/15 分钟）', load)}
       ${renderKv('上次采集', fmtClock(node.collectedAt))}
       <div class="cluster-chips">${chips}</div>
@@ -105,10 +122,9 @@
 
   function renderSplit(view) {
     const split = view.split;
-    if (!split.verified) return '近 1 分钟分流：暂不显示（副节点的日志还没和数据库对账）';
-    if (split.total === null) return `近 1 分钟分流：${UNKNOWN}`;
-    if (split.idle) return '近 1 分钟分流：没有请求';
-    return `近 1 分钟分流：主 ${split.masterPercent}% / 副 ${split.workerPercent}%（${fmtNumber(split.total)} 次）`;
+    if (split.total === null) return `近 5 分钟分流：${UNKNOWN}`;
+    if (split.idle) return '近 5 分钟分流：没有请求';
+    return `近 5 分钟分流：主 ${split.masterPercent}% / 副 ${split.workerPercent}%（${fmtNumber(split.total)} 次）`;
   }
 
   function renderKpi(label, value) {
@@ -167,6 +183,8 @@
 
   return {
     escapeHtml,
+    fmtDuration,
+    fmtRequests,
     renderNode,
     renderLink,
     renderSplit,

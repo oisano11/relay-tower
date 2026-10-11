@@ -23,7 +23,7 @@ def fake_master_sources():
         'load': lambda: [0.1, 0.2, 0.3],
         'containers': lambda expected: [{'name': name, 'state': 'running'} for name in expected],
         'probe': lambda url: True,
-        'requests': lambda container: 7,
+        'requests': lambda container: {'windowSeconds': 300, 'total': 31, 'failed': 1, 'medianLatencyMs': 2500, 'last60s': 7},
     }
 
 
@@ -278,6 +278,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(snapshot['collectedAt'], 1700000000000)
         self.assertEqual(snapshot['nodes']['master']['label'], '主节点测试')
         self.assertIs(snapshot['nodes']['master']['reachable'], True)
+        self.assertEqual(snapshot['nodes']['master']['requests']['total'], 31)
         self.assertEqual(snapshot['nodes']['master']['requests60s'], 7)
         self.assertIsNone(snapshot['nodes']['worker']['reachable'])
         self.assertEqual(collector.latest(), snapshot)

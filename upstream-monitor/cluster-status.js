@@ -18,8 +18,10 @@ const DISK_RECOVER_PERCENT = 80;
 const MEM_ALERT_PERCENT = 90;
 const MEM_RECOVER_PERCENT = 85;
 const ROLE_NAMES = { master: '主节点', worker: '副节点' };
-// 副节点的日志和数据库还没对账，分流比例先不显示（对账通过后改成 true）
-const SPLIT_VERIFIED = false;
+// 一台的请求失败「明显比另一台多」：近 5 分钟至少失败 5 个、失败率至少 20%，而且至少是另一台的两倍。
+// 两台用的是同一批上游账号，一起变差多半是上游的问题（主看板和自动换号会处理）；只有一台差，多半是这台机器自己的问题。
+const FAIL_MIN_COUNT = 5;
+const FAIL_MIN_RATE = 20;
 const INTERNAL_USER_IDS = '1, 8';     // 和主看板一样：这两个是内部账号，客户消费不计入
 
 class HubError extends Error {}
@@ -42,6 +44,20 @@ function pickNumbers(raw, keys) {
   const out = {};
   for (const key of keys) out[key] = numberOrNull(raw[key]);
   return out;
+}
+
+// 近 5 分钟的客户请求：接了多少、失败多少、成功的一般多久回完。接了多少、失败多少缺一个，就整个当成取不到。
+function pickRequests(raw) {
+  if (!isObject(raw)) return null;
+  const total = numberOrNull(raw.total);
+  const failed = numberOrNull(raw.failed);
+  if (total === null || failed === null || total < 0 || failed < 0 || failed > total) return null;
+  return {
+    windowSeconds: numberOrNull(raw.windowSeconds) || 300,
+    total,
+    failed,
+    medianLatencyMs: numberOrNull(raw.medianLatencyMs),
+  };
 }
 
 // 把取数的异常翻译成固定的话：不把地址、令牌带进界面或日志
@@ -121,9 +137,9 @@ function buildNode(role, raw, hub, nowMs) {
       ? node.containers.filter(isObject).map(c => ({ name: String(c.name ?? ''), state: String(c.state ?? '') }))
       : null,
     sub2apiOk: typeof node.sub2apiOk === 'boolean' ? node.sub2apiOk : null,
-    requests60s: numberOrNull(node.requests60s),
+    requests: pickRequests(node.requests),
   } : {
-    cpuPercent: null, memory: null, disk: null, loadAvg: null, containers: null, sub2apiOk: null, requests60s: null,
+    cpuPercent: null, memory: null, disk: null, loadAvg: null, containers: null, sub2apiOk: null, requests: null,
   };
 
   const notRunning = parsed.containers ? parsed.containers.filter(c => c.state !== 'running') : [];
@@ -185,8 +201,7 @@ function buildLink(raw, hub) {
   };
 }
 
-// 近 60 秒两台各接了多少请求。取不到就是 null；总数为 0 是「没有请求」，不算分流。
-// 两台各自近 1 分钟的客户请求数 → 分流比例。纯计算，和是否显示无关。
+// 两台各自近 5 分钟接的客户请求数 → 分流比例。总数为 0 是「没有请求」，不算分流。
 function computeSplit(a, b) {
   const total = a + b;
   if (total === 0) return { total: 0, idle: true, masterPercent: null, workerPercent: null };
@@ -194,17 +209,42 @@ function computeSplit(a, b) {
   return { total, idle: false, masterPercent, workerPercent: 100 - masterPercent };
 }
 
-// 对账通过前（SPLIT_VERIFIED 为 false）不给出分流比例
+// 分流比例。2026-10-11 对过账：同一个小时里，两台日志里成功的对话请求加起来和数据库的记录只差 0.5%
+// （差的是回答写到一半断掉、日志里仍记成功的请求），所以两台各自的数可信。哪台取不到，比例就是 null。
 function buildSplit(master, worker) {
-  const base = { total: null, idle: false, masterPercent: null, workerPercent: null, verified: SPLIT_VERIFIED };
-  if (!SPLIT_VERIFIED || master.requests60s === null || worker.requests60s === null) return base;
-  return { ...base, ...computeSplit(master.requests60s, worker.requests60s) };
+  const base = { total: null, idle: false, masterPercent: null, workerPercent: null };
+  if (!master.requests || !worker.requests) return base;
+  return { ...base, ...computeSplit(master.requests.total, worker.requests.total) };
+}
+
+// 这台的失败是不是明显比另一台多（规则见文件开头）。哪台取不到、哪台没有请求，都不比。
+function failureGap(node, other) {
+  const a = node.requests;
+  const b = other.requests;
+  if (!a || !b || a.total === 0 || b.total === 0) return null;
+  const rate = (100 * a.failed) / a.total;
+  const otherRate = (100 * b.failed) / b.total;
+  if (a.failed < FAIL_MIN_COUNT || rate < FAIL_MIN_RATE || otherRate * 2 > rate) return null;
+  return { rate: roundTo(rate, 1), otherRate: roundTo(otherRate, 1) };
+}
+
+// 失败明显比另一台多：算这台服务异常（客户会受影响），写进它的问题列表
+function markFailureGaps(nodes) {
+  for (const [role, otherRole] of [['master', 'worker'], ['worker', 'master']]) {
+    const node = nodes[role];
+    const other = nodes[otherRole];
+    node.failureGap = failureGap(node, other);
+    if (!node.failureGap) continue;
+    node.problems.push(`近 5 分钟失败 ${node.requests.failed} / ${node.requests.total}（${node.failureGap.rate}%），`
+      + `明显比${other.label}（${node.failureGap.otherRate}%）多`);
+    if (node.state === 'online') node.state = 'degraded';
+  }
 }
 
 // 在线的节点里，有任何一项取不到
 function hasGaps(node) {
   return node.cpuPercent === null || node.memory === null || node.disk === null
-    || node.containers === null || node.sub2apiOk === null || node.requests60s === null;
+    || node.containers === null || node.sub2apiOk === null || node.requests === null;
 }
 
 function summarize(view) {
@@ -230,7 +270,8 @@ function summarize(view) {
   const partial = nodes.filter(hasGaps).map(n => n.label);
   if (view.link.state === 'unknown') partial.push('隧道');
   if (partial.length) return { level: 'unknown', text: `${partial.join('、')}部分数据取不到` };
-  if (nodes.some(n => n.warnings.length)) return { level: 'warn', text: '资源占用偏高' };
+  const warned = nodes.flatMap(n => n.warnings.map(w => `${n.label}${w}`));
+  if (warned.length) return { level: 'warn', text: warned.length > 1 ? `${warned[0]} 等 ${warned.length} 项` : warned[0] };
   return { level: 'ok', text: '运行正常' };
 }
 
@@ -254,6 +295,7 @@ function buildView(result, nowMs) {
     master: buildNode('master', rawNodes.master, hub, nowMs),
     worker: buildNode('worker', rawNodes.worker, hub, nowMs),
   };
+  markFailureGaps(nodes);
   const view = {
     hub,
     nodes,
@@ -304,6 +346,12 @@ function diagnostics(view) {
         bad.length ? bad.map(c => `${c.name}（${c.state === 'missing' ? '不存在' : c.state}）`).join('，')
           : `${node.containers.length} 个都在运行`);
     }
+    const r = node.requests;
+    const requestItem = `${name} · 客户请求（近 5 分钟）`;
+    if (!r) add(requestItem, 'UNKNOWN', '取不到');
+    else if (node.failureGap) {
+      add(requestItem, 'FAIL', `失败 ${r.failed} / ${r.total}（${node.failureGap.rate}%），明显比另一台（${node.failureGap.otherRate}%）多`);
+    } else add(requestItem, 'PASS', r.total ? `接了 ${r.total} 个，失败 ${r.failed} 个` : '近 5 分钟没有请求');
     const readings = [['CPU', node.cpuPercent], ['内存', node.memory && node.memory.percent], ['磁盘', node.disk && node.disk.percent]];
     const missing = readings.filter(([, v]) => v === null || v === undefined).map(([item]) => item);
     if (node.warnings.length) add(`${name} · 资源`, 'WARN', node.warnings.join('，'));
@@ -316,12 +364,11 @@ function diagnostics(view) {
   else if (link.state === 'down') add('两台之间的隧道', 'FAIL', '连不上副节点的端口（隧道可能断了，或副节点不通）');
   else add('两台之间的隧道', 'UNKNOWN', link.error || '取不到');
   const split = view.split;
-  if (!split.verified) add('近 1 分钟分流', 'UNKNOWN', '暂不显示：副节点的日志还没和数据库对账');
-  else if (split.total === null) add('近 1 分钟分流', 'UNKNOWN', '取不到');
-  else if (split.idle) add('近 1 分钟分流', 'PASS', '近 1 分钟没有请求');
+  if (split.total === null) add('近 5 分钟分流', 'UNKNOWN', '取不到');
+  else if (split.idle) add('近 5 分钟分流', 'PASS', '近 5 分钟没有请求');
   else if (split.total >= 10 && (split.masterPercent === 0 || split.workerPercent === 0)) {
-    add('近 1 分钟分流', 'WARN', `只有一台在接请求（主 ${split.masterPercent}% / 副 ${split.workerPercent}%）`);
-  } else add('近 1 分钟分流', 'PASS', `主 ${split.masterPercent}% / 副 ${split.workerPercent}%`);
+    add('近 5 分钟分流', 'WARN', `只有一台在接请求（主 ${split.masterPercent}% / 副 ${split.workerPercent}%）`);
+  } else add('近 5 分钟分流', 'PASS', `主 ${split.masterPercent}% / 副 ${split.workerPercent}%`);
   return checks;
 }
 
@@ -331,12 +378,12 @@ function evaluateAlerts(prevState, view) {
   const state = { counts: { ...((prevState && prevState.counts) || {}) }, active: { ...((prevState && prevState.active) || {}) } };
   const alerts = [];
 
-  function observe(key, bad, { confirm = CONFIRM_POLLS, title, recoverTitle, lines = [] }) {
+  function observe(key, bad, { confirm = CONFIRM_POLLS, level = 'down', title, recoverTitle, lines = [] }) {
     if (bad) {
       state.counts[key] = (state.counts[key] || 0) + 1;
       if (state.counts[key] >= confirm && !state.active[key]) {
         state.active[key] = true;
-        alerts.push({ key, level: 'down', title, lines });
+        alerts.push({ key, level, title, lines });
       }
     } else {
       state.counts[key] = 0;
@@ -385,6 +432,20 @@ function evaluateAlerts(prevState, view) {
       recoverTitle: `${L}的数据恢复更新`,
     });
     if (node.reachable !== true || node.stale) continue;  // 离线、没配置、数据过期：其余指标不作判断
+    const other = K === 'master' ? view.nodes.worker : view.nodes.master;
+    // 失败明显比另一台多：两台的数都读到了才判断，读不到的那一轮原地不动
+    if (node.requests && other.requests) {
+      const gap = node.failureGap;
+      observe(`${K}.failures`, Boolean(gap), {
+        title: `${L}的请求失败明显比${other.label}多`,
+        recoverTitle: `${L}的请求失败恢复正常`,
+        lines: gap ? [
+          `近 5 分钟：${L}失败 ${node.requests.failed} / ${node.requests.total}（${gap.rate}%），`
+            + `${other.label}失败 ${other.requests.failed} / ${other.requests.total}（${gap.otherRate}%）`,
+          '两台用的是同一批上游账号，只有一台变差，多半是这台机器自己出了问题',
+        ] : [],
+      });
+    }
     if (node.sub2apiOk !== null) {
       observe(`${K}.sub2api`, node.sub2apiOk === false, {
         title: `${L}的 Sub2API 没有响应`,
@@ -513,7 +574,6 @@ function createBusinessReader({ load, now = Date.now, cacheMs = BUSINESS_CACHE_M
 }
 
 module.exports = {
-  SPLIT_VERIFIED,
   computeSplit,
   CACHE_MS,
   STALE_AFTER_MS,
