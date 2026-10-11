@@ -22,6 +22,8 @@ const ROLE_NAMES = { master: '主节点', worker: '副节点' };
 // 两台用的是同一批上游账号，一起变差多半是上游的问题（主看板和自动换号会处理）；只有一台差，多半是这台机器自己的问题。
 const FAIL_MIN_COUNT = 5;
 const FAIL_MIN_RATE = 20;
+// 本月流量用到额度的这么多，提醒一次（不响铃）
+const TRAFFIC_ALERT_PERCENT = 80;
 const INTERNAL_USER_IDS = '1, 8';     // 和主看板一样：这两个是内部账号，客户消费不计入
 
 class HubError extends Error {}
@@ -44,6 +46,19 @@ function pickNumbers(raw, keys) {
   const out = {};
   for (const key of keys) out[key] = numberOrNull(raw[key]);
   return out;
+}
+
+// 连外网那块网卡开机以来收发的总字节数，外加开机时间（中转塔台靠它算每天的流量）
+function pickNet(raw) {
+  if (!isObject(raw) || typeof raw.iface !== 'string' || !raw.iface) return null;
+  const rxBytes = numberOrNull(raw.rxBytes);
+  const txBytes = numberOrNull(raw.txBytes);
+  if (rxBytes === null || txBytes === null || rxBytes < 0 || txBytes < 0) return null;
+  return { iface: raw.iface.slice(0, 32), rxBytes, txBytes, bootAt: numberOrNull(raw.bootAt) };
+}
+
+function fmtGb(bytes) {
+  return `${(bytes / 1e9).toFixed(1)} GB`;
 }
 
 // 近 5 分钟的客户请求：接了多少、失败多少、成功的一般多久回完。接了多少、失败多少缺一个，就整个当成取不到。
@@ -138,8 +153,9 @@ function buildNode(role, raw, hub, nowMs) {
       : null,
     sub2apiOk: typeof node.sub2apiOk === 'boolean' ? node.sub2apiOk : null,
     requests: pickRequests(node.requests),
+    net: pickNet(node.net),
   } : {
-    cpuPercent: null, memory: null, disk: null, loadAvg: null, containers: null, sub2apiOk: null, requests: null,
+    cpuPercent: null, memory: null, disk: null, loadAvg: null, containers: null, sub2apiOk: null, requests: null, net: null,
   };
 
   const notRunning = parsed.containers ? parsed.containers.filter(c => c.state !== 'running') : [];
@@ -244,7 +260,7 @@ function markFailureGaps(nodes) {
 // 在线的节点里，有任何一项取不到
 function hasGaps(node) {
   return node.cpuPercent === null || node.memory === null || node.disk === null
-    || node.containers === null || node.sub2apiOk === null || node.requests === null;
+    || node.containers === null || node.sub2apiOk === null || node.requests === null || node.net === null;
 }
 
 function summarize(view) {
@@ -301,6 +317,7 @@ function buildView(result, nowMs) {
     nodes,
     link: buildLink(snapshot ? snapshot.link : null, hub),
     split: buildSplit(nodes.master, nodes.worker),
+    traffic: null,  // 每天、每月的流量由中转塔台自己记，server.js 把汇总放进来（cluster-traffic.js）
   };
   view.summary = summarize(view);
   return view;
@@ -369,6 +386,18 @@ function diagnostics(view) {
   else if (split.total >= 10 && (split.masterPercent === 0 || split.workerPercent === 0)) {
     add('近 5 分钟分流', 'WARN', `只有一台在接请求（主 ${split.masterPercent}% / 副 ${split.workerPercent}%）`);
   } else add('近 5 分钟分流', 'PASS', `主 ${split.masterPercent}% / 副 ${split.workerPercent}%`);
+  const traffic = view.traffic;
+  if (traffic && traffic.quotaGb) {
+    for (const node of [view.nodes.master, view.nodes.worker]) {
+      const t = traffic.nodes && traffic.nodes[node.role];
+      const item = `${node.label} · 本月流量`;
+      if (!t || t.percent === null) add(item, 'UNKNOWN', '还没有记录');
+      else {
+        add(item, t.percent >= TRAFFIC_ALERT_PERCENT ? 'WARN' : 'PASS',
+          `已用 ${fmtGb(t.month.total)}，是额度 ${traffic.quotaGb} GB 的 ${t.percent}%`);
+      }
+    }
+  }
   return checks;
 }
 
@@ -413,6 +442,24 @@ function evaluateAlerts(prevState, view) {
     recoverTitle: '监控中台恢复正常',
     lines: [view.hub.error ? `原因：${view.hub.error}` : '超过 1 分钟没有新数据'],
   });
+  // 流量额度：本月用到 80% 提醒一次（不响铃）。数字是中转塔台自己记的，中台暂时连不上也照样能判断。
+  // 降回 80% 以下（进了新的计费月，或者额度调高了）说一声。
+  const traffic = view.traffic;
+  for (const role of ['master', 'worker']) {
+    const t = traffic && traffic.nodes ? traffic.nodes[role] : null;
+    if (!t || t.percent === null || t.percent === undefined) continue;
+    const key = `${role}.traffic`;
+    const L = view.nodes[role].label;
+    if (!state.active[key] && t.percent >= TRAFFIC_ALERT_PERCENT) {
+      state.active[key] = true;
+      alerts.push({ key, level: 'warn', title: `${L}本月流量已经用了 ${t.percent}%`,
+        lines: [`已用 ${fmtGb(t.month.total)}，额度 ${traffic.quotaGb} GB，每月 ${traffic.resetDay} 号重置`] });
+    } else if (state.active[key] && t.percent < TRAFFIC_ALERT_PERCENT) {
+      state.active[key] = false;
+      alerts.push({ key, level: 'recovered', title: `${L}的流量回到额度的 ${TRAFFIC_ALERT_PERCENT}% 以下`, lines: [] });
+    }
+  }
+
   if (hubBad) return { state, alerts };  // 中台连不上或数据过期：节点和隧道的判断没有依据，全部原地不动
 
   for (const node of [view.nodes.master, view.nodes.worker]) {

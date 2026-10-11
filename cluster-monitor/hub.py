@@ -76,6 +76,8 @@ def load_settings(env=None):
             'expect_containers': common.split_list(env.get('MASTER_EXPECT_CONTAINERS', '')),
             'sub2api_health_url': env.get('MASTER_SUB2API_HEALTH_URL', ''),
             'request_container': env.get('MASTER_REQUEST_CONTAINER', ''),
+            # 统计流量的网卡；不填就用默认路由走的那块（连外网的）
+            'net_iface': (env.get('MASTER_NET_IFACE') or '').strip(),
         },
         'worker': {
             'label': env.get('WORKER_LABEL', '副节点'),
@@ -102,6 +104,7 @@ def empty_node(label, reachable, error, now_ms):
         'sub2apiOk': None,
         'requests': None,
         'requests60s': None,
+        'net': None,
     }
 
 

@@ -9,7 +9,7 @@
   <title>中转塔台 · Relay Tower | 智能上游调度与利润风控中控台</title>
   <link rel="icon" type="image/png" href="favicon.png?v=20261004-mark">
   <link rel="shortcut icon" href="favicon.ico?v=20261004-mark">
-  <link rel="stylesheet" href="style.css?v=20261001_usage_group">
+  <link rel="stylesheet" href="style.css?v=20261011_cluster_traffic">
 </head>
 <body>
   <div class="app-layout">
@@ -2297,6 +2297,19 @@
           </div>
           <div id="clusterNodes" class="cluster-nodes"></div>
           <div id="clusterLink" class="cluster-link"></div>
+          <div class="cluster-section-title cluster-traffic-title">
+            <span id="clusterTrafficHead">流量（收 + 发）</span>
+            <button id="btnEditClusterSettings" class="btn btn-secondary cluster-small-btn" type="button">改额度</button>
+          </div>
+          <div id="clusterTrafficSettings" class="cluster-settings" style="display: none;">
+            <label>每台每月流量额度 <input id="clusterQuotaInput" type="number" min="0" step="1" inputmode="numeric"> GB</label>
+            <label>每月 <input id="clusterResetDayInput" type="number" min="1" max="31" step="1" inputmode="numeric"> 号重置</label>
+            <button id="btnSaveClusterSettings" class="btn btn-primary cluster-small-btn" type="button">保存</button>
+            <button id="btnCancelClusterSettings" class="btn btn-secondary cluster-small-btn" type="button">取消</button>
+            <span id="clusterSettingsMsg" class="cluster-settings-msg"></span>
+            <div class="cluster-settings-hint">照买服务器的后台写的填，1 TB 就填 1000。空着或填 0 表示不设额度。这里的流量是收 + 发合计。</div>
+          </div>
+          <div id="clusterTraffic" class="cluster-traffic"></div>
           <div class="cluster-section-title">今日业务（来自中转塔台的数据库）</div>
           <div id="clusterBusiness" class="cluster-business"></div>
           <div id="clusterChecksWrap" class="cluster-checks-wrap" style="display: none;">
@@ -2308,6 +2321,6 @@
     </div>
 
   <script src="app.js?v=20261009_switch_tags"></script>
-  <script src="cluster-view.js?v=20261009_cluster"></script>
+  <script src="cluster-view.js?v=20261011_cluster_traffic"></script>
 </body>
 </html>

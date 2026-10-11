@@ -29,6 +29,8 @@ const UPSTREAM_MODELS_CACHE_FILE = path.join(DATA_DIR, 'upstream_models_cache.js
 const UPSTREAM_GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
 const UPSTREAM_KEY_STATE_FILE = path.join(DATA_DIR, 'upstream_key_state.json');
 const ADMIN_WATCH_FILE = path.join(DATA_DIR, 'admin_watch_state.json');
+const CLUSTER_TRAFFIC_FILE = path.join(DATA_DIR, 'cluster_traffic.json');
+const CLUSTER_SETTINGS_FILE = path.join(DATA_DIR, 'cluster_settings.json');
 const DATA_DIR_MODE = 0o700;
 const RUNTIME_DATA_FILE_MODE = 0o600;
 
@@ -170,6 +172,7 @@ const SSH_USER = process.env.SSH_USER || 'root';
 const auth = IS_CONTROL_PLANE_WORKER ? null : require('./auth');
 const telegram = IS_CONTROL_PLANE_WORKER ? null : require('./telegram');
 const clusterStatus = require('./cluster-status');
+const clusterTraffic = require('./cluster-traffic');
 const adminWatch = require('./admin-watch');
 // 双机集群：中台地址和令牌只从环境变量来，没配置就显示「未配置」；浏览器拿不到它们
 const clusterClient = clusterStatus.createClusterClient({
@@ -179,6 +182,44 @@ const clusterClient = clusterStatus.createClusterClient({
 const clusterBusiness = clusterStatus.createBusinessReader({
   load: async () => clusterStatus.parseBusinessOutput(await execPsqlAsync(clusterStatus.BUSINESS_SQL)),
 });
+// 双机集群的流量：报警轮询每分钟记一次，按天累加存在数据目录里；每月额度和重置日也存在数据目录里。
+// 只在主进程里读写（控制面子进程不跑轮询，也不处理网页请求）。
+let clusterTrafficState = null;
+let clusterSettingsCache = null;
+let clusterLatestView = null;  // 报警轮询最近一次看到的集群状态，每日简报用
+
+function clusterTrafficData() {
+  if (!clusterTrafficState) {
+    try {
+      clusterTrafficState = clusterTraffic.normalizeState(readJSON(CLUSTER_TRAFFIC_FILE, null));
+    } catch (error) {
+      console.error('[双机集群流量] 读不了记录文件，从头开始：', error.message);
+      clusterTrafficState = clusterTraffic.emptyState();
+    }
+  }
+  return clusterTrafficState;
+}
+
+function clusterSettings() {
+  if (!clusterSettingsCache) {
+    try {
+      clusterSettingsCache = clusterTraffic.normalizeSettings(readJSON(CLUSTER_SETTINGS_FILE, null));
+    } catch (error) {
+      console.error('[双机集群流量] 读不了额度设置：', error.message);
+      return clusterTraffic.normalizeSettings(null);
+    }
+  }
+  return clusterSettingsCache;
+}
+
+function clusterTrafficSummary(now = Date.now()) {
+  return clusterTraffic.summarize(clusterTrafficData(), now, clusterSettings());
+}
+
+function recordClusterTraffic(view, now) {
+  clusterTrafficState = clusterTraffic.recordReadings(clusterTrafficData(), clusterTraffic.readingsFromView(view), now);
+  writeJSON(CLUSTER_TRAFFIC_FILE, clusterTrafficState);
+}
 // 等一件事最多 ms 毫秒，超时给备用值；计时器用完即清
 function withTimeout(promise, ms, fallback) {
   let timer = null;
@@ -1071,8 +1112,23 @@ function buildDailyDigestData(now = Date.now()) {
     switches,
     exhausted,
     lowBalance,
-    newKeys: recent.filter(a => a.type === 'upstream_key').length
+    newKeys: recent.filter(a => a.type === 'upstream_key').length,
+    cluster: buildClusterDigest(now)
   };
+}
+
+// 每日简报里的双机集群：昨天两台各用了多少流量，本月用了额度的百分之几。没配置中台就不写。
+function buildClusterDigest(now) {
+  if (!clusterClient.configured) return null;
+  const summary = clusterTrafficSummary(now);
+  const nodes = clusterLatestView ? clusterLatestView.nodes : {};
+  const traffic = ['master', 'worker'].map(role => {
+    const t = summary.nodes[role];
+    if (!t || !t.yesterday) return null;
+    const label = (nodes[role] && nodes[role].label) || (role === 'master' ? '主节点' : '副节点');
+    return { label, yesterday: t.yesterday.total, partial: t.yesterdayPartial, percent: t.percent };
+  }).filter(Boolean);
+  return { traffic };
 }
 
 let dailyDigestSending = false;
@@ -1106,7 +1162,12 @@ function startClusterAlertPoller() {
   const tick = async () => {
     try {
       const result = await clusterClient.getStatus({ force: true });
-      const evaluated = clusterStatus.evaluateAlerts(alertState, clusterStatus.buildView(result, Date.now()));
+      const now = Date.now();
+      const view = clusterStatus.buildView(result, now);
+      recordClusterTraffic(view, now);
+      view.traffic = clusterTrafficSummary(now);
+      clusterLatestView = view;
+      const evaluated = clusterStatus.evaluateAlerts(alertState, view);
       alertState = evaluated.state;
       for (const alert of evaluated.alerts) {
         const sent = await telegram.notifyClusterAlert(alert);
@@ -10391,6 +10452,7 @@ COMMIT;`;
       wantBusiness ? withTimeout(clusterBusiness.get(), 4000, null) : Promise.resolve(undefined),
     ]);
     const view = clusterStatus.buildView(result, Date.now());
+    if (wantBusiness) view.traffic = clusterTrafficSummary();
     const body = { success: true, configured: clusterClient.configured, view };
     if (business !== undefined) body.business = business;
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -10402,8 +10464,28 @@ COMMIT;`;
   if (pathname === '/api/cluster/diagnostics/run' && req.method === 'POST') {
     const result = await clusterClient.getStatus();
     const view = clusterStatus.buildView(result, Date.now());
+    view.traffic = clusterTrafficSummary();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ success: true, timestamp: new Date().toISOString(), checks: clusterStatus.diagnostics(view) }));
+    return;
+  }
+
+  // 双机集群：每台每月的流量额度和每月几号重置。存在数据目录里，空着或 0 表示不设额度。
+  if (pathname === '/api/cluster/settings' && req.method === 'POST') {
+    const parsed = clusterTraffic.parseSettingsInput(await getBody());
+    if (!parsed.ok) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, message: parsed.error }));
+      return;
+    }
+    if (!writeJSON(CLUSTER_SETTINGS_FILE, parsed.settings)) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, message: '保存失败：写不进数据目录' }));
+      return;
+    }
+    clusterSettingsCache = clusterTraffic.normalizeSettings(parsed.settings);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ success: true, settings: clusterSettingsCache }));
     return;
   }
 

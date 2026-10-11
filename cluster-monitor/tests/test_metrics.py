@@ -232,6 +232,53 @@ class CustomerRequestTests(unittest.TestCase):
         self.assertEqual(metrics.request_stats('sub2api', run=run, now=lambda: NOW)['total'], 2)
 
 
+ROUTE_TABLE = '\n'.join([
+    'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT',
+    'eth0\t00000000\t0102000A\t0003\t0\t0\t100\t00000000\t0\t0\t0',
+    'eth1\t00000000\t0103000A\t0003\t0\t0\t50\t00000000\t0\t0\t0',
+    'eth2\t00000000\t0104000A\t0000\t0\t0\t0\t00000000\t0\t0\t0',   # 没启用的路由不算
+    'wg0\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0',     # 不是默认路由
+    '',
+])
+
+
+def fake_sysfs(test, iface='eth0', rx=123456789, tx=987654321):
+    base = tempfile.mkdtemp()
+    test.addCleanup(lambda: __import__('shutil').rmtree(base, ignore_errors=True))
+    os.makedirs(os.path.join(base, iface, 'statistics'))
+    for name, value in (('rx_bytes', rx), ('tx_bytes', tx)):
+        with open(os.path.join(base, iface, 'statistics', name), 'w') as f:
+            f.write('%d\n' % value)
+    return base
+
+
+class NetTests(unittest.TestCase):
+    def test_the_default_route_with_the_lowest_metric_wins(self):
+        self.assertEqual(metrics.default_route_iface(write_file(self, ROUTE_TABLE)), 'eth1')
+
+    def test_no_default_route_is_an_error_not_a_guess(self):
+        only_local = '\n'.join(ROUTE_TABLE.splitlines()[:1] + ROUTE_TABLE.splitlines()[4:5]) + '\n'
+        self.assertIsNone(metrics.safe(metrics.default_route_iface)(write_file(self, only_local)))
+
+    def test_boot_time_comes_from_btime(self):
+        self.assertEqual(metrics.read_boot_time(write_file(self, 'cpu  1 2 3 4\nbtime 1700001234\nprocesses 9\n')), 1700001234)
+        self.assertIsNone(metrics.safe(metrics.read_boot_time)(write_file(self, 'cpu  1 2 3 4\n')))
+
+    def test_counters_of_the_internet_facing_card_and_the_boot_time(self):
+        base = fake_sysfs(self, 'eth1')
+        result = metrics.read_net(base=base, route_path=write_file(self, ROUTE_TABLE), stat_path=write_file(self, 'btime 1700000000\n'))
+        self.assertEqual(result, {'iface': 'eth1', 'rxBytes': 123456789, 'txBytes': 987654321, 'bootAt': 1700000000})
+
+    def test_a_configured_card_is_used_as_is(self):
+        base = fake_sysfs(self, 'ens3', rx=5, tx=6)
+        result = metrics.read_net('ens3', base=base, route_path='/nonexistent', stat_path=write_file(self, 'btime 1\n'))
+        self.assertEqual((result['iface'], result['rxBytes'], result['txBytes']), ('ens3', 5, 6))
+
+    def test_a_card_name_that_could_point_elsewhere_is_refused(self):
+        for bad in ('../../etc', 'eth0/../x', '', 'a' * 16):
+            self.assertIsNone(metrics.safe(metrics.read_iface_counters)(bad), bad)
+
+
 class ProbeTcpTests(unittest.TestCase):
     def test_a_listening_port_is_up(self):
         with socket.socket() as server:
@@ -300,6 +347,7 @@ class NodeFactsTests(unittest.TestCase):
             'containers': lambda expected: None,
             'probe': lambda url: False,
             'requests': lambda container: None,
+            'net': lambda iface: None,
         }
 
     def test_unreadable_values_stay_none_and_a_down_service_is_false(self):
@@ -307,7 +355,7 @@ class NodeFactsTests(unittest.TestCase):
                     'expect_containers': ['sub2api']}
         node = metrics.node_facts(settings, FakeCpu(None), 1000, self.failing_sources())
         self.assertTrue(node['reachable'])
-        for key in ('cpuPercent', 'memory', 'disk', 'loadAvg', 'containers', 'requests', 'requests60s'):
+        for key in ('cpuPercent', 'memory', 'disk', 'loadAvg', 'containers', 'requests', 'requests60s', 'net'):
             self.assertIsNone(node[key], key)
         self.assertIs(node['sub2apiOk'], False)
 
@@ -317,6 +365,13 @@ class NodeFactsTests(unittest.TestCase):
         self.assertIsNone(node['sub2apiOk'])
         self.assertIsNone(node['requests'])
         self.assertIsNone(node['requests60s'])
+
+    def test_the_network_card_setting_is_passed_and_empty_means_automatic(self):
+        seen = []
+        sources = dict(self.failing_sources(), net=lambda iface: seen.append(iface))
+        metrics.node_facts({'net_iface': 'ens3'}, FakeCpu(1.0), 1000, sources)
+        metrics.node_facts({'net_iface': ''}, FakeCpu(1.0), 1000, sources)
+        self.assertEqual(seen, ['ens3', None])
 
     def test_the_old_one_minute_count_comes_from_the_five_minute_reading(self):
         sources = dict(self.failing_sources(), requests=lambda container: {

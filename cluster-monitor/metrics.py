@@ -15,7 +15,10 @@ import urllib.request
 
 PROC_STAT = '/proc/stat'
 PROC_MEMINFO = '/proc/meminfo'
+PROC_NET_ROUTE = '/proc/net/route'
 SYSFS_NET = '/sys/class/net'
+# 网卡名只允许这些字符（内核的上限是 15 个字符），免得配置里的名字被拼成别的路径
+IFACE_NAME = re.compile(r'^[A-Za-z0-9_.:@-]{1,15}$')
 # 每个请求结束时，Sub2API 写一行「请求完成」，只数这一行。
 # 同一个请求还会写别的日志行（比如转发上游时），里面也带着 path，数它们会重复计数。
 REQUEST_DONE_MARK = 'http request completed'
@@ -220,10 +223,49 @@ def probe_tcp(host, port, source_ip=None, timeout=2.0, connect=socket.create_con
 
 
 def read_iface_counters(iface, base=SYSFS_NET):
+    if not IFACE_NAME.match(iface or ''):
+        raise ValueError('网卡名不对')
+
     def read(name):
         with open(os.path.join(base, iface, 'statistics', name)) as f:
             return int(f.read().strip())
     return {'rxBytes': read('rx_bytes'), 'txBytes': read('tx_bytes')}
+
+
+def default_route_iface(path=PROC_NET_ROUTE):
+    """默认路由走的网卡，也就是连外网的那块。有几条默认路由时，取优先级最高（metric 最小）的。"""
+    best = None
+    with open(path) as f:
+        next(f, None)  # 表头
+        for line in f:
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            iface, destination, flags, metric, mask = fields[0], fields[1], int(fields[3], 16), int(fields[6]), fields[7]
+            if destination == '00000000' and mask == '00000000' and flags & 0x1:  # 0x1：这条路由是启用的
+                if best is None or metric < best[1]:
+                    best = (iface, metric)
+    if best is None:
+        raise ValueError('没有默认路由')
+    return best[0]
+
+
+def read_boot_time(path=PROC_STAT):
+    """这台机器开机的时间（秒）。"""
+    with open(path) as f:
+        for line in f:
+            if line.startswith('btime '):
+                return int(line.split()[1])
+    raise ValueError('/proc/stat 里没有开机时间')
+
+
+def read_net(iface=None, base=SYSFS_NET, route_path=PROC_NET_ROUTE, stat_path=PROC_STAT):
+    """连外网那块网卡开机以来收、发的总字节数，外加开机时间。
+    每天、每月用了多少，由中转塔台每分钟记一次、前后相减算出来；重启后计数器会清零，塔台靠开机时间认出来。
+    iface 不填就用默认路由走的那块网卡。"""
+    name = iface or default_route_iface(route_path)
+    counters = read_iface_counters(name, base)
+    return {'iface': name, 'rxBytes': counters['rxBytes'], 'txBytes': counters['txBytes'], 'bootAt': read_boot_time(stat_path)}
 
 
 def default_sources(run=subprocess.run):
@@ -235,6 +277,7 @@ def default_sources(run=subprocess.run):
         'containers': lambda expected: safe(read_containers)(expected, run=run),
         'probe': probe_http,
         'requests': lambda container: safe(request_stats)(container, run=run),
+        'net': safe(read_net),
     }
 
 
@@ -255,4 +298,5 @@ def node_facts(settings, cpu, now_ms, sources):
         'requests': requests,
         # 老版本的中转塔台只认近 1 分钟的条数，先留着，两边不用同时升级
         'requests60s': requests['last60s'] if requests else None,
+        'net': sources['net'](settings.get('net_iface') or None),
     }

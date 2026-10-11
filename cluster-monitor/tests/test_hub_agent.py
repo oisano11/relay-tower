@@ -24,6 +24,7 @@ def fake_master_sources():
         'containers': lambda expected: [{'name': name, 'state': 'running'} for name in expected],
         'probe': lambda url: True,
         'requests': lambda container: {'windowSeconds': 300, 'total': 31, 'failed': 1, 'medianLatencyMs': 2500, 'last60s': 7},
+        'net': lambda iface: {'iface': 'eth0', 'rxBytes': 10, 'txBytes': 20, 'bootAt': 1600000000},
     }
 
 
@@ -82,6 +83,8 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             hub.load_settings({'HUB_TOKEN': TOKEN, 'HUB_BIND': '::'})
         settings = hub.load_settings({'HUB_TOKEN': TOKEN, 'HUB_BIND': '172.22.0.1'})
+        self.assertEqual(settings['master']['net_iface'], '')
+        self.assertEqual(hub.load_settings(hub_env(MASTER_NET_IFACE='ens3'))['master']['net_iface'], 'ens3')
         self.assertEqual(settings['bind'], '172.22.0.1')
         self.assertEqual(settings['port'], 8899)
         self.assertEqual(settings['interval'], 10)
@@ -104,6 +107,8 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             agent.load_settings({})
         settings = agent.load_settings({'AGENT_TOKEN': WORKER_TOKEN})
+        self.assertEqual(settings['net_iface'], '')
+        self.assertEqual(agent.load_settings({'AGENT_TOKEN': WORKER_TOKEN, 'AGENT_NET_IFACE': ' ens3 '})['net_iface'], 'ens3')
         self.assertEqual(settings['bind'], '127.0.0.1')
         self.assertEqual(settings['port'], 8898)
         self.assertEqual(settings['interval'], 5)
@@ -280,6 +285,7 @@ class CollectorTests(unittest.TestCase):
         self.assertIs(snapshot['nodes']['master']['reachable'], True)
         self.assertEqual(snapshot['nodes']['master']['requests']['total'], 31)
         self.assertEqual(snapshot['nodes']['master']['requests60s'], 7)
+        self.assertEqual(snapshot['nodes']['master']['net']['rxBytes'], 10)
         self.assertIsNone(snapshot['nodes']['worker']['reachable'])
         self.assertEqual(collector.latest(), snapshot)
 
@@ -355,6 +361,7 @@ class AgentTests(ServerCase):
             'containers': lambda expected: None,
             'probe': lambda url: True,
             'requests': lambda container: None,
+            'net': lambda iface: None,
         })
 
     def test_snapshot_needs_the_token_and_returns_the_last_collected_node(self):
@@ -380,6 +387,7 @@ class AgentTests(ServerCase):
         source = self.make_source({
             'memory': lambda: None, 'disk': lambda path: None, 'load': lambda: None,
             'containers': lambda expected: None, 'probe': counting_probe, 'requests': lambda c: None,
+            'net': lambda iface: None,
         })
         source.collect_once()
         base = self.serve(common.make_handler({'/snapshot': agent.snapshot_route(source)}, WORKER_TOKEN))

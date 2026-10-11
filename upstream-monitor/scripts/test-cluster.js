@@ -41,6 +41,7 @@ function healthySnapshot(overrides = {}) {
         loadAvg: [0.1, 0.2, 0.3],
         containers: [{ name: 'sub2api', state: 'running' }],
         sub2apiOk: true, requests: { windowSeconds: 300, total: 150, failed: 1, medianLatencyMs: 9000 }, requests60s: 30, error: null,
+        net: { iface: 'eth0', rxBytes: 5e11, txBytes: 4e11, bootAt: 1700001234 },
       },
       worker: {
         label: '副节点', reachable: true, collectedAt: NOW - 5000, cpuPercent: 4.1,
@@ -49,6 +50,7 @@ function healthySnapshot(overrides = {}) {
         loadAvg: [0.1, 0.1, 0.1],
         containers: [{ name: 'sub2api', state: 'running' }],
         sub2apiOk: true, requests: { windowSeconds: 300, total: 140, failed: 1, medianLatencyMs: 8000 }, requests60s: 10, error: null,
+        net: { iface: 'eth0', rxBytes: 2e10, txBytes: 2e10, bootAt: 1700005678 },
       },
     },
     link: { ok: true, rttMs: 1.2, rxBytes: 1024 * 1024, txBytes: 2 * 1024 * 1024, collectedAt: NOW - 5000, error: null },
@@ -669,4 +671,96 @@ test('after the tunnel comes back, a worker that is still offline is reported on
     fired.push(...out.alerts.map(a => a.title));
   }
   assert.deepEqual(fired, ['两台之间的隧道不通', '两台之间的隧道恢复了', '副节点离线']);
+});
+
+// ---------- 流量 ----------
+
+const traffic = require('../cluster-traffic');
+
+function withTraffic(view, percents, quotaGb = 2000) {
+  const t = { quotaGb, resetDay: 1, period: { start: '2023-11-01', last: '2023-11-30', lengthDays: 30 }, nodes: {} };
+  for (const [role, percent] of Object.entries(percents)) {
+    t.nodes[role] = { percent, month: { total: (percent / 100) * quotaGb * 1e9 } };
+  }
+  return { ...view, traffic: t };
+}
+
+test('the network counters pass through, and a missing or broken reading counts as partly unavailable', () => {
+  const v = cluster.buildView(result(healthySnapshot()), NOW);
+  assert.deepEqual(v.nodes.master.net, { iface: 'eth0', rxBytes: 5e11, txBytes: 4e11, bootAt: 1700001234 });
+  assert.equal(v.summary.text, '运行正常');
+  for (const net of [null, { iface: 'eth0', rxBytes: -1, txBytes: 1 }, { rxBytes: 1, txBytes: 1 }]) {
+    const broken = cluster.buildView(result(withNode(healthySnapshot(), 'worker', { net })), NOW);
+    assert.equal(broken.nodes.worker.net, null, JSON.stringify(net));
+    assert.match(broken.summary.text, /副节点部分数据取不到/);
+  }
+  assert.equal(v.traffic, null, 'the daily numbers are added by the server, not by the hub');
+});
+
+test('traffic quota: a quiet note at 80%, no repeats, and one line when it drops back', () => {
+  const base = cluster.buildView(result(healthySnapshot()), NOW);
+  let out = cluster.evaluateAlerts(null, withTraffic(base, { master: 79.9, worker: 10 }));
+  assert.deepEqual(out.alerts, []);
+  out = cluster.evaluateAlerts(out.state, withTraffic(base, { master: 81.2, worker: 10 }));
+  assert.equal(out.alerts.length, 1);
+  assert.equal(out.alerts[0].level, 'warn', 'quota warnings do not ring');
+  assert.equal(out.alerts[0].title, '主节点本月流量已经用了 81.2%');
+  assert.deepEqual(out.alerts[0].lines, ['已用 1624.0 GB，额度 2000 GB，每月 1 号重置']);
+  out = cluster.evaluateAlerts(out.state, withTraffic(base, { master: 90, worker: 10 }));
+  assert.deepEqual(out.alerts, [], 'still over: no repeat');
+  out = cluster.evaluateAlerts(out.state, withTraffic(cluster.buildView(failedResult(), NOW), { master: 91, worker: 10 }));
+  assert.ok(!out.alerts.some(a => a.key === 'master.traffic'), 'the hub being down does not touch the quota alert');
+  out = cluster.evaluateAlerts(out.state, withTraffic(base, { master: 2, worker: 10 }));
+  assert.deepEqual(out.alerts.map(a => a.title), ['主节点的流量回到额度的 80% 以下']);
+  assert.deepEqual(cluster.evaluateAlerts(null, withTraffic(base, { master: null, worker: null })).alerts, []);
+});
+
+test('diagnostics show this month against the quota only when a quota is set', () => {
+  const base = cluster.buildView(result(healthySnapshot()), NOW);
+  const rows = cluster.diagnostics(withTraffic(base, { master: 85, worker: 3 }));
+  assert.equal(rows.find(c => c.item === '主节点 · 本月流量').status, 'WARN');
+  assert.equal(rows.find(c => c.item === '副节点 · 本月流量').detail, '已用 60.0 GB，是额度 2000 GB 的 3%');
+  assert.ok(!cluster.diagnostics(withTraffic(base, { master: 85 }, null)).some(c => c.item.endsWith('本月流量')));
+});
+
+test('the traffic section: plain words, no record shown as such, 30 bars with today lighter, and escaped labels', () => {
+  const at = Date.parse('2023-11-14T04:00:00Z');
+  let state = traffic.recordReadings(traffic.emptyState(), { master: { iface: 'eth0', rxBytes: 0, txBytes: 0, bootAt: 1 } }, at - 26 * 3600000);
+  state = traffic.recordReadings(state, { master: { iface: 'eth0', rxBytes: 8e9, txBytes: 4e9, bootAt: 1 },
+    link: { iface: 'tunnel', rxBytes: 0, txBytes: 0, bootAt: 1 } }, at);
+  const v = cluster.buildView(result(withNode(healthySnapshot(), 'master', { label: '<b>主</b>' })), NOW);
+  v.traffic = traffic.summarize(state, at, { quotaGb: 2000, resetDay: 1 });
+  const html = view.renderTraffic(v);
+  assert.ok(!html.includes('<b>主'), 'labels are escaped');
+  assert.match(html, /今天<\/span><span>\d+\.\d GB/);
+  assert.match(html, /还没有记录：中控台每分钟记一次/, 'the worker has no record yet');
+  assert.equal((html.match(/class="cluster-bar[ "]/g) || []).length, 30);
+  assert.equal((html.match(/cluster-bar today/g) || []).length, 1);
+  assert.match(html, /11月14日（今天，还没过完）/);
+  assert.match(html, /两台之间的隧道（不算额度）：今天 0 GB · 昨天 没有记录/);
+  assert.doesNotMatch(html, /undefined|NaN|null/);
+  assert.equal(view.trafficHeadText(v), '流量（收 + 发）· 每台每月额度 2000 GB，每月 1 号重置');
+  assert.equal(view.trafficHeadText({ traffic: { quotaGb: null, resetDay: 1 } }), '流量（收 + 发）· 还没设每月额度');
+  assert.match(view.renderTraffic({ traffic: null, nodes: {} }), /流量取不到/);
+  assert.equal(view.fmtBytes(12.34e9), '12.3 GB');
+  assert.equal(view.fmtBytes(1.2e12), '1.20 TB');
+  assert.equal(view.fmtBytes(5e5), '不到 1 MB');
+  assert.equal(view.fmtDay('2026-10-09'), '10月9日');
+});
+
+test('the tunnel line no longer shows running totals since the tunnel came up', () => {
+  const html = view.renderLink(cluster.buildView(result(healthySnapshot()), NOW));
+  assert.doesNotMatch(html, /MB/);
+  assert.match(html, /能通/);
+});
+
+test('the daily digest adds yesterday\'s traffic as a note, and an otherwise quiet day still says all is well', () => {
+  const { api } = telegramBot();
+  const text = api.formatDailyDigest({ dateLabel: '10月12日', cluster: { traffic: [
+    { label: '主节点', yesterday: 12.34e9, partial: false, percent: 3.2 },
+    { label: '副<节点>', yesterday: 8.8e9, partial: true, percent: null },
+  ] } });
+  assert.match(text, /一切正常，没有需要你处理的事。/);
+  assert.match(text, /📶 昨天流量：主节点 12\.3 GB、副&lt;节点&gt; 8\.8 GB（昨天中途才开始记）；本月已用额度：主节点 3\.2%/);
+  assert.doesNotMatch(api.formatDailyDigest({ dateLabel: 'x', cluster: null }), /流量/);
 });

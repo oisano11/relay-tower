@@ -213,6 +213,7 @@ function serverSlice(overrides = {}) {
       saveConfig(next) { Object.assign(this.config, next); }
     },
     upstreamScanner: { getPendingActions: () => [] },
+    clusterClient: { configured: false },
     setInterval: () => ({ unref() {} }),
     ...overrides
   });
@@ -287,6 +288,24 @@ test('daily digest data: 24 h of price changes per account, switches from the lo
   assert.equal(await context.maybeSendDailyDigest(Date.parse('2026-10-05T06:00:00Z')), false, '14:00 Beijing is past the window');
   assert.equal(await context.maybeSendDailyDigest(Date.parse('2026-10-05T00:59:00Z')), false, '08:59 Beijing is too early');
   assert.equal(await context.maybeSendDailyDigest(Date.parse('2026-10-05T01:00:00Z')), true, 'next morning at 9 it goes out again');
+});
+
+test('daily digest data: yesterday\'s traffic per server when the cluster hub is set up, nothing when it is not', () => {
+  const now = Date.parse('2026-10-12T01:30:00Z');
+  const summary = { quotaGb: 2000, resetDay: 1, nodes: {
+    master: { yesterday: { total: 12.3e9 }, yesterdayPartial: false, percent: 3.2 },
+    worker: { yesterday: null, yesterdayPartial: false, percent: 0.1 },
+    link: { yesterday: { total: 7e9 }, yesterdayPartial: false, percent: null },
+  } };
+  const { context } = serverSlice({
+    clusterClient: { configured: true },
+    clusterTrafficSummary: () => summary,
+    clusterLatestView: { nodes: { master: { label: '主机房' }, worker: { label: '副机房' } } },
+  });
+  const data = JSON.parse(JSON.stringify(context.buildDailyDigestData(now)));
+  assert.deepEqual(data.cluster, { traffic: [{ label: '主机房', yesterday: 12.3e9, partial: false, percent: 3.2 }] },
+    'a server without a record for yesterday is left out; the tunnel is not a server');
+  assert.equal(JSON.parse(JSON.stringify(serverSlice().context.buildDailyDigestData(now))).cluster, null);
 });
 
 // ====== upstream_scanner.js：巡检什么时候值得推 ======

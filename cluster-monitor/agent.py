@@ -28,6 +28,8 @@ def load_settings(env=None):
         'expect_containers': common.split_list(env.get('AGENT_EXPECT_CONTAINERS', '')),
         'sub2api_health_url': env.get('AGENT_SUB2API_HEALTH_URL', ''),
         'request_container': env.get('AGENT_REQUEST_CONTAINER', ''),
+        # 统计流量的网卡；不填就用默认路由走的那块（连外网的）
+        'net_iface': (env.get('AGENT_NET_IFACE') or '').strip(),
     }
 
 

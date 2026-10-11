@@ -47,6 +47,21 @@
     return isNumber(ms) ? new Date(ms).toLocaleTimeString('zh-CN', { hour12: false }) : UNKNOWN;
   }
 
+  // 流量：和服务商一样按 1000 进位
+  function fmtBytes(value) {
+    if (!isNumber(value)) return UNKNOWN;
+    if (value >= 1e12) return `${(value / 1e12).toFixed(2)} TB`;
+    if (value >= 1e9) return `${(value / 1e9).toFixed(1)} GB`;
+    if (value >= 1e6) return `${Math.round(value / 1e6)} MB`;
+    return value > 0 ? '不到 1 MB' : '0 GB';
+  }
+
+  // '2026-10-09' → '10月9日'
+  function fmtDay(date) {
+    const parts = String(date || '').split('-').map(Number);
+    return parts.length === 3 && parts.every(Number.isFinite) ? `${parts[1]}月${parts[2]}日` : String(date || '');
+  }
+
   // 一个请求从进来到回完用了多久
   function fmtDuration(ms) {
     if (!isNumber(ms)) return UNKNOWN;
@@ -114,10 +129,69 @@
     const link = view.link;
     const stateText = { ok: '能通', down: '不通', unknown: UNKNOWN }[link.state] || UNKNOWN;
     const rtt = isNumber(link.rttMs) ? `${link.rttMs.toFixed(2)} 毫秒` : UNKNOWN;
-    const mb = value => (isNumber(value) ? `${(value / 1024 / 1024).toFixed(1)} MB` : UNKNOWN);
     const extra = link.error ? ` · ${escapeHtml(link.error)}` : '';
-    return `两台之间的隧道：<strong>${escapeHtml(stateText)}</strong> · 往返 ${escapeHtml(rtt)}
-      · 收 ${escapeHtml(mb(link.rxBytes))} / 发 ${escapeHtml(mb(link.txBytes))}${extra}`;
+    return `两台之间的隧道：<strong>${escapeHtml(stateText)}</strong> · 往返 ${escapeHtml(rtt)}${extra}`;
+  }
+
+  // 流量这一节的标题（纯文字，调用方用 textContent 写入）
+  function trafficHeadText(view) {
+    const t = view.traffic;
+    if (!t) return '流量（收 + 发）';
+    return `流量（收 + 发）· ${t.quotaGb ? `每台每月额度 ${t.quotaGb} GB，每月 ${t.resetDay} 号重置` : '还没设每月额度'}`;
+  }
+
+  // 近 30 天每天的流量：一天一根柱子。开始记录以前的日子没有柱子；今天还没过完，颜色浅一点。
+  function renderBars(label, chart) {
+    if (!Array.isArray(chart) || !chart.length) return '';
+    const values = chart.map(d => (isNumber(d.total) ? d.total : null));
+    const max = Math.max(0, ...values.filter(v => v !== null));
+    const last = chart.length - 1;
+    const bars = chart.map((d, i) => {
+      const v = values[i];
+      const tip = `${fmtDay(d.date)}${i === last ? '（今天，还没过完）' : ''}：${v === null ? '没有记录' : fmtBytes(v)}`;
+      const height = v === null || max === 0 ? 0 : Math.max(3, Math.round((100 * v) / max));
+      const cls = v === null ? ' none' : (i === last ? ' today' : '');
+      return `<span class="cluster-bar${cls}" title="${escapeHtml(tip)}"><span style="height: ${height}%"></span></span>`;
+    }).join('');
+    const peak = max > 0 ? `最多的一天 ${fmtBytes(max)}` : '还没有记录';
+    return `<div class="cluster-bars-wrap">
+      <div class="cluster-bars-caption">近 30 天每天的流量 · ${escapeHtml(peak)}（鼠标停在柱子上看每天的数）</div>
+      <div class="cluster-bars" role="img" aria-label="${escapeHtml(`${label}近 30 天每天的流量，${peak}`)}">${bars}</div>
+      <div class="cluster-bars-axis"><span>${escapeHtml(fmtDay(chart[0].date))}</span><span>今天</span></div>
+    </div>`;
+  }
+
+  function renderTrafficCard(label, n, traffic) {
+    const head = `<div class="cluster-card-head"><strong>${escapeHtml(label)}</strong></div>`;
+    if (!n) {
+      return `<div class="cluster-card">${head}<div class="cluster-traffic-note">还没有记录：中控台每分钟记一次，读到这台机器的数据后开始记。</div></div>`;
+    }
+    const today = n.today ? `${fmtBytes(n.today.total)}${n.todayPartial ? '（今天中途才开始记）' : ''}` : '没有记录';
+    const yesterday = n.yesterday ? `${fmtBytes(n.yesterday.total)}${n.yesterdayPartial ? '（中途才开始记）' : ''}` : '没有记录';
+    const since = n.month.partial ? `，${fmtDay(n.month.since)}起才开始记` : '';
+    const month = n.percent !== null
+      ? renderMeter('本月', n.percent, `${fmtBytes(n.month.total)} / ${traffic.quotaGb} GB${since}`)
+      : renderKv('本月', `${fmtBytes(n.month.total)}${since}`);
+    const projection = n.projectedTotal !== null ? renderKv('照这个速度，本月一共大约', fmtBytes(n.projectedTotal)) : '';
+    return `<div class="cluster-card">${head}
+      ${renderKv('今天', today)}
+      ${renderKv('昨天', yesterday)}
+      ${month}
+      ${projection}
+      ${renderBars(label, n.chart)}
+    </div>`;
+  }
+
+  // 每台每天、每月的流量。数字是中控台自己每分钟记下来的（cluster-traffic.js）
+  function renderTraffic(view) {
+    const t = view.traffic;
+    if (!t || !t.nodes) return `<div class="cluster-traffic-note">流量${UNKNOWN}</div>`;
+    const cards = ['master', 'worker'].map(role => renderTrafficCard(view.nodes[role].label, t.nodes[role], t)).join('');
+    const link = t.nodes.link;
+    const linkLine = link
+      ? `两台之间的隧道（不算额度）：今天 ${link.today ? fmtBytes(link.today.total) : '没有记录'} · 昨天 ${link.yesterday ? fmtBytes(link.yesterday.total) : '没有记录'}`
+      : '';
+    return `<div class="cluster-traffic-cards">${cards}</div>${linkLine ? `<div class="cluster-traffic-link">${escapeHtml(linkLine)}</div>` : ''}`;
   }
 
   function renderSplit(view) {
@@ -183,9 +257,13 @@
 
   return {
     escapeHtml,
+    fmtBytes,
+    fmtDay,
     fmtDuration,
     fmtRequests,
     renderNode,
+    renderTraffic,
+    trafficHeadText,
     renderLink,
     renderSplit,
     renderBusiness,
@@ -219,6 +297,8 @@
     $('clusterFreshness').textContent = view.renderFreshness(data);
     $('clusterNodes').innerHTML = view.renderNode(data.nodes.master) + view.renderNode(data.nodes.worker);
     $('clusterLink').innerHTML = `${view.renderLink(data)}<div>${view.escapeHtml(view.renderSplit(data))}</div>`;
+    $('clusterTrafficHead').textContent = view.trafficHeadText(data);
+    $('clusterTraffic').innerHTML = view.renderTraffic(data);
     $('clusterBusiness').innerHTML = view.renderBusiness(latest.business);
   }
 
@@ -244,6 +324,7 @@
         $('clusterFreshness').textContent = `原因：${error.message}（稍后会自动再试，也可以点刷新）`;
         $('clusterNodes').innerHTML = '';
         $('clusterLink').innerHTML = '';
+        $('clusterTraffic').innerHTML = '';
         $('clusterBusiness').innerHTML = '';
       }
     }
@@ -256,6 +337,42 @@
 
   function closePanel() {
     $('clusterModal').style.display = 'none';
+  }
+
+  // 每月流量额度：填在面板上，存在中控台的数据目录里
+  function openSettings() {
+    const t = latest && latest.view ? latest.view.traffic : null;
+    $('clusterQuotaInput').value = t && t.quotaGb ? String(t.quotaGb) : '';
+    $('clusterResetDayInput').value = t ? String(t.resetDay) : '1';
+    $('clusterSettingsMsg').textContent = '';
+    $('clusterTrafficSettings').style.display = 'flex';
+  }
+
+  function closeSettings() {
+    $('clusterTrafficSettings').style.display = 'none';
+  }
+
+  async function saveSettings() {
+    const button = $('btnSaveClusterSettings');
+    const msg = $('clusterSettingsMsg');
+    button.disabled = true;
+    msg.textContent = '保存中…';
+    try {
+      const res = await fetch('/api/cluster/settings', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quotaGb: $('clusterQuotaInput').value, resetDay: $('clusterResetDayInput').value }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.message || `HTTP ${res.status}`);
+      closeSettings();
+      await load();
+    } catch (error) {
+      msg.textContent = `没保存上：${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
   }
 
   async function runChecks() {
@@ -289,6 +406,9 @@
     bind('btnCloseClusterModal', closePanel);
     bind('btnRefreshCluster', () => load({ fresh: true }));
     bind('btnRunClusterChecks', runChecks);
+    bind('btnEditClusterSettings', openSettings);
+    bind('btnCancelClusterSettings', closeSettings);
+    bind('btnSaveClusterSettings', saveSettings);
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && isPanelOpen()) closePanel();
     });

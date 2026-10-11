@@ -117,6 +117,14 @@ function fmtDuration(ms) {
   return rest ? `${hours} 小时 ${rest} 分` : `${hours} 小时`;
 }
 
+// 流量：和服务商一样按 1000 进位
+function fmtTraffic(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n)) return '?';
+  if (n >= 1e12) return `${(n / 1e12).toFixed(2)} TB`;
+  return `${(n / 1e9).toFixed(1)} GB`;
+}
+
 function fmtMoney(balance, unit) {
   const n = Number(balance);
   if (!Number.isFinite(n)) return '--';
@@ -1319,7 +1327,15 @@ class TelegramBotManager {
     if (d.newKeys) items.push(`🔑 发现 ${d.newKeys} 批还没接入的上游 Key，详见控制台`);
     if (d.pendingCount) items.push(`📝 待你审批 ${d.pendingCount} 项，下方按钮可以直接处理`);
     if (!items.length) items.push('一切正常，没有需要你处理的事。');
-    return [`☀️ <b>中转塔台 · 每日简报</b>（${escapeHtml(d.dateLabel || '')}）`, '过去 24 小时：', ...items].join('\n');
+    // 下面是只供参考的数字，不算「需要你处理的事」
+    const info = [];
+    const traffic = (d.cluster && d.cluster.traffic) || [];
+    if (traffic.length) {
+      const used = traffic.map(t => `${escapeHtml(t.label)} ${fmtTraffic(t.yesterday)}${t.partial ? '（昨天中途才开始记）' : ''}`);
+      const quota = traffic.filter(t => typeof t.percent === 'number').map(t => `${escapeHtml(t.label)} ${t.percent}%`);
+      info.push(`📶 昨天流量：${used.join('、')}${quota.length ? `；本月已用额度：${quota.join('、')}` : ''}`);
+    }
+    return [`☀️ <b>中转塔台 · 每日简报</b>（${escapeHtml(d.dateLabel || '')}）`, '过去 24 小时：', ...items, ...info].join('\n');
   }
 
   async sendDailyDigest(data, pendingActions = []) {
