@@ -129,11 +129,15 @@ END $$;`];
     // 整行复制：to_jsonb + jsonb_populate_record 不依赖具体列清单，兼容不同版本的 Sub2API。
     // 必须用 LATERAL 展开，(func()).* 会对每一列各求值一次，白白消耗序列号。
     // 优先级和接单开关按新账号在它那个分组里的角色来（只有主调接单），不照抄原账号。
+    // API Key 账号打开 Sub2API 的「自动同步倍率」：进价跟着上游真实价格走，利润报表才对得上。
     lines.push(`WITH src AS (
   SELECT to_jsonb(a) || jsonb_build_object(
     'id', nextval(pg_get_serial_sequence('accounts', 'id')),
     'name', ${sqlText(truncateName(copy.name))},
     'notes', COALESCE(to_jsonb(a)->>'notes', '') || ${sqlText(note)},
+    'extra', CASE WHEN a.type = 'apikey'
+      THEN COALESCE(a.extra, '{}'::jsonb) || jsonb_build_object('upstream_billing_probe_enabled', true, 'upstream_billing_rate_sync_enabled', true)
+      ELSE a.extra END,
     'priority', ${priority},
     'schedulable', ${copy.schedulable === true ? 'a.schedulable' : 'false'},
     'created_at', now(), 'updated_at', now(), 'last_used_at', NULL, 'deleted_at', NULL

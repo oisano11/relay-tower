@@ -41,6 +41,8 @@ test('split SQL guards membership, copies the whole row and moves only the copie
   assert.doesNotMatch(sql, /DELETE FROM account_groups WHERE account_id = 7 AND group_id = 102;/, 'the primary group membership is kept');
   assert.match(sql, /'A站-Claude · O''Neil组'/, 'names are SQL-escaped');
   assert.doesNotMatch(sql, /concurrency/, 'concurrency is copied, not changed');
+  // API Key 账号的副本打开「自动同步倍率」，进价跟着上游真实价格走；OAuth 账号原样复制
+  assert.match(sql, /'extra', CASE WHEN a\.type = 'apikey'\s+THEN COALESCE\(a\.extra, '\{\}'::jsonb\) \|\| jsonb_build_object\('upstream_billing_probe_enabled', true, 'upstream_billing_rate_sync_enabled', true\)\s+ELSE a\.extra END/);
 });
 
 test('split copies follow their group role: only mains keep serving, unless a copy is the last server of its group', () => {

@@ -678,3 +678,10 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - **规则怎么定的：** 把两个人工管理分组 8 天的成功和失败记录导出，在本机按分钟回放几组规则（被暂停期间该账号的真实成功数当作「挪给别人的量」，真实失败数当作「省掉的失败」）。最初的「15 分钟失败 5 次、或连续失败 5 次」会在忙碌的号上因为一小段抖动就暂停（例如 15 分钟成功两百多次、失败几次），被否掉；只看「1 小时 0 成功」和「30 分钟失败七成以上」后，暂停次数明显少，被停的大多是真坏的号。短时间的抖动 Sub2API 自己的错误率打分已经会绕开。
 - **测试：** 新文件 `scripts/test-manual-group-guard.js` 27 项（统计 SQL 的过滤条件和整数拼接、判断规则、暂停与三种只提醒、空闲的同组主调、提醒节奏与「好了」、人工接手的五种情况、到点试与加倍、6 小时内再坏加倍、多个坏号、卡住的试探、状态复制；Telegram 四种消息的文字、转义和响不响；`server.js` 接线：真的关、关失败退回、试过放回、试不过继续停、试的途中人工接手、同组合并提醒与分组范围、关掉开关后不查库；控制台开关的回显和保存）；`test-regressions.js` 新增 1 项（`fullStream` 能发现第一帧之后的错误、没有任何文字也算失败，旧代码上失败）。本机用假数据的页面预览看过：暂停账号显示「自动暂停」和提示、告警列表、设置里的开关和保存。
 - **未做：** 部署。
+
+## 新账号、拆分账号默认打开 Sub2API 的「自动同步倍率」（2026-10-17）
+
+- **起因：** 只读核对：开了 `upstream_billing_rate_sync_enabled` 的 API Key 账号，`rate_multiplier` 全部等于上游价格探测的 `effective_rate_multiplier`；没开或没设的账号里有一部分对不上（新建账号默认 1）。财务看板和 `user-usage.js` 的 `EFFECTIVE_COST_SQL` 按 `usage_logs.account_rate_multiplier` / `accounts.rate_multiplier` 算成本，所以这些账号的利润不准。塔台自己的进价（`syncRealSub2APIAccounts` 的 CASE）在探测新鲜时用探测价，过期时退回 `rate_multiplier`（不等于 1 时），于是这类账号的进价在两个数之间来回跳，`ratio_change` 提醒也来回发。
+- **改法：** `upstream-keys.js` 的 `buildConnectSql` 和 `account-split.js` 的拆分 SQL（只对 `type = 'apikey'`）在 `extra` 里写入 `upstream_billing_probe_enabled: true`、`upstream_billing_rate_sync_enabled: true`。Sub2API 只有两个开关都开时才回写倍率（`upstreamBillingRateSyncEnabled`），下一次探测（约 30 分钟一次）生效。
+- **测试：** `test-upstream-keys.js`、`test-account-split.js` 各补断言（旧代码上失败）。生成的 SQL 在本机临时 PostgreSQL 上跑过：API Key 副本和新接入账号带上两个开关，OAuth 副本原样，模板的旧探测结果仍被去掉。
+- **未做（需要单独批准）：** 打开现有账号的开关（线上数据改动）。

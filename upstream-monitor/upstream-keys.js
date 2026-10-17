@@ -281,7 +281,8 @@ WITH src AS (
     'name', ${sqlText(cleanName)},
     'notes', ${sqlText(notes || '')},
     'credentials', ${credentials},
-    'extra', COALESCE(a.extra, '{}'::jsonb) - 'upstream_billing_probe',
+    'extra', (COALESCE(a.extra, '{}'::jsonb) - 'upstream_billing_probe')
+      || jsonb_build_object('upstream_billing_probe_enabled', true, 'upstream_billing_rate_sync_enabled', true),
     'rate_multiplier', ${cost},
     'priority', ${prio},
     'schedulable', ${schedulable ? 'true' : 'false'},

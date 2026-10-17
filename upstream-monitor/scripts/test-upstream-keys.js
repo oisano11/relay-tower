@@ -103,7 +103,9 @@ test('connect SQL copies the template row but replaces the key, cost, role and r
   assert.match(sql, /credentials->>'api_key' = 'sk-it''s'\) THEN\s+RAISE EXCEPTION '这个 Key 已经接入过本站/);
   assert.match(sql, /rate_multiplier FROM groups WHERE id = 3\) <= 0.085/);
   assert.match(sql, /- 'model_mapping'\) \|\| jsonb_build_object\('api_key', 'sk-it''s'\)/);
-  assert.match(sql, /'extra', COALESCE\(a\.extra, '\{\}'::jsonb\) - 'upstream_billing_probe'/);
+  assert.match(sql, /'extra', \(COALESCE\(a\.extra, '\{\}'::jsonb\) - 'upstream_billing_probe'\)/);
+  // 新账号的进价跟着上游真实价格走（Sub2API 的「自动同步倍率」），利润报表才对得上
+  assert.match(sql, /jsonb_build_object\('upstream_billing_probe_enabled', true, 'upstream_billing_rate_sync_enabled', true\)/);
   assert.match(sql, /'priority', 100,\s+'schedulable', false,\s+'status', 'active'/);
   assert.match(sql, /'rate_limited_at', NULL/);
   assert.match(sql, /INSERT INTO account_groups \(account_id, group_id, priority, created_at\)\s+SELECT ins\.id, 3, 100, now\(\) FROM ins\s+RETURNING account_id;/);
