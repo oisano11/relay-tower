@@ -7648,6 +7648,19 @@ function renderFinancialOverview(summary, dailyTrends) {
     yestProfitEl.style.color = yestProfit >= 0 ? '#059669' : '#dc2626';
   }
   setElText('kpiYesterdayMargin', `${Number(summary.yesterdayMarginPercent || 0).toFixed(1)}%`);
+  // 自用花费：内部账号自己用掉的进货钱；「扣掉自用」= 客户毛利 − 自用花费
+  const showNet = (id, value, suffix = '') => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const n = Number(value || 0);
+    el.textContent = `${n >= 0 ? '+' : '-'}¥ ${formatMoney(Math.abs(n))}${suffix}`;
+    el.style.color = n >= 0 ? '#059669' : '#dc2626';
+  };
+  setElText('kpiTodaySelfUse', `¥ ${formatMoney(summary.todaySelfUseCost)}`);
+  setElText('kpiYesterdaySelfUse', `¥ ${formatMoney(summary.yesterdaySelfUseCost)}`);
+  showNet('kpiTodayNet', summary.todayNetProfit);
+  const net7d = Number(summary.past7dNetProfit || 0);
+  showNet('kpiYesterdayNet', summary.yesterdayNetProfit, `（7 天 ${net7d >= 0 ? '+' : '-'}¥${formatMoney(Math.abs(net7d))}）`);
   setElText('kpiYesterdayActive', summary.yesterdayActiveCustomers || 0);
   setElText('kpiYesterdayRequests', summary.yesterdayRequestsCustomers || 0);
 
@@ -7702,6 +7715,12 @@ function renderFinancialOverview(summary, dailyTrends) {
       profitDisplay = `<strong class="mono" style="color: #dc2626; font-weight: 700;">-¥${Math.abs(profit).toFixed(2)}</strong>`;
     } else {
       profitDisplay = `<span class="mono" style="color: #d1cfc5;">-</span>`;
+    }
+    // 那天你自己用掉的进货钱，和扣掉它之后还剩多少
+    const selfUse = Number(item.selfUseCost || 0);
+    if (selfUse > 0) {
+      const net = Number(item.netProfit !== undefined ? item.netProfit : profit - selfUse);
+      profitDisplay += `<div style="font-size: 0.68rem; color: #b45309; margin-top: 1px;" title="内部账号那天用掉的真实进货成本">自用 -¥${selfUse.toFixed(2)} · 剩 <span style="color: ${net >= 0 ? '#059669' : '#dc2626'};">${net >= 0 ? '+' : '-'}¥${Math.abs(net).toFixed(2)}</span></div>`;
     }
 
     return `

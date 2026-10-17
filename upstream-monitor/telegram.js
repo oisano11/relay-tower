@@ -1306,6 +1306,19 @@ class TelegramBotManager {
     return true;
   }
 
+  // 客户余额：「用完了还在请求」响（客户在流失），「快用完」不响。名字来自客户自己填的资料，要转义。
+  async notifyCustomerBalance({ low = [], empty = [] }) {
+    if (!this.config.enabled || !this.hasAdmins() || (!low.length && !empty.length)) return false;
+    const money = n => `¥${Number(n || 0).toFixed(2)}`;
+    const daysText = d => (d === null || d === undefined ? '' : d < 1 ? '不到 1 天' : `${Math.floor(d)} 天多`);
+    const lines = [empty.length ? '💳 <b>客户余额用完了，还在发请求</b>' : '💳 <b>客户余额快用完了</b>'];
+    for (const c of empty) lines.push(`· ${escapeHtml(c.label)}：余额 ${money(c.balance)}，最近 1 小时被拒了 ${c.rejected} 次（余额不足）`);
+    for (const c of low) lines.push(`· ${escapeHtml(c.label)}：余额 ${money(c.balance)}，最近 7 天平均每天花 ${money(c.daily)}，大约还能用 ${daysText(c.daysLeft)}`);
+    lines.push('可以提醒客户充值。充值以后会重新开始算，不会重复提醒。');
+    await this.broadcastToAdmins(lines.join('\n'), empty.length ? {} : { disable_notification: true });
+    return true;
+  }
+
   // 13. 提醒过的号连续 30 分钟没再出错（不响）
   async notifyAccountRecovered({ groupName, name, durationMs = 0 }) {
     if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
@@ -1390,6 +1403,12 @@ class TelegramBotManager {
     }
     const low = d.lowBalance || [];
     if (low.length) items.push('💰 余额偏低：' + low.map(c => `${escapeHtml(c.name)}${c.shared ? '（共用余额）' : ''} ${fmtMoney(c.balance, c.unit)}`).join('；'));
+    const customers = d.customerBalance || [];
+    if (customers.length) {
+      items.push('💳 客户余额：' + customers.map(c => c.kind === 'empty'
+        ? `${escapeHtml(c.label)} 用完了`
+        : `${escapeHtml(c.label)} 剩 ¥${Number(c.balance || 0).toFixed(2)}${c.daysLeft === null || c.daysLeft === undefined ? '' : c.daysLeft < 1 ? '（不到 1 天）' : `（约 ${Math.floor(c.daysLeft)} 天）`}`).join('；'));
+    }
     const prices = d.priceChanges || [];
     if (prices.length) {
       items.push(`📈 价格有变动的账号 ${prices.length} 个：`);
@@ -1414,7 +1433,13 @@ class TelegramBotManager {
     }
     if (!items.length) items.push('一切正常，没有需要你处理的事。');
     // 下面是只供参考的数字，不算「需要你处理的事」
-    const info = [...backupInfo];
+    const info = [];
+    const biz = d.business;
+    if (biz) {
+      const signed = n => `${n >= 0 ? '+' : '-'}¥${Math.abs(n).toFixed(2)}`;
+      info.push(`💵 昨天：客户消费 ¥${biz.spent.toFixed(2)}，毛利 ${signed(biz.profit)}；你自己用掉 ¥${biz.selfUse.toFixed(2)}；扣掉自用 ${signed(biz.net)}（近 7 天 ${signed(biz.net7d)}）`);
+    }
+    info.push(...backupInfo);
     const traffic = (d.cluster && d.cluster.traffic) || [];
     if (traffic.length) {
       const used = traffic.map(t => `${escapeHtml(t.label)} ${fmtTraffic(t.yesterday)}${t.partial ? '（昨天中途才开始记）' : ''}`);

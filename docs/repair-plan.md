@@ -685,3 +685,22 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - **改法：** `upstream-keys.js` 的 `buildConnectSql` 和 `account-split.js` 的拆分 SQL（只对 `type = 'apikey'`）在 `extra` 里写入 `upstream_billing_probe_enabled: true`、`upstream_billing_rate_sync_enabled: true`。Sub2API 只有两个开关都开时才回写倍率（`upstreamBillingRateSyncEnabled`），下一次探测（约 30 分钟一次）生效。
 - **测试：** `test-upstream-keys.js`、`test-account-split.js` 各补断言（旧代码上失败）。生成的 SQL 在本机临时 PostgreSQL 上跑过：API Key 副本和新接入账号带上两个开关，OAuth 副本原样，模板的旧探测结果仍被去掉。
 - **未做（需要单独批准）：** 打开现有账号的开关（线上数据改动）。
+
+## 财务看板与每日简报的「自用花费」（2026-10-17）
+
+- **起因：** `fetchUserFinancialStats` 的客户数字一律 `user_id NOT IN (1, 8)`，内部账号的使用完全不出现。它们的 `actual_cost` 不是收入，但 `effective_cost`（进货成本）是真实支出；只读核对近 7 天，这笔钱和客户毛利是同一个量级。
+- **改法：**
+  - SQL：`s_stats` 加 `today/yesterday/past7d/past30d_self_cost`（`SUM(effective_cost) FILTER (WHERE user_id IN (1, 8) …)`，和客户成本同一个 `normalized_usage`），`summary` 加 `*SelfUseCost` 和 `*NetProfit`（客户毛利减自用花费）；`daily_s` 加 `self_cost`，每日走势加 `selfUseCost`、`netProfit`。
+  - 控制台：「今日收支」「昨日结算」各加「自用花费」「扣掉自用」两行（昨日一行带近 7 天），每日走势的毛利格下加一行。
+  - 每日简报：`buildBusinessDigest` 从 `fetchUserFinancialStats(false)` 取昨天的客户消费、毛利、自用花费、扣掉自用和近 7 天的扣掉自用，写在参考信息的第一行；取不到就不写。
+- **测试：** `test-user-usage.js` 的真实数据库校验新增 1 项（旧代码上失败）：各时间范围的自用花费等于用量页里内部账号的成本之和，「扣掉自用」等于客户毛利减它，每日走势今天那行也对；`test-customer-balance.js` 里有简报文字和 `buildBusinessDigest` 取数、取不到时的用例。线上只读跑了一遍新的看板 SQL，近 7 天的自用花费和手算一致。
+
+## 客户余额提醒（2026-10-17）
+
+- **起因：** 只读核对：有客户余额变成负数后，他的程序又连续几天被 Sub2API 以「Insufficient account balance」拒绝，之后再没回来；当时没有任何渠道告诉运营者。塔台原来只有上游余额提醒（`checkLowBalanceAlerts`），客户余额只在财务页里展示。
+- **新模块 `customer-balance.js`（纯逻辑）：**
+  - `sql()`：只读；客户（排除 1、8 和管理员、非 active）最近 7 天、3 天的消费，最近 60 分钟 402/403 且是余额不足（`billing_error` 或报错文字匹配）的次数，只选这两样至少有一样的客户；不读任何密钥字段。
+  - `evaluate`：`low` = 余额为正、按 7 天平均花法剩不到 2 天、最近 3 天有消费、日均不低于 0.2；`empty` = 余额 ≤ 0.01 且 60 分钟被拒 ≥ 3 次。每个客户一个状态：`low → empty` 再提醒（升级）；余额回到够用 4 天以上，或者充值了（比提醒时多 5 块以上、或从见底回到正数）而且已经不算快用完，才删掉状态重新开始；充了一点还是快用完的，只把起点挪到现在、改成 `low`，不再提醒。30 天没再出现的客户记录丢掉。`outstanding` 给每日简报用。
+  - 名字：用户名，没有就 `maskEmail`（前两个字 + 域名），再加编号。
+- **接线（`server.js`）：** `startCustomerBalancePoller` 每 5 分钟一轮（`execPsqlAsync`），状态存 `data/customer_balance_state.json`；`notifyCustomerBalance` 没发出去就不更新状态，下一轮重来。Telegram：有 `empty` 时响铃，只有 `low` 时不响；名字转义。每日简报 `customerBalance` 列出还没充值的（算「要处理的事」）。`customerBalanceState` 在轮询启动时才读文件，`buildDailyDigestData` 用 `typeof` 兜底，测试切片里没有这个模块也能跑。
+- **测试：** 新文件 `scripts/test-customer-balance.js` 10 项（SQL 范围、命名和打码、快用完、用完了还在请求、只提醒一次与升级、充了一点不重复提醒、充够了重新开始、30 天遗忘、Telegram 文字与响不响、简报两行、`buildBusinessDigest`）。线上只读试跑 184 毫秒，第一轮的结果和手算一致。

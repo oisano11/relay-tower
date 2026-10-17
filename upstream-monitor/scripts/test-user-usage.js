@@ -570,6 +570,21 @@ test('against a real database: per-range numbers are right and match the finance
     assert.ok(checked >= 50, `only compared ${checked} numbers`);
   });
 
+  await t.test('自用花费 is what the internal accounts 1 and 8 cost; 扣掉自用 is customer profit minus that', () => {
+    const s = dashboard.summary;
+    const selfCost = range => [1, 8].reduce((sum, id) => sum + ((user(range, id) || {}).cost || 0), 0);
+    const customerProfit = range => reports[range].users.filter(u => ![1, 8].includes(u.userId)).reduce((sum, u) => sum + u.profit, 0);
+    assert.ok(selfCost('today') > 0, 'the fixture has internal usage today');
+    for (const [range, prefix] of [['today', 'today'], ['yesterday', 'yesterday'], ['7d', 'past7d'], ['30d', 'past30d']]) {
+      assert.ok(Math.abs(Number(s[`${prefix}SelfUseCost`]) - selfCost(range)) <= 0.00501, `${range} self-use ${s[`${prefix}SelfUseCost`]} vs ${selfCost(range)}`);
+      assert.ok(Math.abs(Number(s[`${prefix}NetProfit`]) - (customerProfit(range) - selfCost(range))) <= 0.0101, `${range} net ${s[`${prefix}NetProfit`]}`);
+    }
+    // 每日走势里今天那一行也有自用花费和扣掉之后的数
+    const todayRow = dashboard.dailyTrends.reduce((latest, row) => (!latest || row.date > latest.date ? row : latest), null);
+    assert.ok(Math.abs(Number(todayRow.selfUseCost) - selfCost('today')) <= 0.00501);
+    assert.ok(Math.abs(Number(todayRow.netProfit) - (Number(todayRow.profitCustomers) - Number(todayRow.selfUseCost))) <= 0.0101);
+  });
+
   await t.test('the PGOPTIONS the server sends make the database itself read-only and time-limited', async () => {
     const h = psqlHarness({ IS_VPS: true });
     const pending = h.context.execPsqlAsync('SELECT 1;', { timeoutMs: 300 });

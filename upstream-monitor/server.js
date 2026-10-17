@@ -29,6 +29,7 @@ const UPSTREAM_MODELS_CACHE_FILE = path.join(DATA_DIR, 'upstream_models_cache.js
 const UPSTREAM_GROUP_CATALOG_FILE = path.join(DATA_DIR, 'upstream_group_catalog.json');
 const UPSTREAM_KEY_STATE_FILE = path.join(DATA_DIR, 'upstream_key_state.json');
 const ADMIN_WATCH_FILE = path.join(DATA_DIR, 'admin_watch_state.json');
+const CUSTOMER_BALANCE_FILE = path.join(DATA_DIR, 'customer_balance_state.json');
 const CLUSTER_TRAFFIC_FILE = path.join(DATA_DIR, 'cluster_traffic.json');
 const CLUSTER_SETTINGS_FILE = path.join(DATA_DIR, 'cluster_settings.json');
 const DATA_DIR_MODE = 0o700;
@@ -175,6 +176,7 @@ const clusterStatus = require('./cluster-status');
 const clusterTraffic = require('./cluster-traffic');
 const adminWatch = require('./admin-watch');
 const manualGroupGuard = require('./manual-group-guard');
+const customerBalance = require('./customer-balance');
 // 双机集群：中台地址和令牌只从环境变量来，没配置就显示「未配置」；浏览器拿不到它们
 const clusterClient = clusterStatus.createClusterClient({
   url: process.env.CLUSTER_HUB_URL || '',
@@ -1121,9 +1123,29 @@ function buildDailyDigestData(now = Date.now()) {
     exhausted,
     lowBalance,
     accountGuard: buildAccountGuardDigest(now),
+    business: buildBusinessDigest(),
+    customerBalance: typeof customerBalance !== 'undefined' ? customerBalance.outstanding(customerBalanceState) : [],
     newKeys: recent.filter(a => a.type === 'upstream_key').length,
     cluster: buildClusterDigest(now)
   };
+}
+
+// 每日简报里的昨天的生意：客户消费、毛利，你自己用掉的进货钱，扣掉之后还剩多少（和财务看板同一个口径）
+function buildBusinessDigest() {
+  try {
+    const summary = typeof fetchUserFinancialStats === 'function' ? (fetchUserFinancialStats(false) || {}).summary : null;
+    if (!summary || summary.yesterdaySpentCustomers === undefined) return null;
+    return {
+      spent: Number(summary.yesterdaySpentCustomers) || 0,
+      profit: Number(summary.yesterdayProfitCustomers) || 0,
+      selfUse: Number(summary.yesterdaySelfUseCost) || 0,
+      net: Number(summary.yesterdayNetProfit) || 0,
+      net7d: Number(summary.past7dNetProfit) || 0
+    };
+  } catch (error) {
+    console.error('[每日简报] 读不到昨天的生意数字：', error.message);
+    return null;
+  }
 }
 
 // 每日简报里的坏号看护：现在还停着的、一直失败又停不了的、过去 24 小时停过几次放回几次
@@ -1432,6 +1454,46 @@ function startManualGroupGuardPoller() {
   };
   setTimeout(tick, 75 * 1000);
   setInterval(tick, 60 * 1000);
+}
+
+// 客户余额提醒（规则见 customer-balance.js）：每 5 分钟看一次（只读），快用完、用完了还在请求的客户提醒你一次
+let customerBalanceState = null;  // 启动轮询时从状态文件读进来
+function startCustomerBalancePoller() {
+  if (!telegram || typeof telegram.notifyCustomerBalance !== 'function') return;
+  try {
+    customerBalanceState = customerBalance.normalizeState(readJSON(CUSTOMER_BALANCE_FILE, null));
+  } catch (error) {
+    console.error('[客户余额提醒] 读不了状态文件，从头开始：', error.message);
+    customerBalanceState = customerBalance.emptyState();
+  }
+  let running = false;
+  let lastError = '';
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const rows = customerBalance.parseRows(await execPsqlAsync(customerBalance.sql()));
+      const result = customerBalance.evaluate(customerBalanceState, rows, Date.now());
+      if (result.low.length || result.empty.length) {
+        // 没发出去就不记，下一轮再提醒
+        if (!(await telegram.notifyCustomerBalance({ low: result.low, empty: result.empty }))) {
+          lastError = '';
+          return;
+        }
+        console.log(`💳 [客户余额提醒] 快用完 ${result.low.length} 个，用完了还在请求 ${result.empty.length} 个`);
+      }
+      customerBalanceState = result.state;
+      writeJSON(CUSTOMER_BALANCE_FILE, customerBalanceState);
+      lastError = '';
+    } catch (error) {
+      if (error.message !== lastError) console.error('[客户余额提醒]', error.message);
+      lastError = error.message;
+    } finally {
+      running = false;
+    }
+  };
+  setTimeout(tick, 90 * 1000);
+  setInterval(tick, 5 * 60 * 1000);
 }
 
 function startDailyDigestTimer() {
@@ -5975,7 +6037,13 @@ s_stats AS (
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id NOT IN (1, 8)), 0) as past7d_spent_customers,
     COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id NOT IN (1, 8)), 0) as past7d_profit_customers,
     COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND user_id NOT IN (1, 8)), 0) as past30d_spent_customers,
-    COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND user_id NOT IN (1, 8)), 0) as past30d_profit_customers
+    COALESCE(SUM(actual_cost - effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND user_id NOT IN (1, 8)), 0) as past30d_profit_customers,
+
+    -- 自用花费：内部账号（1、8）自己用掉的真实进货成本。它们的「消费」是自己给自己记的账，不算收入，但进货钱是真花出去的
+    COALESCE(SUM(effective_cost) FILTER (WHERE created_at >= CURRENT_DATE AND user_id IN (1, 8)), 0) as today_self_cost,
+    COALESCE(SUM(effective_cost) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE AND user_id IN (1, 8)), 0) as yesterday_self_cost,
+    COALESCE(SUM(effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id IN (1, 8)), 0) as past7d_self_cost,
+    COALESCE(SUM(effective_cost) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND user_id IN (1, 8)), 0) as past30d_self_cost
   FROM normalized_usage
 ),
 paying_count AS (
@@ -6012,7 +6080,8 @@ daily_s AS (
     SUM(actual_cost) as spent_all,
     SUM(actual_cost) FILTER (WHERE user_id NOT IN (1, 8)) as spent_customers,
     SUM(effective_cost) FILTER (WHERE user_id NOT IN (1, 8)) as cost_customers,
-    SUM(actual_cost - effective_cost) FILTER (WHERE user_id NOT IN (1, 8)) as profit_customers
+    SUM(actual_cost - effective_cost) FILTER (WHERE user_id NOT IN (1, 8)) as profit_customers,
+    SUM(effective_cost) FILTER (WHERE user_id IN (1, 8)) as self_cost
   FROM normalized_usage
   WHERE created_at >= CURRENT_DATE - INTERVAL '14 days'
   GROUP BY 1
@@ -6029,6 +6098,8 @@ daily_trends AS (
       'costCustomers', ROUND(COALESCE(s.cost_customers, 0)::numeric, 2),
       'profitCustomers', ROUND(COALESCE(s.profit_customers, 0)::numeric, 2),
       'marginPercent', ROUND((COALESCE(s.profit_customers, 0) / NULLIF(COALESCE(s.spent_customers, 0), 0) * 100)::numeric, 1),
+      'selfUseCost', ROUND(COALESCE(s.self_cost, 0)::numeric, 2),
+      'netProfit', ROUND((COALESCE(s.profit_customers, 0) - COALESCE(s.self_cost, 0))::numeric, 2),
       'spentAll', ROUND(COALESCE(s.spent_all, 0)::numeric, 2),
       'requestsCustomers', COALESCE(s.requests_customers, 0),
       'requestsAll', COALESCE(s.requests_all, 0),
@@ -6156,7 +6227,15 @@ SELECT json_build_object(
     'past7dProfitCustomers', ROUND(s.past7d_profit_customers::numeric, 2),
     'past30dRecharge', ROUND(r.past30d_recharge::numeric, 2),
     'past30dSpentCustomers', ROUND(s.past30d_spent_customers::numeric, 2),
-    'past30dProfitCustomers', ROUND(s.past30d_profit_customers::numeric, 2)
+    'past30dProfitCustomers', ROUND(s.past30d_profit_customers::numeric, 2),
+    'todaySelfUseCost', ROUND(s.today_self_cost::numeric, 2),
+    'todayNetProfit', ROUND((s.today_profit_customers - s.today_self_cost)::numeric, 2),
+    'yesterdaySelfUseCost', ROUND(s.yesterday_self_cost::numeric, 2),
+    'yesterdayNetProfit', ROUND((s.yesterday_profit_customers - s.yesterday_self_cost)::numeric, 2),
+    'past7dSelfUseCost', ROUND(s.past7d_self_cost::numeric, 2),
+    'past7dNetProfit', ROUND((s.past7d_profit_customers - s.past7d_self_cost)::numeric, 2),
+    'past30dSelfUseCost', ROUND(s.past30d_self_cost::numeric, 2),
+    'past30dNetProfit', ROUND((s.past30d_profit_customers - s.past30d_self_cost)::numeric, 2)
   ),
   'dailyTrends', COALESCE(dt.trends, '[]'::json),
   'users', COALESCE(ul.users, '[]'::json),
@@ -11025,6 +11104,7 @@ function initializeMainProcess() {
     startClusterAlertPoller();
     startAdminWatchPoller();
     startManualGroupGuardPoller();
+    startCustomerBalancePoller();
     refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
   });
 }
