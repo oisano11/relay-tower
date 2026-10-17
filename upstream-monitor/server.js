@@ -174,6 +174,7 @@ const telegram = IS_CONTROL_PLANE_WORKER ? null : require('./telegram');
 const clusterStatus = require('./cluster-status');
 const clusterTraffic = require('./cluster-traffic');
 const adminWatch = require('./admin-watch');
+const manualGroupGuard = require('./manual-group-guard');
 // 双机集群：中台地址和令牌只从环境变量来，没配置就显示「未配置」；浏览器拿不到它们
 const clusterClient = clusterStatus.createClusterClient({
   url: process.env.CLUSTER_HUB_URL || '',
@@ -524,6 +525,8 @@ autoSwitchConfig.manualLockPolicy = 'failover_allowed';
 autoSwitchConfig.singleActiveExclusive = false;
 autoSwitchConfig.autoRecoverLowestCost = false;
 state.failoverRuntime = state.failoverRuntime || {};
+// 人工管理分组的坏号看护：暂停了谁、提醒过谁（manual-group-guard.js）
+state.manualGuard = manualGroupGuard.normalizeState(state.manualGuard);
 // Pending proposals are main-process runtime state. A forked worker used to
 // clear its copy and then return it wholesale, erasing live proposals.
 if (!IS_CONTROL_PLANE_WORKER) state.pendingFailoverProposals = {};
@@ -1062,6 +1065,11 @@ function beijingClock(ms) {
   return { date: d.toISOString().slice(0, 10), hour: d.getUTCHours(), label: `${d.getUTCMonth() + 1}月${d.getUTCDate()}日` };
 }
 
+// 北京时间「时:分」
+function beijingHourMinute(ms) {
+  return new Date(Number(ms) + 8 * 3600000).toISOString().slice(11, 16);
+}
+
 function buildDailyDigestData(now = Date.now()) {
   const since = now - 24 * 3600000;
   const recent = (alerts || []).filter(a => a && Date.parse(a.timestamp) >= since && Date.parse(a.timestamp) <= now)
@@ -1112,8 +1120,30 @@ function buildDailyDigestData(now = Date.now()) {
     switches,
     exhausted,
     lowBalance,
+    accountGuard: buildAccountGuardDigest(now),
     newKeys: recent.filter(a => a.type === 'upstream_key').length,
     cluster: buildClusterDigest(now)
+  };
+}
+
+// 每日简报里的坏号看护：现在还停着的、一直失败又停不了的、过去 24 小时停过几次放回几次
+function buildAccountGuardDigest(now) {
+  const guard = state.manualGuard || {};
+  const since = now - 24 * 3600000;
+  const events = (guard.events || []).filter(event => Number(event.at) >= since && Number(event.at) <= now);
+  const failing = new Map();
+  for (const [key, warning] of Object.entries(guard.warnings || {})) {
+    if (warning.healthySince) continue;
+    const [accountId, groupId] = key.split(':');
+    const channel = (state.channels || []).find(c => String(c.id) === accountId);
+    const group = (state.allGroups || []).find(g => String(g.id) === groupId);
+    failing.set(key, { name: channel ? channel.name : `账号 ${accountId}`, group: group ? group.name : `分组 ${groupId}` });
+  }
+  return {
+    paused: Object.values(guard.pauses || {}).map(pause => ({ name: pause.name, group: pause.groupName, since: pause.since })),
+    failing: [...failing.values()],
+    pausedCount: events.filter(event => event.type === 'pause').length,
+    resumedCount: events.filter(event => event.type === 'resume').length
   };
 }
 
@@ -1228,6 +1258,179 @@ function startAdminWatchPoller() {
     }
   };
   setTimeout(tick, 45 * 1000);
+  setInterval(tick, 60 * 1000);
+}
+
+// ====== 人工管理分组的坏号看护（规则见 manual-group-guard.js）======
+// 只管「人工管理」分组：本组关了自动切号，或者全站自动切号关着。名字带 私人、通用 这类关键字的分组是你自己用的，不管。
+function isManualGuardGroup(group) {
+  if (!group) return false;
+  const name = String(group.name || '').toLowerCase();
+  const keywords = autoSwitchConfig.exemptKeywords || ['通用', '自用', '私人', 'private'];
+  if (keywords.some(kw => name.includes(String(kw).toLowerCase()))) return false;
+  if (!autoSwitchConfig.enabled) return true;
+  const id = String(group.id);
+  const policy = (autoSwitchConfig.groupPolicies && autoSwitchConfig.groupPolicies[id]) || {};
+  return policy.enabled === false || (autoSwitchConfig.exemptGroupIds || []).map(String).includes(id);
+}
+
+function recordManualGuardAlert(action, note) {
+  alerts.unshift({ id: `guard_${action.accountId}_${Date.now()}`, type: 'account_guard', channelId: String(action.accountId), channelName: action.name,
+    groupId: action.groupId, groupName: action.groupName, timestamp: new Date().toISOString(), note });
+  if (alerts.length > 200) alerts = alerts.slice(0, 200);
+  writeJSON(ALERTS_FILE, alerts);
+}
+
+function sendManualGuardTelegram(method, payload) {
+  if (!telegram || typeof telegram[method] !== 'function') return;
+  Promise.resolve(telegram[method](payload)).catch(error => console.error('[坏号看护] Telegram', error.message));
+}
+
+// 试哪个模型：本组客户最近用得最多、这个号也支持的那个，换成上游的真名
+function manualGuardProbeModel(channel, groupId) {
+  const mapping = channel && channel.modelMapping && typeof channel.modelMapping === 'object' ? channel.modelMapping : {};
+  const supported = Object.keys(mapping).length ? Object.keys(mapping) : ((channel && channel.configuredModels) || []);
+  const demand = ((typeof fetchGroupModelDemand === 'function' ? fetchGroupModelDemand() : {}) || {})[String(groupId)] || [];
+  const model = demand.find(name => supported.includes(name)) || supported[0] || '';
+  return mapping[model] || model;
+}
+
+function applyManualGuardPause(action, now) {
+  const channel = state.channels.find(c => String(c.id) === String(action.accountId));
+  try {
+    if (!channel) throw new Error('账号已经不在了');
+    // 只关接单开关，角色（分组里的优先级）不动；不设「手动关闭」，那是你的开关
+    toggleRemoteAccountsSchedulable([action.accountId], false);
+    channel.schedulable = false;
+    channel.isActive = false;
+  } catch (error) {
+    manualGroupGuard.rollbackPause(state.manualGuard, action.accountId);
+    console.error(`[坏号看护] 暂停 ${action.name} 没成功：`, error.message);
+    return false;
+  }
+  const clock = beijingHourMinute(action.until);
+  console.log(`⏸️ [坏号看护] ${action.groupName}：${action.name} 持续出错（${action.facts.verdict}），已暂停，${clock} 试一下`);
+  recordManualGuardAlert(action, `${action.groupName}：${action.name} 持续出错，已先暂停（角色还是主调）。同组 ${action.peers.join('、')} 在接单。${clock} 会用 1 个字的请求试一下，好了自动放回。`);
+  manualGroupGuard.recordEvent(state.manualGuard, { type: 'pause', at: now, accountId: String(action.accountId), groupId: action.groupId });
+  sendManualGuardTelegram('notifyAccountPaused', { groupName: action.groupName, name: action.name, facts: action.facts, until: action.until, peers: action.peers });
+  return true;
+}
+
+async function runManualGuardProbe(action) {
+  const id = String(action.accountId);
+  if (!manualGroupGuard.markProbing(state.manualGuard, id, Date.now())) return;
+  writeJSON(CHANNELS_FILE, state);
+  const channel = state.channels.find(c => String(c.id) === id);
+  const pause = state.manualGuard.pauses[id];
+  const model = manualGuardProbeModel(channel, pause.groupId);
+  let result;
+  try {
+    result = model ? await probeChannelModel(channel, model, { fullStream: true }) : { success: false, error: '不知道该试哪个模型' };
+  } catch (error) {
+    result = { success: false, error: error.message };
+  }
+  // 试的这几秒里你可能已经接手了（改了角色、手动开关）：那就什么都不做
+  if (!state.manualGuard.pauses[id]) return;
+  const fresh = state.channels.find(c => String(c.id) === id);
+  let resumed = false;
+  let error = result.success ? '' : (result.error || '试了没通过');
+  if (result.success && fresh && fresh.schedulable !== true && fresh.autoSwitchDisabled !== true) {
+    try {
+      // 只会打开还是主调、在所有分组都不亏本的号
+      resumed = toggleRemoteAccountsSchedulable([id], true).enabledIds.length > 0;
+      if (resumed) fresh.schedulable = true;
+      else error = '它已经不是主调了';
+    } catch (toggleError) {
+      error = toggleError.message;
+    }
+  }
+  const now = Date.now();
+  const outcome = manualGroupGuard.afterProbe(state.manualGuard, id, { passed: result.success, resumed, error, now });
+  if (outcome && outcome.resumed) {
+    const p = outcome.pause;
+    console.log(`▶️ [坏号看护] ${p.groupName}：${p.name} 试过能出字，已放回`);
+    recordManualGuardAlert({ accountId: id, name: p.name, groupId: p.groupId, groupName: p.groupName }, `${p.groupName}：${p.name} 试过一次能正常出字，已放回接单。`);
+    manualGroupGuard.recordEvent(state.manualGuard, { type: 'resume', at: now, accountId: id, groupId: p.groupId });
+    sendManualGuardTelegram('notifyAccountResumed', { groupName: p.groupName, name: p.name, pausedMs: now - Number(p.since) });
+  } else if (outcome) {
+    const p = outcome.pause;
+    console.log(`⏸️ [坏号看护] ${p.groupName}：${p.name} 试了没通过（${error}），再停到 ${beijingHourMinute(p.until)}`);
+  }
+  writeJSON(CHANNELS_FILE, state);
+  broadcastSSE('CHANNELS_UPDATED', state);
+}
+
+async function runManualGroupGuard(now = Date.now()) {
+  if (autoSwitchConfig.manualGuardEnabled === false) return { skipped: true, actions: [] };
+  const before = JSON.stringify(state.manualGuard || {});
+  const guardState = manualGroupGuard.releaseStaleProbes(manualGroupGuard.normalizeState(state.manualGuard), now);
+  const groups = state.allGroups || [];
+  if (!groups.some(isManualGuardGroup) && !Object.keys(guardState.pauses).length && !Object.keys(guardState.warnings).length) {
+    state.manualGuard = guardState;
+    return { actions: [] };
+  }
+  const stats = manualGroupGuard.parseStats(await execPsqlAsync(manualGroupGuard.statsSql()));
+  const { state: next, actions } = manualGroupGuard.evaluate({
+    groups, channels: state.channels, stats, state: guardState, now,
+    isManualGroup: isManualGuardGroup,
+    isExemptChannel: channel => typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(channel)
+  });
+  state.manualGuard = next;
+  let channelsChanged = false;
+  const warnings = new Map();
+  const probes = [];
+  for (const action of actions) {
+    if (action.type === 'pause') {
+      if (applyManualGuardPause(action, now)) channelsChanged = true;
+    } else if (action.type === 'warn') {
+      const list = warnings.get(action.groupId) || [];
+      list.push(action);
+      warnings.set(action.groupId, list);
+    } else if (action.type === 'warn_resolved') {
+      console.log(`✅ [坏号看护] ${action.groupName}：${action.name} 连续 30 分钟没再出错`);
+      sendManualGuardTelegram('notifyAccountRecovered', { groupName: action.groupName, name: action.name, durationMs: Number(action.healthySince) - Number(action.since) });
+    } else if (action.type === 'probe') {
+      probes.push(action);
+    } else if (action.type === 'forget') {
+      console.log(`ℹ️ [坏号看护] ${action.pause.groupName}：${action.pause.name} 的暂停交给你了（${action.why}）`);
+    }
+  }
+  // 同一个分组同时有几个号在失败，合成一条提醒
+  for (const list of warnings.values()) {
+    const first = list[0];
+    console.log(`⚠️ [坏号看护] ${first.groupName}：${list.map(a => a.name).join('、')} 一直在失败，没法自动暂停（${first.why}）`);
+    recordManualGuardAlert(first, `${first.groupName}：${list.map(a => a.name).join('、')} 一直在失败，没有自动暂停（${first.why === 'last_main' ? '本组只剩它在接单' : first.why === 'shared' ? '它还在别的分组接单' : '同组别的主调也不好'}）。请补一个能用的主调，或者把坏的改成「备用」。`);
+    sendManualGuardTelegram('notifyAccountFailing', {
+      groupName: first.groupName,
+      items: list.map(a => ({ name: a.name, facts: a.facts, why: a.why })),
+      count: Math.max(...list.map(a => a.count)),
+      sinceMs: Math.min(...list.map(a => Number(a.since)))
+    });
+  }
+  if (channelsChanged || JSON.stringify(state.manualGuard) !== before) writeJSON(CHANNELS_FILE, state);
+  if (channelsChanged) broadcastSSE('CHANNELS_UPDATED', state);
+  for (const action of probes) await runManualGuardProbe(action);
+  return { actions };
+}
+
+function startManualGroupGuardPoller() {
+  let running = false;
+  let lastError = '';
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await runManualGroupGuard();
+      lastError = '';
+    } catch (error) {
+      // 同样的错误只记一次，免得每分钟刷一行
+      if (error.message !== lastError) console.error('[坏号看护]', error.message);
+      lastError = error.message;
+    } finally {
+      running = false;
+    }
+  };
+  setTimeout(tick, 75 * 1000);
   setInterval(tick, 60 * 1000);
 }
 
@@ -6096,6 +6299,9 @@ function getEnrichedChannels(forceStabilityRefresh = false, cacheOnly = false, c
     }
     copy.stability = getChannelStabilitySummary(c.id, stabilityMap);
     copy.modelsStability = stabilityMap[String(c.id)] || [];
+    // 坏号看护暂停了它：控制台上写明为什么停、几点再试
+    const pause = state.manualGuard && state.manualGuard.pauses ? state.manualGuard.pauses[String(c.id)] : null;
+    if (pause) copy.autoPause = { groupName: pause.groupName, since: pause.since, until: pause.until, verdict: pause.verdict, lastError: pause.lastError || '' };
 
     const dbAct = userActivityMap[String(c.id)] || {
       activeUsers15m: 0,
@@ -6140,7 +6346,8 @@ function broadcastChannelsUpdate(forceStabilityRefresh = false) {
 }
 
 // 实时流式单 Token 探测模型首字时间 (TTFT) 与存活性
-async function probeChannelModel(channel, modelName) {
+// options.fullStream：把这条 1 个字的回答读完再判断（坏号看护用）。有的上游第一帧先回一个空开头，错误放在后面。
+async function probeChannelModel(channel, modelName, options = {}) {
   if (!channel || !channel.baseUrl || !channel.apiKey) {
     return {
       success: false,
@@ -6220,6 +6427,15 @@ async function probeChannelModel(channel, modelName) {
     const reader = res.body.getReader();
     const { value, done } = await reader.read();
     const ttftMs = Date.now() - t0;
+    let streamText = value ? Buffer.from(value).toString('utf8') : '';
+    if (options.fullStream) {
+      let ended = done;
+      while (!ended && streamText.length < 65536) {
+        const chunk = await reader.read();
+        ended = chunk.done;
+        if (chunk.value) streamText += Buffer.from(chunk.value).toString('utf8');
+      }
+    }
     clearTimeout(timer);
 
     try { reader.cancel(); } catch (e) {}
@@ -6229,8 +6445,14 @@ async function probeChannelModel(channel, modelName) {
     if (done && !firstFrame) {
       return { success: false, statusCode: res.status, ttftMs: null, error: '上游返回空流' };
     }
-    if (/^event:\s*error/m.test(firstFrame) || /"type"\s*:\s*"error"/.test(firstFrame) || /"error"\s*:\s*\{/.test(firstFrame)) {
-      return { success: false, statusCode: res.status, ttftMs: null, error: `流内错误: ${firstFrame.replace(/\s+/g, ' ').slice(0, 200)}` };
+    const inspected = options.fullStream ? streamText.slice(0, 65536) : firstFrame;
+    if (/^event:\s*error/m.test(inspected) || /"type"\s*:\s*"error"/.test(inspected) || /"error"\s*:\s*\{/.test(inspected)) {
+      // 读完整条时，从出错的那一帧开始摘，前面的空开头没用
+      const at = options.fullStream ? Math.max(0, inspected.search(/^event:\s*error|"type"\s*:\s*"error"|"error"\s*:\s*\{/m)) : 0;
+      return { success: false, statusCode: res.status, ttftMs: null, error: `流内错误: ${inspected.slice(at).replace(/\s+/g, ' ').slice(0, 200)}` };
+    }
+    if (options.fullStream && !/"choices"|"content_block_delta"|"delta"/.test(inspected)) {
+      return { success: false, statusCode: res.status, ttftMs: null, error: '上游没有回任何文字' };
     }
 
     return {
@@ -9911,6 +10133,7 @@ async function handleRequest(req, res) {
   if (pathname === '/api/auto-switch/config' && req.method === 'POST') {
     const body = await getBody();
     if (body.enabled !== undefined) autoSwitchConfig.enabled = Boolean(body.enabled);
+    if (body.manualGuardEnabled !== undefined) autoSwitchConfig.manualGuardEnabled = Boolean(body.manualGuardEnabled);
     autoSwitchConfig.singleActiveExclusive = false;
     if (body.promptCacheLock !== undefined) autoSwitchConfig.promptCacheLock = Boolean(body.promptCacheLock);
     if (body.antiFlappingLock !== undefined) autoSwitchConfig.antiFlappingLock = Boolean(body.antiFlappingLock);
@@ -10801,6 +11024,7 @@ function initializeMainProcess() {
     startDailyDigestTimer();
     startClusterAlertPoller();
     startAdminWatchPoller();
+    startManualGroupGuardPoller();
     refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
   });
 }

@@ -1272,8 +1272,13 @@ function renderStripsView(enabledChannels, standbyChannels) {
     // 每行一个「关闭 / 打开」按钮：关闭 = 马上不接单，并且永远不会被自动打开，只能手动再打开
     const roleForToggle = effectiveGroupId ? role : bestChannelRole(ch);
     const manuallyClosed = ch.autoSwitchDisabled === true;
+    const autoPause = !manuallyClosed && !isSchedulable && ch.autoPause ? ch.autoPause : null;
+    const autoPauseUntil = autoPause ? new Date(autoPause.until) : null;
+    const autoPauseClock = autoPauseUntil && !isNaN(autoPauseUntil.getTime())
+      ? `${String(autoPauseUntil.getHours()).padStart(2, '0')}:${String(autoPauseUntil.getMinutes()).padStart(2, '0')} ` : '';
     const powerState = manuallyClosed ? ['手动关闭', '你手动关的：不接单，也不会被自动打开']
       : isSchedulable ? ['接单中', '正在接单']
+      : autoPause ? ['自动暂停', `在【${autoPause.groupName || ''}】里持续出错，塔台先暂停了它（角色还是主调）。${autoPauseClock}会用 1 个字的请求试一下，好了自动放回。想直接换掉它，把它改成备用。${autoPause.lastError ? '上游返回：' + autoPause.lastError : ''}`]
       : roleForToggle === 'main' ? ['暂停中', '主调出了问题被自动换下，恢复后会自动打开、切回来']
       : roleForToggle === 'standby' ? ['已关闭', '备用：不接单，也不会被自动打开']
       : ['待命', `${ROLE_LABELS_CN[roleForToggle]}：平时不接单，主调出问题时会被自动打开`];
@@ -1310,7 +1315,7 @@ function renderStripsView(enabledChannels, standbyChannels) {
         <div class="strip-col-toggle">
           <button type="button" class="btn-strip-power ${manuallyClosed ? 'is-open-action' : 'is-close-action'}" title="${powerButtonTitle}"
                   onclick="toggleChannelSchedulable('${ch.id}', ${manuallyClosed ? 'true' : 'false'})">${manuallyClosed ? '打开' : '关闭'}</button>
-          <span class="strip-power-state state-${manuallyClosed ? 'manual' : (isSchedulable ? 'serving' : (roleForToggle === 'standby' ? 'closed' : 'waiting'))}" title="${powerState[1]}">${powerState[0]}</span>
+          <span class="strip-power-state state-${manuallyClosed ? 'manual' : (isSchedulable ? 'serving' : (roleForToggle === 'standby' ? 'closed' : 'waiting'))}" title="${escapeHtml(powerState[1])}">${powerState[0]}</span>
         </div>
 
         <!-- 4. 上游账户余额 -->
@@ -2573,6 +2578,7 @@ function renderAlertsDrawer() {
     const isError = a.type === 'error';
     const isNewKey = a.type === 'upstream_key';
     const isConnect = a.type === 'account_connect';
+    const isGuard = a.type === 'account_guard';
     const itemTs = new Date(a.timestamp).getTime();
     const isUnread = !isNaN(itemTs) && itemTs > lastReadTs;
 
@@ -2603,6 +2609,9 @@ function renderAlertsDrawer() {
     } else if (isConnect) {
       cardClass = 'is-channel-switch';
       badgeHtml = `<span style="color: #059669; font-weight: 700;">🔗 接入新账号</span>`;
+    } else if (isGuard) {
+      cardClass = 'is-error';
+      badgeHtml = `<span style="color: #b45309; font-weight: 700;">⏸️ 坏号看护</span>`;
     } else if (isRatio) {
       cardClass = isUp ? 'is-up' : 'is-down';
       badgeHtml = `<span style="color: ${isUp ? 'var(--color-red)' : 'var(--color-green)'}; font-weight: 700;">${isUp ? '↗ 进货倍率上涨' : '↘ 进货倍率下调'}</span>`;
@@ -4062,15 +4071,15 @@ function initApp() {
   document.getElementById('btnSendTgTest')?.addEventListener('click', sendTelegramTestMessage);
   document.getElementById('btnTgAutoBind')?.addEventListener('click', autoBindTelegramAdmin);
 
-  // 自动切线开关按钮点击交互
-  document.getElementById('btnToggleAutoSwitch')?.addEventListener('click', () => {
-    const btn = document.getElementById('btnToggleAutoSwitch');
+  // 自动切线开关按钮点击交互（坏号自动暂停的开关同样处理）
+  ['btnToggleAutoSwitch', 'btnToggleManualGuard'].forEach(id => document.getElementById(id)?.addEventListener('click', () => {
+    const btn = document.getElementById(id);
     if (!btn) return;
     const isOn = btn.classList.contains('is-on');
     btn.classList.toggle('is-on', !isOn);
     btn.classList.toggle('is-off', isOn);
     btn.innerHTML = !isOn ? '<span>●</span> <span>已启用</span>' : '<span>○</span> <span>已停用</span>';
-  });
+  }));
 
   // 单主调严格独占模式开关交互
   document.getElementById('btnToggleSingleActive')?.addEventListener('click', () => {
@@ -6924,6 +6933,13 @@ function syncAutoSwitchForm() {
     btnToggle.classList.toggle('is-off', !isEnabled);
     btnToggle.innerHTML = isEnabled ? '<span>●</span> <span>已启用</span>' : '<span>○</span> <span>已停用</span>';
   }
+  const btnGuard = document.getElementById('btnToggleManualGuard');
+  if (btnGuard) {
+    const guardOn = autoSwitchConfig.manualGuardEnabled !== false;
+    btnGuard.classList.toggle('is-on', guardOn);
+    btnGuard.classList.toggle('is-off', !guardOn);
+    btnGuard.innerHTML = guardOn ? '<span>●</span> <span>已启用</span>' : '<span>○</span> <span>已停用</span>';
+  }
 
   // 下拉选项与数值回显
   const selectFailRate = document.getElementById('selectFailRateThreshold');
@@ -7037,7 +7053,9 @@ function closeAutoSwitchModal() {
 async function saveAutoSwitchConfig() {
   const btnToggle = document.getElementById('btnToggleAutoSwitch');
   const enabled = btnToggle?.classList.contains('is-on');
-  
+  const guardButton = document.getElementById('btnToggleManualGuard');
+  const manualGuardEnabled = guardButton ? guardButton.classList.contains('is-on') : undefined;
+
   const failRateThreshold = Number(document.getElementById('selectFailRateThreshold')?.value) || 70;
   const cooldownMinutes = Number(document.getElementById('selectCooldownMinutes')?.value) || 10;
   const minSampleSize = Number(document.getElementById('selectMinSampleSize')?.value) || 50;
@@ -7057,6 +7075,7 @@ async function saveAutoSwitchConfig() {
       // 只提交面板上看得见的设置；首字超时、欠费确认次数等没有展示的项保持服务器上的现值，不再被写死的默认值覆盖。
       body: JSON.stringify({
         enabled,
+        manualGuardEnabled,
         failRateThreshold,
         minSampleSize,
         consecutiveFailuresThreshold,

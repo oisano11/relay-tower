@@ -978,7 +978,7 @@
             </div>
             <div style="background: #faf9f5; border: 1px solid #e8e6dc; border-radius: 6px; padding: 0.55rem; font-size: 0.73rem;">
               <div style="font-weight: 700; color: #3d3d3a; margin-bottom: 2px;">🛡️ 不会乱动</div>
-              <div style="color: #5e5d59; line-height: 1.35;">不改对外售价；不启用你手动停用的账号；人工管理的分组不碰</div>
+              <div style="color: #5e5d59; line-height: 1.35;">不改对外售价；不启用你手动停用的账号；人工管理的分组不换号，坏号只会被暂停并提醒你</div>
             </div>
           </div>
 
@@ -994,6 +994,18 @@
                   <span class="as-config-desc">开启时每分钟检查一次各分组，自动处理故障、欠费和恢复；关闭后暂停所有自动换号</span>
                 </div>
                 <button id="btnToggleAutoSwitch" class="toggle-switch-btn is-on">
+                  <span>●</span> <span>已启用</span>
+                </button>
+              </div>
+
+              <div class="as-divider"></div>
+
+              <div class="as-config-row">
+                <div class="as-config-info">
+                  <span class="as-config-label">⏸️ 人工管理分组：坏号自动暂停</span>
+                  <span class="as-config-desc">关了自动切号的分组里，主调持续出错（1 小时一次没成功，或半小时失败七成以上）、同组还有别的主调正常时，先暂停它，30 分钟后试一下，好了自动放回；停不了就只提醒</span>
+                </div>
+                <button id="btnToggleManualGuard" class="toggle-switch-btn is-on" style="flex-shrink: 0; white-space: nowrap;">
                   <span>●</span> <span>已启用</span>
                 </button>
               </div>

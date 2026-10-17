@@ -2770,6 +2770,28 @@ function streamResponse(text, status = 200) {
     body: { getReader: () => ({ read: async () => sent ? { done: true } : (sent = true, { value: Buffer.from(text), done: false }), cancel() {} }) } };
 }
 
+function chunkedStreamResponse(chunks, status = 200) {
+  let index = 0;
+  return { ok: status < 400, status, text: async () => chunks.join(''),
+    body: { getReader: () => ({ read: async () => index < chunks.length ? { value: Buffer.from(chunks[index++]), done: false } : { done: true }, cancel() {} }) } };
+}
+
+test('reading the whole one-word reply catches an error that comes after an empty first frame', async () => {
+  const chunks = ['data: {"id":"x","choices":[{"delta":{"role":"assistant"}}]}\n\n',
+    'data: {"error":{"message":"No available channel for model demo-model"}}\n\n'];
+  // 只看第一帧（原来的用法）看不出来
+  const firstOnly = loadGenerationProbe({ fetch: async () => chunkedStreamResponse(chunks) });
+  assert.equal((await firstOnly.probeChannelModel({ baseUrl: 'https://x.test', apiKey: 'k' }, 'm')).success, true);
+  const full = loadGenerationProbe({ fetch: async () => chunkedStreamResponse(chunks) });
+  const result = await full.probeChannelModel({ baseUrl: 'https://x.test', apiKey: 'k' }, 'm', { fullStream: true });
+  assert.equal(result.success, false);
+  assert.match(result.error, /^流内错误: "error":\{"message":"No available channel for model demo-model"/, 'quoted from the frame that failed');
+  const silent = loadGenerationProbe({ fetch: async () => chunkedStreamResponse([': keep-alive\n\n', 'data: [DONE]\n\n']) });
+  assert.equal((await silent.probeChannelModel({ baseUrl: 'https://x.test', apiKey: 'k' }, 'm', { fullStream: true })).error, '上游没有回任何文字');
+  const fine = loadGenerationProbe({ fetch: async () => chunkedStreamResponse([chunks[0], 'data: {"choices":[{"delta":{"content":"1"}}]}\n\n', 'data: [DONE]\n\n']) });
+  assert.equal((await fine.probeChannelModel({ baseUrl: 'https://x.test', apiKey: 'k' }, 'm', { fullStream: true })).success, true);
+});
+
 test('a 200 stream whose first frame is an error is not a successful generation', async () => {
   const context = loadGenerationProbe({ fetch: async () => streamResponse('event: error\ndata: {"type":"error","error":{"message":"余额不足"}}\n\n') });
   const result = await context.probeChannelModel({ baseUrl: 'https://x.test', apiKey: 'k' }, 'm');

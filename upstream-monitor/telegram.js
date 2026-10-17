@@ -126,6 +126,24 @@ function fmtTraffic(bytes) {
   return `${Math.round(n / 1e6)} MB`;
 }
 
+// 北京时间几点几分
+function fmtClock(ms) {
+  return formatShanghaiDateTime(new Date(Number(ms))).slice(11, 16);
+}
+
+// 坏号看护：这个号最近怎么了
+function describeGuardFacts(facts = {}) {
+  if (facts.verdict === 'dead') return `最近 1 小时 ${Number(facts.failed60) || 0} 次请求全部失败，一次都没成功。`;
+  const total = (Number(facts.ok30) || 0) + (Number(facts.failed30) || 0);
+  return `最近 30 分钟 ${total} 次请求里失败了 ${Number(facts.failed30) || 0} 次。`;
+}
+
+const GUARD_NO_PAUSE_TEXT = {
+  last_main: '它是本组唯一在接单的主调，停掉客户就全失败了，所以没有自动暂停。',
+  shared: '它还在别的分组接单，停掉会影响那些分组，所以没有自动暂停。',
+  no_healthy_peer: '同组别的主调最近也在出错或没在接单，停掉它不一定更好，所以没有自动暂停。'
+};
+
 function fmtMoney(balance, unit) {
   const n = Number(balance);
   if (!Number.isFinite(n)) return '--';
@@ -1249,6 +1267,54 @@ class TelegramBotManager {
     return true;
   }
 
+  // 10. 人工管理分组的坏号看护：一个主调持续出错，塔台先暂停了它（响）
+  async notifyAccountPaused({ groupName, name, facts = {}, until = 0, peers = [] }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const lines = [`⏸️ <b>${escapeHtml(groupName)}：已暂停 ${escapeHtml(name)}</b>`, describeGuardFacts(facts)];
+    if (facts.lastError) lines.push(`上游返回：${escapeHtml(String(facts.lastError).slice(0, 160))}`);
+    if (peers.length) lines.push(`同组还有 ${escapeHtml(peers.join('、'))} 在正常接单，客户不受影响。`);
+    lines.push(`它的角色还是主调。${until ? `${fmtClock(until)} ` : ''}会先用 1 个字的请求试一下，好了自动放回去；想直接换掉它，在分组里把它改成「备用」。`);
+    await this.broadcastToAdmins(lines.join('\n'));
+    return true;
+  }
+
+  // 11. 一直在失败、但没法自动暂停（本组只剩它、它还在别的分组、同组别的号也不好）：只提醒（响）
+  async notifyAccountFailing({ groupName, items = [], count = 1, sinceMs = 0 }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    if (!items.length) return false;
+    const lines = [`⚠️ <b>${escapeHtml(groupName)}：${escapeHtml(items.map(item => item.name).join('、'))} 一直在失败</b>`];
+    for (const item of items) {
+      const prefix = items.length > 1 ? `· ${escapeHtml(item.name)}：` : '';
+      lines.push(prefix + describeGuardFacts(item.facts));
+      if (item.facts && item.facts.lastError) lines.push(`上游返回：${escapeHtml(String(item.facts.lastError).slice(0, 160))}`);
+    }
+    lines.push(GUARD_NO_PAUSE_TEXT[items[0].why] || '所以没有自动暂停。');
+    lines.push('请看一下：给这个分组补一个能用的主调，或者把坏的改成「备用」。');
+    lines.push(count > 1 && sinceMs
+      ? `已持续 ${fmtDuration(Date.now() - sinceMs)} · 第 ${count} 次提醒`
+      : '问题没解决前，1 小时、3 小时后各再提醒一次，之后每 6 小时一次。');
+    await this.broadcastToAdmins(lines.join('\n'));
+    return true;
+  }
+
+  // 12. 暂停的号试过一次能出字，放回去了（不响）
+  async notifyAccountResumed({ groupName, name, pausedMs = 0 }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const lines = [`▶️ <b>${escapeHtml(groupName)}：${escapeHtml(name)} 已放回</b>`, '试过一次能正常出字，重新接单。'];
+    if (pausedMs > 0) lines.push(`前后停了 ${fmtDuration(pausedMs)}。`);
+    await this.broadcastToAdmins(lines.join('\n'), { disable_notification: true });
+    return true;
+  }
+
+  // 13. 提醒过的号连续 30 分钟没再出错（不响）
+  async notifyAccountRecovered({ groupName, name, durationMs = 0 }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const lines = [`✅ <b>${escapeHtml(groupName)}：${escapeHtml(name)} 好了</b>`, '连续 30 分钟没再出错。'];
+    if (durationMs > 0) lines.push(`前后持续了 ${fmtDuration(durationMs)}。`);
+    await this.broadcastToAdmins(lines.join('\n'), { disable_notification: true });
+    return true;
+  }
+
   // 双机集群：离线、中台连不上、隧道不通、Sub2API 没响应、容器不在运行、指标取不到，这些故障响铃；
   // 磁盘或内存快满、恢复消息只推送不响。
   // 文字全部转义：标题和原因里可能带着从机器上读来的字。
@@ -1311,6 +1377,16 @@ class TelegramBotManager {
     const exhausted = d.exhausted || [];
     if (exhausted.length) {
       items.push('🔴 没有账号能顶上：' + exhausted.map(e => `${escapeHtml(e.group)}（${e.unresolved ? '还没解决' : '已恢复'}）`).join('、'));
+    }
+    const guard = d.accountGuard || {};
+    if ((guard.paused || []).length) {
+      items.push('⏸️ 还在自动暂停的号：' + guard.paused.map(p => `${escapeHtml(p.name)}（${escapeHtml(p.group)}，${fmtClock(p.since)} 起）`).join('、'));
+    }
+    if ((guard.failing || []).length) {
+      items.push('⚠️ 一直在失败、没法自动暂停：' + guard.failing.map(f => `${escapeHtml(f.name)}（${escapeHtml(f.group)}）`).join('、'));
+    }
+    if (guard.pausedCount || guard.resumedCount) {
+      items.push(`⏸️ 人工管理分组里自动暂停 ${guard.pausedCount || 0} 次、试过后放回 ${guard.resumedCount || 0} 次`);
     }
     const low = d.lowBalance || [];
     if (low.length) items.push('💰 余额偏低：' + low.map(c => `${escapeHtml(c.name)}${c.shared ? '（共用余额）' : ''} ${fmtMoney(c.balance, c.unit)}`).join('；'));

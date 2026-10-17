@@ -659,3 +659,22 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
   - `exhausted` 分支先删掉 `exhaustedHealthySince`：又坏了，正常时长重新算；提醒次数和节奏（0、1 小时、3 小时、之后每 6 小时）接着原来的往后排。
   - `clearExhaustedReminder` 一起清 `exhaustedHealthySince`；换号成功照旧马上清零。`evaluateGroup` 复制运行时用的是 `{ ...runtime }`，新字段自然保留。
 - **测试：** `test-regressions.js` 新增 1 项、改写 1 项，两项在旧代码上都失败：五轮「正常一分钟、又坏」只有第一条提醒，没有「已恢复」，计数仍是 1；一小时后第 2 次提醒计数为 2；29 分钟不算恢复，31 分钟算，之后再卡住从第 1 次开始。
+
+## 人工管理分组的坏号看护（2026-10-17）
+
+- **起因：** 只读核对一周的线上数据：两个人工管理分组（`groupPolicies[id].enabled === false`）里，有主调连续一天多 0 次成功，每个请求都在上游流里回「没有这个模型的可用渠道」（状态码 200 的流内错误），接单开关却一直开着。`evaluateAutoSwitch` 对这种分组直接 `continue`，`refreshFailoverHealth` 也跳过它们的账号，所以没有任何提醒；`/v1/models` 探测照样通过。按小时看，「这个号这一小时失败不少于成功、至少 5 次」时段里的失败占了客户上游失败的一大块。
+- **新模块 `manual-group-guard.js`（纯逻辑，不碰数据库和 Telegram）：**
+  - `statsSql()`：只读，按（账号，分组）统计最近 60 分钟和 30 分钟的成功（`usage_logs`）和失败（`ops_error_logs` 里 `error_phase = 'upstream' AND error_owner = 'provider'`，排除 `is_count_tokens`、状态码 400/413、`Recovered upstream error`，499 只算 `response_latency_ms >= 60000` 的），带最近一次失败的原因。拼进 SQL 的只有整数。线上只读试跑 31 毫秒。
+  - `judge`：`dead` = 60 分钟 0 成功且失败 ≥ 5；`failing` = 30 分钟失败 ≥ 15 且 ≥ 70%。
+  - `evaluate`：只看 `isManualGroup` 的分组里 `schedulable`、未手动关闭、分组优先级为 1（主调）、不是关键字例外的账号。坏了时：只在这一个分组、并且同组至少有一个别的主调 `peerHealthy`（30 分钟有请求且失败 < 20%；它没接到请求时，只有坏号 60 分钟 0 成功才算它能顶上）→ `pause`；否则 `warn`（`last_main` / `shared` / `no_healthy_peer`），节奏同「没有能顶上」（0、1 小时、3 小时、之后每 6 小时），满 30 分钟没再坏发 `warn_resolved`。暂停时长 30 分钟，放回去 6 小时内再坏就加倍，上限 4 小时。
+  - 暂停中的账号：被打开、被手动关闭、角色改掉、移出分组、删除 → `forget`（交给人工，不再自动放回）；到点 → `probe`（同一时间只试一次，`releaseStaleProbes` 10 分钟后释放卡住的）。`afterProbe`：通过且已打开 → 删暂停、记 `history`；否则时长加倍。
+- **接线（`server.js`）：**
+  - `isManualGuardGroup`：本组关了自动切号或在 `exemptGroupIds` 里，或者全站自动切号关着；名字带例外关键字的分组不管。开关 `autoSwitchConfig.manualGuardEnabled`（默认开，`POST /api/auto-switch/config` 可改，控制台「自动切号设置」里有按钮）。
+  - `startManualGroupGuardPoller`：每 60 秒一轮，`execPsqlAsync`（只读事务、语句超时），不阻塞主进程。
+  - `pause`：`toggleRemoteAccountsSchedulable([id], false)`（只改 `schedulable`，不动优先级，不设 `autoSwitchDisabled`），失败就 `rollbackPause` 且不通知；写 `alerts`（类型 `account_guard`）、事件流水、`notifyAccountPaused`（响铃）。
+  - `probe`：`probeChannelModel(channel, 模型, { fullStream: true })`，模型取本组客户最近用得最多、这个号也支持的那个，换成 `modelMapping` 里的上游名。试的过程中人工接手了（暂停记录没了）就什么都不做；通过则 `toggleRemoteAccountsSchedulable([id], true)`（只会打开仍是主调、每个分组都不亏本的号），`notifyAccountResumed`（不响）；没通过只记日志。
+  - 同一分组同一轮的多个 `warn` 合成一条 `notifyAccountFailing`；`getEnrichedChannels` 给暂停中的账号加 `autoPause`，控制台开关文字显示「自动暂停」，提示里写原因和下次试的时间（转义后放进 `title`）。每日简报 `accountGuard`：还在暂停的、一直失败停不了的、24 小时内暂停和放回的次数。
+- **`probeChannelModel` 新选项 `fullStream`：** 把 1 个字的回答读完（最多 64 KB，仍受原来的 35 秒超时），整段检查错误帧，并要求出现过 `choices` / `delta`。原来的调用不变（只看第一帧）。
+- **规则怎么定的：** 把两个人工管理分组 8 天的成功和失败记录导出，在本机按分钟回放几组规则（被暂停期间该账号的真实成功数当作「挪给别人的量」，真实失败数当作「省掉的失败」）。最初的「15 分钟失败 5 次、或连续失败 5 次」会在忙碌的号上因为一小段抖动就暂停（例如 15 分钟成功两百多次、失败几次），被否掉；只看「1 小时 0 成功」和「30 分钟失败七成以上」后，暂停次数明显少，被停的大多是真坏的号。短时间的抖动 Sub2API 自己的错误率打分已经会绕开。
+- **测试：** 新文件 `scripts/test-manual-group-guard.js` 27 项（统计 SQL 的过滤条件和整数拼接、判断规则、暂停与三种只提醒、空闲的同组主调、提醒节奏与「好了」、人工接手的五种情况、到点试与加倍、6 小时内再坏加倍、多个坏号、卡住的试探、状态复制；Telegram 四种消息的文字、转义和响不响；`server.js` 接线：真的关、关失败退回、试过放回、试不过继续停、试的途中人工接手、同组合并提醒与分组范围、关掉开关后不查库；控制台开关的回显和保存）；`test-regressions.js` 新增 1 项（`fullStream` 能发现第一帧之后的错误、没有任何文字也算失败，旧代码上失败）。本机用假数据的页面预览看过：暂停账号显示「自动暂停」和提示、告警列表、设置里的开关和保存。
+- **未做：** 部署。
