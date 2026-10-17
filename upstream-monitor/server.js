@@ -6781,6 +6781,8 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
         // 第一次马上提醒；故障一直在，就 1 小时、3 小时后各提醒一次，之后每 6 小时一次（exhaustedReminderDue）。
         // 以前每小时一条一模一样的消息，一天能刷十几条，真正要紧的反而容易被忽略。
         delete decision.runtime.exhaustedNotified;
+        // 又坏了：「正常了多久」从头算
+        delete decision.runtime.exhaustedHealthySince;
         if (exhaustedReminderDue(decision.runtime, now)) {
           const count = (Number(decision.runtime.exhaustedNotifyCount) || 0) + 1;
           const since = Number(decision.runtime.exhaustedSince) || now;
@@ -6821,14 +6823,21 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
       } else {
         // 之前提醒过「没有账号能顶上」、现在原账号自己好了（没换号）：补一条不响的「已恢复」。
         // cooldown 可能发生在故障中（同一目标 3 分钟内不重复切），不算恢复。
+        // 主调时好时坏时，中间正常一两分钟不算恢复：连续正常满 30 分钟才发「已恢复」，
+        // 提醒次数也到那时才从头算。以前每次「正常一分钟」都清零，一小时能收到 9 条「这是第 1 次」。
         const recoveredInPlace = ['healthy', 'manual_main'].includes(decision.reason);
         if (recoveredInPlace && (decision.runtime.exhaustedSince || decision.runtime.exhaustedNotifiedAt)) {
-          const since = Number(decision.runtime.exhaustedSince || decision.runtime.exhaustedNotifiedAt) || now;
-          const current = channels.find(c => String(c.id) === String(decision.currentId));
-          clearExhaustedReminder(decision.runtime);
-          if (telegram && typeof telegram.notifyPoolRecovered === 'function') {
-            Promise.resolve(telegram.notifyPoolRecovered({ groupName: group.name, currentName: current ? current.name : '', durationMs: now - since }))
-              .catch(error => console.error('[切号通知]', error.message));
+          const healthySince = Number(decision.runtime.exhaustedHealthySince) || 0;
+          if (!healthySince) {
+            decision.runtime.exhaustedHealthySince = now;
+          } else if (now - healthySince >= EXHAUSTED_RECOVERY_HOLD_MS) {
+            const since = Number(decision.runtime.exhaustedSince || decision.runtime.exhaustedNotifiedAt) || healthySince;
+            const current = channels.find(c => String(c.id) === String(decision.currentId));
+            clearExhaustedReminder(decision.runtime);
+            if (telegram && typeof telegram.notifyPoolRecovered === 'function') {
+              Promise.resolve(telegram.notifyPoolRecovered({ groupName: group.name, currentName: current ? current.name : '', durationMs: healthySince - since }))
+                .catch(error => console.error('[切号通知]', error.message));
+            }
           }
         }
         details.push(group.name + '：' + (reasonNames[decision.reason] || decision.reason));
@@ -6846,6 +6855,8 @@ function evaluateAutoSwitch(triggerReason = '自动巡检评估') {
 // 本组没有能顶上的账号时的提醒节奏：第一次马上，之后距第一次 1 小时、3 小时各一次，再往后每 6 小时一次
 const EXHAUSTED_REMINDER_OFFSETS_MS = [0, 3600000, 3 * 3600000];
 const EXHAUSTED_REMINDER_EVERY_MS = 6 * 3600000;
+// 提醒过之后，要连续这么久没再卡住才算真的恢复
+const EXHAUSTED_RECOVERY_HOLD_MS = 30 * 60000;
 
 function exhaustedReminderDue(runtime, now) {
   // 旧版本只记了「上次提醒时间」：当作已经提醒过一次，从那时开始算
@@ -6868,6 +6879,7 @@ function clearExhaustedReminder(runtime) {
   delete runtime.exhaustedNotified;
   delete runtime.exhaustedSince;
   delete runtime.exhaustedNotifyCount;
+  delete runtime.exhaustedHealthySince;
 }
 const AUTO_SWITCH_REASON_NAMES = { disabled: '当前账号已停用', balance_empty: '余额不足或连续欠费断粮', request_failures: '连续请求失败或失败率超标', probe_failures: '连续探活失败', routing_failures: '客户请求连续找不到账号接单（主调没被 Sub2API 选上）', no_active_account: '恢复可用账号', cooldown: '回切冷却中', healthy: '运行稳定', cheaper_recovered: '低价账号已稳定恢复', manual_main: '主调是你亲手选的，不为省钱换号', main_recharged: '原主调恢复正常', origin_recent_failures: '原主调最近真实请求出过错，暂不换回', automation_disabled: '自动切号已关闭' };
 

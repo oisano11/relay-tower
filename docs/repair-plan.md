@@ -649,3 +649,13 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
   - agent：`metrics.read_backups(目录, 文件名样式)` 只看文件名和 `stat`，跳过隐藏文件和目录；`backupConfigured` 告诉塔台这台有没有配置备份目录。
   - 塔台：`pickBackup` 算出离现在多久，超过 26 小时（或一份都没有）算断了：卡片警告、诊断 WARN、`<role>.backup` 连续 2 次发不响铃的提醒；配置了却读不到时，诊断 UNKNOWN，`<role>.backupUnknown` 连续 3 次另报。每日简报：正常时在最后写一行参考，断了或读不到算「要处理的事」。
 - **测试：** `cluster-monitor/tests/test_db_backup.py` 6 项（假的 docker 命令：正常一份、文件权限、密码不上命令行、按份数清理、导出失败/文件坏/空文件都不留半成品也不动旧备份、读不到数据库设置就不跑、空间不够就不跑、KEEP 不合法）；Python 读备份目录 4 项、节点数据 1 项；JS 4 项（卡片、过期、读不到、简报）。
+
+## 「没有账号能顶上」提醒在主调时好时坏时反复从第 1 次开始（2026-10-17）
+
+- **现象：** 一个没有可用副调的分组，主调间歇出错。一小时里收到多条「没有能顶上的副调或备选」，每条都是「这是第 1 次」，每条后面跟一条不响的「已恢复」。
+- **原因：** `evaluateAutoSwitch` 的非切换分支里，`decision.reason` 是 `healthy` 或 `manual_main` 就调用 `clearExhaustedReminder` 并发 `notifyPoolRecovered`。主调的 5 分钟统计一会儿过线、一会儿不过线，决策就在 `exhausted` 和 `healthy` 之间来回，每回到 `exhausted` 时 `exhaustedNotifyCount` 已被清零，`exhaustedReminderDue` 立刻返回真。
+- **改法（`server.js`）：**
+  - 运行时新增 `exhaustedHealthySince`。提醒期间第一次判为正常时只记下这个时间；满 `EXHAUSTED_RECOVERY_HOLD_MS`（30 分钟）仍然正常，才清掉整个提醒周期并发「已恢复」，时长按「开始卡住 → 开始正常」算。
+  - `exhausted` 分支先删掉 `exhaustedHealthySince`：又坏了，正常时长重新算；提醒次数和节奏（0、1 小时、3 小时、之后每 6 小时）接着原来的往后排。
+  - `clearExhaustedReminder` 一起清 `exhaustedHealthySince`；换号成功照旧马上清零。`evaluateGroup` 复制运行时用的是 `{ ...runtime }`，新字段自然保留。
+- **测试：** `test-regressions.js` 新增 1 项、改写 1 项，两项在旧代码上都失败：五轮「正常一分钟、又坏」只有第一条提醒，没有「已恢复」，计数仍是 1；一小时后第 2 次提醒计数为 2；29 分钟不算恢复，31 分钟算，之后再卡住从第 1 次开始。

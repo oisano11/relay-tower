@@ -3422,7 +3422,7 @@ test('with no usable backup the group is reminded at once, after 1 h and 3 h, th
   assert.equal(telegrams[3].count, 4);
 });
 
-test('a group that was reminded and then recovers without a switch gets one quiet 已恢复; a cooldown hold is not a recovery', () => {
+test('a group that was reminded and then recovers without a switch gets one quiet 已恢复 after 30 min without trouble', () => {
   const now = Date.now();
   const recovered = [];
   const { context, state } = evaluator({
@@ -3433,14 +3433,74 @@ test('a group that was reminded and then recovers without a switch gets one quie
   state.activeChannelId = '1';
   state.failoverRuntime = { 1: { lastCurrentId: '1', currentSince: now - 600000, exhaustedSince: now - 2 * 3600000, exhaustedNotifyCount: 2, exhaustedNotifiedAt: now - 3600000 } };
   context.evaluateAutoSwitch();
+  assert.equal(recovered.length, 0, 'one fine minute is not a recovery yet');
+  assert.ok(state.failoverRuntime[1].exhaustedHealthySince >= now);
+  assert.equal(state.failoverRuntime[1].exhaustedNotifyCount, 2, 'the episode is kept meanwhile');
+  state.failoverRuntime[1].exhaustedHealthySince = Date.now() - 31 * 60000;
+  context.evaluateAutoSwitch();
   assert.equal(recovered.length, 1);
   assert.equal(recovered[0].groupName, 'A');
   assert.equal(recovered[0].currentName, '主调甲');
-  assert.ok(recovered[0].durationMs >= 2 * 3600000 - 1000);
-  assert.equal(state.failoverRuntime[1].exhaustedSince, undefined);
-  assert.equal(state.failoverRuntime[1].exhaustedNotifyCount, undefined);
+  assert.ok(Math.abs(recovered[0].durationMs - (2 * 3600000 - 31 * 60000)) < 5000, 'the outage ends when it became fine');
+  for (const key of ['exhaustedSince', 'exhaustedNotifyCount', 'exhaustedHealthySince']) {
+    assert.equal(state.failoverRuntime[1][key], undefined, key);
+  }
   context.evaluateAutoSwitch();
   assert.equal(recovered.length, 1, 'said once');
+});
+
+test('a main that flickers between faulty and fine stays one reminder episode instead of restarting at 「第 1 次」', () => {
+  const now = Date.now();
+  let failing = true;
+  const telegrams = [];
+  const recovered = [];
+  const { context, state } = evaluator({
+    fetchRecentGroupRoutingFailures: () => (failing
+      ? { 1: { failures: [1, 2, 3].map(i => ({ at: Date.now() - i * 5000, model: 'gpt-a', type: 'api_error' })), lastSuccessAt: now - 120000 } }
+      : {}),
+    fetchGroupModelDemand: () => ({ 1: ['gpt-a'] }),
+    telegram: {
+      notifyAutoSwitch() {},
+      notifyPoolExhausted: payload => { telegrams.push(payload); return Promise.resolve(true); },
+      notifyPoolRecovered: payload => { recovered.push(payload); return Promise.resolve(true); }
+    }
+  });
+  state.allGroups = [{ id: 1, name: 'A', sale_rate: 1 }];
+  state.channels = [fixChannel(1, { name: '主调甲', priority: 1, schedulable: true, configuredModels: ['gpt-a'], groupsDetail: [{ id: 1, name: 'A', sale_rate: 1, priority: 1 }] })];
+  state.activeChannelId = '1';
+  state.failoverRuntime = { 1: { lastCurrentId: '1', currentSince: now - 600000 } };
+  context.evaluateAutoSwitch();
+  assert.equal(telegrams.length, 1);
+  // 一会儿正常、一会儿又坏：以前每次「正常」都清零，一小时能刷 9 条「这是第 1 次」，还各带一条「已恢复」
+  for (let i = 0; i < 5; i++) {
+    failing = false;
+    context.evaluateAutoSwitch();
+    failing = true;
+    context.evaluateAutoSwitch();
+  }
+  assert.equal(telegrams.length, 1, 'no new reminder inside the first hour');
+  assert.equal(context.alerts.length, 1);
+  assert.equal(recovered.length, 0, 'no 已恢复 while it keeps flickering');
+  assert.equal(state.failoverRuntime[1].exhaustedNotifyCount, 1);
+  assert.equal(state.failoverRuntime[1].exhaustedHealthySince, undefined, 'a new fault restarts the fine-for-30-min clock');
+  // 一直时好时坏，第 2 次提醒照常在 1 小时后来，计数接着往上加
+  state.failoverRuntime[1].exhaustedSince = Date.now() - 61 * 60000;
+  context.evaluateAutoSwitch();
+  assert.equal(telegrams.length, 2);
+  assert.equal(telegrams[1].count, 2);
+  // 满 30 分钟没再卡住才算恢复，之后再卡住从第 1 次算
+  failing = false;
+  context.evaluateAutoSwitch();
+  state.failoverRuntime[1].exhaustedHealthySince = Date.now() - 29 * 60000;
+  context.evaluateAutoSwitch();
+  assert.equal(recovered.length, 0, 'not yet after 29 min');
+  state.failoverRuntime[1].exhaustedHealthySince = Date.now() - 31 * 60000;
+  context.evaluateAutoSwitch();
+  assert.equal(recovered.length, 1);
+  failing = true;
+  context.evaluateAutoSwitch();
+  assert.equal(telegrams.length, 3);
+  assert.equal(telegrams[2].count, 1);
 });
 
 test('a successful switch clears the reminder clock, so the next stuck moment is reported at once', () => {
