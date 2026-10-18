@@ -131,6 +131,12 @@ function fmtClock(ms) {
   return formatShanghaiDateTime(new Date(Number(ms))).slice(11, 16);
 }
 
+// 北京时间：今天的只写几点几分，别的日子带上日期
+function fmtWhen(ms, now = Date.now()) {
+  const text = formatShanghaiDateTime(new Date(Number(ms)));
+  return text.slice(0, 10) === formatShanghaiDateTime(new Date(now)).slice(0, 10) ? text.slice(11, 16) : text.slice(5, 16);
+}
+
 // 坏号看护：这个号最近怎么了
 function describeGuardFacts(facts = {}) {
   if (facts.verdict === 'dead') return `最近 1 小时 ${Number(facts.failed60) || 0} 次请求全部失败，一次都没成功。`;
@@ -1328,6 +1334,35 @@ class TelegramBotManager {
     return true;
   }
 
+  // 14. 人工管理分组整组断了：本组接过的模型，最近一段时间一个请求都没成功（响）。
+  // 不管原因是号坏了、号都在歇着还是没有号可用；节奏和坏号提醒一样（由 manual-group-guard.js 控制）
+  async notifyGroupDown({ groupName, model, failed = 0, windowMinutes = 30, startedAt = 0, lastOkAt = 0, count = 1, mains = [] }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const lines = [`⛔ <b>${escapeHtml(groupName)} 断了：${escapeHtml(model)} 一个请求都没成功</b>`];
+    lines.push(`最近 ${windowMinutes} 分钟 ${failed} 个请求全部失败${startedAt ? `，${fmtWhen(startedAt)} 开始` : ''}${lastOkAt ? `；最后一次成功是 ${fmtWhen(lastOkAt)}` : ''}。`);
+    if (mains.length) {
+      lines.push('在接单的主调：');
+      for (const main of mains) lines.push(`· ${escapeHtml(main.name)}${main.lastError ? `：上游返回 ${escapeHtml(String(main.lastError).slice(0, 160))}` : ''}`);
+    } else {
+      lines.push('这个分组现在没有在接单的主调。');
+    }
+    lines.push('这个分组是人工管理，塔台不会自己换号：请换一个能用的主调。恢复后会告诉你。');
+    lines.push(count > 1 && startedAt
+      ? `已经断了 ${fmtDuration(Date.now() - startedAt)} · 第 ${count} 次提醒`
+      : '没恢复前，1 小时、3 小时后各再提醒一次，之后每 6 小时一次。');
+    await this.broadcastToAdmins(lines.join('\n'));
+    return true;
+  }
+
+  // 15. 整组断了以后又有请求成功了（不响）
+  async notifyGroupRecovered({ groupName, model, startedAt = 0, recoveredAt = 0 }) {
+    if (!this.config.enabled || this.config.notifyOnOutage === false || !this.hasAdmins()) return false;
+    const lines = [`✅ <b>${escapeHtml(groupName)} 恢复了</b>`, `${escapeHtml(model)} ${recoveredAt ? `${fmtWhen(recoveredAt)} ` : ''}又有请求成功了。`];
+    if (startedAt && recoveredAt > startedAt) lines.push(`前后断了 ${fmtDuration(recoveredAt - startedAt)}。`);
+    await this.broadcastToAdmins(lines.join('\n'), { disable_notification: true });
+    return true;
+  }
+
   // 双机集群：离线、中台连不上、隧道不通、Sub2API 没响应、容器不在运行、指标取不到，这些故障响铃；
   // 磁盘或内存快满、恢复消息只推送不响。
   // 文字全部转义：标题和原因里可能带着从机器上读来的字。
@@ -1392,6 +1427,12 @@ class TelegramBotManager {
       items.push('🔴 没有账号能顶上：' + exhausted.map(e => `${escapeHtml(e.group)}（${e.unresolved ? '还没解决' : '已恢复'}）`).join('、'));
     }
     const guard = d.accountGuard || {};
+    if ((guard.down || []).length) {
+      items.push('⛔ 现在还断着：' + guard.down.map(x => `${escapeHtml(x.group)} 的 ${escapeHtml(x.model)}（${fmtWhen(x.startedAt)} 开始）`).join('、'));
+    }
+    if ((guard.outages || []).length) {
+      items.push('⛔ 整组断过：' + guard.outages.map(x => `${escapeHtml(x.group)} 的 ${escapeHtml(x.model)} 断了 ${fmtDuration(Number(x.recoveredAt) - Number(x.startedAt))}（${fmtWhen(x.startedAt)}–${fmtWhen(x.recoveredAt)}）`).join('、'));
+    }
     if ((guard.paused || []).length) {
       items.push('⏸️ 还在自动暂停的号：' + guard.paused.map(p => `${escapeHtml(p.name)}（${escapeHtml(p.group)}，${fmtClock(p.since)} 起）`).join('、'));
     }

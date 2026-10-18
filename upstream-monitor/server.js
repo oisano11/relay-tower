@@ -1148,7 +1148,7 @@ function buildBusinessDigest() {
   }
 }
 
-// 每日简报里的坏号看护：现在还停着的、一直失败又停不了的、过去 24 小时停过几次放回几次
+// 每日简报里的坏号看护：现在还停着的、一直失败又停不了的、过去 24 小时停过几次放回几次、整组断过的和还断着的
 function buildAccountGuardDigest(now) {
   const guard = state.manualGuard || {};
   const since = now - 24 * 3600000;
@@ -1165,7 +1165,11 @@ function buildAccountGuardDigest(now) {
     paused: Object.values(guard.pauses || {}).map(pause => ({ name: pause.name, group: pause.groupName, since: pause.since })),
     failing: [...failing.values()],
     pausedCount: events.filter(event => event.type === 'pause').length,
-    resumedCount: events.filter(event => event.type === 'resume').length
+    resumedCount: events.filter(event => event.type === 'resume').length,
+    down: Object.values(guard.groupDowns || {}).map(entry => ({ group: entry.groupName || `分组 ${entry.groupId}`, model: entry.model, startedAt: entry.startedAt })),
+    outages: events.filter(event => event.type === 'group_up').map(event => ({
+      group: event.groupName || `分组 ${event.groupId}`, model: event.model, startedAt: event.startedAt, recoveredAt: event.recoveredAt
+    }))
   };
 }
 
@@ -1285,6 +1289,7 @@ function startAdminWatchPoller() {
 
 // ====== 人工管理分组的坏号看护（规则见 manual-group-guard.js）======
 // 只管「人工管理」分组：本组关了自动切号，或者全站自动切号关着。名字带 私人、通用 这类关键字的分组是你自己用的，不管。
+// 除了单个坏号，还看整组断了没有：本组接过的模型一段时间一个请求都没成功，响铃提醒。
 function isManualGuardGroup(group) {
   if (!group) return false;
   const name = String(group.name || '').toLowerCase();
@@ -1297,7 +1302,7 @@ function isManualGuardGroup(group) {
 }
 
 function recordManualGuardAlert(action, note) {
-  alerts.unshift({ id: `guard_${action.accountId}_${Date.now()}`, type: 'account_guard', channelId: String(action.accountId), channelName: action.name,
+  alerts.unshift({ id: `guard_${action.accountId || `group${action.groupId}`}_${Date.now()}`, type: 'account_guard', channelId: String(action.accountId || ''), channelName: action.name,
     groupId: action.groupId, groupName: action.groupName, timestamp: new Date().toISOString(), note });
   if (alerts.length > 200) alerts = alerts.slice(0, 200);
   writeJSON(ALERTS_FILE, alerts);
@@ -1382,18 +1387,55 @@ async function runManualGuardProbe(action) {
   broadcastSSE('CHANNELS_UPDATED', state);
 }
 
+// 整组断了（响）：第一次提醒时在控制台和简报流水里各记一条，之后按节奏再推 Telegram
+function notifyManualGroupDown(action, now) {
+  const mains = action.mains.map(main => main.name).join('、');
+  console.log(`⛔ [坏号看护] ${action.groupName}：${action.model} 最近 ${action.windowMinutes} 分钟 ${action.failed} 个请求全部失败（第 ${action.count} 次提醒）`);
+  if (action.count === 1) {
+    recordManualGuardAlert({ accountId: '', name: action.groupName, groupId: action.groupId, groupName: action.groupName },
+      `${action.groupName} 断了：${action.model} 从 ${beijingHourMinute(action.startedAt)} 开始一个请求都没成功。${mains ? `在接单的主调：${mains}。` : '这个分组现在没有在接单的主调。'}这个分组是人工管理，塔台不会自己换号，请换一个能用的主调。`);
+    manualGroupGuard.recordEvent(state.manualGuard, { type: 'group_down', at: now, groupId: action.groupId, groupName: action.groupName, model: action.model, startedAt: action.startedAt });
+  }
+  sendManualGuardTelegram('notifyGroupDown', {
+    groupName: action.groupName, model: action.model, failed: action.failed, windowMinutes: action.windowMinutes,
+    startedAt: action.startedAt, lastOkAt: action.lastOkAt, count: action.count, mains: action.mains
+  });
+}
+
+// 整组又有请求成功了（不响）
+function notifyManualGroupUp(action, now) {
+  console.log(`✅ [坏号看护] ${action.groupName}：${action.model} ${beijingHourMinute(action.recoveredAt)} 又有请求成功了`);
+  recordManualGuardAlert({ accountId: '', name: action.groupName, groupId: action.groupId, groupName: action.groupName },
+    `${action.groupName} 恢复了：${action.model} ${beijingHourMinute(action.recoveredAt)} 又有请求成功了（${beijingHourMinute(action.startedAt)} 开始断的）。`);
+  manualGroupGuard.recordEvent(state.manualGuard, {
+    type: 'group_up', at: now, groupId: action.groupId, groupName: action.groupName, model: action.model, startedAt: action.startedAt, recoveredAt: action.recoveredAt
+  });
+  sendManualGuardTelegram('notifyGroupRecovered', { groupName: action.groupName, model: action.model, startedAt: action.startedAt, recoveredAt: action.recoveredAt });
+}
+
+let manualGroupDownError = '';
 async function runManualGroupGuard(now = Date.now()) {
   if (autoSwitchConfig.manualGuardEnabled === false) return { skipped: true, actions: [] };
   const before = JSON.stringify(state.manualGuard || {});
   const guardState = manualGroupGuard.releaseStaleProbes(manualGroupGuard.normalizeState(state.manualGuard), now);
   const groups = state.allGroups || [];
-  if (!groups.some(isManualGuardGroup) && !Object.keys(guardState.pauses).length && !Object.keys(guardState.warnings).length) {
+  if (!groups.some(isManualGuardGroup) && !Object.keys(guardState.pauses).length && !Object.keys(guardState.warnings).length &&
+    !Object.keys(guardState.groupDowns).length) {
     state.manualGuard = guardState;
     return { actions: [] };
   }
   const stats = manualGroupGuard.parseStats(await execPsqlAsync(manualGroupGuard.statsSql()));
+  // 整组统计读不到时照样看单个坏号；记着的「断了」不会因此被当成恢复
+  let downs = { down: [], ok: [] };
+  try {
+    downs = manualGroupGuard.parseGroupDown(await execPsqlAsync(manualGroupGuard.groupDownSql()));
+    manualGroupDownError = '';
+  } catch (error) {
+    if (error.message !== manualGroupDownError) console.error('[坏号看护] 整组统计没读到：', error.message);
+    manualGroupDownError = error.message;
+  }
   const { state: next, actions } = manualGroupGuard.evaluate({
-    groups, channels: state.channels, stats, state: guardState, now,
+    groups, channels: state.channels, stats, downs, state: guardState, now,
     isManualGroup: isManualGuardGroup,
     isExemptChannel: channel => typeof isKeywordExemptChannel === 'function' && isKeywordExemptChannel(channel)
   });
@@ -1415,6 +1457,10 @@ async function runManualGroupGuard(now = Date.now()) {
       probes.push(action);
     } else if (action.type === 'forget') {
       console.log(`ℹ️ [坏号看护] ${action.pause.groupName}：${action.pause.name} 的暂停交给你了（${action.why}）`);
+    } else if (action.type === 'group_down') {
+      notifyManualGroupDown(action, now);
+    } else if (action.type === 'group_up') {
+      notifyManualGroupUp(action, now);
     }
   }
   // 同一个分组同时有几个号在失败，合成一条提醒

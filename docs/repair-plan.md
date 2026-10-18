@@ -704,3 +704,15 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
   - 名字：用户名，没有就 `maskEmail`（前两个字 + 域名），再加编号。
 - **接线（`server.js`）：** `startCustomerBalancePoller` 每 5 分钟一轮（`execPsqlAsync`），状态存 `data/customer_balance_state.json`；`notifyCustomerBalance` 没发出去就不更新状态，下一轮重来。Telegram：有 `empty` 时响铃，只有 `low` 时不响；名字转义。每日简报 `customerBalance` 列出还没充值的（算「要处理的事」）。`customerBalanceState` 在轮询启动时才读文件，`buildDailyDigestData` 用 `typeof` 兜底，测试切片里没有这个模块也能跑。
 - **测试：** 新文件 `scripts/test-customer-balance.js` 10 项（SQL 范围、命名和打码、快用完、用完了还在请求、只提醒一次与升级、充了一点不重复提醒、充够了重新开始、30 天遗忘、Telegram 文字与响不响、简报两行、`buildBusinessDigest`）。线上只读试跑 184 毫秒，第一轮的结果和手算一致。
+
+## 人工管理分组整组断了没有提醒（2026-10-18）
+
+- **起因：** 只读核对：一个人工管理分组只剩一个主调，上游从凌晨开始对它回 404「Model … is not supported by any configured account in this group」（我方记为 502、`error_owner = 'provider'`）。Sub2API 随即给这个号记 `model_rate_limits`，大约每 30 分钟才放一个请求过去，其余请求在路由阶段失败（`error_phase = 'routing'`、`error_owner = 'platform'`、503「Service temporarily unavailable」、`account_id` 为空）。`statsSql` 只数 `error_phase = 'upstream'` 的、按账号归属，这个号每小时只有 2 次失败，到不了 `dead`（≥ 5）；路由失败没有账号归属。人工管理分组又被 `evaluateAutoSwitch` 跳过，没有「没有账号能顶上」提醒。结果是几个小时全部失败，期间没有任何提醒。
+- **改法（`manual-group-guard.js`）：**
+  - `groupDownSql()`：只读。最近 `downWindowMinutes`（30）分钟按（分组，模型）统计失败：`error_phase IN ('upstream', 'routing', 'internal') AND error_owner IN ('provider', 'platform')`，加上和 `statsSql` 共用的 `failureFilter`；`HAVING COUNT(*) >= downMinFailures`（10）。只保留窗口内这个（分组，模型）没有任何成功、并且最近 `downServedDays`（7）天成功过的（`LATERAL` 取最近一次成功，走 `idx_usage_logs_group_created_at_not_null`）。另外返回窗口内每个（分组，模型）的最后一次成功时间，用来判断恢复。模型一律按 `COALESCE(NULLIF(btrim(requested_model), ''), model)`。拼进 SQL 的只有整数。线上只读试跑 33–55 毫秒。
+  - `evaluate`：新参数 `downs`（`parseGroupDown` 的结果），状态新增 `groupDowns`（键 `分组:模型`）。断着 → `group_down`（节奏同 `warn`：0、1 小时、3 小时、之后每 6 小时；带在接单的主调和它们最近一次上游报错）；记着的出现了比开始时间晚的成功 → `group_up`；分组没了或改回自动切号 → 悄悄丢掉；24 小时没再出现、也没成功 → 丢掉。整组断着时，组里的账号不产生 `warn`（也不记 warning），恢复后还坏的号照常提醒。
+  - `judge`：最近一次报错匹配 `FATAL_ERROR`（不支持这个模型、`No available channel`、`model_not_found`、`does not exist`、`Invalid API key`、余额不足）时，60 分钟 0 成功且失败 ≥ `fatalMinFailures`（2）就算 `dead`。
+  - `failureFilter`：两种统计共用；新排除内容审核拦截（`违反使用限制|cyber_policy`）。
+- **接线（`server.js`）：** `runManualGroupGuard` 多一条只读查询；查询失败只记一次日志，单个号的判断照常进行，记着的「断了」不会被当成恢复。`group_down`：第一次提醒时写 `alerts`（`account_guard`，`channelName` 用分组名）和事件流水，每次推 `notifyGroupDown`（响）；`group_up`：写 `alerts`、事件流水，推 `notifyGroupRecovered`（不响）。`buildAccountGuardDigest` 新增 `down`（还断着的）和 `outages`（24 小时内的 `group_up`），`formatDailyDigest` 各写一行（算「要处理的事」）。
+- **回放：** 把规则写成一条窗口函数 SQL，在线上只读回放最近 7 天：人工管理分组里只有两次真事故会响（一次是 Key 失效加另一家限流的 10 分钟，一次是这次，开始后 2 分钟内会响）；其余命中都在不受看护的自用分组和自动切号分组。把查询的 `NOW()` 换成事故中的几个时间点试跑：事故开始两分钟后能查出两个分组，换号后的第一分钟就不再出现。
+- **测试：** `scripts/test-manual-group-guard.js` 新增 12 项、改 2 项（`FATAL_ERROR` 判断、整组查询的条件和整数拼接、解析、断了→再提醒→恢复的完整过程、恢复后还坏的号照常提醒、非人工管理和遗忘、状态复制、Telegram 两种消息和简报两行、简报取数、`server.js` 接线和查询失败时的兜底），旧代码上 14 项失败。全部测试 Node 434、Python 83 通过。

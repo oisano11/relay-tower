@@ -11,6 +11,7 @@ const guard = require('../manual-group-guard');
 const NOW = 1_700_000_000_000;
 const MIN = 60000;
 const GROUP = { id: 901, name: '示例 | 专用' };
+const plain = value => JSON.parse(JSON.stringify(value));
 
 function account(id, name, { priority = 1, schedulable = true, groups = [901], closed = false } = {}) {
   return {
@@ -22,8 +23,8 @@ function account(id, name, { priority = 1, schedulable = true, groups = [901], c
 const healthy = { ok60: 120, failed60: 2, ok30: 60, failed30: 1, lastError: '' };
 const dead = { ok60: 0, failed60: 6, ok30: 0, failed30: 4, lastError: 'No available channel for model demo-model' };
 
-function run({ channels, stats, state, now = NOW, manual = () => true, exempt = () => false, groups = [GROUP] }) {
-  return guard.evaluate({ groups, channels, stats, state, now, isManualGroup: manual, isExemptChannel: exempt });
+function run({ channels, stats, downs, state, now = NOW, manual = () => true, exempt = () => false, groups = [GROUP] }) {
+  return guard.evaluate({ groups, channels, stats, downs, state, now, isManualGroup: manual, isExemptChannel: exempt });
 }
 
 test('the statistics query only counts upstream faults and only interpolates integers', () => {
@@ -34,8 +35,36 @@ test('the statistics query only counts upstream faults and only interpolates int
   assert.match(sql, /NOT IN \(400, 413\)/, 'request-specific upstream errors do not count');
   assert.match(sql, /status_code, 0\) <> 499 OR COALESCE\(response_latency_ms, 0\) >= 60000/, 'a client that gave up quickly is not the account’s fault');
   assert.match(sql, /\^recovered upstream error/, 'retried-then-successful rows do not count');
+  assert.match(sql, /违反使用限制\|cyber_policy/, 'a request blocked by content review is that request’s problem');
   const hostile = guard.statsSql({ ...guard.RULES, deadWindowMinutes: '60; DROP TABLE x', busyWindowMinutes: 30, hangMs: '1 OR 1=1' });
   assert.doesNotMatch(hostile, /DROP|OR 1=1/);
+});
+
+test('the whole-group query counts every failure the customer saw, only for models the group has served, and only interpolates integers', () => {
+  const sql = guard.groupDownSql();
+  assert.match(sql, /error_phase IN \('upstream', 'routing', 'internal'\) AND error_owner IN \('provider', 'platform'\)/, '「没有号可用」 counts too');
+  assert.match(sql, /INTERVAL '30 minutes'/);
+  assert.match(sql, /HAVING COUNT\(\*\) >= 10/);
+  assert.match(sql, /INTERVAL '7 days'/, 'only models the group served in the last week');
+  assert.match(sql, /NOT EXISTS \(SELECT 1 FROM ok WHERE ok.group_id = bad.group_id AND ok.model = bad.model\)/, 'one success in the window means it is not down');
+  assert.match(sql, /NOT IN \(400, 413\)/);
+  assert.match(sql, /违反使用限制\|cyber_policy/);
+  assert.doesNotMatch(sql, /client/, 'the customer’s own problems (balance, bad request) do not count');
+  const hostile = guard.groupDownSql({ ...guard.RULES, downWindowMinutes: '30; DROP TABLE x', downMinFailures: '1 OR 1=1', downServedDays: 'x' });
+  assert.doesNotMatch(hostile, /DROP|OR 1=1|'x'/);
+});
+
+test('whole-group rows are parsed into numbers; bad output is an error', () => {
+  const parsed = guard.parseGroupDown(JSON.stringify({
+    down: [{ groupId: '901', model: 'demo-model', failed: '22', firstFailedAt: 1000, lastOkAt: null, lastError: 'Service temporarily unavailable' }, { groupId: 901 }],
+    ok: [{ groupId: 902, model: 'demo-model', lastOkAt: '2000' }]
+  }));
+  assert.deepEqual(plain(parsed), {
+    down: [{ groupId: 901, model: 'demo-model', failed: 22, firstFailedAt: 1000, lastOkAt: null, lastError: 'Service temporarily unavailable' }],
+    ok: [{ groupId: 902, model: 'demo-model', lastOkAt: 2000 }]
+  });
+  assert.deepEqual(plain(guard.parseGroupDown('')), { down: [], ok: [] });
+  assert.throws(() => guard.parseGroupDown('[]'), /格式不对/);
 });
 
 test('statistics rows are keyed by account and group; bad output is an error', () => {
@@ -52,6 +81,17 @@ test('only a sustained fault counts: an hour without a single success, or most o
   assert.equal(guard.judge({ ok60: 60, failed60: 20, ok30: 15, failed30: 15 }), null, 'half failing is not most');
   assert.equal(guard.judge({ ok60: 400, failed60: 12, ok30: 208, failed30: 9 }), null, 'a short burst inside a busy, mostly fine stream');
   assert.equal(guard.judge({ ok60: 0, failed60: 4, ok30: 0, failed30: 4 }), null, 'too few requests to tell');
+});
+
+test('when the upstream says the account cannot work (no such model, bad key, no balance), two failures in an hour are enough', () => {
+  const fatal = message => ({ ok60: 0, failed60: 2, ok30: 0, failed30: 1, lastError: message });
+  assert.equal(guard.judge(fatal('Model "demo-model" is not supported by any configured account in this group')), 'dead');
+  assert.equal(guard.judge(fatal('No available channel for model demo-model under group x')), 'dead');
+  assert.equal(guard.judge(fatal('Invalid API key')), 'dead');
+  assert.equal(guard.judge(fatal('Insufficient account balance')), 'dead');
+  assert.equal(guard.judge(fatal('Upstream service temporarily unavailable')), null, 'an ordinary error still needs 5');
+  assert.equal(guard.judge({ ...fatal('Invalid API key'), failed60: 1 }), null, 'once is not enough');
+  assert.equal(guard.judge({ ...fatal('Invalid API key'), ok60: 1 }), null, 'it still worked once this hour');
 });
 
 test('a dead main is paused when another main in the manual group is serving fine', () => {
@@ -207,6 +247,65 @@ test('a probe left hanging (for example across a restart) is released after 10 m
   assert.equal(state.pauses['7001'].probing, undefined);
 });
 
+// 整组断了：一个号也接不了单（上游说没有这个模型，Sub2API 让号歇着，其余请求「没有号可用」）
+const downRow = { groupId: 901, model: 'demo-model', failed: 22, firstFailedAt: NOW - 20 * MIN, lastOkAt: NOW - 2 * 3600000, lastError: 'Service temporarily unavailable' };
+const notSupported = { ok60: 0, failed60: 2, ok30: 0, failed30: 1, lastError: 'Model "demo-model" is not supported by any configured account in this group' };
+
+test('a manual group where nothing succeeds rings once, again after 1 h and 3 h, and says 恢复了 when a request gets through', () => {
+  const channels = [account(7001, '号甲'), account(7004, '备用号', { priority: 100, schedulable: false })];
+  let state = guard.emptyState();
+  const tick = (minutes, { stats = { '7001:901': notSupported }, downs = { down: [downRow], ok: [] } } = {}) => {
+    const result = run({ channels, stats, downs, state, now: NOW + minutes * MIN });
+    state = result.state;
+    return result.actions;
+  };
+  const [first, ...others] = tick(0);
+  assert.deepEqual(others, [], 'the dead main is not announced separately');
+  assert.equal(first.type, 'group_down');
+  assert.equal(first.count, 1);
+  assert.equal(first.groupName, GROUP.name);
+  assert.equal(first.model, 'demo-model');
+  assert.equal(first.failed, 22);
+  assert.equal(first.windowMinutes, 30);
+  assert.equal(first.startedAt, NOW - 20 * MIN);
+  assert.equal(first.lastOkAt, NOW - 2 * 3600000);
+  assert.deepEqual(plain(first.mains), [{ id: '7001', name: '号甲', lastError: notSupported.lastError }], 'serving mains only, with what the upstream said');
+  assert.deepEqual(state.warnings, {}, 'no separate reminder is kept for the account either');
+  assert.deepEqual(tick(1), []);
+  assert.deepEqual(tick(30, { downs: { down: [], ok: [] } }).map(a => a.type), [], 'fewer failures for a while is not a recovery');
+  assert.deepEqual(tick(61).map(a => `${a.type}:${a.count}`), ['group_down:2']);
+  assert.deepEqual(tick(181).map(a => `${a.type}:${a.count}`), ['group_down:3']);
+  const [up, ...rest] = tick(190, { stats: { '7001:901': healthy }, downs: { down: [], ok: [{ groupId: 901, model: 'demo-model', lastOkAt: NOW + 189 * MIN }] } });
+  assert.deepEqual(rest, []);
+  assert.deepEqual(plain(up), { type: 'group_up', groupId: 901, groupName: GROUP.name, model: 'demo-model', startedAt: NOW - 20 * MIN, recoveredAt: NOW + 189 * MIN });
+  assert.deepEqual(state.groupDowns, {});
+  assert.deepEqual(tick(191, { stats: { '7001:901': healthy }, downs: { down: [], ok: [] } }), [], 'and no 好了 for an account that was never announced');
+});
+
+test('once the group serves again, a main that is still broken gets its own reminder', () => {
+  let state = run({ channels: [account(7001, '号甲'), account(7002, '号乙')], stats: { '7001:901': notSupported, '7002:901': notSupported }, downs: { down: [downRow], ok: [] } }).state;
+  const channels = [account(7001, '号甲'), account(7002, '号乙', { schedulable: false })];
+  const result = run({ channels, stats: { '7001:901': dead }, downs: { down: [], ok: [{ groupId: 901, model: 'demo-model', lastOkAt: NOW + MIN }] }, state, now: NOW + 2 * MIN });
+  assert.deepEqual(result.actions.map(a => `${a.type}${a.why ? ':' + a.why : ''}`), ['group_up', 'warn:last_main']);
+});
+
+test('groups that are not manual or unknown are not reported; a down group that goes quiet for a day is forgotten', () => {
+  const channels = [account(7001, '号甲')];
+  assert.deepEqual(run({ channels, stats: {}, downs: { down: [downRow], ok: [] }, manual: () => false }).actions, []);
+  assert.deepEqual(run({ channels, stats: {}, downs: { down: [{ ...downRow, groupId: 902 }], ok: [] } }).actions, []);
+  let { state } = run({ channels, stats: {}, downs: { down: [downRow], ok: [] } });
+  assert.ok(state.groupDowns['901:demo-model']);
+  ({ state } = run({ channels, stats: {}, downs: { down: [], ok: [] }, state, now: NOW + 23 * 3600000 }));
+  assert.ok(state.groupDowns['901:demo-model'], 'still remembered after 23 h');
+  const quiet = run({ channels, stats: {}, downs: { down: [], ok: [] }, state, now: NOW + 24 * 3600000 });
+  assert.deepEqual(quiet.actions, []);
+  assert.deepEqual(quiet.state.groupDowns, {});
+  ({ state } = run({ channels, stats: {}, downs: { down: [downRow], ok: [] } }));
+  const switchedToAuto = run({ channels, stats: {}, downs: { down: [downRow], ok: [] }, state, now: NOW + MIN, manual: () => false });
+  assert.deepEqual(switchedToAuto.actions, []);
+  assert.deepEqual(switchedToAuto.state.groupDowns, {}, 'switched back to automatic: dropped quietly');
+});
+
 test('saved state is copied, not shared, and the event list stays short', () => {
   const saved = { pauses: { 1: { until: 5 } }, warnings: [], events: Array.from({ length: 80 }, (_, i) => ({ type: 'pause', at: i })) };
   const state = guard.normalizeState(saved);
@@ -218,6 +317,7 @@ test('saved state is copied, not shared, and the event list stays short', () => 
   assert.equal(state.events.length, 50);
   assert.equal(state.events[49].at, 99);
   assert.deepEqual(guard.normalizeState(null), guard.emptyState());
+  assert.deepEqual(guard.normalizeState({ groupDowns: [] }).groupDowns, {});
 });
 
 // ---- Telegram 文字（同 test-admin-watch.js：沙箱里跑，禁止联网，推送只记下来）----
@@ -288,10 +388,66 @@ test('Telegram: the daily digest lists paused and failing accounts and the day�
   assert.doesNotMatch(api.formatDailyDigest({ dateLabel: '1月2日' }), /暂停/);
 });
 
+test('Telegram: a whole group down rings, says since when, which mains serve and what the upstream said', async () => {
+  const { api, sent } = telegramBot();
+  const startedAt = Date.UTC(2026, 0, 2, 19, 7);  // 北京时间 1 月 3 日 03:07
+  const lastOkAt = Date.UTC(2026, 0, 2, 17, 10);  // 01:10
+  await api.notifyGroupDown({ groupName: '示例 <专用>', model: 'demo-model', failed: 22, windowMinutes: 30, startedAt, lastOkAt, count: 1,
+    mains: [{ name: '号甲', lastError: 'Model "demo-model" is not supported <by> any configured account in this group' }] });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].disable_notification, undefined, 'rings');
+  assert.match(sent[0].text, /⛔ <b>示例 &lt;专用&gt; 断了：demo-model 一个请求都没成功<\/b>/);
+  assert.match(sent[0].text, /最近 30 分钟 22 个请求全部失败，01-03 03:07 开始；最后一次成功是 01-03 01:10。/);
+  assert.match(sent[0].text, /在接单的主调：\n· 号甲：上游返回 Model "demo-model" is not supported &lt;by&gt; any configured account/);
+  assert.match(sent[0].text, /人工管理，塔台不会自己换号：请换一个能用的主调/);
+  assert.match(sent[0].text, /1 小时、3 小时后各再提醒一次/);
+  await api.notifyGroupDown({ groupName: GROUP.name, model: 'demo-model', failed: 24, startedAt: Date.now() - 3 * 3600000, count: 3, mains: [] });
+  assert.match(sent[1].text, /这个分组现在没有在接单的主调/);
+  assert.match(sent[1].text, /已经断了 3 小时 · 第 3 次提醒/);
+});
+
+test('Telegram: 恢复了 is quiet and says how long it was down', async () => {
+  const { api, sent } = telegramBot();
+  const startedAt = Date.UTC(2026, 0, 2, 19, 7);
+  await api.notifyGroupRecovered({ groupName: GROUP.name, model: 'demo-model', startedAt, recoveredAt: startedAt + 350 * MIN });
+  assert.equal(sent[0].disable_notification, true);
+  assert.match(sent[0].text, /✅ <b>示例 \| 专用 恢复了<\/b>\ndemo-model 01-03 08:57 又有请求成功了。\n前后断了 5 小时 50 分。/);
+});
+
+test('Telegram: the daily digest says which groups were down and which still are', () => {
+  const { api } = telegramBot();
+  const startedAt = Date.UTC(2026, 0, 2, 19, 7);
+  const text = api.formatDailyDigest({ dateLabel: '1月3日', accountGuard: {
+    down: [{ group: '示例 | 备用', model: 'demo-model', startedAt }],
+    outages: [{ group: GROUP.name, model: 'demo-model', startedAt, recoveredAt: startedAt + 350 * MIN }]
+  } });
+  assert.match(text, /⛔ 现在还断着：示例 \| 备用 的 demo-model（01-03 03:07 开始）/);
+  assert.match(text, /⛔ 整组断过：示例 \| 专用 的 demo-model 断了 5 小时 50 分（01-03 03:07–01-03 08:57）/);
+  assert.doesNotMatch(text, /一切正常/);
+});
+
+test('server: the digest takes groups that are still down and the outages of the last 24 hours', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+  const from = source.indexOf('function buildAccountGuardDigest(');
+  const context = vm.createContext({ state: { channels: [], allGroups: [GROUP], manualGuard: {
+    pauses: {}, warnings: {},
+    groupDowns: { '902:demo-model': { groupId: 902, groupName: '示例 | 备用', model: 'demo-model', startedAt: NOW - 30 * MIN } },
+    events: [
+      { type: 'group_up', at: NOW - 25 * 3600000, groupId: 901, groupName: GROUP.name, model: 'old', startedAt: 1, recoveredAt: 2 },
+      { type: 'group_down', at: NOW - 3 * 3600000, groupId: 901, groupName: GROUP.name, model: 'demo-model', startedAt: NOW - 3 * 3600000 },
+      { type: 'group_up', at: NOW - 3600000, groupId: 901, groupName: GROUP.name, model: 'demo-model', startedAt: NOW - 3 * 3600000, recoveredAt: NOW - 3600000 }
+    ] } } });
+  vm.runInContext(source.slice(from, source.indexOf('\n}\n', from) + 3), context);
+  const digest = plain(context.buildAccountGuardDigest(NOW));
+  assert.deepEqual(digest.down, [{ group: '示例 | 备用', model: 'demo-model', startedAt: NOW - 30 * MIN }]);
+  assert.deepEqual(digest.outages, [{ group: GROUP.name, model: 'demo-model', startedAt: NOW - 3 * 3600000, recoveredAt: NOW - 3600000 }]);
+});
+
 // ---- server.js 里的接线：真的关、真的开、失败退回、你接手后不动 ----
-const plain = value => JSON.parse(JSON.stringify(value));
 
 function loadServerGuard(overrides = {}) {
+  // 两条只读查询：单个号的统计（execPsqlAsync）、整组断没断（groupDownQuery）
+  const { execPsqlAsync: statsQuery = async () => '[]', groupDownQuery = async () => '{"down":[],"ok":[]}', ...rest } = overrides;
   const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
   const calls = { toggles: [], telegram: [], writes: 0, broadcasts: 0, probes: [] };
   const context = vm.createContext({
@@ -308,9 +464,9 @@ function loadServerGuard(overrides = {}) {
     fetchGroupModelDemand: () => ({ 901: ['demo-model'] }),
     toggleRemoteAccountsSchedulable: (ids, on) => { calls.toggles.push([ids.map(String), on]); return { enabledIds: on ? ids.map(Number) : [] }; },
     probeChannelModel: async (channel, model, options) => { calls.probes.push({ id: channel.id, model, options }); return { success: true }; },
-    execPsqlAsync: async () => '[]',
+    execPsqlAsync: async sql => (sql.includes("'down'") ? groupDownQuery(sql) : statsQuery(sql)),
     telegram: new Proxy({}, { get: (_, method) => payload => { calls.telegram.push({ method, payload }); return Promise.resolve(true); } }),
-    ...overrides
+    ...rest
   });
   vm.runInContext(source.slice(source.indexOf('// ====== 人工管理分组的坏号看护'), source.indexOf('function startManualGroupGuardPoller(')), context);
   return { context, calls };
@@ -406,6 +562,48 @@ test('server: the guard can be switched off and then does not even query', async
   const result = await context.runManualGroupGuard(NOW);
   assert.equal(result.skipped, true);
   assert.equal(queried, false);
+});
+
+test('server: a manual group where nothing succeeds rings and is recorded once; the recovery is quiet', async () => {
+  let downs = { down: [downRow], ok: [] };
+  const rows = [{ accountId: 7001, groupId: 901, ...notSupported }];
+  const { context, calls } = loadServerGuard({ execPsqlAsync: async () => JSON.stringify(rows), groupDownQuery: async () => JSON.stringify(downs) });
+  context.state.channels = [account(7001, '号甲')];
+  await context.runManualGroupGuard(NOW);
+  assert.deepEqual(plain(calls.telegram.map(t => t.method)), ['notifyGroupDown'], 'one message for the whole group, none for the account');
+  const payload = calls.telegram[0].payload;
+  assert.deepEqual(plain(payload.mains), [{ id: '7001', name: '号甲', lastError: notSupported.lastError }]);
+  assert.equal(payload.startedAt, NOW - 20 * MIN);
+  assert.equal(context.alerts.length, 1);
+  assert.equal(context.alerts[0].channelName, GROUP.name, 'the console card is titled with the group');
+  assert.match(context.alerts[0].note, /示例 \| 专用 断了：demo-model 从 \d\d:\d\d 开始一个请求都没成功。在接单的主调：号甲。/);
+  assert.deepEqual(plain(context.state.manualGuard.events.map(e => e.type)), ['group_down']);
+  assert.deepEqual(plain(calls.toggles), [], 'nothing is switched: it is the last main');
+
+  await context.runManualGroupGuard(NOW + MIN);
+  assert.equal(calls.telegram.length, 1, 'not again within the hour');
+  assert.equal(context.alerts.length, 1);
+
+  downs = { down: [], ok: [{ groupId: 901, model: 'demo-model', lastOkAt: NOW + 2 * MIN }] };
+  rows[0] = { accountId: 7001, groupId: 901, ...healthy };
+  await context.runManualGroupGuard(NOW + 3 * MIN);
+  assert.deepEqual(plain(calls.telegram.map(t => t.method)), ['notifyGroupDown', 'notifyGroupRecovered']);
+  assert.equal(calls.telegram[1].payload.recoveredAt, NOW + 2 * MIN);
+  assert.match(context.alerts[0].note, /示例 \| 专用 恢复了：demo-model \d\d:\d\d 又有请求成功了/);
+  assert.deepEqual(plain(context.state.manualGuard.events.map(e => e.type)), ['group_down', 'group_up']);
+  assert.deepEqual(plain(context.state.manualGuard.groupDowns), {});
+});
+
+test('server: if the whole-group query fails, single accounts are still watched and nothing is called recovered', async () => {
+  const rows = [{ accountId: 7001, groupId: 901, ok60: 0, failed60: 6, ok30: 0, failed30: 4, lastError: 'boom' },
+    { accountId: 7002, groupId: 901, ok60: 50, failed60: 0, ok30: 30, failed30: 0 }];
+  const { context, calls } = loadServerGuard({ execPsqlAsync: async () => JSON.stringify(rows), groupDownQuery: async () => { throw new Error('statement timeout'); } });
+  context.state.channels = [account(7001, '号甲'), account(7002, '号乙')];
+  context.state.manualGuard.groupDowns['901:demo-model'] = { groupId: 901, groupName: GROUP.name, model: 'demo-model', since: NOW - 5 * MIN, startedAt: NOW - 10 * MIN, count: 1, lastSeenAt: NOW - MIN };
+  await context.runManualGroupGuard(NOW);
+  assert.deepEqual(plain(calls.toggles), [[['7001'], false]], 'the dead main with a fine peer is still paused');
+  assert.deepEqual(plain(calls.telegram.map(t => t.method)), ['notifyAccountPaused']);
+  assert.ok(context.state.manualGuard.groupDowns['901:demo-model'], 'still remembered as down');
 });
 
 test('console: the 坏号自动暂停 switch shows the saved setting and is sent when saving', async () => {
