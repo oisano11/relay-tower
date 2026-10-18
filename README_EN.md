@@ -4,7 +4,7 @@
 
 # Relay Tower (中转塔台)
 
-**Ops console for Sub2API / New-API relay-station operators: watch upstream rate multipliers, get price-hike alerts, auto-switch the primary account when it fails, switch lines from your phone via Telegram, and see profit per customer.**
+**Ops console for Sub2API relay-station operators: watch upstream rate multipliers, get price-hike alerts, auto-switch the primary account when it fails, switch lines from your phone via Telegram, and see profit per customer.**
 
 <sub>中转塔台 · 上游倍率监控与涨价预警 · 主调故障自动切换 · Telegram 手机一键切线 · 客户用量与利润统计</sub>
 
@@ -25,7 +25,9 @@
 
 ## 🎯 At a Glance
 
-**Who it is for:** operators of Sub2API / New-API relay stations with many upstream accounts, multipliers that change, and the occasional 3 a.m. outage, who want to keep watch from a phone.
+**Who it is for:** operators of Sub2API relay stations with many upstream accounts, multipliers that change, and the occasional 3 a.m. outage, who want to keep watch from a phone.
+
+**Not supported yet:** relay stations that run on New-API.
 
 | Your problem | What Relay Tower does |
 | :--- | :--- |

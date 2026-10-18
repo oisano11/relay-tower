@@ -4,9 +4,9 @@
 
 # 中转塔台 · Relay Tower
 
-**给 Sub2API / New-API 中转站站长用的运维面板：盯上游倍率、涨价预警、主调出故障自动切换、手机 Telegram 一键切线、算清每个客户的用量和利润**
+**给 Sub2API 中转站站长用的运维面板：盯上游倍率、涨价预警、主调出故障自动切换、手机 Telegram 一键切线、算清每个客户的用量和利润**
 
-<sub>Upstream rate monitor & auto-failover console for Sub2API / New-API relay operators · Prompt Cache affinity · Telegram remote control</sub>
+<sub>Upstream rate monitor & auto-failover console for Sub2API relay operators · Prompt Cache affinity · Telegram remote control</sub>
 
 [![CI](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml/badge.svg)](https://github.com/oisano11/relay-tower/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -25,7 +25,9 @@
 
 ## 🎯 一句话看懂
 
-**适合谁：** 运营 **Sub2API / New-API 中转站** 的站长。上游账号多、倍率会变、半夜可能出故障，又想用手机随时盯着。
+**适合谁：** 运营 **Sub2API 中转站** 的站长。上游账号多、倍率会变、半夜可能出故障，又想用手机随时盯着。
+
+**暂不支持：** 自己的站是 New-API 的，目前还用不了。
 
 | 您遇到的麻烦 | 中转塔台怎么帮您 |
 | :--- | :--- |
