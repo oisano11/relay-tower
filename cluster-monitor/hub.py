@@ -6,6 +6,8 @@
 - 副节点的数据由它上面的 agent.py 提供，这里主动去拉。不 SSH，不用 root 账号。
   注意：运行账号要在 docker 组里才能读容器状态，而 docker 组本身等同于 root 权限。
 - 两台之间的隧道用 TCP 连一下副节点的 agent 端口判断（不用 ping，不需要特殊权限）。
+- New API 的数据库备份存在这台机器上的话（NEWAPI_BACKUP_DIR），也报告最新一份的时间和大小。
+  New API 本身能不能打开由中转塔台自己去查，不经过这里。
 - 读不到的值是 null，绝不补默认值。
 """
 import json
@@ -22,6 +24,8 @@ import common
 import metrics
 
 WORKER_TIMEOUT_SECONDS = 3.0
+# New API 数据库备份的文件名（没填 NEWAPI_BACKUP_PATTERN 时用）。备份到一半的临时文件、日志都不算
+NEWAPI_BACKUP_PATTERN = '*.sql.gz'
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -89,6 +93,12 @@ def load_settings(env=None):
             'timeout': WORKER_TIMEOUT_SECONDS,
         },
         'link': link_settings(worker_url, env),
+        # New API 的数据库备份存在这台机器上的话，填备份目录；面板显示最新一份的时间和大小，太久没有新的就提醒。
+        # 只看文件名、时间和大小，不读内容：运行账号要能列出这个目录（文件本身可以是 600）
+        'newapi': {
+            'backup_dir': (env.get('NEWAPI_BACKUP_DIR') or '').strip(),
+            'backup_pattern': (env.get('NEWAPI_BACKUP_PATTERN') or '').strip() or NEWAPI_BACKUP_PATTERN,
+        },
     }
 
 
@@ -138,6 +148,15 @@ def fetch_worker(worker, now_ms, opener=WORKER_OPENER):
     return dict(node, label=label, reachable=True, collectedAt=now_ms - int(age))
 
 
+def newapi_facts(settings, sources):
+    """New API 的数据库备份：一共几份、最新一份的时间和大小。没配置备份目录就只说没配置；目录读不到是 None（取不到）。"""
+    backup_dir = settings.get('backup_dir')
+    return {
+        'backupConfigured': bool(backup_dir),
+        'backup': sources['backup'](backup_dir, settings.get('backup_pattern') or NEWAPI_BACKUP_PATTERN) if backup_dir else None,
+    }
+
+
 def read_link(link, now_ms, probe=metrics.probe_tcp, iface_reader=metrics.read_iface_counters):
     """两台之间的隧道：TCP 连一下副节点的 agent 端口。检查本身出错就是 None（取不到）。"""
     counters = metrics.safe(iface_reader)(link['iface']) or {}
@@ -181,12 +200,19 @@ class Collector:
             print(f'[hub] 隧道检查出错：{type(error).__name__}', file=sys.stderr)
             link = {'ok': None, 'rttMs': None, 'rxBytes': None, 'txBytes': None,
                     'collectedAt': now_ms, 'error': f'采集出错：{type(error).__name__}'}
+        newapi_settings = self.settings.get('newapi') or {}
+        try:
+            newapi = newapi_facts(newapi_settings, self._sources)
+        except Exception as error:
+            print(f'[hub] New API 备份检查出错：{type(error).__name__}', file=sys.stderr)
+            newapi = {'backupConfigured': bool(newapi_settings.get('backup_dir')), 'backup': None}
         snapshot = {
             'schemaVersion': 1,
             'collectedAt': now_ms,
             'intervalSeconds': self.settings['interval'],
             'nodes': {'master': master, 'worker': worker},
             'link': link,
+            'newapi': newapi,
         }
         with self._lock:
             self._latest = snapshot

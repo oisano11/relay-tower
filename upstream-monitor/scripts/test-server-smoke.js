@@ -7,7 +7,7 @@ const http = require('http');
 const { once } = require('events');
 const gateway = require('../gateway');
 
-async function startIsolatedServer(t, files = new Map()) {
+async function startIsolatedServer(t, files = new Map(), env = {}) {
   const cache = new Map();
   let server;
   const fakeFs = { existsSync: p => files.has(p), readFileSync: p => files.get(p),
@@ -15,7 +15,7 @@ async function startIsolatedServer(t, files = new Map()) {
     renameSync(a, b) { files.set(b, files.get(a)); files.delete(a); },
     stat(p, cb) { cb(new Error('Not found')); } };
   const context = vm.createContext({ console: { log() {}, warn() {}, error() {} },
-    process: { env: { PORT: '0', ADMIN_PASSWORD: 'test-password', IS_VPS: 'false' } },
+    process: { env: { PORT: '0', ADMIN_PASSWORD: 'test-password', IS_VPS: 'false', ...env } },
     Buffer, URL, AbortSignal, AbortController, setInterval: () => ({}), clearInterval() {},
     setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout,
     setImmediate: fn => setImmediate(fn), clearImmediate,
@@ -24,6 +24,11 @@ async function startIsolatedServer(t, files = new Map()) {
     fetch: async input => {
       const target = new URL(String(input && input.url ? input.url : input));
       if (target.port === '1') throw new Error('Upstream unreachable');
+      // New API 的状态接口（只在设置了 NEWAPI_BASE_URL 的用例里会被访问）
+      if (target.hostname === 'newapi.example.com' && target.pathname === '/api/status') {
+        return { status: 200, ok: true, type: 'basic', headers: new Headers(),
+          text: async () => JSON.stringify({ success: true, data: { version: 'v0.0.0-smoke', start_time: 1700000000, setup: true } }) };
+      }
       return { status: 200, ok: true, headers: new Headers(), json: async () => ({ data: [] }), text: async () => '{}' };
     } });
   const load = name => {
@@ -202,10 +207,27 @@ test('cluster status needs a login, says when the hub is not configured, and nev
   assert.equal(body.configured, false);
   assert.equal(body.view.summary.text, '监控中台未配置');
   assert.equal(body.view.nodes.master.cpuPercent, null);
+  assert.equal(body.view.newapi, null, 'no NEWAPI_BASE_URL: no New API part');
   assert.equal(body.business, null);
   const lite = await (await request('/api/cluster/status?lite=1', { headers })).json();
   assert.equal('business' in lite, false, 'the header refresh does not run the business queries');
   const checks = await (await request('/api/cluster/diagnostics/run', { method: 'POST', headers })).json();
   assert.equal(checks.success, true);
   assert.equal(checks.checks[0].status, 'FAIL');
+});
+
+test('with NEWAPI_BASE_URL set, the cluster panel, the header refresh and the checks all show New API from its status page', async t => {
+  const server = await startIsolatedServer(t, new Map(), { NEWAPI_BASE_URL: 'https://newapi.example.com/' });
+  const request = (route, options = {}) => fetch(`http://127.0.0.1:${server.address().port}${route}`, options);
+  const login = await request('/api/login', { method: 'POST', body: JSON.stringify({ password: 'test-password' }) });
+  const headers = { Authorization: `Bearer ${(await login.json()).token}` };
+  const body = await (await request('/api/cluster/status?fresh=1', { headers })).json();
+  assert.equal(body.view.newapi.state, 'up');
+  assert.equal(body.view.newapi.host, 'newapi.example.com');
+  assert.equal(body.view.newapi.version, 'v0.0.0-smoke');
+  assert.equal(body.view.summary.text, '监控中台未配置', 'a healthy New API does not hide that the hub is not set up');
+  const lite = await (await request('/api/cluster/status?lite=1', { headers })).json();
+  assert.equal(lite.view.newapi.state, 'up');
+  const checks = await (await request('/api/cluster/diagnostics/run', { method: 'POST', headers })).json();
+  assert.equal(checks.checks.find(c => c.item === 'New API · 能不能打开').status, 'PASS');
 });

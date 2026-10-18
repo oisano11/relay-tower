@@ -126,6 +126,13 @@ function fmtTraffic(bytes) {
   return `${Math.round(n / 1e6)} MB`;
 }
 
+// 文件大小：备份可能只有几十 KB（比如刚装好的 New API），不足 1 MB 的写成 KB
+function fmtFileSize(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n >= 1e6) return fmtTraffic(n);
+  return n >= 1e3 ? `${Math.round(n / 1e3)} KB` : `${n} 字节`;
+}
+
 // 北京时间几点几分
 function fmtClock(ms) {
   return formatShanghaiDateTime(new Date(Number(ms))).slice(11, 16);
@@ -1363,8 +1370,8 @@ class TelegramBotManager {
     return true;
   }
 
-  // 双机集群：离线、中台连不上、隧道不通、Sub2API 没响应、容器不在运行、指标取不到，这些故障响铃；
-  // 磁盘或内存快满、恢复消息只推送不响。
+  // 双机集群：离线、中台连不上、隧道不通、Sub2API 没响应、容器不在运行、指标取不到、New API 连不上，这些故障响铃；
+  // 磁盘或内存快满、数据库备份断了、恢复消息只推送不响。
   // 文字全部转义：标题和原因里可能带着从机器上读来的字。
   async notifyClusterAlert({ level = 'down', title, lines = [] }) {
     if (!this.config.enabled || !this.hasAdmins()) return false;
@@ -1463,14 +1470,15 @@ class TelegramBotManager {
     }
     if (d.newKeys) items.push(`🔑 发现 ${d.newKeys} 批还没接入的上游 Key，详见控制台`);
     if (d.pendingCount) items.push(`📝 待你审批 ${d.pendingCount} 项，下方按钮可以直接处理`);
-    // 数据库备份：断了算「要处理的事」，正常只作为参考写在最后
+    // 数据库备份：断了算「要处理的事」，正常只作为参考写在最后。what 是哪个程序的库（不写就是 Sub2API 的）
     const backupInfo = [];
     for (const b of (d.cluster && d.cluster.backups) || []) {
       const where = escapeHtml(b.label);
-      if (b.unknown) items.push(`💾 数据库备份：${where}的备份目录读不到，详见控制台`);
-      else if (b.latestAt === null || b.latestAt === undefined) items.push(`💾 数据库备份：${where}上还没有备份`);
-      else if (b.stale) items.push(`💾 数据库备份断了：${where}最新一份是 ${escapeHtml(formatShanghaiDateTime(b.latestAt))} 的`);
-      else backupInfo.push(`💾 数据库备份：最新一份 ${escapeHtml(formatShanghaiDateTime(b.latestAt))}（${fmtTraffic(b.latestBytes)}，存在${where}，一共 ${b.count} 份）`);
+      const what = b.what ? `${escapeHtml(b.what)} ` : '';
+      if (b.unknown) items.push(`💾 ${what}数据库备份：${where}的备份目录读不到，详见控制台`);
+      else if (b.latestAt === null || b.latestAt === undefined) items.push(`💾 ${what}数据库备份：${where}上还没有备份`);
+      else if (b.stale) items.push(`💾 ${what}数据库备份断了：${where}最新一份是 ${escapeHtml(formatShanghaiDateTime(b.latestAt))} 的`);
+      else backupInfo.push(`💾 ${what}数据库备份：最新一份 ${escapeHtml(formatShanghaiDateTime(b.latestAt))}（${fmtFileSize(b.latestBytes)}，存在${where}，一共 ${b.count} 份）`);
     }
     if (!items.length) items.push('一切正常，没有需要你处理的事。');
     // 下面是只供参考的数字，不算「需要你处理的事」

@@ -174,6 +174,7 @@ const auth = IS_CONTROL_PLANE_WORKER ? null : require('./auth');
 const telegram = IS_CONTROL_PLANE_WORKER ? null : require('./telegram');
 const clusterStatus = require('./cluster-status');
 const clusterTraffic = require('./cluster-traffic');
+const newapiStatus = require('./newapi-status');
 const adminWatch = require('./admin-watch');
 const manualGroupGuard = require('./manual-group-guard');
 const customerBalance = require('./customer-balance');
@@ -185,6 +186,9 @@ const clusterClient = clusterStatus.createClusterClient({
 const clusterBusiness = clusterStatus.createBusinessReader({
   load: async () => clusterStatus.parseBusinessOutput(await execPsqlAsync(clusterStatus.BUSINESS_SQL)),
 });
+// New API：塔台每分钟去它的状态接口看一次（集群报警轮询里），连续几次不正常就报警。
+// 地址只从环境变量 NEWAPI_BASE_URL 来；没设置就不看，集群面板上也不显示这一块
+const newApiClient = newapiStatus.createNewApiClient({ baseUrl: process.env.NEWAPI_BASE_URL || '' });
 // 双机集群的流量：报警轮询每分钟记一次，按天累加存在数据目录里；每月额度和重置日也存在数据目录里。
 // 只在主进程里读写（控制面子进程不跑轮询，也不处理网页请求）。
 let clusterTrafficState = null;
@@ -1191,6 +1195,14 @@ function buildClusterDigest(now) {
       ? { label: labelOf(role), latestAt: b.latestAt, latestBytes: b.latestBytes, count: b.count, stale: b.stale }
       : { label: labelOf(role), unknown: true };
   });
+  // New API 的数据库备份放在主节点上，由中台读
+  const newapi = clusterLatestView ? clusterLatestView.newapi : null;
+  if (newapi && newapi.backupConfigured) {
+    const b = newapi.backup;
+    backups.push(b
+      ? { what: 'New API', label: labelOf('master'), latestAt: b.latestAt, latestBytes: b.latestBytes, count: b.count, stale: b.stale }
+      : { what: 'New API', label: labelOf('master'), unknown: true });
+  }
   return { traffic, backups };
 }
 
@@ -1213,21 +1225,27 @@ async function maybeSendDailyDigest(now = Date.now()) {
   }
 }
 
-// 双机集群报警：每分钟看一次。连续几次异常才报，恢复时说一声。
-// 没配置中台时不跑，但会在启动日志里说清楚，免得悄悄没有报警。
+// 双机集群报警：每分钟看一次（New API 也在这里一起查）。连续几次异常才报，恢复时说一声。
+// 中台和 New API 都没配置时不跑，但会在启动日志里说清楚，免得悄悄没有报警。
 function startClusterAlertPoller() {
   if (!telegram || typeof telegram.notifyClusterAlert !== 'function') return;
   if (!clusterClient.configured) {
-    console.log('[双机集群] 没有设置 CLUSTER_HUB_URL 和 CLUSTER_HUB_TOKEN：集群面板显示「未配置」，报警也没有启动');
-    return;
+    console.log('[双机集群] 没有设置 CLUSTER_HUB_URL 和 CLUSTER_HUB_TOKEN：集群面板显示「未配置」，两台机器的报警没有启动');
+    if (!newApiClient.configured) return;
+  }
+  if (newApiClient.configured) {
+    console.log(`[New API] 每分钟查一次 ${newApiClient.host || '（NEWAPI_BASE_URL 填得不对）'} 的状态接口，连续 ${clusterStatus.NEWAPI_CONFIRM_POLLS} 次不正常就报警`);
   }
   let alertState = null;
   const tick = async () => {
     try {
-      const result = await clusterClient.getStatus({ force: true });
+      const [result, newapi] = await Promise.all([
+        clusterClient.getStatus({ force: true }),
+        newApiClient.getStatus({ force: true }),
+      ]);
       const now = Date.now();
-      const view = clusterStatus.buildView(result, now);
-      recordClusterTraffic(view, now);
+      const view = clusterStatus.buildView(result, now, { newapi });
+      if (clusterClient.configured) recordClusterTraffic(view, now);
       view.traffic = clusterTrafficSummary(now);
       clusterLatestView = view;
       const evaluated = clusterStatus.evaluateAlerts(alertState, view);
@@ -10809,16 +10827,17 @@ COMMIT;`;
   }
 
   // 双机集群状态：只给已登录的中控台。数据来自主节点上的中台，读不到的字段是 null（界面显示「取不到」）。
-  // lite=1 时不查业务数字（顶栏定时刷新用）。中台和数据库两边并行，各自最多等几秒。
+  // lite=1 时不查业务数字（顶栏定时刷新用）。中台、New API 和数据库并行，各自最多等几秒。
   if (pathname === '/api/cluster/status' && req.method === 'GET') {
     const params = new URL(req.url, 'http://localhost').searchParams;
     const fresh = params.get('fresh') === '1';
     const wantBusiness = params.get('lite') !== '1';
-    const [result, business] = await Promise.all([
+    const [result, newapi, business] = await Promise.all([
       clusterClient.getStatus({ force: fresh }),
+      newApiClient.getStatus({ force: fresh }),
       wantBusiness ? withTimeout(clusterBusiness.get(), 4000, null) : Promise.resolve(undefined),
     ]);
-    const view = clusterStatus.buildView(result, Date.now());
+    const view = clusterStatus.buildView(result, Date.now(), { newapi });
     if (wantBusiness) view.traffic = clusterTrafficSummary();
     const body = { success: true, configured: clusterClient.configured, view };
     if (business !== undefined) body.business = business;
@@ -10829,8 +10848,8 @@ COMMIT;`;
 
   // 双机集群全链路检查：结果从同一份缓存数据算出来，连点也不会多去打中台
   if (pathname === '/api/cluster/diagnostics/run' && req.method === 'POST') {
-    const result = await clusterClient.getStatus();
-    const view = clusterStatus.buildView(result, Date.now());
+    const [result, newapi] = await Promise.all([clusterClient.getStatus(), newApiClient.getStatus()]);
+    const view = clusterStatus.buildView(result, Date.now(), { newapi });
     view.traffic = clusterTrafficSummary();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ success: true, timestamp: new Date().toISOString(), checks: clusterStatus.diagnostics(view) }));

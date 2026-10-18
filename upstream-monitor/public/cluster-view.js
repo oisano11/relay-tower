@@ -9,6 +9,7 @@
   const STATE_TEXT = { online: ['在线', 'ok'], degraded: ['服务异常', 'warn'], offline: ['离线', 'down'], unknown: ['取不到', 'unknown'] };
   const CHECK_TEXT = { PASS: ['正常', 'pass'], WARN: ['注意', 'warn'], FAIL: ['异常', 'fail'], UNKNOWN: ['取不到', 'unknown'] };
   const CONTAINER_TEXT = { running: '运行中', missing: '不存在', exited: '已退出', restarting: '重启中', paused: '已暂停', created: '未启动' };
+  const NEWAPI_STATE_TEXT = { up: ['正常', 'ok'], down: ['连不上', 'down'], reset: ['被重置了', 'down'], unknown: ['还没检查', 'unknown'], off: ['只看备份', 'unknown'] };
 
   function escapeHtml(value) {
     return String(value === null || value === undefined ? '' : value)
@@ -69,11 +70,17 @@
     return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
+  // 文件大小：备份可能只有几十 KB（比如刚装好的 New API），不足 1 MB 的写成 KB
+  function fmtFileSize(value) {
+    if (!isNumber(value) || value >= 1e6) return fmtBytes(value);
+    return value >= 1e3 ? `${Math.round(value / 1e3)} KB` : `${value} 字节`;
+  }
+
   // 数据库备份：最新一份什么时候、多大、一共几份
   function fmtBackup(b) {
     if (!b) return UNKNOWN;
     if (b.latestAt === null) return '还没有备份';
-    return `${fmtDateTime(b.latestAt)} · ${fmtBytes(b.latestBytes)} · 一共 ${b.count} 份`;
+    return `${fmtDateTime(b.latestAt)} · ${fmtFileSize(b.latestBytes)} · 一共 ${b.count} 份`;
   }
 
   // 一个请求从进来到回完用了多久
@@ -82,6 +89,12 @@
     if (ms < 10000) return `${(ms / 1000).toFixed(1)} 秒`;
     if (ms < 120000) return `${Math.round(ms / 1000)} 秒`;
     return `${(ms / 60000).toFixed(1)} 分钟`;
+  }
+
+  // 一次检查用了多久：196 毫秒、1.2 秒
+  function fmtLatency(ms) {
+    if (!isNumber(ms)) return UNKNOWN;
+    return ms < 1000 ? `${Math.round(ms)} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`;
   }
 
   // 近 5 分钟的客户请求：接了多少、失败多少、成功的一般多久回完
@@ -138,6 +151,40 @@
       <div class="cluster-chips">${chips}</div>
       ${problems}${warnings}
     </div>`;
+  }
+
+  // New API：能不能打开（中控台每分钟查一次它的状态接口）和它的数据库备份。没配置就什么都不画。
+  function renderNewApi(view) {
+    const n = view.newapi;
+    if (!n) return '';
+    const [stateText, cls] = NEWAPI_STATE_TEXT[n.state] || NEWAPI_STATE_TEXT.unknown;
+    const rows = [];
+    if (n.probeConfigured) {
+      rows.push(renderKv('检查的网址', n.host ? `${n.host}/api/status` : '地址填得不对'));
+      if (n.ok === true) {
+        rows.push(renderKv('状态接口', `正常回应${isNumber(n.latencyMs) ? ` · 用了 ${fmtLatency(n.latencyMs)}` : ''}`));
+        rows.push(renderKv('版本', n.version || UNKNOWN));
+        rows.push(renderKv('这次启动于', fmtDateTime(n.startedAt)));
+      } else if (n.ok === false) {
+        rows.push(renderKv('状态接口', '没有正常回应'));
+        rows.push(renderKv('最后一次正常', isNumber(n.lastOkAt) ? fmtDateTime(n.lastOkAt) : '中控台这次启动以来还没正常过'));
+      } else {
+        rows.push(renderKv('状态接口', '还没检查过'));
+      }
+      rows.push(renderKv('上次检查', fmtClock(n.checkedAt)));
+    }
+    if (n.backupConfigured) rows.push(renderKv('数据库备份（最新一份）', fmtBackup(n.backup)));
+    const problems = n.problems.map(p => `<div class="cluster-problem">${escapeHtml(p)}</div>`).join('');
+    const warnings = n.warnings.map(w => `<div class="cluster-warning">${escapeHtml(w)}</div>`).join('');
+    return `<div class="cluster-section-title">New API</div>
+      <div class="cluster-newapi"><div class="cluster-card">
+        <div class="cluster-card-head">
+          <span class="cluster-tag ${cls}">${escapeHtml(stateText)}</span>
+          <strong>New API</strong>
+        </div>
+        ${rows.join('')}
+        ${problems}${warnings}
+      </div></div>`;
   }
 
   function renderLink(view) {
@@ -276,8 +323,10 @@
     fmtBytes,
     fmtDay,
     fmtDuration,
+    fmtFileSize,
     fmtRequests,
     renderNode,
+    renderNewApi,
     renderTraffic,
     trafficHeadText,
     renderLink,
@@ -313,6 +362,8 @@
     $('clusterFreshness').textContent = view.renderFreshness(data);
     $('clusterNodes').innerHTML = view.renderNode(data.nodes.master) + view.renderNode(data.nodes.worker);
     $('clusterLink').innerHTML = `${view.renderLink(data)}<div>${view.escapeHtml(view.renderSplit(data))}</div>`;
+    const newapiBox = $('clusterNewApi');
+    if (newapiBox) newapiBox.innerHTML = view.renderNewApi(data);
     $('clusterTrafficHead').textContent = view.trafficHeadText(data);
     $('clusterTraffic').innerHTML = view.renderTraffic(data);
     $('clusterBusiness').innerHTML = view.renderBusiness(latest.business);
@@ -340,6 +391,7 @@
         $('clusterFreshness').textContent = `原因：${error.message}（稍后会自动再试，也可以点刷新）`;
         $('clusterNodes').innerHTML = '';
         $('clusterLink').innerHTML = '';
+        if ($('clusterNewApi')) $('clusterNewApi').innerHTML = '';
         $('clusterTraffic').innerHTML = '';
         $('clusterBusiness').innerHTML = '';
       }

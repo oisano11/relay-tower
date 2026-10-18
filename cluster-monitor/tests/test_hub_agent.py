@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -11,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import agent  # noqa: E402
 import common  # noqa: E402
 import hub  # noqa: E402
+import metrics  # noqa: E402
 
 TOKEN = 'test-token-' + 'x' * 20  # 测试用的假令牌，长度够 24
 WORKER_TOKEN = 'worker-token-' + 'y' * 20
@@ -97,6 +99,12 @@ class SettingsTests(unittest.TestCase):
         bare = hub.load_settings(hub_env(WORKER_AGENT_URL='https://192.0.2.2', WORKER_AGENT_TOKEN=WORKER_TOKEN))
         self.assertEqual(bare['link']['peer_port'], 443)
         self.assertEqual(bare['link']['source_ip'], '')
+
+    def test_the_new_api_backup_folder_is_optional_and_has_a_default_pattern(self):
+        self.assertEqual(hub.load_settings(hub_env())['newapi'], {'backup_dir': '', 'backup_pattern': '*.sql.gz'})
+        settings = hub.load_settings(hub_env(NEWAPI_BACKUP_DIR=' /var/backups/newapi-db ', NEWAPI_BACKUP_PATTERN='newapi-*.sql.gz'))
+        self.assertEqual(settings['newapi'], {'backup_dir': '/var/backups/newapi-db', 'backup_pattern': 'newapi-*.sql.gz'})
+        self.assertEqual(hub.load_settings(hub_env(NEWAPI_BACKUP_PATTERN='  '))['newapi']['backup_pattern'], '*.sql.gz')
 
     def test_worker_url_needs_a_scheme_and_its_own_token(self):
         with self.assertRaises(SystemExit):
@@ -266,8 +274,8 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(seen, {'ip': '192.0.2.2', 'port': 8898, 'src': '192.0.2.1'})
 
 
-def make_collector(master_sources=None, fetch=None, link_reader=None):
-    settings = hub.load_settings(hub_env())
+def make_collector(master_sources=None, fetch=None, link_reader=None, env=None):
+    settings = hub.load_settings(env or hub_env())
     return hub.Collector(
         settings,
         clock=lambda: 1700000000.0,
@@ -311,6 +319,48 @@ class CollectorTests(unittest.TestCase):
         snapshot = collector.collect_once()
         self.assertIsNone(snapshot['link']['ok'])
         self.assertIs(snapshot['nodes']['master']['reachable'], True)
+
+    def test_new_api_backups_are_reported_only_when_a_folder_is_set(self):
+        self.assertEqual(make_collector().collect_once()['newapi'], {'backupConfigured': False, 'backup': None})
+        seen = []
+        sources = fake_master_sources()
+
+        def backup(directory, pattern):
+            seen.append((directory, pattern))
+            return {'count': 14, 'latestAt': 1700000000000, 'latestBytes': 10718}
+        sources['backup'] = backup
+        snapshot = make_collector(master_sources=sources, env=hub_env(NEWAPI_BACKUP_DIR='/var/backups/newapi-db')).collect_once()
+        self.assertEqual(snapshot['newapi'], {'backupConfigured': True, 'backup': {'count': 14, 'latestAt': 1700000000000, 'latestBytes': 10718}})
+        self.assertEqual(seen, [('/var/backups/newapi-db', '*.sql.gz')], 'only the New API folder is read; the master has no Sub2API backup folder here')
+
+    def test_a_broken_new_api_backup_check_only_affects_that_part(self):
+        sources = fake_master_sources()
+
+        def broken(directory, pattern):
+            raise RuntimeError('unexpected')
+        sources['backup'] = broken
+        snapshot = make_collector(master_sources=sources, env=hub_env(NEWAPI_BACKUP_DIR='/var/backups/newapi-db')).collect_once()
+        self.assertEqual(snapshot['newapi'], {'backupConfigured': True, 'backup': None})
+        self.assertIs(snapshot['nodes']['master']['reachable'], True)
+        self.assertEqual(snapshot['nodes']['master']['memory']['percent'], 50.0)
+
+
+class NewApiBackupFolderTests(unittest.TestCase):
+    def test_only_finished_copies_count_and_a_folder_that_cannot_be_read_is_unknown(self):
+        sources = {'backup': metrics.safe(metrics.read_backups)}
+        with tempfile.TemporaryDirectory() as folder:
+            files = (('newapi-20261017-2045.sql.gz', 1000, 10), ('newapi-20261018-2045.sql.gz', 2000, 11),
+                     ('newapi-20261019-2045.sql.gz.part', 3000, 5), ('backup.log', 4000, 36))
+            for name, mtime, size in files:
+                path = os.path.join(folder, name)
+                with open(path, 'wb') as f:
+                    f.write(b'x' * size)
+                os.utime(path, (mtime, mtime))
+            facts = hub.newapi_facts({'backup_dir': folder, 'backup_pattern': hub.NEWAPI_BACKUP_PATTERN}, sources)
+            self.assertEqual(facts, {'backupConfigured': True, 'backup': {'count': 2, 'latestAt': 2000000, 'latestBytes': 11}},
+                             'a half-written copy and the log are not backups')
+            missing = hub.newapi_facts({'backup_dir': os.path.join(folder, 'missing'), 'backup_pattern': '*.sql.gz'}, sources)
+            self.assertEqual(missing, {'backupConfigured': True, 'backup': None})
 
 
 class HubHttpTests(ServerCase):

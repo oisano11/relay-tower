@@ -5362,6 +5362,9 @@ body {
 .cluster-problem { font-size: 0.78rem; color: #8e1f18; margin-top: 0.4rem; }
 .cluster-warning { font-size: 0.78rem; color: #8a5a12; margin-top: 0.4rem; }
 .cluster-link { margin-top: 0.75rem; font-size: 0.85rem; color: #3d3d3a; }
+/* New API 只有一张卡片：宽屏时和上面一台机器的卡片一样宽（占一半），窄屏占满 */
+.cluster-newapi { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+@media (min-width: 720px) { .cluster-newapi { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .cluster-section-title { margin: 1rem 0 0.4rem; font-size: 0.85rem; font-weight: 600; color: #3d3d3a; }
 .cluster-business { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.6rem; }
 .cluster-kpi { border: 1px solid #e8e6dc; border-radius: 10px; padding: 0.6rem 0.75rem; background: #faf9f5; }

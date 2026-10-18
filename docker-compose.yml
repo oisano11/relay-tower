@@ -257,6 +257,7 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - CLUSTER_HUB_URL=${CLUSTER_HUB_URL:-}
       - CLUSTER_HUB_TOKEN=${CLUSTER_HUB_TOKEN:-}
+      - NEWAPI_BASE_URL=${NEWAPI_BASE_URL:-}
     networks:
       - sub2api-network
     depends_on:

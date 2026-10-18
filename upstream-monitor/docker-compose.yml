@@ -29,6 +29,7 @@ services:
       GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
       CLUSTER_HUB_URL: "${CLUSTER_HUB_URL:-}"
       CLUSTER_HUB_TOKEN: "${CLUSTER_HUB_TOKEN:-}"
+      NEWAPI_BASE_URL: "${NEWAPI_BASE_URL:-}"
 
 volumes:
   upstream-monitor-data:

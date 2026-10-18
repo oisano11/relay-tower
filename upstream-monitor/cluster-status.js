@@ -26,6 +26,9 @@ const FAIL_MIN_RATE = 20;
 const TRAFFIC_ALERT_PERCENT = 80;
 // 数据库备份每天一次；最新一份超过这么久，就当成备份断了
 const BACKUP_STALE_MS = 26 * 3600 * 1000;
+// New API 每分钟查一次，连续这么多次没有正常回应才报警（一两次抖动不响）
+const NEWAPI_CONFIRM_POLLS = 3;
+const NEWAPI_RESET_TEXT = 'New API 变回了首次安装的状态：第一个打开网站的人会成为管理员';
 const INTERNAL_USER_IDS = '1, 8';     // 和主看板一样：这两个是内部账号，客户消费不计入
 
 class HubError extends Error {}
@@ -63,8 +66,24 @@ function fmtGb(bytes) {
   return `${(bytes / 1e9).toFixed(1)} GB`;
 }
 
+// 文件大小：备份可能只有几十 KB（比如刚装好的 New API），不足 1 MB 的写成 KB
 function fmtSize(bytes) {
-  return bytes >= 1e9 ? fmtGb(bytes) : `${Math.round(bytes / 1e6)} MB`;
+  if (bytes >= 1e9) return fmtGb(bytes);
+  if (bytes >= 1e6) return `${Math.round(bytes / 1e6)} MB`;
+  return bytes >= 1e3 ? `${Math.round(bytes / 1e3)} KB` : `${bytes} 字节`;
+}
+
+// 一段时间有多长：12 分钟、1 小时 5 分钟
+function fmtSpan(ms) {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  const hours = Math.floor(minutes / 60);
+  if (!hours) return `${minutes} 分钟`;
+  return minutes % 60 ? `${hours} 小时 ${minutes % 60} 分钟` : `${hours} 小时`;
+}
+
+// 一次请求用了多久：196 毫秒、1.2 秒
+function fmtLatency(ms) {
+  return ms < 1000 ? `${Math.round(ms)} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`;
 }
 
 // 数据库备份：一共几份、最新一份的时间和大小。顺手算出离现在多久、是不是断了。
@@ -87,6 +106,11 @@ function backupProblem(backup) {
   if (!backup || !backup.stale) return null;
   if (backup.latestAt === null) return '还没有数据库备份';
   return `数据库备份已经 ${Math.floor(backup.ageMs / 3600000)} 小时没有更新`;
+}
+
+// 全链路检查里一份正常的备份怎么写
+function backupDetail(backup) {
+  return `最近一份是 ${Math.floor(backup.ageMs / 3600000)} 小时前的${backup.latestBytes !== null ? `（${fmtSize(backup.latestBytes)}）` : ''}，一共 ${backup.count} 份`;
 }
 
 // 近 5 分钟的客户请求：接了多少、失败多少、成功的一般多久回完。接了多少、失败多少缺一个，就整个当成取不到。
@@ -250,6 +274,49 @@ function buildLink(raw, hub) {
   };
 }
 
+// New API：塔台自己每分钟去看的「能不能打开」（不经过中台），加上中台读到的数据库备份（备份放在主节点上）。
+// 两样都没配置就是 null，面板不显示这一块。还没检查过、读不到的值都是 null，不算正常也不算不正常。
+function buildNewApi(probe, raw, hub, nowMs) {
+  const section = isObject(raw) ? raw : {};
+  const probeConfigured = Boolean(probe && probe.configured);
+  const backupConfigured = section.backupConfigured === true;
+  if (!probeConfigured && !backupConfigured) return null;
+  const checkedAt = probeConfigured ? numberOrNull(probe.checkedAt) : null;
+  const ok = checkedAt !== null && typeof probe.ok === 'boolean' ? probe.ok : null;
+  const setup = ok === true && typeof probe.setup === 'boolean' ? probe.setup : null;
+  const backup = backupConfigured && hub.ok && !hub.stale ? pickBackup(section.backup, nowMs) : null;
+  let state;
+  if (!probeConfigured) state = 'off';
+  else if (ok === null) state = 'unknown';
+  else if (!ok) state = 'down';
+  else if (setup === false) state = 'reset';
+  else state = 'up';
+  const error = ok === false ? String(probe.error || '没有正常回应') : null;
+  const problems = [];
+  if (state === 'down') problems.push(`连不上：${error}`);
+  if (state === 'reset') problems.push(NEWAPI_RESET_TEXT);
+  const warnings = [];
+  const backupWarning = backupConfigured ? backupProblem(backup) : null;
+  if (backupWarning) warnings.push(backupWarning);
+  return {
+    state,
+    probeConfigured,
+    host: probeConfigured && typeof probe.host === 'string' && probe.host ? probe.host : null,
+    ok,
+    error,
+    latencyMs: ok ? numberOrNull(probe.latencyMs) : null,
+    version: ok && typeof probe.version === 'string' && probe.version ? probe.version : null,
+    startedAt: ok ? numberOrNull(probe.startedAt) : null,
+    setup,
+    checkedAt,
+    lastOkAt: probeConfigured ? numberOrNull(probe.lastOkAt) : null,
+    backupConfigured,
+    backup,
+    problems,
+    warnings,
+  };
+}
+
 // 两台各自近 5 分钟接的客户请求数 → 分流比例。总数为 0 是「没有请求」，不算分流。
 function computeSplit(a, b) {
   const total = a + b;
@@ -297,8 +364,23 @@ function hasGaps(node) {
     || (node.backupConfigured && node.backup === null);
 }
 
+// New API 有没有取不到的：还没检查过，或者备份目录读不到
+function newApiHasGaps(newapi) {
+  return (newapi.probeConfigured && newapi.state === 'unknown') || (newapi.backupConfigured && newapi.backup === null);
+}
+
+// New API 连不上（或者变回了首次安装的状态），客户直接受影响：排在最前面说；集群本身也断了的话，两件事都说
 function summarize(view) {
+  const cluster = summarizeCluster(view);
+  const newapi = view.newapi;
+  if (!newapi || (newapi.state !== 'down' && newapi.state !== 'reset')) return cluster;
+  const text = newapi.state === 'down' ? 'New API 连不上' : 'New API 变回了首次安装的状态';
+  return { level: 'down', text: cluster.level === 'down' ? `${cluster.text}；${text}` : text };
+}
+
+function summarizeCluster(view) {
   const nodes = [view.nodes.master, view.nodes.worker];
+  const newapi = view.newapi;
   if (!view.hub.configured) return { level: 'unknown', text: '监控中台未配置' };
   if (!view.hub.ok) return { level: 'down', text: '监控中台连不上' };
   if (view.hub.stale) return { level: 'unknown', text: '数据过期，超过 1 分钟没有更新' };
@@ -319,13 +401,19 @@ function summarize(view) {
   }
   const partial = nodes.filter(hasGaps).map(n => n.label);
   if (view.link.state === 'unknown') partial.push('隧道');
-  if (partial.length) return { level: 'unknown', text: `${partial.join('、')}部分数据取不到` };
-  const warned = nodes.flatMap(n => n.warnings.map(w => `${n.label}${w}`));
+  if (newapi && newApiHasGaps(newapi)) partial.push('New API');
+  if (partial.length) {
+    const names = partial.join('、');
+    return { level: 'unknown', text: `${names}${/[A-Za-z]$/.test(names) ? ' ' : ''}部分数据取不到` };
+  }
+  const warned = nodes.flatMap(n => n.warnings.map(w => `${n.label}${w}`))
+    .concat(newapi ? newapi.warnings.map(w => `New API ${w}`) : []);
   if (warned.length) return { level: 'warn', text: warned.length > 1 ? `${warned[0]} 等 ${warned.length} 项` : warned[0] };
   return { level: 'ok', text: '运行正常' };
 }
 
-function buildView(result, nowMs) {
+// newapi：New API 检查器（newapi-status.js）最近一次的结果；没配置就不传
+function buildView(result, nowMs, { newapi = null } = {}) {
   const snapshot = result && result.snapshot ? result.snapshot : null;
   const collectedAt = snapshot ? numberOrNull(snapshot.collectedAt) : null;
   const ageMs = collectedAt === null ? null : Math.max(0, nowMs - collectedAt);
@@ -352,13 +440,42 @@ function buildView(result, nowMs) {
     link: buildLink(snapshot ? snapshot.link : null, hub),
     split: buildSplit(nodes.master, nodes.worker),
     traffic: null,  // 每天、每月的流量由中转塔台自己记，server.js 把汇总放进来（cluster-traffic.js）
+    newapi: buildNewApi(newapi, snapshot ? snapshot.newapi : null, hub, nowMs),
   };
   view.summary = summarize(view);
   return view;
 }
 
 // 诊断清单：每一项都由真实数据算出。取不到或数据过期是 UNKNOWN，绝不写死 PASS。
+// New API 是塔台自己查的，中台连不上时照样列出来。
 function diagnostics(view) {
+  return clusterChecks(view).concat(newApiChecks(view));
+}
+
+function newApiChecks(view) {
+  const newapi = view.newapi;
+  const checks = [];
+  if (!newapi) return checks;
+  const add = (item, status, detail) => checks.push({ item, status, detail });
+  if (newapi.probeConfigured) {
+    const item = 'New API · 能不能打开';
+    if (newapi.ok === true) {
+      add(item, 'PASS', `正常回应${newapi.latencyMs !== null ? `，用了 ${fmtLatency(newapi.latencyMs)}` : ''}${newapi.version ? `，版本 ${newapi.version}` : ''}`);
+    } else if (newapi.ok === false) add(item, 'FAIL', `连不上：${newapi.error}`);
+    else add(item, 'UNKNOWN', '还没检查过');
+    if (newapi.state === 'reset') add('New API · 安装状态', 'FAIL', NEWAPI_RESET_TEXT);
+  }
+  if (newapi.backupConfigured) {
+    const b = newapi.backup;
+    const item = 'New API · 数据库备份';
+    if (!b) add(item, 'UNKNOWN', view.hub.ok && !view.hub.stale ? '备份目录读不到' : '备份要经过监控中台读，这次读不到');
+    else if (b.stale) add(item, 'WARN', backupProblem(b));
+    else add(item, 'PASS', backupDetail(b));
+  }
+  return checks;
+}
+
+function clusterChecks(view) {
   const checks = [];
   const add = (item, status, detail) => checks.push({ item, status, detail });
   if (!view.hub.ok) {
@@ -408,7 +525,7 @@ function diagnostics(view) {
       const item = `${name} · 数据库备份`;
       if (!b) add(item, 'UNKNOWN', '备份目录读不到');
       else if (b.stale) add(item, 'WARN', backupProblem(b));
-      else add(item, 'PASS', `最近一份是 ${Math.floor(b.ageMs / 3600000)} 小时前的${b.latestBytes !== null ? `（${fmtSize(b.latestBytes)}）` : ''}，一共 ${b.count} 份`);
+      else add(item, 'PASS', backupDetail(b));
     }
     const readings = [['CPU', node.cpuPercent], ['内存', node.memory && node.memory.percent], ['磁盘', node.disk && node.disk.percent]];
     const missing = readings.filter(([, v]) => v === null || v === undefined).map(([item]) => item);
@@ -445,10 +562,14 @@ function diagnostics(view) {
 // 报警判断。只有读到了确定结果（好或坏）的项才计数；读不到的项原地不动。
 // 状态由调用方保存；发送失败时用 revertAlert 把那一条退回去，下一轮会重新发。
 function evaluateAlerts(prevState, view) {
-  const state = { counts: { ...((prevState && prevState.counts) || {}) }, active: { ...((prevState && prevState.active) || {}) } };
+  const state = {
+    counts: { ...((prevState && prevState.counts) || {}) },
+    active: { ...((prevState && prevState.active) || {}) },
+    since: { ...((prevState && prevState.since) || {}) },  // 断了从什么时候算（恢复消息里写断了多久）
+  };
   const alerts = [];
 
-  function observe(key, bad, { confirm = CONFIRM_POLLS, level = 'down', title, recoverTitle, lines = [] }) {
+  function observe(key, bad, { confirm = CONFIRM_POLLS, level = 'down', title, recoverTitle, lines = [], recoverLines = [] }) {
     if (bad) {
       state.counts[key] = (state.counts[key] || 0) + 1;
       if (state.counts[key] >= confirm && !state.active[key]) {
@@ -459,7 +580,7 @@ function evaluateAlerts(prevState, view) {
       state.counts[key] = 0;
       if (state.active[key]) {
         state.active[key] = false;
-        alerts.push({ key, level: 'recovered', title: recoverTitle, lines: [] });
+        alerts.push({ key, level: 'recovered', title: recoverTitle, lines: recoverLines });
       }
     }
   }
@@ -476,6 +597,37 @@ function evaluateAlerts(prevState, view) {
       alerts.push({ key, level: 'recovered', title: recoverTitle, lines: [] });
     }
   }
+
+  // New API 能不能打开：塔台自己每分钟查一次，不经过中台，所以中台连不上时照样判断。还没检查过的那一轮原地不动。
+  const newapi = view.newapi;
+  if (newapi && newapi.probeConfigured && newapi.ok !== null) {
+    const down = newapi.ok === false;
+    // 第一次查不通时，记下在这之前最后一次正常的时间（塔台重启后还没正常过就不知道）
+    if (down && !state.counts['newapi.down']) state.since['newapi.down'] = newapi.lastOkAt;
+    const since = state.since['newapi.down'];
+    observe('newapi.down', down, {
+      confirm: NEWAPI_CONFIRM_POLLS,
+      title: 'New API 连不上',
+      recoverTitle: 'New API 恢复了',
+      lines: down ? [
+        `连续 ${NEWAPI_CONFIRM_POLLS} 次检查都没有正常回应（每分钟查一次）`,
+        `最近一次：${newapi.error}`,
+        ...(view.link.state === 'down' ? ['两台之间的隧道也不通，多半是同一个原因'] : []),
+        '这段时间客户调 New API 会失败；恢复了会再告诉你',
+      ] : [],
+      recoverLines: !down && since && newapi.checkedAt > since ? [`前后断了大约 ${fmtSpan(newapi.checkedAt - since)}`] : [],
+    });
+    // 变回首次安装的状态：网站开着，但谁先打开谁就成了管理员（多半是数据库被清空或换掉了）
+    if (newapi.ok && newapi.setup !== null) {
+      observe('newapi.setup', newapi.setup === false, {
+        title: 'New API 变回了首次安装的状态',
+        recoverTitle: 'New API 的安装状态恢复正常',
+        lines: ['第一个打开网站的人会成为管理员', '多半是数据库被清空或者换掉了，要马上查一下'],
+      });
+    }
+  }
+
+  if (!view.hub.configured) return { state, alerts };  // 没配置中台（只看 New API）：两台机器和隧道都不判断
 
   const hubBad = !view.hub.ok || view.hub.stale;
   observe('hub', hubBad, {
@@ -592,6 +744,23 @@ function evaluateAlerts(prevState, view) {
       recoverTitle: '两台之间的隧道恢复了',
     });
   }
+  // New API 的数据库备份（中台在主节点上读的）：和 Sub2API 的备份一样，断了提醒、不响铃；目录读不到连续三次另报
+  if (newapi && newapi.backupConfigured) {
+    if (newapi.backup) {
+      observe('newapi.backup', newapi.backup.stale, {
+        level: 'warn',
+        title: 'New API 的数据库备份断了',
+        recoverTitle: 'New API 的数据库备份恢复了',
+        lines: newapi.backup.stale ? [backupProblem(newapi.backup), '客户的请求不受影响，但要尽快查一下为什么没备份上'] : [],
+      });
+    }
+    observe('newapi.backupUnknown', newapi.backup === null, {
+      confirm: UNKNOWN_CONFIRM_POLLS,
+      level: 'warn',
+      title: 'New API 的备份目录读不到',
+      recoverTitle: 'New API 的备份目录恢复读取',
+    });
+  }
   return { state, alerts };
 }
 
@@ -682,6 +851,7 @@ module.exports = {
   computeSplit,
   CACHE_MS,
   STALE_AFTER_MS,
+  NEWAPI_CONFIRM_POLLS,
   BUSINESS_SQL,
   createClusterClient,
   buildView,
