@@ -3,7 +3,7 @@
 // 每个客户用了多少量、用了哪些模型、贡献了多少利润。
 // 金额口径和「用户财务」大盘（server.js 的 fetchUserFinancialStats）完全一致：
 //   客户消费 = usage_logs.actual_cost（客户实付）
-//   采购成本 = total_cost × 账号倍率（EFFECTIVE_COST_SQL）
+//   采购成本 = 标价 × 账号倍率（EFFECTIVE_COST_SQL）；标价按上游真实价格算（认出来了的），没认出来的用 total_cost
 //   利润     = 客户消费 − 采购成本
 // 用量只统计成功计费的请求（失败的请求不写 usage_logs）。
 // 分组取每条请求记下的 usage_logs.group_id，也就是这次请求实际走的分组（客户的 Key 后来改绑了别的分组，历史用量不会跟着变）。
@@ -20,9 +20,11 @@ const USAGE_RANGES = {
 };
 const DEFAULT_USAGE_RANGE = '7d';
 
-// 采购成本的算法。必须和 server.js fetchUserFinancialStats 里 normalized_usage 的 effective_cost 一字不差，
-// 否则这里的利润和「用户财务」大盘对不上（scripts/test-user-usage.js 会核对两处是否一致）。
-const EFFECTIVE_COST_SQL = `(u.total_cost * COALESCE(
+// 采购成本的算法。server.js fetchUserFinancialStats 的 normalized_usage 直接用这一份，
+// 这里的利润和「用户财务」大盘才对得上（scripts/test-user-usage.js 会核对）。
+// 标价那一半见 upstream-pricing.js 的 COST_BASIS_SQL：查询里要带上 upstreamPriceCte 那张小表和 UPSTREAM_PRICE_JOIN_SQL。
+const { COST_BASIS_SQL, UPSTREAM_PRICE_JOIN_SQL, upstreamPriceCte } = require('./upstream-pricing');
+const EFFECTIVE_COST_SQL = `(${COST_BASIS_SQL} * COALESCE(
       CASE
         WHEN u.account_rate_multiplier IS NOT NULL AND u.account_rate_multiplier != 1.0 THEN u.account_rate_multiplier
         WHEN a.rate_multiplier IS NOT NULL AND a.rate_multiplier < 1.0 THEN a.rate_multiplier
@@ -45,11 +47,13 @@ function normalizeRange(raw) {
 // 只读查询：每个「客户 × 分组 × 模型」一行，汇总请求次数、各类 token、消费、成本和利润。
 // 客户的账号信息一起带出来，删除了的客户也保留（他们的消费同样算在这段时间的总数里）；
 // 已删除的分组同样保留并标出来（历史用量还在），分组被彻底删除后记录里的分组是空的。
-function buildUserUsageSql(rangeKey) {
+// priceRows：上游真实价格（upstream-pricing.js 的 reportPriceRows），没有就照旧用 total_cost。
+function buildUserUsageSql(rangeKey, priceRows = []) {
   const range = Object.prototype.hasOwnProperty.call(USAGE_RANGES, rangeKey) ? USAGE_RANGES[rangeKey] : null;
   if (!range) throw new Error(`不支持的时间范围: ${rangeKey}`);
   return `
-WITH usage AS (
+WITH ${upstreamPriceCte(priceRows)},
+usage AS (
   SELECT
     u.user_id,
     u.group_id,
@@ -63,6 +67,7 @@ WITH usage AS (
     u.created_at
   FROM usage_logs u
   LEFT JOIN accounts a ON u.account_id = a.id
+  ${UPSTREAM_PRICE_JOIN_SQL}
   WHERE ${range.where}
 ),
 by_model AS (

@@ -323,3 +323,44 @@ test('scan reports are pushed only when there is something to act on, or when yo
   assert.equal(scanner.shouldNotifyTelegram(empty, 'Telegram /scan 指令'), true);
   assert.equal(scanner.isTelegramTrigger('Web 控制台'), false);
 });
+
+test('upstream prices: a rise rings, applied changes are listed quietly, pending ones come with confirm buttons', async () => {
+  const { api, sent } = bot();
+  await api.notifyUpstreamPrices({
+    changed: [{ text: '示例号 · demo-model：输入 $0.1 → 输入 $0.2', up: true }],
+    applied: [{ text: '「示例组」demo-model：输入 $0.1 → 输入 $0.2' }],
+    pending: [{ text: '「示例组」demo-new：— → 输入 $2', why: '现价查不到' }],
+    autoApply: false
+  });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /上游改价了/);
+  assert.match(sent[0].text, /（涨了）/);
+  assert.match(sent[0].text, /分组价格已按上游改好/);
+  assert.match(sent[0].text, /等你确认/);
+  assert.match(sent[0].text, /「自动同步」还没打开/);
+  assert.equal(sent[0].disable_notification, false);
+  const buttons = sent[0].reply_markup.inline_keyboard.flat().map(b => b.callback_data);
+  assert.equal(buttons.join(','), 'prices:apply,prices:auto_on');
+
+  sent.length = 0;
+  await api.notifyUpstreamPrices({ changed: [{ text: 'x', up: false }], applied: [], pending: [], autoApply: true });
+  assert.equal(sent[0].disable_notification, true, 'only cheaper: no sound');
+  assert.equal(sent[0].reply_markup, undefined);
+  assert.equal(await api.notifyUpstreamPrices({ changed: [], applied: [], pending: [] }), false);
+});
+
+test('upstream prices: the confirm button applies the pending changes and reports back; the auto button turns syncing on', async () => {
+  const { api, sent } = bot();
+  let auto = null;
+  api.context.applyPendingPrices = async () => ({ applied: ['「示例组」demo-new：— → 输入 $2'], skipped: [{ id: 'x', why: '这个价格在列出来以后被改过' }] });
+  api.context.setPriceAutoApply = async (on) => { auto = on; };
+  await api.handleCallbackQuery({ id: 'q1', data: 'prices:apply', from: { id: 1001 }, message: { chat: { id: 1001 }, message_id: 5 } });
+  const msg = sent.find(s => s.method === 'sendMessage');
+  assert.match(msg.text, /改好了 1 个分组价格/);
+  assert.match(msg.text, /跳过 1 个：这个价格在列出来以后被改过/);
+  await api.handleCallbackQuery({ id: 'q2', data: 'prices:auto_on', from: { id: 1001 }, message: { chat: { id: 1001 }, message_id: 6 } });
+  assert.equal(auto, true);
+  sent.length = 0;
+  await api.handleCallbackQuery({ id: 'q3', data: 'prices:apply', from: { id: 4242 }, message: { chat: { id: 4242 }, message_id: 7 } });
+  assert.ok(sent.every(s => s.method !== 'sendMessage'), 'someone who is not an admin cannot apply prices');
+});

@@ -9,6 +9,7 @@ const { execFileSync } = require('child_process');
 const userUsage = require('../user-usage');
 
 const serverSource = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
+const upstreamPricing = require('../upstream-pricing');
 const squash = sql => sql.replace(/\s+/g, ' ').trim();
 const plain = value => JSON.parse(JSON.stringify(value));
 
@@ -53,7 +54,8 @@ test('time ranges are a fixed whitelist and never reach SQL as free text', () =>
   }
   for (const key of Object.keys(userUsage.USAGE_RANGES)) {
     const sql = userUsage.buildUserUsageSql(key);
-    assert.match(sql, /^\s*WITH usage AS/);
+    assert.match(sql, /^\s*WITH upstream_prices\(account_id, model, p_in, p_out, p_cw, p_cr\) AS/);
+    assert.match(sql, /\nusage AS \(/);
     assert.doesNotMatch(sql, /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT)\b/i, key);
     assert.equal(sql.trim().split(';').filter(Boolean).length, 1, `${key}: exactly one statement`);
   }
@@ -62,10 +64,12 @@ test('time ranges are a fixed whitelist and never reach SQL as free text', () =>
 test('the purchase-cost rule is the same one the finance dashboard uses, so profit numbers agree', () => {
   const from = serverSource.indexOf('normalized_usage AS (');
   assert.ok(from >= 0, 'dashboard query moved: update this test');
-  const dashboard = serverSource.slice(from, serverSource.indexOf('FROM usage_logs u', from));
-  const expression = dashboard.slice(dashboard.indexOf('(u.total_cost * COALESCE('), dashboard.indexOf(') as effective_cost') + 1);
-  assert.ok(expression.startsWith('(u.total_cost'), 'could not find the dashboard cost expression');
-  assert.equal(squash(userUsage.EFFECTIVE_COST_SQL), squash(expression));
+  const dashboard = serverSource.slice(from, serverSource.indexOf('),', from));
+  assert.match(dashboard, /\$\{userUsage\.EFFECTIVE_COST_SQL\} as effective_cost/, 'the dashboard uses the shared cost rule');
+  assert.match(dashboard, /\$\{upstreamPricing\.UPSTREAM_PRICE_JOIN_SQL\}/, 'and joins the upstream price table');
+  assert.match(serverSource, /WITH \$\{upstreamPricing\.upstreamPriceCte\(upstreamPricing\.reportPriceRows\(upstreamPriceData\(\)\.keys\)\)\},\nu_summary AS/);
+  assert.match(userUsage.EFFECTIVE_COST_SQL, /^\(COALESCE\(CASE WHEN up\.account_id IS NOT NULL/, 'the list price comes from the upstream price table when known');
+  assert.match(userUsage.EFFECTIVE_COST_SQL, /END, u\.total_cost\) \* COALESCE\(/, 'and falls back to Sub2API’s own list price');
 });
 
 test('report groups models under each customer, totals add up and profit-losing customers are kept', () => {
@@ -301,6 +305,8 @@ test('usage report is cached briefly, concurrent requests share one query and fa
   let failNext = false;
   const context = vm.createContext({
     userUsage,
+    upstreamPricing,
+    upstreamPriceData: () => ({ keys: {} }),
     Date: class extends Date { static now() { return clock.now; } },
     execPsqlAsync(sql) {
       calls.push(sql);
@@ -369,7 +375,7 @@ CREATE TABLE users (
 CREATE TABLE accounts (id bigserial PRIMARY KEY, name varchar(100) NOT NULL, rate_multiplier numeric(10,4) NOT NULL DEFAULT 1.0);
 CREATE TABLE usage_logs (
   id bigserial PRIMARY KEY, user_id bigint NOT NULL, api_key_id bigint NOT NULL DEFAULT 0, account_id bigint, group_id bigint,
-  model varchar(100) NOT NULL, requested_model varchar(100), upstream_model varchar(100),
+  model varchar(100) NOT NULL, requested_model varchar(100), upstream_model varchar(100), billing_mode varchar(20),
   input_tokens int NOT NULL DEFAULT 0, output_tokens int NOT NULL DEFAULT 0,
   cache_creation_tokens int NOT NULL DEFAULT 0, cache_read_tokens int NOT NULL DEFAULT 0,
   total_cost numeric(20,10) NOT NULL DEFAULT 0, actual_cost numeric(20,10) NOT NULL DEFAULT 0,
@@ -423,13 +429,17 @@ INSERT INTO usage_logs (user_id, account_id, group_id, model, requested_model, i
   (6, 10, 2, 'other-free', 'other-free', 10, 10, 0, 0, 0, 0, 1.0, CURRENT_DATE);
 `;
 
-function dashboardSqlFromServer() {
+// 大盘的查询里有三处插值：上游价格小表、共用的成本公式、和小表的连接。这里按服务里一样的方式填进去。
+function dashboardSqlFromServer(priceRows = []) {
   const from = serverSource.indexOf('function fetchUserFinancialStats(');
   const start = serverSource.indexOf('const sql = `', from) + 'const sql = `'.length;
   const end = serverSource.indexOf('`;\n    const output = execPsql(sql, true)', start);
   assert.ok(from >= 0 && end > start, 'dashboard query moved: update this test');
-  const sql = serverSource.slice(start, end);
-  assert.equal(sql.includes('${'), false, 'the dashboard query now has interpolations: update this test');
+  const sql = serverSource.slice(start, end)
+    .replace('${upstreamPricing.upstreamPriceCte(upstreamPricing.reportPriceRows(upstreamPriceData().keys))}', () => upstreamPricing.upstreamPriceCte(priceRows))
+    .replace('${userUsage.EFFECTIVE_COST_SQL}', () => userUsage.EFFECTIVE_COST_SQL)
+    .replace('${upstreamPricing.UPSTREAM_PRICE_JOIN_SQL}', () => upstreamPricing.UPSTREAM_PRICE_JOIN_SQL);
+  assert.equal(sql.includes('${'), false, 'the dashboard query has a new interpolation: update this test');
   return sql;
 }
 
@@ -595,6 +605,38 @@ test('against a real database: per-range numbers are right and match the finance
     assert.throws(() => db.psql('CREATE TABLE should_fail (id int);', guard), /read-only transaction/);
     assert.throws(() => db.psql('SELECT pg_sleep(3);', guard), /statement timeout/);
     assert.equal(db.psql('SELECT 1;', guard).trim(), '1', 'plain reads still work');
+  });
+
+  await t.test('with upstream prices known, both reports price the purchase from them and still agree', () => {
+    // 账号 11 的 gpt-5.1-upstream 认出了上游价格；今天客户 2 有两条：一条有缓存写入，一条没有
+    const known = [{ accountId: 11, model: 'gpt-5.1-upstream', input: 0.001, output: 0.002, cacheWrite: 0.0005, cacheRead: 0.0001 }];
+    const noCacheWritePrice = [{ ...known[0], cacheWrite: null }];
+    const run = rows => {
+      const out = db.psql(['BEGIN;', FIXTURE_SCHEMA, FIXTURE_DATA, '\\echo @@dashboard', dashboardSqlFromServer(rows),
+        '\\echo @@today', userUsage.buildUserUsageSql('today', rows), 'ROLLBACK;'].join('\n'));
+      const parts = {};
+      let cur = null;
+      for (const line of out.split('\n')) {
+        const m = line.match(/^@@(\w+)$/);
+        if (m) { cur = m[1]; parts[cur] = []; } else if (cur) parts[cur].push(line);
+      }
+      const report = userUsage.buildUserUsageReport(userUsage.parseUserUsageRows(parts.today.join('\n')), 'today', new Date());
+      return { dashboard: JSON.parse(parts.dashboard.join('\n')), alice: report.users.find(u => u.userId === 2), report };
+    };
+    const priced = run(known);
+    // 上游标价：1000×0.001 + 200×0.002 + 50×0.0005 + 4000×0.0001 = 1.825；2000×0.001 + 400×0.002 = 2.8；都乘账号 11 的倍率 0.5
+    // 另一条 claude 没认出价格，照旧 4 × 0.3 = 1.2
+    assert.deepEqual(money(priced.alice), [3, 9.5, 3.5125, 5.9875]);
+    const unpriced = run([]);
+    assert.deepEqual(money(unpriced.alice), [3, 9.5, 2.7, 6.8], 'without known prices nothing changes');
+    // 有缓存写入、但上游缓存写入价不知道的那条退回 Sub2API 的标价
+    assert.deepEqual(money(run(noCacheWritePrice).alice), [3, 9.5, 3.1, 6.4]);
+    for (const r of [priced, unpriced]) {
+      for (const d of r.dashboard.users) {
+        const mine = r.report.users.find(u => u.userId === d.id) || { spent: 0, profit: 0 };
+        assert.ok(Math.abs(Number(d.todayProfit || 0) - mine.profit) <= 0.00501, `user ${d.id} today profit: dashboard ${d.todayProfit} vs usage page ${mine.profit}`);
+      }
+    }
   });
 });
 

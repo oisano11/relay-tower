@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const url = require('url');
 const crypto = require('crypto');
-const { execSync, execFileSync, fork, spawn } = require('child_process');
+const { execSync, execFileSync, execFile, fork, spawn } = require('child_process');
 const gateway = require('./gateway');
 const gatewayMetrics = new gateway.GatewayMetrics();
 const { groupIds, assertExclusiveScope, groupCostIsSafe, channelGroupPriority, ROLE_PRIORITY, ROLE_LABELS, roleForPriority, groupRole } = require('./routing-policy');
@@ -32,6 +32,8 @@ const ADMIN_WATCH_FILE = path.join(DATA_DIR, 'admin_watch_state.json');
 const CUSTOMER_BALANCE_FILE = path.join(DATA_DIR, 'customer_balance_state.json');
 const CLUSTER_TRAFFIC_FILE = path.join(DATA_DIR, 'cluster_traffic.json');
 const CLUSTER_SETTINGS_FILE = path.join(DATA_DIR, 'cluster_settings.json');
+const UPSTREAM_PRICES_FILE = path.join(DATA_DIR, 'upstream_prices.json');
+const PRICE_SYNC_CONFIG_FILE = path.join(DATA_DIR, 'price_sync_config.json');
 const DATA_DIR_MODE = 0o700;
 const RUNTIME_DATA_FILE_MODE = 0o600;
 
@@ -178,6 +180,7 @@ const newapiStatus = require('./newapi-status');
 const adminWatch = require('./admin-watch');
 const manualGroupGuard = require('./manual-group-guard');
 const customerBalance = require('./customer-balance');
+const upstreamPricing = require('./upstream-pricing');
 // 双机集群：中台地址和令牌只从环境变量来，没配置就显示「未配置」；浏览器拿不到它们
 const clusterClient = clusterStatus.createClusterClient({
   url: process.env.CLUSTER_HUB_URL || '',
@@ -1002,6 +1005,516 @@ async function refreshAllBalances() {
   // 同步余额时各家上游刚登录过，顺便检查有没有新建的 Key（不等待，失败只记日志）
   discoverUpstreamKeys({ notify: true }).catch(err => console.error('[上游新 Key] 检查失败:', err.message));
   return state.channels;
+}
+
+// ====== 上游价格对账（规则见 upstream-pricing.js）======
+// 用我们自己的 Key 查每家上游自己记的账，认出它每个模型的四个单价（输入 / 输出 / 缓存写入 / 缓存读取），
+// 再把分组的模型价格改成和上游一样（倍率不动，差价只靠倍率赚）；名字里带例外关键字的分组（设置文件里填）不动。
+// 什么时候查：每 6 小时一次；新接入一个号时马上查一次 —— 上游那边还没账可查，就先用它发两条很小的请求把价格试出来。
+// 改动太大的、或者「自动同步」没打开时，改动先列出来等你确认（Telegram 会提醒）。
+const PRICE_SYNC_DEFAULTS = Object.freeze({ autoApply: false, excludeKeywords: [], excludeGroupIds: [], intervalHours: 6, probeNewAccounts: true });
+// 测试会把 server.js 的一段放进沙箱里跑，那里没有 process
+const SUB2API_CONTAINER = (typeof process !== 'undefined' && process.env.SUB2API_CONTAINER) || 'sub2api';
+const SUB2API_PRICING_FILE = (typeof process !== 'undefined' && process.env.SUB2API_PRICING_FILE) || '/app/data/model_pricing.json';
+const PRICE_PROBE_MAX_MODELS = 3;
+let upstreamPriceState = null;
+let upstreamPriceRun = null;
+let sub2apiDefaultPricingCache = { at: 0, data: null };
+
+function priceSyncConfig() {
+  const raw = readJSON(PRICE_SYNC_CONFIG_FILE, {}) || {};
+  const cfg = { ...PRICE_SYNC_DEFAULTS, ...raw };
+  cfg.autoApply = cfg.autoApply === true;
+  cfg.probeNewAccounts = cfg.probeNewAccounts !== false;
+  cfg.excludeKeywords = Array.isArray(cfg.excludeKeywords) ? cfg.excludeKeywords.map(String).filter(Boolean) : [...PRICE_SYNC_DEFAULTS.excludeKeywords];
+  cfg.excludeGroupIds = Array.isArray(cfg.excludeGroupIds) ? cfg.excludeGroupIds.map(String) : [];
+  const hours = Number(cfg.intervalHours);
+  cfg.intervalHours = Number.isFinite(hours) && hours >= 1 && hours <= 48 ? hours : PRICE_SYNC_DEFAULTS.intervalHours;
+  return cfg;
+}
+
+function upstreamPriceData() {
+  if (!upstreamPriceState) {
+    try {
+      upstreamPriceState = upstreamPricing.normalizeState(readJSON(UPSTREAM_PRICES_FILE, null));
+    } catch (error) {
+      console.error('[上游价格] 读不了记录文件，从头开始：', error.message);
+      upstreamPriceState = upstreamPricing.emptyState();
+    }
+  }
+  return upstreamPriceState;
+}
+
+// 不阻塞网关地跑一个命令，拿它的输出
+function execFileText(command, args, { timeoutMs = 20000, maxBuffer = 64 * 1024 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { encoding: 'utf-8', timeout: timeoutMs, maxBuffer }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+// Sub2API 自己的默认价（它从公共价格库下载、存在容器里的 model_pricing.json），6 小时读一次
+async function readSub2apiDefaultPricing(now = Date.now()) {
+  if (sub2apiDefaultPricingCache.data && now - sub2apiDefaultPricingCache.at < 6 * 3600000) return sub2apiDefaultPricingCache.data;
+  const args = ['exec', SUB2API_CONTAINER, 'cat', SUB2API_PRICING_FILE];
+  let text;
+  if (IS_VPS) {
+    text = await execFileText('docker', args, { timeoutMs: 15000 });
+  } else if (SSH_HOST) {
+    text = await execFileText('ssh', [...(SSH_KEY ? ['-i', SSH_KEY] : []), '-p', SSH_PORT, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4',
+      `${SSH_USER}@${SSH_HOST}`, `docker ${args.join(' ')}`], { timeoutMs: 20000 });
+  } else {
+    throw new Error('未配置 Sub2API 连接');
+  }
+  const data = upstreamPricing.parseDefaultPricing(JSON.parse(text));
+  sub2apiDefaultPricingCache = { at: now, data };
+  return data;
+}
+
+// 要对账的账号：Sub2API 里用 API Key 接的号。几个号共用一个上游 Key（拆分出来的副本）时，Key 的代号一样。
+// 代号是上游地址 + Key 的哈希前 12 位，Key 本身不进记录文件。
+function priceAccounts() {
+  const out = [];
+  for (const c of state.channels || []) {
+    if (!c || !c.apiKey || !c.baseUrl || (c.accountType && c.accountType !== 'apikey')) continue;
+    let origin;
+    try { origin = new URL(c.baseUrl).origin; } catch (e) { continue; }
+    out.push({
+      id: String(c.id), name: c.name || String(c.id), platform: String(c.platform || 'openai').toLowerCase(),
+      origin, host: new URL(origin).host, apiKey: c.apiKey,
+      keyId: crypto.createHash('sha256').update(`${origin}|${c.apiKey}`).digest('hex').slice(0, 12),
+      groupsDetail: Array.isArray(c.groupsDetail) ? c.groupsDetail : [],
+      supportedModels: Array.isArray(c.supportedModels) ? c.supportedModels : []
+    });
+  }
+  return out;
+}
+
+async function fetchJsonQuiet(urlText, { headers = {}, timeoutMs = 15000 } = {}) {
+  try {
+    const res = await fetch(urlText, { headers: { 'User-Agent': 'RelayTower-PriceCheck', ...headers }, signal: AbortSignal.timeout(timeoutMs) });
+    let body = null;
+    try { body = await res.json(); } catch (e) { body = null; }
+    return { ok: res.ok, status: res.status, body };
+  } catch (error) {
+    return { ok: false, status: 0, body: null, error: error.message };
+  }
+}
+
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// 北京时间最近 n 天的日期，今天在前（上游按它自己的时区分天，国内的站都是北京时间）
+function beijingDays(n, now = Date.now()) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(new Date(now + 8 * 3600000 - i * 86400000).toISOString().slice(0, 10));
+  return out;
+}
+
+// 一个 Key 最近几天在上游那边的账（按模型、按天）。上游不支持这个查询（403 / 404）就记下来，不再往下查。
+async function upstreamUsageForKey(entry, days) {
+  const byModel = {};
+  for (const day of days) {
+    const got = await fetchJsonQuiet(`${entry.origin}/v1/usage?start_date=${day}&end_date=${day}`, { headers: { Authorization: `Bearer ${entry.apiKey}` } });
+    if (!got.ok) {
+      const unsupported = got.status === 401 || got.status === 403 || got.status === 404 || got.status === 405;
+      return { usageApi: unsupported ? 'unsupported' : 'error', error: got.error || `HTTP ${got.status}`, byModel };
+    }
+    for (const o of upstreamPricing.parseUsageStats(got.body, day)) (byModel[o.model] = byModel[o.model] || []).push(o);
+  }
+  return { usageApi: 'ok', error: '', byModel };
+}
+
+// 各家公开的价格表：Sub2API 的模型广场、New API 的 /api/pricing（不用登录）
+async function publicPriceLists(origins) {
+  const plazas = {};
+  const newapis = {};
+  await mapLimit(origins, 4, async origin => {
+    const host = new URL(origin).host;
+    const plaza = await fetchJsonQuiet(`${origin}/api/v1/model-plaza`);
+    if (plaza.ok && plaza.body && (plaza.body.code === 0 || plaza.body.data)) {
+      const groups = upstreamPricing.parsePlaza(plaza.body);
+      if (groups.length) plazas[host] = groups;
+    }
+    const pricing = await fetchJsonQuiet(`${origin}/api/pricing`);
+    if (pricing.ok && pricing.body) {
+      const parsed = upstreamPricing.parseNewApiPricing(pricing.body);
+      if (parsed && Object.keys(parsed.models).length) newapis[host] = parsed;
+    }
+  });
+  return { plazas, newapis };
+}
+
+// 一段一千多 token 的固定文字（开头带一个随机串，保证第一次一定没有缓存），发两次：
+// 第一次是新内容（会有缓存写入），第二次命中缓存（会有缓存读取），四个单价都能试出来
+function pricingProbeText(nonce) {
+  const lines = [`核对价格用的测试文字 ${nonce}，请忽略内容，只回复一个字。`];
+  for (let i = 1; i <= 120; i++) lines.push(`第 ${i} 条：这是一段用来核对上游缓存价格的固定说明文字，内容没有任何含义，请直接忽略。`);
+  return lines.join('\n');
+}
+
+async function probeUpstreamPrices(account, models) {
+  const sent = [];
+  for (const model of models.slice(0, PRICE_PROBE_MAX_MODELS)) {
+    const text = pricingProbeText(crypto.randomBytes(6).toString('hex'));
+    let ok = 0;
+    for (let i = 0; i < 2; i++) {
+      const isAnthropic = account.platform === 'anthropic';
+      const endpoint = isAnthropic ? `${account.origin}/v1/messages` : `${account.origin}/v1/chat/completions`;
+      const headers = isAnthropic
+        ? { 'x-api-key': account.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+        : { Authorization: `Bearer ${account.apiKey}`, 'Content-Type': 'application/json' };
+      const body = isAnthropic
+        ? { model, max_tokens: 8, system: [{ type: 'text', text, cache_control: { type: 'ephemeral' } }], messages: [{ role: 'user', content: '只回复：好' }] }
+        : { model, max_tokens: 8, stream: false, messages: [{ role: 'system', content: text }, { role: 'user', content: '只回复：好' }] };
+      try {
+        const res = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(90000) });
+        await res.text().catch(() => '');
+        if (res.ok) ok++;
+      } catch (e) { /* 试不出来就算了，等真实请求 */ }
+    }
+    sent.push({ model, ok });
+  }
+  return sent;
+}
+
+// 这个号所在分组卖的模型（按最近用量从多到少），用来决定新号要试哪几个模型
+function modelsToProbe(account, sold, groups) {
+  const counts = new Map();
+  const supported = new Set((account.supportedModels || []).map(m => upstreamPricing.normalizeModel(m)));
+  for (const g of account.groupsDetail) {
+    const gid = String(g.id);
+    for (const [model, info] of Object.entries(sold[gid] || {})) counts.set(model, (counts.get(model) || 0) + (info.requests || 0));
+    const group = groups.find(x => x.id === gid);
+    for (const rule of group ? group.modelPricing : []) {
+      for (const m of Array.isArray(rule && rule.models) ? rule.models : []) if (!String(m).includes('*') && !counts.has(String(m))) counts.set(String(m), 0);
+    }
+  }
+  return [...counts.entries()]
+    .filter(([m]) => upstreamPricing.isSafeModelName(m) && (!supported.size || supported.has(upstreamPricing.normalizeModel(m))))
+    .sort((a, b) => b[1] - a[1])
+    .map(([m]) => m);
+}
+
+function summarizeKeys(keyEntries, usage, identified) {
+  const keys = {};
+  for (const entry of keyEntries) {
+    const u = usage[entry.keyId] || {};
+    keys[entry.keyId] = {
+      host: entry.host,
+      accountIds: entry.accounts.map(a => a.id),
+      names: entry.accounts.map(a => a.name),
+      usageApi: u.usageApi || 'error',
+      spendApi: u.spendApi || '',
+      error: u.error || '',
+      models: identified[entry.keyId] || {}
+    };
+  }
+  return keys;
+}
+
+function priceChangeText(c) {
+  if (c.kind === 'account_rate') return `「${c.accountName}」进价倍率：${c.from} → ${c.to}（按上游这段时间实际扣的钱算）`;
+  return `「${c.groupName}」${c.model}：${upstreamPricing.describeSet(c.from)} → ${upstreamPricing.describeSet(c.to)}`;
+}
+
+// 把改动写进 Sub2API（一个事务，每个分组先核对价格没被别人改过）。返回写进去的改动。
+function applyPriceChanges(changes, groups) {
+  const byGroup = new Map();
+  const rateChanges = changes.filter(c => c.kind === 'account_rate');
+  for (const c of changes) {
+    if (c.kind === 'account_rate') continue;
+    if (!byGroup.has(c.groupId)) byGroup.set(c.groupId, []);
+    byGroup.get(c.groupId).push(c);
+  }
+  const plans = [];
+  for (const [groupId, list] of byGroup) {
+    const group = groups.find(g => g.id === String(groupId));
+    if (!group) continue;
+    plans.push({ groupId, oldPricing: group.modelPricing, changes: list });
+  }
+  const parts = [];
+  if (plans.length) parts.push(upstreamPricing.buildApplySql(plans));
+  if (rateChanges.length) parts.push(upstreamPricing.buildAccountRateSql(rateChanges));
+  if (!parts.length) return [];
+  execPsql(`BEGIN;\n${parts.join('\n')}\nCOMMIT;`, false);
+  return [...plans.flatMap(p => p.changes), ...rateChanges];
+}
+
+// 跑一次对账。probeAccountIds：刚接入的号，上游还没它的账时先发两条小请求试价格。
+async function runUpstreamPriceCheck({ reason = '定时对账', probeAccountIds = [] } = {}) {
+  if (upstreamPriceRun) return upstreamPriceRun;
+  upstreamPriceRun = (async () => {
+    const started = Date.now();
+    const config = priceSyncConfig();
+    const prev = upstreamPriceData();
+    const accounts = priceAccounts();
+    const keyMap = new Map();
+    for (const a of accounts) {
+      if (!keyMap.has(a.keyId)) keyMap.set(a.keyId, { keyId: a.keyId, origin: a.origin, host: a.host, apiKey: a.apiKey, accounts: [] });
+      keyMap.get(a.keyId).accounts.push(a);
+    }
+    const keyEntries = [...keyMap.values()];
+    const errors = [];
+    let defaults = {};
+    try {
+      defaults = await readSub2apiDefaultPricing(started);
+    } catch (error) {
+      errors.push(`读不到 Sub2API 默认价：${error.message}`);
+    }
+    const [groups, sold, publicLists] = await Promise.all([
+      execPsqlAsync(upstreamPricing.groupsSql()).then(upstreamPricing.parseGroups),
+      execPsqlAsync(upstreamPricing.soldSql(14), { timeoutMs: 30000 }).then(upstreamPricing.parseSold),
+      publicPriceLists([...new Set(keyEntries.map(k => k.origin))])
+    ]);
+    const days = beijingDays(upstreamPricing.RULES.days, started);
+    const usage = {};
+    await mapLimit(keyEntries, 4, async entry => { usage[entry.keyId] = await upstreamUsageForKey(entry, days); });
+
+    // 查不到按天账的上游（New API 搭的）：记一次「这个 Key 一共花了多少」，后面和上次比，算真实倍率
+    const spend = { ...(prev.spend || {}) };
+    const spendKeys = keyEntries.filter(e => (usage[e.keyId] || {}).usageApi === 'unsupported');
+    await mapLimit(spendKeys, 4, async entry => {
+      const got = await fetchJsonQuiet(`${entry.origin}/api/usage/token`, { headers: { Authorization: `Bearer ${entry.apiKey}` } });
+      const snap = got.ok ? upstreamPricing.parseTokenUsage(got.body) : null;
+      spend[entry.keyId] = upstreamPricing.addSpendSnapshot(spend[entry.keyId], snap, started);
+      usage[entry.keyId].spendApi = snap ? 'ok' : 'unsupported';
+    });
+    for (const keyId of Object.keys(spend)) if (!keyMap.has(keyId)) delete spend[keyId];
+
+    // 刚接入的号：上游那边它要卖的模型还没有账，就先试
+    const probeIds = new Set((probeAccountIds || []).map(String));
+    const probed = [];
+    if (config.probeNewAccounts && probeIds.size) {
+      for (const entry of keyEntries) {
+        const fresh = entry.accounts.filter(a => probeIds.has(a.id));
+        if (!fresh.length || (usage[entry.keyId] || {}).usageApi !== 'ok') continue;
+        const known = usage[entry.keyId].byModel;
+        const wanted = [...new Set(fresh.flatMap(a => modelsToProbe(a, sold, groups)))]
+          .filter(m => !(known[m] || []).some(o => o.cost > 0));
+        if (!wanted.length) continue;
+        const sent = await probeUpstreamPrices(fresh[0], wanted);
+        probed.push({ keyId: entry.keyId, accountIds: fresh.map(a => a.id), sent });
+        await new Promise(resolve => setTimeout(resolve, 8000));
+        const today = await upstreamUsageForKey(entry, [days[0]]);
+        if (today.usageApi === 'ok') {
+          for (const [model, list] of Object.entries(today.byModel)) {
+            known[model] = [...(known[model] || []).filter(o => o.day !== days[0]), ...list];
+          }
+        }
+      }
+    }
+
+    // 认价格：同一个模型别的 Key 以前认出来的价格也拿来当候选
+    const knownSets = [];
+    for (const [keyId, entry] of Object.entries(prev.keys || {})) {
+      for (const [model, r] of Object.entries(entry.models || {})) {
+        if (r && r.priceSet && (r.status === 'matched' || r.status === 'solved')) knownSets.push({ model, label: entry.host || keyId, priceSet: r.priceSet });
+      }
+    }
+    const identified = {};
+    const relaxed = { ...upstreamPricing.RULES, minCost: 1e-7, absTolerance: 1e-9 };
+    for (const entry of keyEntries) {
+      identified[entry.keyId] = {};
+      for (const [model, obs] of Object.entries((usage[entry.keyId] || {}).byModel || {})) {
+        if (!upstreamPricing.isSafeModelName(model)) continue;
+        const candidates = upstreamPricing.collectCandidates(model, { host: entry.host, defaults, plazas: publicLists.plazas, newapis: publicLists.newapis, known: knownSets });
+        let result = upstreamPricing.identifyPriceSet(obs, candidates);
+        // 只有试价格那两条小请求：钱太少，按更细的精度再认一次
+        if (result.status === 'nodata' && obs.some(o => o.cost > 0)) result = { ...upstreamPricing.identifyPriceSet(obs, candidates, relaxed), fromProbe: true };
+        identified[entry.keyId][model] = result;
+      }
+    }
+    // New API 搭的上游：这段时间实际扣的钱 ÷ 按价格表算的标价 = 真实倍率；价格表用它公开的、没有就用 Sub2API 默认价
+    const rateChanges = [];
+    const spendResults = {};
+    const spendWithWindow = spendKeys.filter(e => upstreamPricing.spendWindow(spend[e.keyId]));
+    if (spendWithWindow.length) {
+      const rateRows = await execPsqlAsync(upstreamPricing.accountRatesSql(spendWithWindow.flatMap(e => e.accounts.map(a => a.id))))
+        .then(text => JSON.parse(String(text || '[]').trim() || '[]')).catch(() => []);
+      const rates = new Map(rateRows.map(r => [String(r.id), r]));
+      for (const entry of spendWithWindow) {
+        const window = upstreamPricing.spendWindow(spend[entry.keyId]);
+        let windowUsage = [];
+        try {
+          windowUsage = upstreamPricing.parseWindowUsage(await execPsqlAsync(upstreamPricing.windowUsageSql(entry.accounts.map(a => a.id), window.from, window.to)));
+        } catch (error) {
+          errors.push(`读不到 ${entry.host} 那几个号这段时间的用量：${error.message}`);
+          continue;
+        }
+        const priceFor = model => upstreamPricing.collectCandidates(model, { host: entry.host, defaults, newapis: publicLists.newapis })
+          .find(c => c.exact && (c.source === 'newapi' || c.source === 'default')) || null;
+        const eff = upstreamPricing.effectiveRateFromSpend({ window, usage: windowUsage, priceFor });
+        spendResults[entry.keyId] = eff ? { ...eff, models: undefined, from: window.from, to: window.to } : null;
+        if (!eff || eff.status !== 'ok') continue;
+        for (const [model, m] of Object.entries(eff.models)) {
+          const observed = {};
+          upstreamPricing.COMPONENTS.forEach(c => { observed[c] = (m.mix[c] || 0) > 0; });
+          identified[entry.keyId][model] = {
+            status: 'matched', priceSet: m.priceSet, source: m.source, sourceLabel: `${m.sourceLabel}（倍率按上游实际扣的钱算）`,
+            multiplier: eff.rate, observed, mix: m.mix, days: 1, unconfirmed: [], recentOnly: false, fromSpend: true
+          };
+        }
+        for (const a of entry.accounts) {
+          const current = rates.get(a.id);
+          if (!current || current.probe === 'ok') continue;
+          const change = upstreamPricing.accountRateChange({ id: a.id, name: a.name, rate: Number(current.rate) }, eff.rate);
+          if (change) rateChanges.push({ ...change, host: entry.host, spentUsd: eff.spentUsd, listCost: eff.listCost });
+        }
+      }
+    }
+
+    const keys = summarizeKeys(keyEntries, usage, identified);
+    for (const [keyId, result] of Object.entries(spendResults)) if (keys[keyId]) keys[keyId].spend = result;
+    const changed = upstreamPricing.priceChanges(prev.keys, keys);
+
+    const plan = upstreamPricing.buildSyncPlan({ groups, channels: accounts, identified, sold, defaults, config });
+    plan.changes.push(...rateChanges);
+    const now = new Date().toISOString();
+    let applied = [];
+    const auto = config.autoApply ? plan.changes.filter(c => !c.needsConfirm) : [];
+    if (auto.length) {
+      try {
+        applied = applyPriceChanges(auto, groups).map(c => ({ ...c, at: now, how: '自动' }));
+      } catch (error) {
+        const why = String(error.message || error).split('\n').find(line => /ERROR/.test(line)) || error.message;
+        errors.push(`自动改价没写进去：${why}`);
+      }
+    }
+    const appliedIds = new Set(applied.map(c => c.id));
+    const prevPending = new Map((prev.pending || []).map(p => [p.id, p]));
+    const pending = plan.changes.filter(c => !appliedIds.has(c.id)).map(c => ({ ...c, firstSeenAt: (prevPending.get(c.id) || {}).firstSeenAt || now }));
+    const newPending = pending.filter(c => !prevPending.has(c.id));
+
+    upstreamPriceState = upstreamPricing.normalizeState({
+      ...prev,
+      checkedAt: started,
+      reason,
+      keys,
+      plan,
+      pending,
+      applied: [...(prev.applied || []), ...applied],
+      errors: [...(prev.errors || []), ...errors.map(message => ({ at: now, message }))],
+      probed: [...(prev.probed || []), ...probed.map(p => ({ ...p, at: now }))],
+      spend,
+      knownAccountIds: accounts.map(a => a.id)
+    });
+    writeJSON(UPSTREAM_PRICES_FILE, upstreamPriceState);
+
+    const servingKeys = new Set(accounts.filter(a => a.groupsDetail.some(g => Number(g.priority) <= upstreamPricing.RULES.servingPriorityMax)).map(a => a.keyId));
+    const changedServing = changed.filter(c => servingKeys.has(c.keyId));
+    if (telegram && typeof telegram.notifyUpstreamPrices === 'function' && (changedServing.length || applied.length || newPending.length)) {
+      const priceLine = c => `${(c.accounts || []).slice(0, 2).join('、') || c.host} · ${c.model}：${upstreamPricing.describeSet(c.from)} → ${upstreamPricing.describeSet(c.to)}`;
+      await Promise.resolve(telegram.notifyUpstreamPrices({
+        changed: changedServing.map(c => ({ text: priceLine(c), up: upstreamPricing.COMPONENTS.some(k => c.to[k] > c.from[k]) })),
+        applied: applied.map(c => ({ text: priceChangeText(c) })),
+        pending: newPending.map(c => ({
+          text: priceChangeText(c),
+          why: c.kind === 'account_rate' ? `这段时间上游实际扣了 $${c.spentUsd}，按价格表算是 $${c.listCost}`
+            : c.costRatio === null ? '现价查不到' : `客户花费会变成原来的 ${c.costRatio} 倍`
+        })),
+        autoApply: config.autoApply
+      })).catch(error => console.error('[上游价格] 通知失败:', error.message));
+    }
+    const idCount = Object.values(identified).reduce((n, m) => n + Object.values(m).filter(r => r.status === 'matched' || r.status === 'solved').length, 0);
+    console.log(`💲 [上游价格] ${reason}：认出 ${idCount} 个模型的价格，上游改价 ${changed.length} 个，自动改了 ${applied.length} 个，等确认 ${pending.length} 个，用时 ${Math.round((Date.now() - started) / 1000)} 秒`);
+    return upstreamPriceState;
+  })().finally(() => { upstreamPriceRun = null; });
+  return upstreamPriceRun;
+}
+
+// 你确认的改动：先重新读分组价格，现价还是当时那样才改（被别人改过的跳过）
+async function applyPendingPriceChanges(ids = null) {
+  const data = upstreamPriceData();
+  const wanted = ids && ids.length ? new Set(ids.map(String)) : null;
+  const picked = (data.pending || []).filter(c => !wanted || wanted.has(c.id));
+  if (!picked.length) return { applied: [], skipped: [] };
+  const groups = upstreamPricing.parseGroups(await execPsqlAsync(upstreamPricing.groupsSql()));
+  const ready = [];
+  const skipped = [];
+  const rateIds = picked.filter(c => c.kind === 'account_rate').map(c => c.accountId);
+  const currentRates = rateIds.length
+    ? new Map(JSON.parse(String(await execPsqlAsync(upstreamPricing.accountRatesSql(rateIds)) || '[]').trim() || '[]').map(r => [String(r.id), r]))
+    : new Map();
+  for (const c of picked) {
+    if (c.kind === 'account_rate') {
+      const current = currentRates.get(String(c.accountId));
+      if (!current || Math.abs(Number(current.rate) - Number(c.from)) > 1e-9) skipped.push({ id: c.id, why: '这个号的倍率在列出来以后被改过' });
+      else ready.push(c);
+      continue;
+    }
+    const group = groups.find(g => g.id === String(c.groupId));
+    if (!group) { skipped.push({ id: c.id, why: '分组不在了' }); continue; }
+    const found = upstreamPricing.findGroupRule(group.modelPricing, c.model);
+    const rulePrice = found && !found.wildcard ? upstreamPricing.currentGroupPrice(group, c.model).priceSet : null;
+    const same = c.fromSource === 'custom'
+      ? !!rulePrice && upstreamPricing.COMPONENTS.every(k => (rulePrice[k] === null && c.from[k] === null) || (rulePrice[k] !== null && c.from[k] !== null && Math.abs(rulePrice[k] - c.from[k]) <= Math.max(rulePrice[k], c.from[k]) * 0.005))
+      : !found || found.wildcard;
+    if (!same) { skipped.push({ id: c.id, why: '这个价格在列出来以后被改过' }); continue; }
+    ready.push(c);
+  }
+  const now = new Date().toISOString();
+  const applied = ready.length ? applyPriceChanges(ready, groups).map(c => ({ ...c, at: now, how: '确认后' })) : [];
+  const done = new Set(applied.map(c => c.id));
+  upstreamPriceState = upstreamPricing.normalizeState({
+    ...data,
+    pending: (data.pending || []).filter(c => !done.has(c.id)),
+    applied: [...(data.applied || []), ...applied]
+  });
+  writeJSON(UPSTREAM_PRICES_FILE, upstreamPriceState);
+  if (applied.length) console.log(`💲 [上游价格] 按你的确认改了 ${applied.length} 个分组价格`);
+  return { applied, skipped };
+}
+
+// 新接入的号：每分钟看一眼有没有没见过的 API Key 号，有就等 2 分钟（你可能还在设分组）再对一次账、试价格
+function startUpstreamPricePoller() {
+  let lastPeriodic = 0;
+  let pendingNew = new Set();
+  let newSince = 0;
+  let lastError = '';
+  const tick = async () => {
+    if (upstreamPriceRun) return;
+    try {
+      const config = priceSyncConfig();
+      const data = upstreamPriceData();
+      const ids = priceAccounts().map(a => a.id);
+      if (!Array.isArray(data.knownAccountIds)) {
+        // 第一次：现有的号都算见过，不去试价格
+        data.knownAccountIds = ids;
+        writeJSON(UPSTREAM_PRICES_FILE, data);
+      }
+      const known = new Set(data.knownAccountIds.map(String));
+      for (const id of ids) if (!known.has(id)) { if (!pendingNew.size) newSince = Date.now(); pendingNew.add(id); }
+      const now = Date.now();
+      if (pendingNew.size && now - newSince >= 2 * 60000) {
+        const fresh = [...pendingNew];
+        pendingNew = new Set();
+        lastPeriodic = now;
+        await runUpstreamPriceCheck({ reason: `新接入的号 #${fresh.join('、#')}`, probeAccountIds: fresh });
+      } else if (!lastPeriodic || now - lastPeriodic >= config.intervalHours * 3600000) {
+        lastPeriodic = now;
+        await runUpstreamPriceCheck({ reason: '定时对账' });
+      }
+      lastError = '';
+    } catch (error) {
+      if (error.message !== lastError) console.error('[上游价格]', error.message);
+      lastError = error.message;
+    }
+  };
+  setTimeout(tick, 5 * 60 * 1000);
+  setInterval(tick, 60 * 1000);
 }
 
 // ====== 余额提醒与每日简报 ======
@@ -6037,7 +6550,7 @@ function fetchUserFinancialStats(forceRefresh = false, options = {}) {
   }
   try {
     const sql = `
-WITH 
+WITH ${upstreamPricing.upstreamPriceCte(upstreamPricing.reportPriceRows(upstreamPriceData().keys))},
 u_summary AS (
   SELECT 
     COUNT(*) as total_users,
@@ -6065,17 +6578,10 @@ normalized_usage AS (
     u.user_id,
     u.created_at,
     u.actual_cost,
-    (u.total_cost * COALESCE(
-      CASE
-        WHEN u.account_rate_multiplier IS NOT NULL AND u.account_rate_multiplier != 1.0 THEN u.account_rate_multiplier
-        WHEN a.rate_multiplier IS NOT NULL AND a.rate_multiplier < 1.0 THEN a.rate_multiplier
-        ELSE u.account_rate_multiplier
-      END,
-      a.rate_multiplier,
-      0
-    )) as effective_cost
+    ${userUsage.EFFECTIVE_COST_SQL} as effective_cost
   FROM usage_logs u
   LEFT JOIN accounts a ON u.account_id = a.id
+  ${upstreamPricing.UPSTREAM_PRICE_JOIN_SQL}
 ),
 s_stats AS (
   SELECT 
@@ -6334,7 +6840,7 @@ async function fetchUserUsageReport(rangeKey, { force = false } = {}) {
   if (!force && cached && Date.now() - cached.at < USER_USAGE_CACHE_MS) return cached.report;
   if (userUsageInflight.has(rangeKey)) return userUsageInflight.get(rangeKey);
   const pending = (async () => {
-    const output = await execPsqlAsync(userUsage.buildUserUsageSql(rangeKey));
+    const output = await execPsqlAsync(userUsage.buildUserUsageSql(rangeKey, upstreamPricing.reportPriceRows(upstreamPriceData().keys)));
     const report = userUsage.buildUserUsageReport(userUsage.parseUserUsageRows(output), rangeKey, new Date());
     userUsageCache.set(rangeKey, { at: Date.now(), report });
     return report;
@@ -10409,6 +10915,70 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ====== 上游价格对账 ======
+  if (pathname === '/api/upstream/prices' && req.method === 'GET') {
+    const data = upstreamPriceData();
+    const keys = Object.entries(data.keys || {}).map(([keyId, k]) => ({
+      keyId, host: k.host, accountIds: k.accountIds, names: k.names, usageApi: k.usageApi, spendApi: k.spendApi || '', spend: k.spend || null, error: k.error,
+      models: Object.entries(k.models || {}).map(([model, r]) => ({
+        model, status: r.status, source: r.source || '', sourceLabel: r.sourceLabel || '', multiplier: r.multiplier,
+        recentOnly: !!r.recentOnly, days: r.days, ratioVsReference: r.ratioVsReference ?? null,
+        price: r.priceSet ? upstreamPricing.describeSet(r.priceSet) : ''
+      }))
+    }));
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      success: true, checkedAt: data.checkedAt, reason: data.reason, running: !!upstreamPriceRun, config: priceSyncConfig(), keys,
+      pending: (data.pending || []).map(c => ({ ...c, text: priceChangeText(c) })),
+      applied: (data.applied || []).slice(-50).map(c => ({ ...c, text: priceChangeText(c) })),
+      skipped: (data.plan && data.plan.skipped) || [], errors: (data.errors || []).slice(-20), probed: (data.probed || []).slice(-20)
+    }));
+    return;
+  }
+
+  if (pathname === '/api/upstream/prices/check' && req.method === 'POST') {
+    const body = await getBody();
+    try {
+      const ids = Array.isArray(body.probeAccountIds) ? body.probeAccountIds.map(String).filter(id => /^\d+$/.test(id)) : [];
+      const data = await runUpstreamPriceCheck({ reason: '手动对账', probeAccountIds: ids });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: true, checkedAt: data.checkedAt, pending: data.pending.length, applied: data.applied.length }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/api/upstream/prices/apply' && req.method === 'POST') {
+    const body = await getBody();
+    try {
+      const ids = Array.isArray(body.ids) ? body.ids.map(String) : null;
+      const result = await applyPendingPriceChanges(ids);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: true, applied: result.applied.map(c => priceChangeText(c)), skipped: result.skipped }));
+    } catch (err) {
+      const reason = String(err.message || err).split('\n').find(line => /ERROR/.test(line)) || err.message;
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: String(reason).replace(/^.*?ERROR:\s*/, '') }));
+    }
+    return;
+  }
+
+  if (pathname === '/api/upstream/prices/config' && req.method === 'POST') {
+    const body = await getBody();
+    const next = { ...readJSON(PRICE_SYNC_CONFIG_FILE, {}) };
+    if (typeof body.autoApply === 'boolean') next.autoApply = body.autoApply;
+    if (typeof body.probeNewAccounts === 'boolean') next.probeNewAccounts = body.probeNewAccounts;
+    if (Array.isArray(body.excludeKeywords)) next.excludeKeywords = body.excludeKeywords.map(String).map(k => k.trim()).filter(Boolean).slice(0, 20);
+    if (Array.isArray(body.excludeGroupIds)) next.excludeGroupIds = body.excludeGroupIds.map(String).filter(id => /^\d+$/.test(id)).slice(0, 200);
+    if (body.intervalHours !== undefined) next.intervalHours = Number(body.intervalHours);
+    writeJSON(PRICE_SYNC_CONFIG_FILE, next);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ success: true, config: priceSyncConfig() }));
+    return;
+  }
+
   if (pathname === '/api/upstream/keys/dismiss' && req.method === 'POST') {
     const body = await getBody();
     try {
@@ -11123,6 +11693,14 @@ function initializeMainProcess() {
       globalUserStats: getCachedGlobalUserStats()
     }),
     getAutoSwitchConfig: () => autoSwitchConfig,
+    applyPendingPrices: async () => {
+      const result = await applyPendingPriceChanges(null);
+      return { applied: result.applied.map(c => priceChangeText(c)), skipped: result.skipped };
+    },
+    setPriceAutoApply: async (enabled) => {
+      writeJSON(PRICE_SYNC_CONFIG_FILE, { ...readJSON(PRICE_SYNC_CONFIG_FILE, {}), autoApply: Boolean(enabled) });
+      return { success: true };
+    },
     activateChannel: async (targetId, operator = 'Telegram Bot') => {
       return activateChannel(targetId, operator);
     },
@@ -11170,6 +11748,7 @@ function initializeMainProcess() {
     startAdminWatchPoller();
     startManualGroupGuardPoller();
     startCustomerBalancePoller();
+    startUpstreamPricePoller();
     refreshAllBalances().then(() => console.log('✅ 各上游账户钱包余额初始抓取完成')).catch(e => console.error('余额初始抓取异常:', e.message));
   });
 }

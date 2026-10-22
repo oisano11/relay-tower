@@ -646,6 +646,20 @@ class TelegramBotManager {
     } else if (data.startsWith('switch:')) {
       const channelId = data.replace('switch:', '');
       await this.handleDoSwitch(chatId, queryId, channelId, query.message.message_id);
+    } else if (data === 'prices:apply') {
+      await this.answerCallbackQuery(queryId, { text: '正在按上游改价格…' });
+      try {
+        const result = await this.context.applyPendingPrices();
+        const lines = [result.applied.length ? `✅ 改好了 ${result.applied.length} 个分组价格：` : '没有可以改的了（可能已经改过，或者价格在列出来以后被改过）。'];
+        result.applied.slice(0, 10).forEach(text => lines.push(`· ${escapeHtml(text)}`));
+        if (result.skipped.length) lines.push(`跳过 ${result.skipped.length} 个：${escapeHtml(result.skipped.map(x => x.why).slice(0, 3).join('；'))}`);
+        await this.sendMessage(chatId, lines.join('\n'));
+      } catch (error) {
+        await this.sendMessage(chatId, `⚠️ 没改成：${escapeHtml(error.message)}`);
+      }
+    } else if (data === 'prices:auto_on') {
+      await this.context.setPriceAutoApply(true);
+      await this.answerCallbackQuery(queryId, { text: '✅ 已打开：以后上游价格变了，分组价格自动跟（改动太大的还会先问你）', show_alert: true });
     } else if (data === 'toggle_auto') {
       const autoConfig = this.context.getAutoSwitchConfig();
       const newEnabled = !autoConfig.enabled;
@@ -1329,6 +1343,42 @@ class TelegramBotManager {
     for (const c of low) lines.push(`· ${escapeHtml(c.label)}：余额 ${money(c.balance)}，最近 7 天平均每天花 ${money(c.daily)}，大约还能用 ${daysText(c.daysLeft)}`);
     lines.push('可以提醒客户充值。充值以后会重新开始算，不会重复提醒。');
     await this.broadcastToAdmins(lines.join('\n'), empty.length ? {} : { disable_notification: true });
+    return true;
+  }
+
+  // 上游价格对账（规则见 upstream-pricing.js）：
+  // 上游改价了（有涨价就响，只降价不响）、分组价格已按上游改好（不响）、有改动等你确认（响，带按钮）。
+  async notifyUpstreamPrices({ changed = [], applied = [], pending = [], autoApply = false }) {
+    if (!this.config.enabled || !this.hasAdmins() || (!changed.length && !applied.length && !pending.length)) return false;
+    const list = (items, fmt) => {
+      const lines = items.slice(0, 8).map(fmt);
+      if (items.length > 8) lines.push(`…还有 ${items.length - 8} 个，塔台里能看全`);
+      return lines;
+    };
+    const lines = [];
+    if (changed.length) {
+      lines.push('💲 <b>上游改价了</b>（四个价格按每百万 token）');
+      lines.push(...list(changed, c => `· ${escapeHtml(c.text)}${c.up ? '（涨了）' : '（降了）'}`));
+    }
+    if (applied.length) {
+      if (lines.length) lines.push('');
+      lines.push('✅ <b>分组价格已按上游改好</b>（倍率没动）');
+      lines.push(...list(applied, c => `· ${escapeHtml(c.text)}`));
+    }
+    let keyboard;
+    if (pending.length) {
+      if (lines.length) lines.push('');
+      lines.push('📝 <b>这些分组价格和上游不一样，等你确认</b>');
+      lines.push(...list(pending, c => `· ${escapeHtml(c.text)}${c.why ? `（${escapeHtml(c.why)}）` : ''}`));
+      lines.push(autoApply ? '<i>改动太大的不自动改，免得认错价格把客户价改坏。</i>' : '<i>「自动同步」还没打开，所以先列出来，你点了才改。</i>');
+      keyboard = [[{ text: '✅ 按上游改', callback_data: 'prices:apply' }]];
+      if (!autoApply) keyboard.push([{ text: '🔁 以后自动改（改动太大的还会问你）', callback_data: 'prices:auto_on' }]);
+    }
+    const up = changed.some(c => c.up);
+    await this.broadcastToAdmins(lines.join('\n'), {
+      ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+      disable_notification: !(up || pending.length)
+    });
     return true;
   }
 
