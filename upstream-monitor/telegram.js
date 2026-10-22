@@ -1350,9 +1350,10 @@ class TelegramBotManager {
   // 上游改价了（有涨价就响，只降价不响）、分组价格已按上游改好（不响）、有改动等你确认（响，带按钮）。
   async notifyUpstreamPrices({ changed = [], applied = [], pending = [], autoApply = false }) {
     if (!this.config.enabled || !this.hasAdmins() || (!changed.length && !applied.length && !pending.length)) return false;
-    const list = (items, fmt) => {
-      const lines = items.slice(0, 8).map(fmt);
-      if (items.length > 8) lines.push(`…还有 ${items.length - 8} 个，塔台里能看全`);
+    // 等确认的要全列出来：「按上游改」会把列出的和没列出的一起改
+    const list = (items, fmt, max = 20) => {
+      const lines = items.slice(0, max).map(fmt);
+      if (items.length > max) lines.push(`…还有 ${items.length - max} 个没列出来（按钮会一起改）`);
       return lines;
     };
     const lines = [];

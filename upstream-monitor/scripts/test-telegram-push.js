@@ -364,3 +364,13 @@ test('upstream prices: the confirm button applies the pending changes and report
   await api.handleCallbackQuery({ id: 'q3', data: 'prices:apply', from: { id: 4242 }, message: { chat: { id: 4242 }, message_id: 7 } });
   assert.ok(sent.every(s => s.method !== 'sendMessage'), 'someone who is not an admin cannot apply prices');
 });
+
+test('upstream prices: up to 20 pending changes are listed; beyond that the message says the button changes them too', async () => {
+  const { api, sent } = bot();
+  const pending = Array.from({ length: 23 }, (_, i) => ({ text: `「示例组」demo-${i}：— → 输入 $2` }));
+  await api.notifyUpstreamPrices({ changed: [], applied: [], pending, autoApply: true });
+  assert.match(sent[0].text, /demo-19：/);
+  assert.doesNotMatch(sent[0].text, /demo-20：/);
+  assert.match(sent[0].text, /…还有 3 个没列出来（按钮会一起改）/);
+  assert.doesNotMatch(sent[0].text, /塔台里能看全/);
+});
