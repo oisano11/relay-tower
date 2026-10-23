@@ -249,55 +249,58 @@ test('reports: identified prices become a small SQL table per account and model;
   assert.match(up.COST_BASIS_SQL, /COALESCE\(u\.billing_mode, 'token'\) = 'token'/, 'per-request and per-image rows keep Sub2API’s price');
 });
 
-test('New API upstreams: the key’s total spend is sampled; two samples 1–26 h apart give what the upstream really charged', () => {
-  assert.deepEqual(up.parseTokenUsage({ code: true, data: { total_used: 2592584, unlimited_quota: true } }), { used: 2592584, unlimited: true });
-  assert.equal(up.parseTokenUsage({ data: {} }), null);
-  const H = 3600000;
-  const now = 100 * 24 * H;
-  let list = up.addSpendSnapshot([], { used: 1_000_000 }, now - 30 * H);
-  list = up.addSpendSnapshot(list, { used: 1_500_000 }, now - 20 * H);
-  list = up.addSpendSnapshot(list, { used: 3_500_000 }, now);
-  list = up.addSpendSnapshot(list, null, now);
-  assert.equal(list.length, 3, 'a failed read adds nothing');
-  assert.deepEqual(up.spendWindow(list), { from: now - 20 * H, to: now, spentUsd: 4 }, '30 h ago is too old; 2,000,000 quota = $4');
-  assert.equal(up.spendWindow([{ at: now - 10 * 60000, used: 1 }, { at: now, used: 2 }]), null, 'less than an hour apart');
-  assert.equal(up.spendWindow([{ at: now - 5 * H, used: 9 }, { at: now - 2 * H, used: 3 }, { at: now, used: 4 }]), null, 'the counter went down (reset): skip');
-  assert.equal(up.addSpendSnapshot([{ at: now - 10 * 24 * H, used: 1 }], { used: 2 }, now).length, 1, 'older than 9 days is dropped');
+test('New API upstreams: the logged-in bill gives per-request charges and the group ratio; one token is picked by its key', () => {
+  const at = Date.UTC(2026, 0, 2, 4) / 1000;  // 北京时间 1 月 2 日中午
+  const rec = (extra = {}, other = {}) => ({ model_name: 'demo-opus', token_id: 5, token_name: 'mine', created_at: at, quota: 4111, prompt_tokens: 1840, completion_tokens: 727,
+    other: JSON.stringify({ group_ratio: 0.25, cache_tokens: 34956, cache_creation_tokens: 800, usage_semantic: 'anthropic', model_price: 0, ...other }), ...extra });
+  const logs = up.parseNewApiLogs({ success: true, data: { items: [rec(), rec({ token_id: 6, token_name: 'other' }), rec({ quota: 0 }), rec({}, { model_price: 0.1 }), { quota: 5 }] } });
+  assert.equal(logs.length, 4, 'records without a model are dropped');
+  assert.equal(logs[0].other.group_ratio, 0.25, 'other is parsed');
+  assert.deepEqual(up.parseNewApiLogs({ data: [rec()] }).length, 1, 'a plain list works too');
+
+  const tokens = [{ id: 5, name: 'mine', key: 'abcd1234wxyz' }, { id: 6, name: 'other', key: 'zzzz0000zzzz' }];
+  assert.equal(up.matchNewApiToken(tokens, 'sk-abcd1234wxyz').id, 5, 'full key, with or without sk-');
+  assert.equal(up.matchNewApiToken([{ id: 7, key: 'abcd**********wxyz' }], 'abcd1234wxyz').id, 7, 'masked: head and tail');
+  assert.equal(up.matchNewApiToken([{ id: 7, key: 'ab****yz' }, { id: 8, key: 'ab****yz' }], 'abcd1234wxyz'), null, 'two masked look-alikes: not sure');
+  assert.equal(up.matchNewApiToken(tokens, ''), null);
+
+  const { byModel, groupRatio } = up.newApiObservations(logs, { tokenId: 5 });
+  assert.equal(groupRatio, 0.25);
+  const [o] = byModel['demo-opus'];
+  assert.equal(o.day, '2026-01-02');
+  assert.deepEqual([o.requests, o.input, o.output, o.cacheWrite, o.cacheRead], [1, 1840, 727, 800, 34956], 'only our token, only charged per-token records');
+  assert.ok(Math.abs(o.actualCost - 4111 / 500000) < 1e-12);
+  assert.ok(Math.abs(o.cost - 4111 / 500000 / 0.25) < 1e-12, 'list price = charged ÷ group ratio');
+
+  // OpenAI 口径：prompt_tokens 里含缓存命中，要减掉
+  const openai = up.newApiObservations(up.parseNewApiLogs({ data: [rec({}, { usage_semantic: 'openai', cache_tokens: 1000 })] }), { tokenName: 'mine' });
+  assert.equal(openai.byModel['demo-opus'][0].input, 840);
+
+  // 上游自己的账按天合起来以后，和 Sub2API 上游一样能认出价格，倍率就是分组倍率
+  const OPUS = up.priceSet({ input: 4e-6, output: 2e-5, cacheWrite: 5e-6, cacheRead: 2e-7 });
+  const fake = (d, k) => ({ model_name: 'demo-opus', token_id: 5, created_at: Date.UTC(2026, 0, d, 4) / 1000, prompt_tokens: 1000 * k, completion_tokens: 300 * k,
+    quota: Math.round(up.predictCost({ input: 1000 * k, output: 300 * k, cacheWrite: 500 * k, cacheRead: 20000 * k }, OPUS) * 0.25 * 500000),
+    other: { group_ratio: 0.25, cache_tokens: 20000 * k, cache_creation_tokens: 500 * k, usage_semantic: 'anthropic' } });
+  const many = up.newApiObservations([fake(1, 40), fake(2, 70), fake(3, 55)], { tokenId: 5 });
+  const r = up.identifyPriceSet(many.byModel['demo-opus'], [{ source: 'default', label: '默认价', priceSet: OPUS, exact: true }]);
+  assert.equal(r.status, 'matched');
+  assert.equal(r.multiplier, 0.25);
 });
 
-test('New API upstreams: real rate = charged ÷ list price of our own usage in the same window; only a clear difference changes the account', () => {
-  const usage = [{ model: 'demo-opus', input: 100, output: 20000, cacheWrite: 700000, cacheRead: 3000000 }];
-  const OPUS = up.priceSet({ input: 4e-6, output: 2e-5, cacheWrite: 5e-6, cacheRead: 2e-7 });
-  const priceFor = m => (m === 'demo-opus' ? { priceSet: OPUS, source: 'default', label: 'Sub2API 默认价' } : null);
-  const list = up.predictCost(usage[0], OPUS);
-  const eff = up.effectiveRateFromSpend({ window: { from: 0, to: 1, spentUsd: list * 0.21 }, usage, priceFor });
-  assert.equal(eff.status, 'ok');
-  assert.equal(eff.rate, 0.21);
-  assert.equal(eff.models['demo-opus'].source, 'default');
-  assert.equal(up.effectiveRateFromSpend({ window: { from: 0, to: 1, spentUsd: 1 }, usage: [{ model: 'unknown', input: 1, output: 1, cacheWrite: 0, cacheRead: 0 }], priceFor }).status, 'unpriced');
-  assert.equal(up.effectiveRateFromSpend({ window: { from: 0, to: 1, spentUsd: 0.01 }, usage: [{ model: 'demo-opus', input: 10, output: 10, cacheWrite: 0, cacheRead: 0 }], priceFor }).status, 'too_little');
-
+test('account rate: only a clear difference changes it; the write checks the old rate and never fights Sub2API’s own sync', () => {
   assert.equal(up.accountRateChange({ id: 7, name: '号7', rate: 0.25 }, 0.26), null, 'within 5%');
-  const big = up.accountRateChange({ id: 7, name: '号7', rate: 1 }, 0.2134);
-  assert.deepEqual({ ...big }, { id: 'rate|7|0.213', kind: 'account_rate', accountId: '7', accountName: '号7', from: 1, to: 0.213, costRatio: 0.213, needsConfirm: true });
+  const big = up.accountRateChange({ id: 7, name: '号7', rate: 1 }, 0.25);
+  assert.deepEqual({ ...big }, { id: 'rate|7|0.25', kind: 'account_rate', accountId: '7', accountName: '号7', from: 1, to: 0.25, costRatio: 0.25, needsConfirm: true });
   assert.equal(up.accountRateChange({ id: 7, name: '号7', rate: 0.2 }, 0.22).needsConfirm, false);
   assert.equal(up.accountRateChange({ id: 7, name: '号7', rate: 0.2 }, Infinity), null);
-
   const sql = up.buildAccountRateSql([big]);
-  assert.match(sql, /UPDATE accounts SET rate_multiplier = 0\.2130, updated_at = NOW\(\)\n   WHERE id = 7 AND deleted_at IS NULL AND rate_multiplier = 1\.0000/);
-  assert.match(sql, /extra->'upstream_billing_probe'->>'status', ''\) <> 'ok'/, 'never fight Sub2API’s own rate sync');
+  assert.match(sql, /UPDATE accounts SET rate_multiplier = 0\.2500, updated_at = NOW\(\)\n   WHERE id = 7 AND deleted_at IS NULL AND rate_multiplier = 1\.0000/);
+  assert.match(sql, /extra->'upstream_billing_probe'->>'status', ''\) <> 'ok'/);
   assert.match(sql, /INSERT INTO scheduler_outbox \(event_type, account_id\) VALUES \('account_changed', 7\)/);
   assert.throws(() => up.buildAccountRateSql([{ ...big, accountId: '7 OR 1=1' }]), /账号编号不对/);
   assert.throws(() => up.buildAccountRateSql([{ ...big, to: -1 }]), /倍率不对/);
   assert.match(up.accountRatesSql([7, '8', 'x']), /WHERE id IN \(7, 8\) AND deleted_at IS NULL/);
   assert.equal(up.accountRatesSql([]), "SELECT '[]'::json;");
-
-  const w = up.windowUsageSql([7, 8], 1_700_000_000_000, 1_700_003_600_000);
-  assert.match(w, /account_id IN \(7, 8\)/);
-  assert.match(w, /to_timestamp\(1700000000\.000\) AND created_at <= to_timestamp\(1700003600\.000\)/);
-  assert.throws(() => up.windowUsageSql([], 1, 2), /时间段或账号不对/);
-  assert.throws(() => up.windowUsageSql([7], 5, 1), /时间段或账号不对/);
-  assert.deepEqual(up.parseWindowUsage('[{"model":"m","input":1,"output":"2","cacheWrite":null,"cacheRead":4}]'), [{ model: 'm', input: 1, output: 2, cacheWrite: 0, cacheRead: 4 }]);
 });
 
 test('a group that has not sold a model yet takes the price other groups (without their own price) really charged for it', () => {

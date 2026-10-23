@@ -734,83 +734,83 @@ function parseSold(text) {
   return out;
 }
 
-// ---------- New API 搭的上游：按「这个 Key 一共花了多少」算真实倍率 ----------
-// New API 查不到每天每个模型的账，但能用 Key 查到它一共花了多少（/api/usage/token，500000 = 1 美元）。
-// 每次对账记一次，两次一减就是这段时间上游实际扣的钱；我们这边同一段时间这个 Key 的号用了多少 token，
-// 按它公开的价格表（没有就按 Sub2API 默认价）算出标价，实际扣的 ÷ 标价 = 真实倍率。
-// 这个 Key 要是在别处也在用，算出来会偏高；所以只在标价够多（默认 0.2 美元以上）时才算。
+// ---------- New API 搭的上游：登录它的后台，读每条扣费记录 ----------
+// New API 查不到按天的账，但登录后台（塔台的「上游面板」）以后能读到我们账号的每条扣费记录（/api/log/self）：
+// 用了哪个模型、多少输入 / 输出 / 缓存 token、扣了多少（quota，500000 = 1 美元），以及这条用的分组倍率（group_ratio）。
+// 实扣 ÷ 分组倍率 = 标价；按天合起来，和 Sub2API 的账一样拿去认价格。分组倍率就是这个号真实的进价倍率。
 const NEWAPI_QUOTA_PER_USD = 500000;
-const SPEND_RULES = { minWindowMs: 3600000, maxWindowMs: 26 * 3600000, keepMs: 9 * 24 * 3600000, minListCost: 0.2, rateTolerance: 0.05 };
+const RATE_RULES = { rateTolerance: 0.05 };
 
-function parseTokenUsage(body) {
-  const d = body && (body.data || body);
-  const used = d ? Number(d.total_used) : NaN;
-  if (!Number.isFinite(used) || used < 0) return null;
-  return { used, unlimited: !!(d && d.unlimited_quota) };
+function parseOther(raw) {
+  if (raw && typeof raw === 'object') return raw;
+  try { return JSON.parse(raw || '{}') || {}; } catch (e) { return {}; }
 }
 
-function addSpendSnapshot(list, snapshot, now, rules = SPEND_RULES) {
-  const kept = (Array.isArray(list) ? list : []).filter(x => x && now - Number(x.at) <= rules.keepMs);
-  if (snapshot) kept.push({ at: now, used: snapshot.used });
-  return kept.slice(-200);
+// 一页扣费记录（New API 的 data 可能是列表，也可能是 { items: [...] }）
+function parseNewApiLogs(body) {
+  const d = body && body.data;
+  const list = Array.isArray(d) ? d : (d && Array.isArray(d.items) ? d.items : []);
+  return list.filter(x => x && x.model_name).map(x => ({ ...x, other: parseOther(x.other) }));
 }
 
-// 取一段：结束是最新那次，开始是 1 到 26 小时以前里最早的一次；中间额度变少了（重置过）就不算
-function spendWindow(list, rules = SPEND_RULES) {
-  const snaps = (Array.isArray(list) ? list : []).filter(x => x && Number.isFinite(Number(x.used))).sort((a, b) => a.at - b.at);
-  if (snaps.length < 2) return null;
-  const end = snaps[snaps.length - 1];
-  const start = snaps.find(x => end.at - x.at <= rules.maxWindowMs && end.at - x.at >= rules.minWindowMs);
-  if (!start) return null;
-  const between = snaps.filter(x => x.at >= start.at && x.at <= end.at);
-  for (let i = 1; i < between.length; i++) if (between[i].used < between[i - 1].used) return null;
-  return { from: start.at, to: end.at, spentUsd: (end.used - start.used) / NEWAPI_QUOTA_PER_USD };
+// 令牌列表里哪个是我们这个号用的 Key：完整 Key 对得上最好，后台只给打码的就比头尾
+function matchNewApiToken(tokens, apiKey) {
+  const strip = k => String(k || '').trim().replace(/^sk-/, '');
+  const ours = strip(apiKey);
+  if (!ours) return null;
+  const list = Array.isArray(tokens) ? tokens : [];
+  const exact = list.find(t => strip(t.key) === ours);
+  if (exact) return exact;
+  const masked = list.filter(t => {
+    const k = strip(t.key);
+    const m = k.match(/^([^*]{2,})\*+([^*]{2,})$/);
+    return m && ours.startsWith(m[1]) && ours.endsWith(m[2]);
+  });
+  return masked.length === 1 ? masked[0] : null;
 }
 
-// 只读：一段时间里这些号每个模型用了多少 token（按 Sub2API 记账的那一刻算）
-function windowUsageSql(accountIds, fromMs, toMs) {
-  const ids = (accountIds || []).map(Number).filter(n => Number.isInteger(n) && n > 0);
-  const from = Number(fromMs);
-  const to = Number(toMs);
-  if (!ids.length || !Number.isFinite(from) || !Number.isFinite(to) || to <= from) throw new Error('时间段或账号不对');
-  return `SELECT COALESCE(json_agg(json_build_object('model', model, 'input', t_in, 'output', t_out, 'cacheWrite', t_cw, 'cacheRead', t_cr)), '[]'::json)
-FROM (
-  SELECT lower(btrim(COALESCE(NULLIF(btrim(upstream_model), ''), model))) AS model,
-    SUM(input_tokens) AS t_in, SUM(output_tokens) AS t_out, SUM(cache_creation_tokens) AS t_cw, SUM(cache_read_tokens) AS t_cr
-  FROM usage_logs
-  WHERE account_id IN (${ids.join(', ')}) AND COALESCE(billing_mode, 'token') = 'token'
-    AND created_at > to_timestamp(${(from / 1000).toFixed(3)}) AND created_at <= to_timestamp(${(to / 1000).toFixed(3)})
-  GROUP BY 1
-) t;`;
+function beijingDay(seconds) {
+  return new Date(Number(seconds) * 1000 + 8 * 3600000).toISOString().slice(0, 10);
 }
 
-function parseWindowUsage(text) {
-  return parseJsonOutput(text, '时间段用量').map(r => {
-    const out = { model: String(r.model || '') };
-    COMPONENTS.forEach(c => { out[c] = Number(r[c]) || 0; });
-    return out;
-  }).filter(r => r.model);
-}
-
-// 这段时间的真实倍率：每个模型的价格按顺序找（上游公开价、Sub2API 默认价）；有一个模型找不到价格就不算
-function effectiveRateFromSpend({ window, usage, priceFor }, rules = SPEND_RULES) {
-  if (!window || !Array.isArray(usage) || !usage.length) return null;
-  let listCost = 0;
-  const models = {};
-  for (const u of usage) {
-    const found = priceFor(u.model);
-    if (!found) return { status: 'unpriced', model: u.model };
-    const cost = predictCost(u, found.priceSet);
-    if (cost === null) return { status: 'unpriced', model: u.model };
-    listCost += cost;
-    models[u.model] = { priceSet: found.priceSet, source: found.source, sourceLabel: found.label, mix: { input: u.input, output: u.output, cacheWrite: u.cacheWrite, cacheRead: u.cacheRead } };
+// 一个令牌的扣费记录 → 按天、按模型的账（和 parseUsageStats 一样的格式），外加它最近用的分组倍率。
+// 按次计费的、没扣钱的、倍率不知道的记录不算。OpenAI 口径的 prompt_tokens 里含缓存命中，要减掉。
+function newApiObservations(records, { tokenName = null, tokenId = null } = {}) {
+  const byKey = new Map();
+  let ratio = null;
+  let ratioAt = -Infinity;
+  for (const r of records || []) {
+    if (tokenId !== null && tokenId !== undefined && String(r.token_id) !== String(tokenId)) continue;
+    if ((tokenId === null || tokenId === undefined) && tokenName !== null && r.token_name !== tokenName) continue;
+    const o = r.other || {};
+    const groupRatio = num(o.group_ratio);
+    const quota = Number(r.quota) || 0;
+    if (!groupRatio || quota <= 0 || (num(o.model_price) || 0) > 0) continue;
+    if (Number(r.created_at) > ratioAt) { ratioAt = Number(r.created_at); ratio = groupRatio; }
+    const cacheRead = Number(o.cache_tokens) || 0;
+    const cacheWrite = Number(o.cache_creation_tokens ?? o.cache_write_tokens) || 0;
+    let input = Number(r.prompt_tokens) || 0;
+    if (o.usage_semantic !== 'anthropic' && cacheRead > 0 && input >= cacheRead) input -= cacheRead;
+    const day = beijingDay(r.created_at);
+    const key = `${day}|${r.model_name}`;
+    if (!byKey.has(key)) byKey.set(key, { day, model: String(r.model_name), requests: 0, input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, actualCost: 0 });
+    const ob = byKey.get(key);
+    const actual = quota / NEWAPI_QUOTA_PER_USD;
+    ob.requests += 1;
+    ob.input += input;
+    ob.output += Number(r.completion_tokens) || 0;
+    ob.cacheWrite += cacheWrite;
+    ob.cacheRead += cacheRead;
+    ob.actualCost += actual;
+    ob.cost += actual / groupRatio;
   }
-  if (listCost < rules.minListCost) return { status: 'too_little', listCost };
-  return { status: 'ok', rate: Number((window.spentUsd / listCost).toFixed(4)), listCost: Number(listCost.toFixed(4)), spentUsd: Number(window.spentUsd.toFixed(4)), models };
+  const byModel = {};
+  for (const ob of byKey.values()) (byModel[ob.model] = byModel[ob.model] || []).push(ob);
+  return { byModel, groupRatio: ratio };
 }
 
 // 账号进价倍率要不要改：上游自己的倍率同步不了的号（探测不支持），真实倍率和记的差 5% 以上就改
-function accountRateChange(account, rate, rules = SPEND_RULES) {
+function accountRateChange(account, rate, rules = RATE_RULES) {
   const from = Number(account.rate);
   if (!Number.isFinite(rate) || rate <= 0 || rate >= 100 || !Number.isFinite(from) || from <= 0) return null;
   if (Math.abs(rate - from) <= from * rules.rateTolerance) return null;
@@ -852,7 +852,7 @@ FROM accounts WHERE id IN (${ids.join(', ')}) AND deleted_at IS NULL;`;
 
 // knownAccountIds：见过的 API Key 号；null 表示还没记过（第一次运行时把现有的号都记上，不去试价格）
 function emptyState() {
-  return { checkedAt: 0, reason: '', keys: {}, plan: { changes: [], skipped: [] }, pending: [], applied: [], errors: [], probed: [], spend: {}, knownAccountIds: null };
+  return { checkedAt: 0, reason: '', keys: {}, plan: { changes: [], skipped: [] }, pending: [], applied: [], errors: [], probed: [], knownAccountIds: null };
 }
 
 function normalizeState(raw) {
@@ -867,7 +867,6 @@ function normalizeState(raw) {
     applied: Array.isArray(s.applied) ? s.applied.slice(-MAX_HISTORY) : [],
     errors: Array.isArray(s.errors) ? s.errors.slice(-50) : [],
     probed: Array.isArray(s.probed) ? s.probed.slice(-50) : [],
-    spend: s.spend && typeof s.spend === 'object' ? s.spend : {},
     knownAccountIds: Array.isArray(s.knownAccountIds) ? s.knownAccountIds.map(String) : null
   };
 }
@@ -897,7 +896,7 @@ module.exports = {
   excludedGroup, findGroupRule, currentGroupPrice, componentMax, buildSyncPlan,
   applyChangesToPricing, buildApplySql, groupsSql, soldSql, parseGroups, parseSold,
   reportPriceRows, upstreamPriceCte, UPSTREAM_PRICE_JOIN_SQL, COST_BASIS_SQL,
-  SPEND_RULES, parseTokenUsage, addSpendSnapshot, spendWindow, windowUsageSql, parseWindowUsage,
-  effectiveRateFromSpend, accountRateChange, buildAccountRateSql, accountRatesSql,
+  parseNewApiLogs, matchNewApiToken, newApiObservations,
+  accountRateChange, buildAccountRateSql, accountRatesSql,
   emptyState, normalizeState, priceChanges
 };

@@ -743,3 +743,16 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - **线上只读试跑：** 主要几家上游的 GPT、DeepSeek、GLM、Grok、Gemini 等模型都认出了价格（大多和默认价一致，国产模型和广场价一致）；只读重算最近几天的客户利润，比看板上的旧算法高约 1.4–3.4 倍。第一次的同步计划全部需要确认（自用分组的国产模型、一个还没卖过的国产模型分组、一个按默认价卖的分组的几个型号）。
 - **测试：** 新文件 `scripts/test-upstream-pricing.js` 16 项（解析、认价格的各种情况、改价、解价格、计划、改写规则、SQL 守卫和拒绝的输入、报表小表、New API 的花费窗口和倍率、状态）；`test-telegram-push.js` 新增 2 项；`test-user-usage.js` 改 3 项、新增 1 项（真实数据库：两个报表按上游价格算出的每个客户利润一致，价格不知道的那条退回原价）。全部测试 Node 478、Python 87 通过。
 - **未做（需要单独批准）：** 部署；第一次计划里的改动等确认；打开 `autoApply`。
+
+## New API 上游的倍率改读后台扣费记录（2026-10-23）
+
+- **起因：** 10-22 的做法每 6 小时记一次 `/api/usage/token` 的累计花费，两次相减 ÷ 同时段我方 token 按价格表算的标价。线上第二次对账给一家算出 0.797，而这家自己的扣费记录里 146 条的 `group_ratio` 全是 0.25，token 数和我方记录逐条一致、标价和 Sub2API 默认价一致。误差来自同一个 Key 在别处的用量、窗口里只有不到 1 美元的标价，以及这家用表达式计费。
+- **改法：**
+  - 去掉 `parseTokenUsage`、`addSpendSnapshot`、`spendWindow`、`windowUsageSql`、`parseWindowUsage`、`effectiveRateFromSpend` 和状态里的 `spend`。
+  - `upstream-pricing.js` 新增 `parseNewApiLogs`（`data` 是列表或 `{ items }`，`other` 解析成对象）、`matchNewApiToken`（完整 Key 相等，或打码 Key 的头尾对得上且只有一个）、`newApiObservations`（只算这个令牌、`quota > 0`、`group_ratio > 0`、不是按次计费的记录；`cache_tokens` 当缓存读取，`cache_creation_tokens`（或 `cache_write_tokens`）当缓存写入，`usage_semantic` 不是 anthropic 时 `prompt_tokens` 减去缓存命中；`actualCost = quota / 500000`，`cost = actualCost / group_ratio`，按北京时间分天；`groupRatio` 取最新一条的）。
+  - `server.js`：`/v1/usage` 不支持的 Key，找同一网址、登录过的上游面板（有 cookie 或令牌）；`newApiPanelBills` 带面板的会话头（加 `New-Api-User`），读 `/api/token/?p=1&size=100` 和 `/api/log/self?type=2&start_timestamp=<7 天前>`（每页 100 条，最多 10 页）；认不出令牌时只有一个令牌在扣费就用它，否则报「认不出哪个是这个号的 Key」。读到的账交给同一个 `identifyPriceSet`；`groupRatio` 交给 `accountRateChange`（只对上游倍率探测不是 ok 的号）。没登录的提示去上游面板登录。
+  - 面板登录：New API 的 `/api/user/login` 把用户直接放在 `data`（One-API 是 `data.user`），两种都读；用会话探活和读 `/api/user/self` 时，知道用户编号就带 `New-Api-User`。
+  - Telegram 等确认的清单最多列 20 个，超出的写「按钮会一起改」。
+- **测试：** `test-upstream-pricing.js` 用 2 项新测试换掉 2 项花费相减的测试（扣费记录的解析、认令牌、按天合账、OpenAI 口径减缓存、合账后认出价格且倍率等于分组倍率；进价倍率的改动和 SQL）；`test-telegram-push.js` 新增 1 项。全部测试 Node 479、Python 87 通过。
+- **还要做的（只能运营者做）：** 在「上游面板」里登录这几家 New API 站的后台（账号密码），之后的对账才会读它们的扣费记录和余额。
+

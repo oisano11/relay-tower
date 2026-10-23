@@ -1217,7 +1217,8 @@ function summarizeKeys(keyEntries, usage, identified) {
       accountIds: entry.accounts.map(a => a.id),
       names: entry.accounts.map(a => a.name),
       usageApi: u.usageApi || 'error',
-      spendApi: u.spendApi || '',
+      groupRatio: u.groupRatio || null,
+      panelName: u.panelName || '',
       error: u.error || '',
       models: identified[entry.keyId] || {}
     };
@@ -1226,7 +1227,7 @@ function summarizeKeys(keyEntries, usage, identified) {
 }
 
 function priceChangeText(c) {
-  if (c.kind === 'account_rate') return `「${c.accountName}」进价倍率：${c.from} → ${c.to}（按上游这段时间实际扣的钱算）`;
+  if (c.kind === 'account_rate') return `「${c.accountName}」进价倍率：${c.from} → ${c.to}（上游后台扣费记录里的分组倍率）`;
   return `「${c.groupName}」${c.model}：${upstreamPricing.describeSet(c.from)} → ${upstreamPricing.describeSet(c.to)}`;
 }
 
@@ -1251,6 +1252,54 @@ function applyPriceChanges(changes, groups) {
   if (!parts.length) return [];
   execPsql(`BEGIN;\n${parts.join('\n')}\nCOMMIT;`, false);
   return [...plans.flatMap(p => p.changes), ...rateChanges];
+}
+
+// New API 搭的上游，在「上游面板」里登录过的那一个（同一个网址）
+function newApiPanelFor(origin) {
+  return (upstreamPanels || []).find(p => {
+    if (!p || p.enabled === false || !p.backendUrl || (!p.cookie && !p.userToken)) return false;
+    try { return new URL(p.backendUrl).origin === origin; } catch (e) { return false; }
+  }) || null;
+}
+
+function newApiPanelHeaders(panel) {
+  const headers = { 'User-Agent': 'Mozilla/5.0' };
+  if (panel.userToken) headers.Authorization = panel.userToken.startsWith('Bearer ') ? panel.userToken : `Bearer ${panel.userToken}`;
+  if (panel.cookie) headers.Cookie = panel.cookie;
+  // 新版 New API 用登录会话调接口时要带上自己的用户编号
+  const uid = panel.userInfo && panel.userInfo.id;
+  if (uid !== undefined && uid !== null && /^\d+$/.test(String(uid))) headers['New-Api-User'] = String(uid);
+  return headers;
+}
+
+// 登录后台读：令牌列表（找出这个号用的是哪个令牌）和最近 7 天的扣费记录（最多 10 页）
+async function newApiPanelBills(panel, apiKey, now = Date.now()) {
+  const origin = new URL(panel.backendUrl).origin;
+  const headers = newApiPanelHeaders(panel);
+  const tokensGot = await fetchJsonQuiet(`${origin}/api/token/?p=1&size=100`, { headers });
+  const tokens = tokensGot.ok && tokensGot.body && tokensGot.body.success !== false
+    ? (Array.isArray(tokensGot.body.data) ? tokensGot.body.data : ((tokensGot.body.data && tokensGot.body.data.items) || []))
+    : [];
+  const records = [];
+  const since = Math.floor(now / 1000) - 7 * 86400;
+  for (let page = 1; page <= 10; page++) {
+    const got = await fetchJsonQuiet(`${origin}/api/log/self?p=${page}&page_size=100&type=2&start_timestamp=${since}`, { headers });
+    if (!got.ok || !got.body || got.body.success === false) {
+      if (page === 1) return { error: `上游后台的扣费记录读不到（${got.status ? `HTTP ${got.status}` : got.error || '连不上'}${got.body && got.body.message ? `：${String(got.body.message).slice(0, 60)}` : ''}），请在「上游面板」里重新登录一次` };
+      break;
+    }
+    const list = upstreamPricing.parseNewApiLogs(got.body);
+    records.push(...list);
+    if (list.length < 100) break;
+  }
+  let token = upstreamPricing.matchNewApiToken(tokens, apiKey);
+  if (!token) {
+    const names = [...new Set(records.filter(r => Number(r.quota) > 0).map(r => r.token_name))];
+    if (names.length > 1) return { error: '上游后台有好几个令牌在用，认不出哪个是这个号的 Key' };
+    token = names.length ? { name: names[0] } : null;
+  }
+  const obs = upstreamPricing.newApiObservations(records, { tokenId: token && token.id !== undefined ? token.id : null, tokenName: token ? token.name : null });
+  return { byModel: obs.byModel, groupRatio: obs.groupRatio };
 }
 
 // 跑一次对账。probeAccountIds：刚接入的号，上游还没它的账时先发两条小请求试价格。
@@ -1283,16 +1332,21 @@ async function runUpstreamPriceCheck({ reason = '定时对账', probeAccountIds 
     const usage = {};
     await mapLimit(keyEntries, 4, async entry => { usage[entry.keyId] = await upstreamUsageForKey(entry, days); });
 
-    // 查不到按天账的上游（New API 搭的）：记一次「这个 Key 一共花了多少」，后面和上次比，算真实倍率
-    const spend = { ...(prev.spend || {}) };
-    const spendKeys = keyEntries.filter(e => (usage[e.keyId] || {}).usageApi === 'unsupported');
-    await mapLimit(spendKeys, 4, async entry => {
-      const got = await fetchJsonQuiet(`${entry.origin}/api/usage/token`, { headers: { Authorization: `Bearer ${entry.apiKey}` } });
-      const snap = got.ok ? upstreamPricing.parseTokenUsage(got.body) : null;
-      spend[entry.keyId] = upstreamPricing.addSpendSnapshot(spend[entry.keyId], snap, started);
-      usage[entry.keyId].spendApi = snap ? 'ok' : 'unsupported';
+    // 查不到按天账的上游（New API 搭的）：在「上游面板」里登录了它的后台，就读我们账号的每条扣费记录
+    const newApiKeys = keyEntries.filter(e => (usage[e.keyId] || {}).usageApi === 'unsupported');
+    await mapLimit(newApiKeys, 2, async entry => {
+      const panel = newApiPanelFor(entry.origin);
+      if (!panel) {
+        usage[entry.keyId].error = '这家是 New API 搭的站：在「上游面板」里登录它的后台以后，才能认出价格和倍率';
+        return;
+      }
+      const bills = await newApiPanelBills(panel, entry.apiKey, started);
+      if (bills.error) {
+        usage[entry.keyId].error = bills.error;
+        return;
+      }
+      usage[entry.keyId] = { ...usage[entry.keyId], usageApi: 'panel', error: '', byModel: bills.byModel, groupRatio: bills.groupRatio, panelName: panel.name || '' };
     });
-    for (const keyId of Object.keys(spend)) if (!keyMap.has(keyId)) delete spend[keyId];
 
     // 刚接入的号：上游那边它要卖的模型还没有账，就先试
     const probeIds = new Set((probeAccountIds || []).map(String));
@@ -1337,47 +1391,24 @@ async function runUpstreamPriceCheck({ reason = '定时对账', probeAccountIds 
         identified[entry.keyId][model] = result;
       }
     }
-    // New API 搭的上游：这段时间实际扣的钱 ÷ 按价格表算的标价 = 真实倍率；价格表用它公开的、没有就用 Sub2API 默认价
+    // New API 搭的上游：扣费记录里的分组倍率就是这个号真实的进价倍率（Sub2API 自己同步不了的号才改）
     const rateChanges = [];
-    const spendResults = {};
-    const spendWithWindow = spendKeys.filter(e => upstreamPricing.spendWindow(spend[e.keyId]));
-    if (spendWithWindow.length) {
-      const rateRows = await execPsqlAsync(upstreamPricing.accountRatesSql(spendWithWindow.flatMap(e => e.accounts.map(a => a.id))))
+    const panelKeys = newApiKeys.filter(e => (usage[e.keyId] || {}).usageApi === 'panel' && usage[e.keyId].groupRatio);
+    if (panelKeys.length) {
+      const rateRows = await execPsqlAsync(upstreamPricing.accountRatesSql(panelKeys.flatMap(e => e.accounts.map(a => a.id))))
         .then(text => JSON.parse(String(text || '[]').trim() || '[]')).catch(() => []);
       const rates = new Map(rateRows.map(r => [String(r.id), r]));
-      for (const entry of spendWithWindow) {
-        const window = upstreamPricing.spendWindow(spend[entry.keyId]);
-        let windowUsage = [];
-        try {
-          windowUsage = upstreamPricing.parseWindowUsage(await execPsqlAsync(upstreamPricing.windowUsageSql(entry.accounts.map(a => a.id), window.from, window.to)));
-        } catch (error) {
-          errors.push(`读不到 ${entry.host} 那几个号这段时间的用量：${error.message}`);
-          continue;
-        }
-        const priceFor = model => upstreamPricing.collectCandidates(model, { host: entry.host, defaults, newapis: publicLists.newapis })
-          .find(c => c.exact && (c.source === 'newapi' || c.source === 'default')) || null;
-        const eff = upstreamPricing.effectiveRateFromSpend({ window, usage: windowUsage, priceFor });
-        spendResults[entry.keyId] = eff ? { ...eff, models: undefined, from: window.from, to: window.to } : null;
-        if (!eff || eff.status !== 'ok') continue;
-        for (const [model, m] of Object.entries(eff.models)) {
-          const observed = {};
-          upstreamPricing.COMPONENTS.forEach(c => { observed[c] = (m.mix[c] || 0) > 0; });
-          identified[entry.keyId][model] = {
-            status: 'matched', priceSet: m.priceSet, source: m.source, sourceLabel: `${m.sourceLabel}（倍率按上游实际扣的钱算）`,
-            multiplier: eff.rate, observed, mix: m.mix, days: 1, unconfirmed: [], recentOnly: false, fromSpend: true
-          };
-        }
+      for (const entry of panelKeys) {
         for (const a of entry.accounts) {
           const current = rates.get(a.id);
           if (!current || current.probe === 'ok') continue;
-          const change = upstreamPricing.accountRateChange({ id: a.id, name: a.name, rate: Number(current.rate) }, eff.rate);
-          if (change) rateChanges.push({ ...change, host: entry.host, spentUsd: eff.spentUsd, listCost: eff.listCost });
+          const change = upstreamPricing.accountRateChange({ id: a.id, name: a.name, rate: Number(current.rate) }, usage[entry.keyId].groupRatio);
+          if (change) rateChanges.push({ ...change, host: entry.host, fromBill: true });
         }
       }
     }
 
     const keys = summarizeKeys(keyEntries, usage, identified);
-    for (const [keyId, result] of Object.entries(spendResults)) if (keys[keyId]) keys[keyId].spend = result;
     const changed = upstreamPricing.priceChanges(prev.keys, keys);
 
     const plan = upstreamPricing.buildSyncPlan({ groups, channels: accounts, identified, sold, defaults, config });
@@ -1408,7 +1439,6 @@ async function runUpstreamPriceCheck({ reason = '定时对账', probeAccountIds 
       applied: [...(prev.applied || []), ...applied],
       errors: [...(prev.errors || []), ...errors.map(message => ({ at: now, message }))],
       probed: [...(prev.probed || []), ...probed.map(p => ({ ...p, at: now }))],
-      spend,
       knownAccountIds: accounts.map(a => a.id)
     });
     writeJSON(UPSTREAM_PRICES_FILE, upstreamPriceState);
@@ -1422,7 +1452,7 @@ async function runUpstreamPriceCheck({ reason = '定时对账', probeAccountIds 
         applied: applied.map(c => ({ text: priceChangeText(c) })),
         pending: newPending.map(c => ({
           text: priceChangeText(c),
-          why: c.kind === 'account_rate' ? `这段时间上游实际扣了 $${c.spentUsd}，按价格表算是 $${c.listCost}`
+          why: c.kind === 'account_rate' ? '上游后台的扣费记录里写的分组倍率'
             : c.costRatio === null ? '现价查不到' : `客户花费会变成原来的 ${c.costRatio} 倍`
         })),
         autoApply: config.autoApply
@@ -2541,6 +2571,8 @@ async function syncSingleUpstreamPanel(params = {}) {
           const probeHeaders = { 'User-Agent': 'Mozilla/5.0' };
           if (token) probeHeaders['Authorization'] = `Bearer ${token}`;
           if (cookie) probeHeaders['Cookie'] = cookie;
+          // 新版 New API 用登录会话调接口时要带上自己的用户编号
+          if (previousUserInfo && /^\d+$/.test(String(previousUserInfo.id ?? ''))) probeHeaders['New-Api-User'] = String(previousUserInfo.id);
           const probeRes = await fetch(`${backendUrl}/api/user/self`, {
             method: 'GET',
             headers: probeHeaders,
@@ -2621,8 +2653,10 @@ async function syncSingleUpstreamPanel(params = {}) {
             if (loginData.data && loginData.data.access_token) {
               token = loginData.data.access_token;
             }
-            if (loginData.data && loginData.data.user) {
-              const u = loginData.data.user;
+            // One-API 把用户放在 data.user，New API 直接放在 data
+            const loggedUser = loginData.data && (loginData.data.user || (loginData.data.id !== undefined ? loginData.data : null));
+            if (loggedUser) {
+              const u = loggedUser;
               const quota = u.quota || 0;
               const isUnlimited = (quota < 0 || quota >= 50000000000);
               userInfo = {
@@ -2689,8 +2723,11 @@ async function syncSingleUpstreamPanel(params = {}) {
     // 尝试 2: New-API /api/user/self 获取最新的详细个人中心信息
     if ((token || cookie) && !userInfo) {
       try {
+        const selfHeaders = { ...reqHeaders };
+        const knownId = previousUserInfo && previousUserInfo.id;
+        if (/^\d+$/.test(String(knownId ?? ''))) selfHeaders['New-Api-User'] = String(knownId);
         const userRes = await fetch(`${backendUrl}/api/user/self`, {
-          headers: reqHeaders,
+          headers: selfHeaders,
           signal: AbortSignal.timeout(6000)
         });
         const userData = await userRes.json();
@@ -10919,7 +10956,7 @@ async function handleRequest(req, res) {
   if (pathname === '/api/upstream/prices' && req.method === 'GET') {
     const data = upstreamPriceData();
     const keys = Object.entries(data.keys || {}).map(([keyId, k]) => ({
-      keyId, host: k.host, accountIds: k.accountIds, names: k.names, usageApi: k.usageApi, spendApi: k.spendApi || '', spend: k.spend || null, error: k.error,
+      keyId, host: k.host, accountIds: k.accountIds, names: k.names, usageApi: k.usageApi, groupRatio: k.groupRatio || null, panelName: k.panelName || '', error: k.error,
       models: Object.entries(k.models || {}).map(([model, r]) => ({
         model, status: r.status, source: r.source || '', sourceLabel: r.sourceLabel || '', multiplier: r.multiplier,
         recentOnly: !!r.recentOnly, days: r.days, ratioVsReference: r.ratioVsReference ?? null,
