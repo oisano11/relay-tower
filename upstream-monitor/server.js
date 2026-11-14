@@ -1543,8 +1543,10 @@ function startUpstreamPricePoller() {
       lastError = error.message;
     }
   };
-  setTimeout(tick, 5 * 60 * 1000);
-  setInterval(tick, 60 * 1000);
+  const startTimer = setTimeout(tick, 5 * 60 * 1000);
+  if (startTimer.unref) startTimer.unref();
+  const pollTimer = setInterval(tick, 60 * 1000);
+  if (pollTimer.unref) pollTimer.unref();
 }
 
 // ====== 余额提醒与每日简报 ======
@@ -1801,8 +1803,10 @@ function startClusterAlertPoller() {
       console.error('[双机集群报警]', error.message);
     }
   };
-  setTimeout(tick, 30 * 1000);
-  setInterval(tick, 60 * 1000);
+  const startTimer = setTimeout(tick, 30 * 1000);
+  if (startTimer.unref) startTimer.unref();
+  const pollTimer = setInterval(tick, 60 * 1000);
+  if (pollTimer.unref) pollTimer.unref();
 }
 
 // Sub2API 后台登录提醒：每分钟读一次 Sub2API 的操作审计表（只读），
@@ -1844,8 +1848,10 @@ function startAdminWatchPoller() {
       running = false;
     }
   };
-  setTimeout(tick, 45 * 1000);
-  setInterval(tick, 60 * 1000);
+  const startTimer = setTimeout(tick, 45 * 1000);
+  if (startTimer.unref) startTimer.unref();
+  const pollTimer = setInterval(tick, 60 * 1000);
+  if (pollTimer.unref) pollTimer.unref();
 }
 
 // ====== 人工管理分组的坏号看护（规则见 manual-group-guard.js）======
@@ -2059,8 +2065,10 @@ function startManualGroupGuardPoller() {
       running = false;
     }
   };
-  setTimeout(tick, 75 * 1000);
-  setInterval(tick, 60 * 1000);
+  const startTimer = setTimeout(tick, 75 * 1000);
+  if (startTimer.unref) startTimer.unref();
+  const pollTimer = setInterval(tick, 60 * 1000);
+  if (pollTimer.unref) pollTimer.unref();
 }
 
 // 客户余额提醒（规则见 customer-balance.js）：每 5 分钟看一次（只读），快用完、用完了还在请求的客户提醒你一次
@@ -2099,8 +2107,10 @@ function startCustomerBalancePoller() {
       running = false;
     }
   };
-  setTimeout(tick, 90 * 1000);
-  setInterval(tick, 5 * 60 * 1000);
+  const startTimer = setTimeout(tick, 90 * 1000);
+  if (startTimer.unref) startTimer.unref();
+  const pollTimer = setInterval(tick, 5 * 60 * 1000);
+  if (pollTimer.unref) pollTimer.unref();
 }
 
 function startDailyDigestTimer() {
