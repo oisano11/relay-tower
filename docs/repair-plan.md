@@ -756,3 +756,12 @@ macOS 自带的 bash 3.2 在中文（UTF-8）环境下，会把紧跟在 `$变�
 - **测试：** `test-upstream-pricing.js` 用 2 项新测试换掉 2 项花费相减的测试（扣费记录的解析、认令牌、按天合账、OpenAI 口径减缓存、合账后认出价格且倍率等于分组倍率；进价倍率的改动和 SQL）；`test-telegram-push.js` 新增 1 项。全部测试 Node 479、Python 87 通过。
 - **还要做的（只能运营者做）：** 在「上游面板」里登录这几家 New API 站的后台（账号密码），之后的对账才会读它们的扣费记录和余额。
 
+## 控制台「上游价格对账」面板与 Sub2API 坏 Key 误判修复（2026-11-14）
+
+- **起因：** 10-23 版本上线后只读核对线上 `upstream_prices.json`：① 网页控制台没有查看或逐条审批 `pending` 价格改动的面板，压着 7 条待确认改动（含手动定价分组与无现价新模型）无法按需筛选或排除分组；② `nextpro.top`、`ai.lcodex.cc`、`lingsu.xyz`、`api-us.zitongwl.cn` 等 Sub2API 上游站里，有 6 把失效/特殊 Key 查 `/v1/usage` 返回 401/403 被标成 `unsupported`，旧代码一律当成 New API 去请求 `/api/token/` 与 `/api/log/self`，拿到 404 后误报「请在『上游面板』里重新登录一次」；③ 5 个后台轮询启动定时器没调 `.unref()`，导致 `test-server-smoke.js` 与 `deploy.sh` 跑完断言后干等 5 分钟才退出。
+- **改法：**
+  - `upstream-pricing.js` 新增 `detectSub2ApiOrigins`（同 `origin` 有 Key 返回 `usageApi === 'ok'`，或有 `/api/v1/model-plaza` 且无 `/api/pricing`）与 `classifyKeyFallback`：Sub2API 站上被拒的 Key 直接标 `key_rejected` 且不发 `/api/token/` 请求；`/api/token/` 与 `/api/log/self` 双 404 的站点标明无 New API 扣费接口，不再提示重新登录。
+  - `server.js`：`GET /api/upstream/prices` 补充每条改动的 `fromDesc`、`toDesc` 与解析出名称的 `excludedGroups`；`POST /api/upstream/prices/config` 保存 `excludeKeywords` / `excludeGroupIds` 后立即过滤掉内存中已排除分组的 `pending` 项并落盘；后台轮询定时器全部补 `.unref()`。
+  - `public/index.html`、`public/app.js`：【⚙️ 系统管理 → 上游供应商】新增「💲 上游价格对账」入口与待确认徽标（联动顶栏小红点）；弹窗支持勾选部分 `ids` 同步（默认仅预选 `!needsConfirm` 常规项）、单组一键加入/移出 `excludeGroupIds`、修改 `autoApply` / `probeNewAccounts` / `excludeKeywords`、手动触发立即对账、单独提示未登录的 New API 站并一键跳「上游供应商后台」，以及展开已认出价格明细与最近同步记录。全部外部字段经 `escapeHtml` 转义，复选框使用 `data-price-id`。
+- **测试：** `test-upstream-pricing.js` 新增 2 项（Sub2API/NewAPI/双 404 分类、前端面板渲染与默认安全勾选及 XSS 转义）；`test-server-smoke.js` 新增 1 项（排除分组后立即清掉对应 `pending` 并保留其它分组与 `account_rate`）。全部测试 Node 482、巡检 16、Python 87 通过，总耗时约 11 秒。
+

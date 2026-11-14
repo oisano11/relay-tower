@@ -310,3 +310,103 @@ test('a group that has not sold a model yet takes the price other groups (withou
   const plan = up.buildSyncPlan({ groups, channels, identified, sold });
   assert.equal(plan.changes.length, 0, 'group 4 already charges the same base price: nothing to confirm');
 });
+
+test('Sub2API keys rejected on /v1/usage are not mistaken for New API upstreams or dead sessions', () => {
+  const entries = [
+    { keyId: 'k1', origin: 'https://nextpro.example.com', host: 'nextpro.example.com' },
+    { keyId: 'k2', origin: 'https://nextpro.example.com', host: 'nextpro.example.com' },
+    { keyId: 'k3', origin: 'https://plaza-only.example.com', host: 'plaza-only.example.com' },
+    { keyId: 'k4', origin: 'https://newapi.example.com', host: 'newapi.example.com' }
+  ];
+  const usage = {
+    k1: { usageApi: 'ok' },
+    k2: { usageApi: 'unsupported', httpStatus: 401, error: 'HTTP 401' },
+    k3: { usageApi: 'unsupported', httpStatus: 401, error: 'HTTP 401' },
+    k4: { usageApi: 'unsupported', httpStatus: 404, error: 'HTTP 404' }
+  };
+  const plazas = { 'plaza-only.example.com': [{ name: 'default', models: { 'gpt-5': BASE } }] };
+  const newapis = { 'newapi.example.com': { models: { 'gpt-5': BASE } } };
+  const sub2 = up.detectSub2ApiOrigins(entries, usage, { plazas, newapis });
+  assert.equal(sub2.has('https://nextpro.example.com'), true, 'sibling key proved Sub2API');
+  assert.equal(sub2.has('https://plaza-only.example.com'), true, 'model-plaza without /api/pricing proved Sub2API');
+  assert.equal(sub2.has('https://newapi.example.com'), false);
+
+  const sub2Rejected = up.classifyKeyFallback({ origin: 'https://nextpro.example.com', host: 'nextpro.example.com', httpStatus: 401, error: 'HTTP 401', sub2apiOrigins: sub2, newapis });
+  assert.equal(sub2Rejected.usageApi, 'key_rejected');
+  assert.match(sub2Rejected.error, /Sub2API/);
+  assert.doesNotMatch(sub2Rejected.error, /重新登录/);
+
+  const realNewApiUnlogged = up.classifyKeyFallback({ origin: 'https://newapi.example.com', host: 'newapi.example.com', httpStatus: 404, sub2apiOrigins: sub2, newapis, hasPanel: false });
+  assert.equal(realNewApiUnlogged.usageApi, 'unsupported');
+  assert.match(realNewApiUnlogged.error, /登录它的后台/);
+
+  const nonNewApi404 = up.classifyKeyFallback({ origin: 'https://other.example.com', host: 'other.example.com', httpStatus: 404, sub2apiOrigins: sub2, newapis: {}, hasPanel: true, bills: { notNewApi: true } });
+  assert.equal(nonNewApi404.usageApi, 'unsupported');
+  assert.doesNotMatch(nonNewApi404.error, /重新登录/);
+  assert.match(nonNewApi404.error, /没有 New API 后台扣费记录接口/);
+
+  const loggedPanel = up.classifyKeyFallback({ origin: 'https://newapi.example.com', host: 'newapi.example.com', sub2apiOrigins: sub2, newapis, hasPanel: true, bills: { byModel: { 'gpt-5': [] }, groupRatio: 0.25, panelName: 'New站' } });
+  assert.equal(loggedPanel.usageApi, 'panel');
+  assert.equal(loggedPanel.groupRatio, 0.25);
+});
+
+test('console UI has the upstream price reconciliation entry, pre-selects only safe items and escapes untrusted names', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const vm = require('vm');
+  const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  assert.match(html, /id="btnOpenUpstreamPricesModal"/);
+  assert.match(html, /id="upstreamPricesBadge"/);
+
+  const appSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const start = appSrc.indexOf('// ====== 上游价格对账：认出上游真实模型价格');
+  const end = appSrc.indexOf('async function deleteChannel(');
+  assert.ok(start > 0 && end > start, 'price reconciliation UI block exists in app.js');
+
+  const elements = {
+    upstreamPricesBadge: { textContent: '', style: { display: 'none' } },
+    navDropdownPendingDot: { style: { display: 'none' } },
+    upstreamPricesBody: { innerHTML: '' },
+    upstreamPricesMeta: { textContent: '' }
+  };
+  const sandbox = {
+    window: {},
+    document: { getElementById: id => elements[id] || null },
+    escapeHtml: s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'),
+    formatTime: s => String(s),
+    refreshNavPendingDot() {
+      elements.navDropdownPendingDot.style.display = (sandbox.window._upstreamPricesPending || 0) > 0 ? 'inline-block' : 'none';
+    },
+    Set, Number, String, Boolean, Array, Date
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(appSrc.slice(start, end) + '\nthis.__set = d => { upstreamPricesData = d; upstreamPricesSelectedIds = null; };', sandbox);
+
+  sandbox.updateUpstreamPricesBadge(2);
+  assert.equal(elements.upstreamPricesBadge.textContent, '2');
+  assert.equal(elements.upstreamPricesBadge.style.display, 'inline-block');
+  assert.equal(elements.navDropdownPendingDot.style.display, 'inline-block');
+
+  sandbox.__set({
+    checkedAt: 1700000000000,
+    reason: '定时对账',
+    config: { autoApply: false, probeNewAccounts: true, excludeKeywords: ['<img onerror=1>'] },
+    excludedGroups: [{ id: '9', name: '<b>手动组</b>' }],
+    pending: [
+      { id: '1|gpt-5|1', groupId: '1', groupName: '<script>x</script>', model: 'gpt-5', fromSource: 'custom', fromDesc: '输入 $1', toDesc: '输入 $2', costRatio: 2, needsConfirm: false, accounts: [{ name: '号A', source: '公开价' }] },
+      { id: '2|mimo|1', groupId: '2', groupName: '国模测试', model: 'mimo', fromSource: 'unknown', fromDesc: '—', toDesc: '输入 $1', costRatio: null, needsConfirm: true, accounts: [{ name: '号B' }] }
+    ],
+    keys: [
+      { keyId: 'k1', host: 'new.example.com', names: ['号N'], usageApi: 'unsupported', error: '这家是 New API 搭的站：在「上游面板」里登录它的后台以后，才能认出价格和倍率', models: [] },
+      { keyId: 'k2', host: 'sub2.example.com', names: ['坏Key'], usageApi: 'key_rejected', error: '这把 Key 查不到这家 Sub2API 站的账单（HTTP 401）', models: [] }
+    ],
+    applied: []
+  });
+  sandbox.renderUpstreamPricesModal();
+  const out = elements.upstreamPricesBody.innerHTML;
+  assert.doesNotMatch(out, /<script>|<img onerror|<b>手动组<\/b>/, 'every untrusted field is escaped');
+  assert.match(out, /&lt;script&gt;x&lt;\/script&gt;/);
+  assert.match(out, /按上游同步选中项 \(1\)/, 'only the safe item is pre-selected by default');
+  assert.match(out, /去「上游面板」登录/, 'New API login prompt gets its own jump button');
+  assert.match(out, /其余 1 把查不到按天账单的 Key/, 'rejected Sub2API keys are separated from login prompts');
+});

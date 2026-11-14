@@ -3916,6 +3916,426 @@ function toggleDismissedUpstreamKeys(event) {
   renderUpstreamKeysModal();
 }
 
+// ====== 上游价格对账：认出上游真实模型价格 → 分组价格同步与审批 ======
+let upstreamPricesData = null;
+let upstreamPricesSelectedIds = null;
+let upstreamPricesShowIdentified = false;
+let upstreamPricesShowApplied = false;
+
+const PRICE_FROM_SOURCE_LABELS = {
+  custom: '自定价格',
+  actual: '本组实收',
+  default: '默认价',
+  unknown: '现价未知'
+};
+
+function updateUpstreamPricesBadge(count) {
+  const badge = document.getElementById('upstreamPricesBadge');
+  const n = Number(count) || 0;
+  if (badge) {
+    badge.textContent = String(n);
+    badge.style.display = n > 0 ? 'inline-block' : 'none';
+  }
+  window._upstreamPricesPending = n;
+  refreshNavPendingDot();
+}
+
+async function loadUpstreamPrices() {
+  const res = await fetch('/api/upstream/prices');
+  const data = await res.json();
+  if (!res.ok || !data.success) throw new Error(data.error || '读取上游价格失败');
+  upstreamPricesData = data;
+  updateUpstreamPricesBadge((data.pending || []).length);
+  return data;
+}
+
+function defaultUpstreamPricesSelection(pending) {
+  const list = Array.isArray(pending) ? pending : [];
+  const safe = list.filter(c => !c.needsConfirm).map(c => String(c.id));
+  return new Set(safe);
+}
+
+function upstreamPricePendingRowHtml(c, checked) {
+  const isRate = c.kind === 'account_rate';
+  const badge = c.needsConfirm
+    ? `<span style="background:#fff7ed;border:1px solid #fdba74;color:#c2410c;border-radius:999px;padding:1px 8px;font-size:0.7rem;font-weight:700;">⚠️ ${escapeHtml(c.costRatio === null || c.costRatio === undefined ? '现价查不到' : `花费变为 ${c.costRatio}x`)}</span>`
+    : `<span style="background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;border-radius:999px;padding:1px 8px;font-size:0.7rem;font-weight:600;">常规同步${c.costRatio ? ` · ${escapeHtml(String(c.costRatio))}x` : ''}</span>`;
+  const titleHtml = isRate
+    ? `<span style="background:#f3e8ff;color:#6b21a8;border-radius:4px;padding:1px 5px;font-size:0.7rem;font-weight:700;">账号倍率</span> <b>${escapeHtml(c.accountName || `#${c.accountId}`)}</b>`
+    : `<span style="background:#f5f4ed;color:#3d3d3a;border-radius:4px;padding:1px 6px;font-size:0.72rem;font-weight:700;">${escapeHtml(c.groupName || `分组 #${c.groupId}`)}</span> · <b class="mono" style="color:#141413;">${escapeHtml(c.model || '')}</b>`;
+  const fromSource = isRate ? '当前记的倍率' : (PRICE_FROM_SOURCE_LABELS[c.fromSource] || c.fromSource || '');
+  const fromText = c.fromDesc || (isRate ? `${c.from}x` : '—');
+  const toText = c.toDesc || (isRate ? `${c.to}x` : '—');
+  const basis = isRate
+    ? `来自 ${escapeHtml(c.host || '上游')} 后台扣费记录里的分组倍率`
+    : `依据在用账号：${escapeHtml((c.accounts || []).map(a => `${a.name}${a.source ? `（${a.source}）` : ''}`).join('、') || '-')}`;
+  const excludeBtn = isRate
+    ? ''
+    : `<button type="button" class="btn btn-secondary btn-price-exclude-group" data-group-id="${escapeHtml(String(c.groupId))}" data-group-name="${escapeHtml(c.groupName || '')}" style="font-size:0.7rem;padding:0.18rem 0.5rem;color:#73726c;" title="把这个分组设为手动定价例外，以后不再同步它的价格">排除本组</button>`;
+
+  return `<div class="upstream-price-pending-row" style="background:#fff;border:1px solid ${c.needsConfirm ? '#fed7aa' : '#e8e6dc'};border-radius:6px;padding:0.5rem 0.65rem;display:flex;gap:0.55rem;align-items:flex-start;">
+    <input type="checkbox" class="upstream-price-check" data-price-id="${escapeHtml(String(c.id))}" ${checked ? 'checked' : ''} style="margin-top:0.25rem;cursor:pointer;" />
+    <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:0.25rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+        <div style="font-size:0.8rem;">${titleHtml}</div>
+        <div style="display:flex;align-items:center;gap:0.4rem;">${badge}${excludeBtn}</div>
+      </div>
+      <div style="font-size:0.75rem;color:#3d3d3a;line-height:1.5;">
+        <span style="color:#73726c;">${escapeHtml(fromSource)}：</span><span class="mono">${escapeHtml(fromText)}</span>
+        <span style="margin:0 0.35rem;color:#9c9a92;">→</span>
+        <span style="color:#15803d;font-weight:700;">上游标价：</span><b class="mono" style="color:#15803d;">${escapeHtml(toText)}</b>
+      </div>
+      <div style="font-size:0.7rem;color:#9c9a92;">${basis}</div>
+    </div>
+  </div>`;
+}
+
+function renderUpstreamPricesModal() {
+  const root = document.getElementById('upstreamPricesBody');
+  const meta = document.getElementById('upstreamPricesMeta');
+  if (!root || !upstreamPricesData) return;
+
+  const data = upstreamPricesData;
+  const cfg = data.config || {};
+  const pending = data.pending || [];
+  const keys = data.keys || [];
+  const applied = data.applied || [];
+  const excludedGroups = data.excludedGroups || [];
+
+  const validPendingIds = new Set(pending.map(c => String(c.id)));
+  if (!upstreamPricesSelectedIds) {
+    upstreamPricesSelectedIds = defaultUpstreamPricesSelection(pending);
+  } else {
+    upstreamPricesSelectedIds = new Set([...upstreamPricesSelectedIds].filter(id => validPendingIds.has(id)));
+  }
+
+  let matchedPairs = 0;
+  for (const k of keys) {
+    for (const m of k.models || []) if (m.status === 'matched' || m.status === 'solved') matchedPairs++;
+  }
+  const needLoginKeys = keys.filter(k => k.usageApi === 'unsupported' && /登录它的后台|重新登录/.test(k.error || ''));
+  const otherTroubleKeys = keys.filter(k => k.usageApi !== 'ok' && k.usageApi !== 'panel' && !needLoginKeys.includes(k));
+
+  if (meta) {
+    const t = data.checkedAt ? new Date(data.checkedAt).toLocaleString() : '尚未执行';
+    meta.textContent = `上次对账：${t}${data.reason ? `（${data.reason}）` : ''} · 已认出 ${matchedPairs} 组「Key × 模型」价格`;
+  }
+
+  const excludedChips = excludedGroups.map(g =>
+    `<span style="display:inline-flex;align-items:center;gap:4px;background:#fff;border:1px solid #d5d3c8;border-radius:999px;padding:1px 8px;font-size:0.7rem;color:#3d3d3a;">
+      ${escapeHtml(g.name)}
+      <button type="button" class="btn-price-restore-group" data-group-id="${escapeHtml(g.id)}" title="恢复同步这个分组" style="border:none;background:none;color:#9c9a92;cursor:pointer;padding:0 2px;font-size:0.75rem;">✕</button>
+    </span>`
+  ).join('');
+
+  const selectedCount = upstreamPricesSelectedIds.size;
+  const allSelected = pending.length > 0 && selectedCount === pending.length;
+
+  const pendingHtml = pending.length
+    ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.4rem;">
+        <div style="display:flex;align-items:center;gap:0.6rem;font-size:0.75rem;color:#3d3d3a;">
+          <label style="display:inline-flex;align-items:center;gap:0.3rem;cursor:pointer;font-weight:600;">
+            <input type="checkbox" id="chkUpstreamPriceAll" ${allSelected ? 'checked' : ''} /> 全选 (${pending.length})
+          </label>
+          <button type="button" id="btnUpstreamPriceSelectSafe" class="btn-micro-edit" style="font-size:0.7rem;">只选常规项</button>
+          <span style="color:#73726c;">已选 <b>${selectedCount}</b> 项（每百万 token 美元标价，分组自身销售倍率不变）</span>
+        </div>
+        <button type="button" id="btnApplySelectedPrices" class="btn btn-primary" ${selectedCount === 0 ? 'disabled' : ''} style="font-size:0.76rem;padding:0.3rem 0.85rem;">
+          ✅ 按上游同步选中项 (${selectedCount})
+        </button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:0.4rem;max-height:290px;overflow-y:auto;padding-right:2px;">
+        ${pending.map(c => upstreamPricePendingRowHtml(c, upstreamPricesSelectedIds.has(String(c.id)))).join('')}
+      </div>`
+    : `<div style="padding:0.85rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;text-align:center;color:#166534;font-size:0.78rem;">
+        ✅ 当前所有受管分组的模型定价与上游真实标价一致，没有待确认的改动。
+      </div>`;
+
+  const loginHintHtml = needLoginKeys.length
+    ? `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:0.5rem 0.65rem;font-size:0.74rem;color:#92400e;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;margin-bottom:0.25rem;">
+          <b>🔑 有 ${needLoginKeys.length} 组 New API 上游需登录后台才能读扣费记录认价</b>
+          <button type="button" id="btnJumpToUpstreamPanels" class="btn btn-secondary" style="font-size:0.7rem;padding:0.18rem 0.55rem;">去「上游面板」登录</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:2px;color:#78350f;">
+          ${needLoginKeys.map(k => `<div>· <b>${escapeHtml(k.host)}</b>（${escapeHtml((k.names || []).join('、'))}）：${escapeHtml(k.error || '')}</div>`).join('')}
+        </div>
+      </div>`
+    : '';
+
+  const otherTroubleHtml = otherTroubleKeys.length
+    ? `<details style="background:#faf9f5;border:1px solid #e8e6dc;border-radius:6px;padding:0.4rem 0.6rem;font-size:0.73rem;color:#5e5d59;">
+        <summary style="cursor:pointer;font-weight:600;">ℹ️ 其余 ${otherTroubleKeys.length} 把查不到按天账单的 Key（失效 Key 或非标准上游，不影响其它号对账）</summary>
+        <div style="margin-top:0.35rem;display:flex;flex-direction:column;gap:3px;max-height:130px;overflow-y:auto;">
+          ${otherTroubleKeys.map(k => `<div>· <b>${escapeHtml(k.host)}</b>（${escapeHtml((k.names || []).join('、'))}）：<span style="color:#73726c;">${escapeHtml(k.error || k.usageApi)}</span></div>`).join('')}
+        </div>
+      </details>`
+    : '';
+
+  const identifiedKeys = keys.filter(k => (k.models || []).some(m => m.status === 'matched' || m.status === 'solved'));
+  const identifiedHtml = `<div style="border:1px solid #e8e6dc;border-radius:6px;padding:0.4rem 0.6rem;background:#faf9f5;font-size:0.73rem;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-weight:600;color:#3d3d3a;">📊 已认出价格的上游明细（${identifiedKeys.length} 把 Key · ${matchedPairs} 组模型价格）</span>
+      <button type="button" id="btnToggleIdentifiedPrices" class="btn-micro-edit" style="font-size:0.7rem;">${upstreamPricesShowIdentified ? '收起 ▴' : '展开查看 ▾'}</button>
+    </div>
+    ${upstreamPricesShowIdentified ? `<div style="margin-top:0.4rem;max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:0.35rem;">
+      ${identifiedKeys.length ? identifiedKeys.map(k => {
+        const good = (k.models || []).filter(m => m.status === 'matched' || m.status === 'solved');
+        return `<div style="background:#fff;border:1px solid #eceae2;border-radius:5px;padding:0.35rem 0.5rem;">
+          <div style="font-weight:600;color:#141413;margin-bottom:2px;">${escapeHtml(k.host)} <span style="font-weight:400;color:#73726c;">（${escapeHtml((k.names || []).slice(0, 3).join('、'))}${(k.names || []).length > 3 ? ` 等 ${k.names.length} 个号` : ''}）</span>${k.groupRatio ? ` · <span class="mono" style="color:#6b21a8;">分组倍率 ${escapeHtml(String(k.groupRatio))}x</span>` : ''}</div>
+          <div style="display:flex;flex-direction:column;gap:2px;color:#5e5d59;">
+            ${good.map(m => `<div>· <span class="mono" style="color:#141413;">${escapeHtml(m.model)}</span>：${escapeHtml(m.price)} <span style="color:#9c9a92;">（${escapeHtml(m.sourceLabel || m.source)}${m.multiplier ? ` · 实扣倍率 ${Number(m.multiplier).toFixed(3).replace(/\.?0+$/, '')}x` : ''}${m.recentOnly ? ' · 近期改过价' : ''}）</span></div>`).join('')}
+          </div>
+        </div>`;
+      }).join('') : '<div style="color:#73726c;">暂无已认出的模型价格。</div>'}
+    </div>` : ''}
+  </div>`;
+
+  const appliedHtml = applied.length
+    ? `<div style="border:1px solid #e8e6dc;border-radius:6px;padding:0.4rem 0.6rem;background:#faf9f5;font-size:0.73rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-weight:600;color:#3d3d3a;">🕓 最近已同步记录（${applied.length} 条）</span>
+          <button type="button" id="btnToggleAppliedPrices" class="btn-micro-edit" style="font-size:0.7rem;">${upstreamPricesShowApplied ? '收起 ▴' : '展开查看 ▾'}</button>
+        </div>
+        ${upstreamPricesShowApplied ? `<div style="margin-top:0.35rem;max-height:150px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;color:#5e5d59;">
+          ${applied.map(a => `<div>· <span class="mono" style="color:#9c9a92;">${escapeHtml(a.at ? formatTime(a.at) : '')}</span> [${escapeHtml(a.how || '同步')}] ${escapeHtml(a.text || '')}</div>`).join('')}
+        </div>` : ''}
+      </div>`
+    : '';
+
+  root.innerHTML = `
+    <div style="background:#faf9f5;border:1px solid #e8e6dc;border-radius:6px;padding:0.5rem 0.65rem;display:flex;flex-direction:column;gap:0.4rem;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:0.6rem;flex-wrap:wrap;">
+        <label style="display:inline-flex;align-items:center;gap:0.35rem;font-size:0.76rem;color:#141413;cursor:pointer;font-weight:600;">
+          <input type="checkbox" id="chkPriceAutoApply" ${cfg.autoApply ? 'checked' : ''} />
+          常规价格改动自动同步（跨度超过 5 倍、低于 0.5 倍或查不到现价的仍留在这里等你确认）
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:0.35rem;font-size:0.74rem;color:#5e5d59;cursor:pointer;">
+          <input type="checkbox" id="chkPriceProbeNew" ${cfg.probeNewAccounts !== false ? 'checked' : ''} />
+          新接入账号自动发小请求试价
+        </label>
+      </div>
+      <div style="display:flex;align-items:center;gap:0.45rem;flex-wrap:wrap;font-size:0.74rem;">
+        <span style="color:#5e5d59;white-space:nowrap;">不同步的例外分组关键字：</span>
+        <input type="text" id="inputPriceExcludeKeywords" class="form-input" value="${escapeHtml((cfg.excludeKeywords || []).join(', '))}" placeholder="逗号分隔，如：标书, 私人" style="flex:1;min-width:180px;font-size:0.74rem;padding:0.22rem 0.5rem;" />
+        <button type="button" id="btnSavePriceSyncConfig" class="btn btn-secondary" style="font-size:0.73rem;padding:0.24rem 0.65rem;">保存设置</button>
+      </div>
+      ${excludedChips ? `<div style="display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap;font-size:0.72rem;color:#73726c;"><span>已单独排除的分组：</span>${excludedChips}</div>` : ''}
+    </div>
+
+    <div>
+      <div style="font-size:0.8rem;font-weight:700;color:#141413;margin-bottom:0.35rem;">📝 待确认的价格与倍率改动</div>
+      ${pendingHtml}
+    </div>
+
+    ${loginHintHtml}
+    ${otherTroubleHtml}
+    ${identifiedHtml}
+    ${appliedHtml}
+  `;
+}
+
+async function openUpstreamPricesModal() {
+  document.getElementById('upstreamPricesModalBackdrop')?.remove();
+  upstreamPricesSelectedIds = null;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = `
+    <div id="upstreamPricesModalBackdrop" class="modal-backdrop open" style="z-index: 1050;">
+      <div class="modal-dialog" style="max-width: 860px;">
+        <div class="dialog-content" style="display:flex;flex-direction:column;gap:0.6rem;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+            <div>
+              <div style="font-size:1.05rem;font-weight:700;color:#141413;">💲 上游价格对账与分组同步</div>
+              <div style="font-size:0.73rem;color:#73726c;margin-top:2px;line-height:1.5;">
+                每 6 小时用我方 Key 只读核对各家上游真实的四个 token 价格与扣费倍率，把分组模型定价对齐上游标价（不改分组自身的销售倍率），并让财务利润按真实进价计算。
+              </div>
+            </div>
+            <button type="button" onclick="document.getElementById('upstreamPricesModalBackdrop').remove()" class="modal-close-btn" title="关闭窗口">✕</button>
+          </div>
+          <div id="upstreamPricesBody" style="display:flex;flex-direction:column;gap:0.55rem;max-height:68vh;overflow-y:auto;padding-right:2px;">
+            <div style="padding:1rem;text-align:center;color:#73726c;font-size:0.8rem;">正在读取对账结果…</div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;border-top:1px solid #e8e6dc;padding-top:0.5rem;flex-wrap:wrap;">
+            <span id="upstreamPricesMeta" style="font-size:0.72rem;color:#9c9a92;"></span>
+            <div style="display:flex;gap:0.5rem;">
+              <button id="btnRunUpstreamPriceCheck" type="button" class="btn btn-secondary" title="立即向各家上游拉取最近 7 天账单并重新核对价格（约需 15–30 秒）">⟳ 立即对账</button>
+              <button type="button" onclick="document.getElementById('upstreamPricesModalBackdrop').remove()" class="btn btn-primary">关闭</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  const backdrop = wrapper.firstElementChild;
+  document.body.appendChild(backdrop);
+
+  backdrop.addEventListener('click', async (e) => {
+    if (e.target === backdrop) { backdrop.remove(); return; }
+    if (e.target.closest('#btnUpstreamPriceSelectSafe')) {
+      upstreamPricesSelectedIds = defaultUpstreamPricesSelection(upstreamPricesData?.pending);
+      renderUpstreamPricesModal();
+      return;
+    }
+    if (e.target.closest('#btnToggleIdentifiedPrices')) {
+      upstreamPricesShowIdentified = !upstreamPricesShowIdentified;
+      renderUpstreamPricesModal();
+      return;
+    }
+    if (e.target.closest('#btnToggleAppliedPrices')) {
+      upstreamPricesShowApplied = !upstreamPricesShowApplied;
+      renderUpstreamPricesModal();
+      return;
+    }
+    if (e.target.closest('#btnJumpToUpstreamPanels')) {
+      backdrop.remove();
+      if (typeof openJinlongModal === 'function') openJinlongModal();
+      return;
+    }
+    if (e.target.closest('#btnSavePriceSyncConfig')) {
+      await saveUpstreamPriceSyncConfig(e.target.closest('#btnSavePriceSyncConfig'));
+      return;
+    }
+    if (e.target.closest('#btnApplySelectedPrices')) {
+      await submitSelectedUpstreamPrices(e.target.closest('#btnApplySelectedPrices'));
+      return;
+    }
+    const exBtn = e.target.closest('.btn-price-exclude-group');
+    if (exBtn) {
+      const gid = exBtn.getAttribute('data-group-id');
+      const gname = exBtn.getAttribute('data-group-name') || `分组 #${gid}`;
+      if (!gid || !confirm(`把分组「${gname}」设为例外吗？\n\n设为例外后，这个分组的价格由你手动管理，不再跟随上游改价（随时可以在上方「已单独排除的分组」里点 ✕ 恢复）。`)) return;
+      const cur = new Set((upstreamPricesData?.config?.excludeGroupIds || []).map(String));
+      cur.add(String(gid));
+      await updateUpstreamPriceExcludeGroups([...cur], `已将「${gname}」加入例外分组`);
+      return;
+    }
+    const resBtn = e.target.closest('.btn-price-restore-group');
+    if (resBtn) {
+      const gid = resBtn.getAttribute('data-group-id');
+      const cur = (upstreamPricesData?.config?.excludeGroupIds || []).map(String).filter(x => x !== String(gid));
+      await updateUpstreamPriceExcludeGroups(cur, '已恢复该分组的价格对账（下次对账时重新纳入）');
+    }
+  });
+
+  backdrop.addEventListener('change', (e) => {
+    if (e.target.id === 'chkUpstreamPriceAll') {
+      const all = (upstreamPricesData?.pending || []).map(c => String(c.id));
+      upstreamPricesSelectedIds = e.target.checked ? new Set(all) : new Set();
+      renderUpstreamPricesModal();
+      return;
+    }
+    if (e.target.classList.contains('upstream-price-check')) {
+      const id = e.target.getAttribute('data-price-id');
+      if (!upstreamPricesSelectedIds) upstreamPricesSelectedIds = new Set();
+      if (e.target.checked) upstreamPricesSelectedIds.add(id);
+      else upstreamPricesSelectedIds.delete(id);
+      renderUpstreamPricesModal();
+    }
+  });
+
+  document.getElementById('btnRunUpstreamPriceCheck')?.addEventListener('click', triggerManualUpstreamPriceCheck);
+
+  try {
+    await loadUpstreamPrices();
+    renderUpstreamPricesModal();
+  } catch (err) {
+    const root = document.getElementById('upstreamPricesBody');
+    if (root) root.innerHTML = `<div style="color:#dc2626;font-size:0.78rem;">读取失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function saveUpstreamPriceSyncConfig(btn) {
+  const autoApply = Boolean(document.getElementById('chkPriceAutoApply')?.checked);
+  const probeNewAccounts = Boolean(document.getElementById('chkPriceProbeNew')?.checked);
+  const rawKw = document.getElementById('inputPriceExcludeKeywords')?.value || '';
+  const excludeKeywords = rawKw.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const res = await fetch('/api/upstream/prices/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ autoApply, probeNewAccounts, excludeKeywords })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || '保存失败');
+    showToast('✅ 上游价格同步设置已保存', 'success');
+    await loadUpstreamPrices();
+    renderUpstreamPricesModal();
+  } catch (err) {
+    showToast(`保存失败：${err.message}`, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '保存设置'; }
+  }
+}
+
+async function updateUpstreamPriceExcludeGroups(excludeGroupIds, toastMsg) {
+  try {
+    const res = await fetch('/api/upstream/prices/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ excludeGroupIds })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || '操作失败');
+    showToast(toastMsg, 'success');
+    await loadUpstreamPrices();
+    renderUpstreamPricesModal();
+  } catch (err) {
+    showToast(`操作失败：${err.message}`, 'error');
+  }
+}
+
+async function submitSelectedUpstreamPrices(btn) {
+  const ids = [...(upstreamPricesSelectedIds || [])];
+  if (!ids.length) return;
+  const riskyCount = (upstreamPricesData?.pending || []).filter(c => ids.includes(String(c.id)) && c.needsConfirm).length;
+  const confirmMsg = riskyCount
+    ? `确认将选中的 ${ids.length} 项（其中包含 ${riskyCount} 项幅度较大或无现价基准的改动）写进 Sub2API 吗？`
+    : `确认将选中的 ${ids.length} 项价格改动写进 Sub2API 吗？`;
+  if (!confirm(confirmMsg)) return;
+  if (btn) { btn.disabled = true; btn.textContent = '正在写入…'; }
+  try {
+    const res = await fetch('/api/upstream/prices/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || '同步失败');
+    const appliedCount = (data.applied || []).length;
+    const skippedCount = (data.skipped || []).length;
+    showToast(`✅ 已同步 ${appliedCount} 项${skippedCount ? `（跳过 ${skippedCount} 项已被改动的条目）` : ''}`, 'success');
+    upstreamPricesSelectedIds = null;
+    await loadUpstreamPrices();
+    renderUpstreamPricesModal();
+    loadChannels();
+  } catch (err) {
+    showToast(`写入失败（未生效）：${err.message}`, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = `✅ 按上游同步选中项 (${ids.length})`; }
+  }
+}
+
+async function triggerManualUpstreamPriceCheck() {
+  const btn = document.getElementById('btnRunUpstreamPriceCheck');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 对账中（约15~30秒）…'; }
+  try {
+    const res = await fetch('/api/upstream/prices/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || '对账失败');
+    showToast(`✅ 对账完成，当前待确认 ${data.pending ?? 0} 项`, 'success');
+    upstreamPricesSelectedIds = null;
+    await loadUpstreamPrices();
+    renderUpstreamPricesModal();
+  } catch (err) {
+    showToast(`对账失败：${err.message}`, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⟳ 立即对账'; }
+  }
+}
+
 async function deleteChannel(channelId, channelName) {
   const name = channelName || `ID: ${channelId}`;
   if (!confirm(`确定要在 Sub2API 数据库与塔台中彻底删除上游渠道 [${name}] 吗？\n\n⚠️ 注意：删除后该渠道将立即从系统与销售分组中下线，不可逆恢复。`)) {
@@ -4157,7 +4577,9 @@ function initApp() {
   });
   document.getElementById('kpiAutoSwitchItem')?.addEventListener('click', openAutoSwitchModal);
   document.getElementById('btnOpenUpstreamKeysModal')?.addEventListener('click', openUpstreamKeysModal);
+  document.getElementById('btnOpenUpstreamPricesModal')?.addEventListener('click', openUpstreamPricesModal);
   loadUpstreamKeys(false).catch(err => console.warn('读取上游新 Key 失败:', err.message));
+  loadUpstreamPrices().catch(err => console.warn('读取上游价格对账失败:', err.message));
 
   // 搜索
   document.getElementById('channelSearchInput')?.addEventListener('input', () => {
@@ -4399,7 +4821,7 @@ if (document.readyState === 'loading') {
 
 // ====== 全局弹窗安全关闭调度器 ======
 // 用 JS 临时生成的弹窗，关闭时直接移除
-const DYNAMIC_MODAL_IDS = ['upstreamKeysModalBackdrop', 'splitSharedModalBackdrop', 'autoSwitchPreviewBackdrop'];
+const DYNAMIC_MODAL_IDS = ['upstreamKeysModalBackdrop', 'upstreamPricesModalBackdrop', 'splitSharedModalBackdrop', 'autoSwitchPreviewBackdrop'];
 
 function closeActiveModal(targetBackdrop = null) {
   if (targetBackdrop && targetBackdrop.id) {
@@ -8858,10 +9280,10 @@ function updateScannerPendingBadge(pendingActions) {
   refreshNavPendingDot();
 }
 
-// 「系统管理」按钮上的小红点：巡检待审批或上游新 Key 任一有内容就亮
+// 「系统管理」按钮上的小红点：巡检待审批、上游新 Key 或上游价格对账待确认任一有内容就亮
 function refreshNavPendingDot() {
   const dot = document.getElementById('navDropdownPendingDot');
-  if (dot) dot.style.display = (window._scannerPendingCount || 0) + (window._upstreamKeysPending || 0) > 0 ? 'inline-block' : 'none';
+  if (dot) dot.style.display = (window._scannerPendingCount || 0) + (window._upstreamKeysPending || 0) + (window._upstreamPricesPending || 0) > 0 ? 'inline-block' : 'none';
 }
 
 async function openUpstreamScanModal() {

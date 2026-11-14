@@ -231,3 +231,39 @@ test('with NEWAPI_BASE_URL set, the cluster panel, the header refresh and the ch
   const checks = await (await request('/api/cluster/diagnostics/run', { method: 'POST', headers })).json();
   assert.equal(checks.checks.find(c => c.item === 'New API · 能不能打开').status, 'PASS');
 });
+
+test('excluding a group in upstream price config immediately drops its pending items and reports its name', async t => {
+  const files = new Map([
+    ['/isolated/data/channels.json', JSON.stringify({
+      activeChannelId: '1', autoPollIntervalSeconds: 300,
+      channels: [{ id: '1', name: 'ch1', baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'k1', status: 'online', schedulable: true, priority: 1, groupsDetail: [{ id: 16, name: 'Grok 专区', sale_rate: 1 }, { id: 66, name: '国模测试', sale_rate: 1 }] }]
+    })],
+    ['/isolated/data/upstream_prices.json', JSON.stringify({
+      checkedAt: 1700000000000, reason: '定时对账', keys: {}, plan: { changes: [], skipped: [] },
+      pending: [
+        { id: '16|grok|1', groupId: '16', groupName: 'Grok 专区', model: 'grok', from: { input: 1e-6, output: 2e-6, cacheWrite: null, cacheRead: null }, fromSource: 'custom', to: { input: 2e-6, output: 4e-6, cacheWrite: null, cacheRead: null }, costRatio: 2, needsConfirm: false, accounts: [] },
+        { id: '66|mimo|1', groupId: '66', groupName: '国模测试', model: 'mimo', from: null, fromSource: 'unknown', to: { input: 1e-6, output: 2e-6, cacheWrite: null, cacheRead: null }, costRatio: null, needsConfirm: true, accounts: [] },
+        { id: 'rate|7|0.25', kind: 'account_rate', accountId: '7', accountName: '号7', from: 1, to: 0.25, costRatio: 0.25, needsConfirm: true }
+      ],
+      applied: [], errors: [], probed: [], knownAccountIds: ['1']
+    })]
+  ]);
+  const server = await startIsolatedServer(t, files);
+  const request = (route, options = {}) => fetch(`http://127.0.0.1:${server.address().port}${route}`, options);
+  const login = await request('/api/login', { method: 'POST', body: JSON.stringify({ password: 'test-password' }) });
+  const headers = { Authorization: `Bearer ${(await login.json()).token}`, 'Content-Type': 'application/json' };
+
+  const before = await (await request('/api/upstream/prices', { headers })).json();
+  assert.equal(before.pending.length, 3);
+  assert.match(before.pending[0].toDesc, /输入 \$2/);
+
+  const saved = await (await request('/api/upstream/prices/config', {
+    method: 'POST', headers, body: JSON.stringify({ excludeGroupIds: ['66'] })
+  })).json();
+  assert.equal(saved.success, true);
+  assert.equal(saved.pendingCount, 2, 'group 66 pending item is removed immediately while group 16 and account_rate remain');
+
+  const after = await (await request('/api/upstream/prices', { headers })).json();
+  assert.deepEqual(after.pending.map(p => p.id), ['16|grok|1', 'rate|7|0.25']);
+  assert.deepEqual(after.excludedGroups, [{ id: '66', name: '国模测试' }]);
+});

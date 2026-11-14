@@ -97,6 +97,11 @@
               <span class="dropdown-item-label">接入上游新 Key</span>
               <span id="upstreamKeysBadge" class="auto-switch-status-pill on" style="display: none; background: #2563eb; color: #fff; padding: 1px 6px; border-radius: 999px; font-weight: 700;">0</span>
             </button>
+            <button id="btnOpenUpstreamPricesModal" class="dropdown-item" title="核对每家上游真实的模型单价与扣费倍率，查看并确认分组价格同步">
+              <span class="dropdown-item-icon">💲</span>
+              <span class="dropdown-item-label">上游价格对账</span>
+              <span id="upstreamPricesBadge" class="auto-switch-status-pill on" style="display: none; background: #d97706; color: #fff; padding: 1px 6px; border-radius: 999px; font-weight: 700;">0</span>
+            </button>
             <button id="btnOpenJinlongModal" class="dropdown-item" title="登记上游供应商的后台账号，用来查余额、模型和倍率">
               <span class="dropdown-item-icon">🔑</span>
               <span class="dropdown-item-label">上游供应商后台</span>
@@ -2349,7 +2354,7 @@
       </div>
     </div>
 
-  <script src="app.js?v=20261009_switch_tags"></script>
+  <script src="app.js?v=20261114_upstream_prices"></script>
   <script src="cluster-view.js?v=20261018_newapi"></script>
 </body>
 </html>

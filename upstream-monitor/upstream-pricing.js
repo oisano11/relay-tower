@@ -888,6 +888,59 @@ function priceChanges(previousKeys, currentKeys, rules = RULES) {
   return out;
 }
 
+// 哪些上游网址可以确定是 Sub2API 站：
+// 1) 同一个网址上有别的 Key 已经从 /v1/usage 读到了按天账；
+// 2) 或者它公开了 Sub2API 独有的 /api/v1/model-plaza，且没有 New API 的 /api/pricing。
+function detectSub2ApiOrigins(keyEntries = [], usage = {}, { plazas = {}, newapis = {} } = {}) {
+  const out = new Set();
+  for (const e of keyEntries) {
+    if (!e || !e.origin) continue;
+    if ((usage[e.keyId] || {}).usageApi === 'ok') { out.add(e.origin); continue; }
+    const hasPlaza = Array.isArray(plazas[e.host]) && plazas[e.host].length > 0;
+    if (hasPlaza && !newapis[e.host]) out.add(e.origin);
+  }
+  return out;
+}
+
+// /v1/usage 读不到按天账时，区分「Sub2API 站上的失效/特殊 Key」「没登录后台的 New API 站」和「后台接口对不上的站」
+function classifyKeyFallback({ origin = '', host = '', httpStatus = 0, error = '', sub2apiOrigins = new Set(), newapis = {}, hasPanel = false, bills = null } = {}) {
+  const statusText = error || (httpStatus ? `HTTP ${httpStatus}` : '请求被拒');
+  if (sub2apiOrigins.has(origin)) {
+    return {
+      usageApi: 'key_rejected',
+      error: `这把 Key 查不到这家 Sub2API 站的账单（${statusText}），可能已失效或不是普通 API Key`
+    };
+  }
+  if (!hasPanel) {
+    if (newapis[host] || httpStatus === 404 || httpStatus === 405) {
+      return {
+        usageApi: 'unsupported',
+        error: '这家是 New API 搭的站：在「上游面板」里登录它的后台以后，才能认出价格和倍率'
+      };
+    }
+    return {
+      usageApi: 'key_rejected',
+      error: `这把 Key 查不到上游账单（${statusText}）：若是 New API 站请去「上游面板」登录后台，否则请检查 Key 是否有效`
+    };
+  }
+  if (bills && bills.notNewApi) {
+    return {
+      usageApi: 'unsupported',
+      error: '这家上游不支持按 Key 查账，也没有 New API 后台扣费记录接口（HTTP 404）'
+    };
+  }
+  if (bills && bills.error) {
+    return { usageApi: 'unsupported', error: bills.error };
+  }
+  return {
+    usageApi: 'panel',
+    error: '',
+    byModel: (bills && bills.byModel) || {},
+    groupRatio: (bills && bills.groupRatio) || null,
+    panelName: (bills && bills.panelName) || ''
+  };
+}
+
 module.exports = {
   RULES, COMPONENTS, COMPONENT_LABELS,
   priceSet, hasAnyPrice, perMillion, describeSet, normalizeModel, isSafeModelName,
@@ -897,6 +950,7 @@ module.exports = {
   applyChangesToPricing, buildApplySql, groupsSql, soldSql, parseGroups, parseSold,
   reportPriceRows, upstreamPriceCte, UPSTREAM_PRICE_JOIN_SQL, COST_BASIS_SQL,
   parseNewApiLogs, matchNewApiToken, newApiObservations,
+  detectSub2ApiOrigins, classifyKeyFallback,
   accountRateChange, buildAccountRateSql, accountRatesSql,
   emptyState, normalizeState, priceChanges
 };

@@ -762,6 +762,15 @@ function getVendorCandidateModels(channel) {
       'gpt-5.4-openai-compact', 'gpt-5.5-openai-compact', 'gpt-5.6-sol-openai-compact', 'gpt-5.6-terra-openai-compact'
     ];
   }
+  if (combined.includes('flux')) {
+    return ['flux-pro', 'flux-dev', 'flux-schnell', 'flux-kontext-pro'];
+  }
+  if (combined.includes('seedream') || combined.includes('jimeng')) {
+    return ['doubao-seedream-3-0-t2i', 'seedream-3.0', 'seedream-4.0'];
+  }
+  if (combined.includes('dall-e') || combined.includes('生图') || combined.includes('绘图') || combined.includes('画图') || combined.includes('imagen')) {
+    return ['gpt-image-1', 'dall-e-3', 'gpt-image-1.5'];
+  }
   return [];
 }
 
@@ -1130,7 +1139,7 @@ async function upstreamUsageForKey(entry, days) {
     const got = await fetchJsonQuiet(`${entry.origin}/v1/usage?start_date=${day}&end_date=${day}`, { headers: { Authorization: `Bearer ${entry.apiKey}` } });
     if (!got.ok) {
       const unsupported = got.status === 401 || got.status === 403 || got.status === 404 || got.status === 405;
-      return { usageApi: unsupported ? 'unsupported' : 'error', error: got.error || `HTTP ${got.status}`, byModel };
+      return { usageApi: unsupported ? 'unsupported' : 'error', httpStatus: got.status || 0, error: got.error || `HTTP ${got.status}`, byModel };
     }
     for (const o of upstreamPricing.parseUsageStats(got.body, day)) (byModel[o.model] = byModel[o.model] || []).push(o);
   }
@@ -1203,7 +1212,9 @@ function modelsToProbe(account, sold, groups) {
     }
   }
   return [...counts.entries()]
-    .filter(([m]) => upstreamPricing.isSafeModelName(m) && (!supported.size || supported.has(upstreamPricing.normalizeModel(m))))
+    .filter(([m]) => upstreamPricing.isSafeModelName(m) &&
+      !(typeof isImageGenerationModel === 'function' && isImageGenerationModel(m, account)) &&
+      (!supported.size || supported.has(upstreamPricing.normalizeModel(m))))
     .sort((a, b) => b[1] - a[1])
     .map(([m]) => m);
 }
@@ -1285,7 +1296,10 @@ async function newApiPanelBills(panel, apiKey, now = Date.now()) {
   for (let page = 1; page <= 10; page++) {
     const got = await fetchJsonQuiet(`${origin}/api/log/self?p=${page}&page_size=100&type=2&start_timestamp=${since}`, { headers });
     if (!got.ok || !got.body || got.body.success === false) {
-      if (page === 1) return { error: `上游后台的扣费记录读不到（${got.status ? `HTTP ${got.status}` : got.error || '连不上'}${got.body && got.body.message ? `：${String(got.body.message).slice(0, 60)}` : ''}），请在「上游面板」里重新登录一次` };
+      if (page === 1) {
+        if (got.status === 404 && tokensGot.status === 404) return { notNewApi: true };
+        return { error: `上游后台的扣费记录读不到（${got.status ? `HTTP ${got.status}` : got.error || '连不上'}${got.body && got.body.message ? `：${String(got.body.message).slice(0, 60)}` : ''}），请在「上游面板」里重新登录一次` };
+      }
       break;
     }
     const list = upstreamPricing.parseNewApiLogs(got.body);
@@ -1332,20 +1346,31 @@ async function runUpstreamPriceCheck({ reason = '定时对账', probeAccountIds 
     const usage = {};
     await mapLimit(keyEntries, 4, async entry => { usage[entry.keyId] = await upstreamUsageForKey(entry, days); });
 
-    // 查不到按天账的上游（New API 搭的）：在「上游面板」里登录了它的后台，就读我们账号的每条扣费记录
-    const newApiKeys = keyEntries.filter(e => (usage[e.keyId] || {}).usageApi === 'unsupported');
-    await mapLimit(newApiKeys, 2, async entry => {
+    // 查不到按天账的上游：先排除已确认是 Sub2API 站上的失效/特殊 Key，其余若在「上游面板」登录了后台就读每条扣费记录
+    const sub2apiOrigins = upstreamPricing.detectSub2ApiOrigins(keyEntries, usage, publicLists);
+    const unsupportedKeys = keyEntries.filter(e => (usage[e.keyId] || {}).usageApi === 'unsupported');
+    const newApiKeys = [];
+    await mapLimit(unsupportedKeys, 2, async entry => {
+      const current = usage[entry.keyId] || {};
+      if (sub2apiOrigins.has(entry.origin)) {
+        const res = upstreamPricing.classifyKeyFallback({ origin: entry.origin, host: entry.host, httpStatus: current.httpStatus, error: current.error, sub2apiOrigins, newapis: publicLists.newapis });
+        usage[entry.keyId] = { ...current, ...res };
+        return;
+      }
       const panel = newApiPanelFor(entry.origin);
       if (!panel) {
-        usage[entry.keyId].error = '这家是 New API 搭的站：在「上游面板」里登录它的后台以后，才能认出价格和倍率';
+        const res = upstreamPricing.classifyKeyFallback({ origin: entry.origin, host: entry.host, httpStatus: current.httpStatus, error: current.error, sub2apiOrigins, newapis: publicLists.newapis, hasPanel: false });
+        usage[entry.keyId] = { ...current, ...res };
         return;
       }
       const bills = await newApiPanelBills(panel, entry.apiKey, started);
-      if (bills.error) {
-        usage[entry.keyId].error = bills.error;
-        return;
-      }
-      usage[entry.keyId] = { ...usage[entry.keyId], usageApi: 'panel', error: '', byModel: bills.byModel, groupRatio: bills.groupRatio, panelName: panel.name || '' };
+      const res = upstreamPricing.classifyKeyFallback({
+        origin: entry.origin, host: entry.host, httpStatus: current.httpStatus, error: current.error,
+        sub2apiOrigins, newapis: publicLists.newapis, hasPanel: true,
+        bills: { ...bills, panelName: panel.name || '' }
+      });
+      usage[entry.keyId] = { ...current, ...res };
+      if (res.usageApi === 'panel') newApiKeys.push(entry);
     });
 
     // 刚接入的号：上游那边它要卖的模型还没有账，就先试
@@ -1885,7 +1910,11 @@ function manualGuardProbeModel(channel, groupId) {
   const mapping = channel && channel.modelMapping && typeof channel.modelMapping === 'object' ? channel.modelMapping : {};
   const supported = Object.keys(mapping).length ? Object.keys(mapping) : ((channel && channel.configuredModels) || []);
   const demand = ((typeof fetchGroupModelDemand === 'function' ? fetchGroupModelDemand() : {}) || {})[String(groupId)] || [];
-  const model = demand.find(name => supported.includes(name)) || supported[0] || '';
+  const isImg = name => typeof isImageGenerationModel === 'function' && isImageGenerationModel(mapping[name] || name, channel);
+  const model = demand.find(name => supported.includes(name))
+    || supported.find(name => !isImg(name))
+    || supported[0]
+    || '';
   return mapping[model] || model;
 }
 
@@ -1942,8 +1971,9 @@ async function runManualGuardProbe(action) {
   const outcome = manualGroupGuard.afterProbe(state.manualGuard, id, { passed: result.success, resumed, error, now });
   if (outcome && outcome.resumed) {
     const p = outcome.pause;
-    console.log(`▶️ [坏号看护] ${p.groupName}：${p.name} 试过能出字，已放回`);
-    recordManualGuardAlert({ accountId: id, name: p.name, groupId: p.groupId, groupName: p.groupName }, `${p.groupName}：${p.name} 试过一次能正常出字，已放回接单。`);
+    const okVerb = result && result.probeType === 'image' ? '试过能正常出图' : '试过能出字';
+    console.log(`▶️ [坏号看护] ${p.groupName}：${p.name} ${okVerb}，已放回`);
+    recordManualGuardAlert({ accountId: id, name: p.name, groupId: p.groupId, groupName: p.groupName }, `${p.groupName}：${p.name} ${okVerb}，已放回接单。`);
     manualGroupGuard.recordEvent(state.manualGuard, { type: 'resume', at: now, accountId: id, groupId: p.groupId });
     sendManualGuardTelegram('notifyAccountResumed', { groupName: p.groupName, name: p.name, pausedMs: now - Number(p.since) });
   } else if (outcome) {
@@ -6239,12 +6269,14 @@ SELECT json_agg(t) FROM (
       }
       ch.knownModels = Array.from(allModelNames);
 
-      // 5. 对已有 24h 日志的模型打上 enabled, isUpstreamSupported 标记
+      // 5. 对已有 24h 日志的模型打上 enabled, isUpstreamSupported, isImageModel 标记
       const existingItemsMap = new Map();
+      const mappedUpstream = m => (ch.modelMapping && typeof ch.modelMapping[m] === 'string' && !ch.modelMapping[m].includes('*')) ? ch.modelMapping[m] : m;
       for (const item of list) {
         item.enabled = mappedModels.has(item.model);
         item.isUpstreamSupported = upstreamSet.has(item.model);
         item.isConfiguredReal = item.enabled;
+        item.isImageModel = isImageGenerationModel(mappedUpstream(item.model), ch);
         if (!item.badgeText || item.statusLevel === 'untested') {
           item.badgeText = item.enabled ? '已开启调度 · 待测' : (item.isUpstreamSupported ? '上游支持 · 未开启' : '未开启调度');
         }
@@ -6256,6 +6288,10 @@ SELECT json_agg(t) FROM (
         if (!existingItemsMap.has(mName)) {
           const isMapped = mappedModels.has(mName);
           const isUpstream = upstreamSet.has(mName);
+          const isImage = isImageGenerationModel(mappedUpstream(mName), ch);
+          const actionHint = isImage
+            ? '点击右侧「🎨 测生图」将调用 /v1/images/generations 实测一次出图（按张计费）。'
+            : '点击右侧「⚡ 测首字」可实测上游延迟。';
           const item = {
             model: mName,
             totalCalls: 0,
@@ -6279,12 +6315,13 @@ SELECT json_agg(t) FROM (
             enabled: isMapped,
             isUpstreamSupported: isUpstream,
             isConfiguredReal: isMapped,
+            isImageModel: isImage,
             tooltipTitle: isMapped ? 'ℹ️ 已配置调度 · 暂无 24h 生产调用' : (isUpstream ? 'ℹ️ 上游接口支持 · 尚未开启调度' : 'ℹ️ 备用模型 · 未开启'),
             tooltipDesc: isMapped 
-              ? '该模型已配置在中转系统的调度映射中。点击右侧「⚡ 测首字」可实测上游延迟。'
+              ? `该模型已配置在中转系统的调度映射中。${actionHint}`
               : (isUpstream 
-                ? '上游 /v1/models 接口证实支持此模型。点击开关可立即启用分流调度，点击「⚡ 测首字」可先行实测。'
-                : '此为该厂商通用模型。可点击开关加入调度，或点击「⚡ 测首字」进行测试。')
+                ? `上游 /v1/models 接口证实支持此模型。点击开关可立即启用分流调度，${actionHint}`
+                : `此为该厂商通用模型。可点击开关加入调度，或${actionHint}`)
           };
           list.push(item);
           existingItemsMap.set(mName, item);
@@ -6300,10 +6337,12 @@ SELECT json_agg(t) FROM (
           item.liveStatusCode = live.statusCode;
           item.liveTestedAt = live.timestamp;
           item.liveError = live.error;
+          item.liveProbeType = live.probeType || (item.isImageModel ? 'image' : 'chat');
+          item.liveResultKind = live.resultKind || null;
           if (live.success && live.ttftMs) {
             item.statusLevel = 'healthy';
             if (item.totalCalls === 0) {
-              item.badgeText = `实测 ${live.ttftMs}ms`;
+              item.badgeText = item.liveProbeType === 'image' ? `实测出图 ${live.ttftMs}ms` : `实测 ${live.ttftMs}ms`;
             }
           }
         }
@@ -7041,7 +7080,7 @@ function broadcastChannelsUpdate(forceStabilityRefresh = false) {
   }
 }
 
-// 实时流式单 Token 探测模型首字时间 (TTFT) 与存活性
+// 实时流式单 Token 探测模型首字时间 (TTFT) 与存活性；生图模型自动走 /v1/images/generations 探测出图。
 // options.fullStream：把这条 1 个字的回答读完再判断（坏号看护用）。有的上游第一帧先回一个空开头，错误放在后面。
 async function probeChannelModel(channel, modelName, options = {}) {
   if (!channel || !channel.baseUrl || !channel.apiKey) {
@@ -7054,6 +7093,12 @@ async function probeChannelModel(channel, modelName, options = {}) {
   }
 
   const model = (modelName || 'gpt-4o-mini').trim();
+  const forceChat = options.probeType === 'chat';
+  const forceImage = options.probeType === 'image';
+  if (forceImage || (!forceChat && isImageGenerationModel(model, channel))) {
+    return probeImageModel(channel, model, options);
+  }
+
   const rawBase = (channel.baseUrl || '').trim().replace(/\/+$/, '');
   const isAnthropic = (channel.platform || '').toLowerCase() === 'anthropic' || (channel.providerType || '').toLowerCase().includes('anthropic');
   
@@ -7090,8 +7135,9 @@ async function probeChannelModel(channel, modelName, options = {}) {
   }
 
   const t0 = Date.now();
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 35000);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 35000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(endpoint, {
@@ -7104,19 +7150,11 @@ async function probeChannelModel(channel, modelName, options = {}) {
     if (!res.ok) {
       clearTimeout(timer);
       const errText = await res.text().catch(() => '');
-      let errMsg = `上游返回 HTTP ${res.status}`;
-      try {
-        const j = JSON.parse(errText);
-        if (j.error && j.error.message) errMsg += `: ${j.error.message}`;
-        else if (j.message) errMsg += `: ${j.message}`;
-      } catch (e) {
-        if (errText) errMsg += `: ${errText.slice(0, 100)}`;
-      }
       return {
         success: false,
         statusCode: res.status,
         ttftMs: null,
-        error: errMsg
+        error: extractHttpErrorMessage(res.status, errText)
       };
     }
 
@@ -7155,24 +7193,235 @@ async function probeChannelModel(channel, modelName, options = {}) {
       success: true,
       statusCode: res.status,
       ttftMs,
+      probeType: 'chat',
       testedAt: new Date().toISOString()
     };
   } catch (err) {
     clearTimeout(timer);
-    const elapsed = Date.now() - t0;
-    const isTimeout = err.name === 'AbortError' || elapsed >= 7900 || (err.message && err.message.includes('context deadline exceeded'));
-    let errMsg = err.message || '网络连接失败';
-    if (isTimeout) {
-      errMsg = '首字响应超时 (>8秒)';
-    } else if (errMsg.includes('context canceled')) {
-      errMsg = '探测请求已中断 (Context Canceled)';
-    }
+    return buildProbeCatchResult(err, timeoutMs, 'chat');
+  }
+}
+
+function bareModelName(modelName) {
+  const clean = String(modelName || '').trim().toLowerCase();
+  const slash = clean.lastIndexOf('/');
+  return slash >= 0 ? clean.slice(slash + 1) : clean;
+}
+
+const IMAGE_MODEL_PATTERNS = [
+  /^dall-e(?:-\d+(?:\.\d+)?)?(?:$|-)/i,
+  /^gpt-image(?:[-_.]|$)/i,
+  /^chatgpt-image(?:[-_.]|$)/i,
+  /^grok-(?:imagine-image|2-image)(?:[-_.]|$)/i,
+  /^flux(?:[-_./0-9]|$)/i,
+  /^(?:doubao-)?seedream(?:[-_.]|$)/i,
+  /^seededit(?:[-_.]|$)/i,
+  /^jimeng(?:[-_.]|$)/i,
+  /^imagen(?:[-_.]|$)/i,
+  /^qwen-image(?:[-_.]|$)/i,
+  /^wanx(?:[-_.]|\d|$)/i,
+  /^cogview(?:[-_.]|\d|$)/i,
+  /^kolors(?:[-_.]|$)/i,
+  /^hunyuan-image(?:[-_.]|$)/i,
+  /^ideogram(?:[-_.]|$)/i,
+  /^recraft(?:[-_.]|$)/i,
+  /^(?:stable-diffusion|sdxl|sd3|sd-3)(?:[-_.]|$)/i
+];
+
+function isImageGenerationModel(modelName, channel = null) {
+  const raw = String(modelName || '').trim();
+  if (!raw || raw.includes('*')) return false;
+  if (channel && Array.isArray(channel.imageModels) && channel.imageModels.includes(raw)) return true;
+  const bare = bareModelName(raw);
+  return IMAGE_MODEL_PATTERNS.some(re => re.test(bare) || re.test(raw.toLowerCase()));
+}
+
+function isImageOnlyChannel(channel) {
+  if (!channel) return false;
+  const mapping = channel.modelMapping && typeof channel.modelMapping === 'object' ? channel.modelMapping : {};
+  const rawModels = [
+    ...Object.keys(mapping),
+    ...Object.values(mapping),
+    ...(Array.isArray(channel.configuredModels) ? channel.configuredModels : []),
+    ...(Array.isArray(channel.knownModels) ? channel.knownModels : [])
+  ];
+  const concrete = rawModels
+    .map(m => (typeof m === 'string' ? m.trim() : ''))
+    .filter(m => m && !m.includes('*') && m !== '通用模型');
+  if (concrete.length > 0) {
+    return concrete.every(m => isImageGenerationModel(m, channel));
+  }
+  const meta = `${channel.name || ''} ${(Array.isArray(channel.groups) ? channel.groups.join(' ') : '')}`;
+  const hasImageHint = /(生图|绘图|画图|dall-?e|gpt-image|flux|seedream|imagen|grok-imagine-image)/i.test(meta);
+  const hasTextHint = /(gpt-4|gpt-5|codex|claude|deepseek|kimi|glm|minimax|gemini)/i.test(meta);
+  return hasImageHint && !hasTextHint;
+}
+
+function extractHttpErrorMessage(statusCode, rawText) {
+  let errMsg = `上游返回 HTTP ${statusCode}`;
+  const text = String(rawText || '');
+  try {
+    const j = JSON.parse(text);
+    const detail = (j.error && (j.error.message || (typeof j.error === 'string' ? j.error : ''))) || j.message || j.msg;
+    if (detail) errMsg += `: ${String(detail).slice(0, 200)}`;
+  } catch (e) {
+    if (text) errMsg += `: ${text.replace(/\s+/g, ' ').slice(0, 120)}`;
+  }
+  return errMsg;
+}
+
+function buildProbeCatchResult(err, timeoutMs, probeType) {
+  const isTimeout = err && (err.name === 'AbortError' || (err.message && /context deadline exceeded|timeout/i.test(err.message)));
+  let errMsg = (err && err.message) || '网络连接失败';
+  if (isTimeout) {
+    const sec = Math.max(1, Math.round(timeoutMs / 1000));
+    errMsg = probeType === 'image' ? `生图响应超时 (>${sec}秒)` : `首字响应超时 (>${sec}秒)`;
+  } else if (errMsg.includes('context canceled')) {
+    errMsg = '探测请求已中断 (Context Canceled)';
+  }
+  return {
+    success: false,
+    statusCode: isTimeout ? 524 : 0,
+    ttftMs: null,
+    probeType,
+    error: errMsg
+  };
+}
+
+function parseImageProbeStream(streamText, statusCode, elapsedMs) {
+  const inspected = String(streamText || '').slice(0, 65536);
+  if (!inspected.trim()) {
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: '上游返回空流' };
+  }
+  if (/^event:\s*error/m.test(inspected) || /"type"\s*:\s*"error"/.test(inspected) || /"error"\s*:\s*\{/.test(inspected)) {
+    const at = Math.max(0, inspected.search(/^event:\s*error|"type"\s*:\s*"error"|"error"\s*:\s*\{/m));
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: `流内错误: ${inspected.slice(at).replace(/\s+/g, ' ').slice(0, 200)}` };
+  }
+  if (/"(?:b64_json|url|partial_image|image_generation)"/.test(inspected)) {
     return {
-      success: false,
-      statusCode: isTimeout ? 524 : 0,
-      ttftMs: null,
-      error: errMsg
+      success: true,
+      statusCode,
+      ttftMs: elapsedMs,
+      durationMs: elapsedMs,
+      probeType: 'image',
+      imageCount: 1,
+      resultKind: /"url"\s*:/.test(inspected) ? 'url' : 'b64_json',
+      testedAt: new Date().toISOString()
     };
+  }
+  return { success: false, statusCode, ttftMs: null, probeType: 'image', error: '上游流内未包含生图数据' };
+}
+
+function parseImageProbeJson(rawText, statusCode, elapsedMs) {
+  const text = String(rawText || '');
+  if (!text.trim()) {
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: '上游返回空响应' };
+  }
+  if (text.trimStart().startsWith('data:') || /^event:\s*/m.test(text)) {
+    return parseImageProbeStream(text, statusCode, elapsedMs);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: `上游返回非 JSON 响应: ${text.replace(/\s+/g, ' ').slice(0, 120)}` };
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: '上游生图响应格式无效' };
+  }
+  if (parsed.error) {
+    const detail = parsed.error.message || (typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error));
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: `生图接口返回错误: ${String(detail).slice(0, 200)}` };
+  }
+  if (parsed.success === false || (typeof parsed.code === 'number' && parsed.code !== 0 && parsed.code !== 200)) {
+    const detail = parsed.message || parsed.msg || `code=${parsed.code}`;
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: `生图接口返回错误: ${String(detail).slice(0, 200)}` };
+  }
+  const items = Array.isArray(parsed.data)
+    ? parsed.data
+    : (parsed.data && Array.isArray(parsed.data.data) ? parsed.data.data : (Array.isArray(parsed.images) ? parsed.images : []));
+  if (!items.length) {
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: '上游未返回生图结果 (data 为空)' };
+  }
+  const nonEmpty = v => typeof v === 'string' && v.trim().length > 0;
+  const validItem = items.find(item => item && (nonEmpty(item.url) || nonEmpty(item.b64_json) || nonEmpty(item.image) || nonEmpty(item.base64)));
+  if (!validItem) {
+    return { success: false, statusCode, ttftMs: null, probeType: 'image', error: '上游未返回有效的图片地址或 Base64 数据' };
+  }
+  return {
+    success: true,
+    statusCode,
+    ttftMs: elapsedMs,
+    durationMs: elapsedMs,
+    probeType: 'image',
+    imageCount: items.length,
+    resultKind: nonEmpty(validItem.url) ? 'url' : 'b64_json',
+    testedAt: new Date().toISOString()
+  };
+}
+
+async function probeImageModel(channel, model, options = {}) {
+  const rawBase = (channel.baseUrl || '').trim().replace(/\/+$/, '');
+  const endpoint = rawBase.endsWith('/v1') ? `${rawBase}/images/generations` : `${rawBase}/v1/images/generations`;
+  const headers = {
+    'Authorization': `Bearer ${channel.apiKey}`,
+    'Content-Type': 'application/json'
+  };
+  const bodyPayload = {
+    model,
+    prompt: 'a simple red dot',
+    n: 1
+  };
+  if (/^dall-e-2$/i.test(bareModelName(model))) {
+    bodyPayload.size = '256x256';
+  }
+
+  const t0 = Date.now();
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 90000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(bodyPayload),
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      clearTimeout(timer);
+      const errText = await res.text().catch(() => '');
+      return {
+        success: false,
+        statusCode: res.status,
+        ttftMs: null,
+        probeType: 'image',
+        error: extractHttpErrorMessage(res.status, errText)
+      };
+    }
+
+    const contentType = String(res.headers && typeof res.headers.get === 'function' ? res.headers.get('content-type') : '').toLowerCase();
+    if (contentType.includes('text/event-stream') && res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      let streamText = '';
+      let ended = false;
+      while (!ended && streamText.length < 65536) {
+        const chunk = await reader.read();
+        ended = chunk.done;
+        if (chunk.value) streamText += Buffer.from(chunk.value).toString('utf8');
+      }
+      clearTimeout(timer);
+      try { reader.cancel(); } catch (e) {}
+      return parseImageProbeStream(streamText, res.status, Date.now() - t0);
+    }
+
+    const rawText = await res.text().catch(() => '');
+    clearTimeout(timer);
+    return parseImageProbeJson(rawText, res.status, Date.now() - t0);
+  } catch (err) {
+    clearTimeout(timer);
+    return buildProbeCatchResult(err, timeoutMs, 'image');
   }
 }
 
@@ -7901,7 +8150,11 @@ function previewAutoSwitch(now = Date.now()) {
         const until = new Date(Number(decision.heldOrigin.until) + 8 * 3600000); // 北京时间
         notes.push(`真实请求最近出过错，${until.getUTCMonth() + 1}月${until.getUTCDate()}日 ${until.toISOString().slice(11, 16)} 以后才自动换回`);
       }
-      if (channel.lastProbeStatus !== 'online') notes.push(channel.probeMode === 'generation' ? '无 /v1/models，等待生成探测' : `探活: ${channel.lastProbeStatus || '无'}`);
+      if (channel.lastProbeStatus !== 'online') {
+        notes.push(channel.probeMode === 'generation'
+          ? (isImageOnlyChannel(channel) ? '无 /v1/models（纯生图渠道不自动付费生图，可手动点测）' : '无 /v1/models，等待生成探测')
+          : `探活: ${channel.lastProbeStatus || '无'}`);
+      }
       if (channel.lastGenerationProbeStatus && channel.lastGenerationProbeStatus !== 'ok') notes.push(`生成探测: ${channel.lastGenerationProbeStatus}${channel.lastGenerationProbeError ? '（' + String(channel.lastGenerationProbeError).slice(0, 80) + '）' : ''}`);
       row.accounts.push({ id, name: channel.name, cost: channel.costMultiplier ?? channel.multiplier, priority: channel.priority,
         schedulable: channel.schedulable === true, isCurrent, isTarget: row.target?.id === id,
@@ -7985,8 +8238,14 @@ function pickGenerationProbeModels(channel, limit = 4) {
   const concrete = value => typeof value === 'string' && value.trim() && !value.includes('*');
   const mapping = channel.modelMapping && typeof channel.modelMapping === 'object' ? channel.modelMapping : {};
   const upstreamName = model => (concrete(mapping[model]) ? mapping[model] : model);
-  const ordered = [];
-  const add = model => { if (concrete(model) && !ordered.includes(model)) ordered.push(model); };
+  const imageOnly = isImageOnlyChannel(channel);
+  const textOrdered = [];
+  const imageOrdered = [];
+  const add = model => {
+    if (!concrete(model)) return;
+    const target = isImageGenerationModel(model, channel) ? imageOrdered : textOrdered;
+    if (!target.includes(model)) target.push(model);
+  };
   // 上次成功的模型最可靠，优先复用。
   add(channel.generationProbeModel);
   for (const [clientModel, upstreamModel] of Object.entries(mapping)) {
@@ -7994,9 +8253,16 @@ function pickGenerationProbeModels(channel, limit = 4) {
   }
   groupIds(channel).flatMap(gid => (state.failoverRuntime?.[String(gid)]?.requiredModels) || []).forEach(model => add(upstreamName(model)));
   (channel.knownModels || []).slice(0, 6).forEach(model => add(upstreamName(model)));
+  if (imageOnly) {
+    if (imageOrdered.length === 0 && typeof getVendorCandidateModels === 'function') {
+      getVendorCandidateModels(channel).forEach(add);
+    }
+    if (imageOrdered.length === 0) ['gpt-image-1', 'dall-e-3'].forEach(add);
+    return imageOrdered.slice(0, Math.max(1, limit));
+  }
   const isAnthropic = String(channel.platform || '').toLowerCase() === 'anthropic';
   (isAnthropic ? ['claude-3-5-haiku-latest', 'claude-sonnet-4-20250514'] : ['gpt-4o-mini', 'gpt-4.1-mini']).forEach(add);
-  return ordered.slice(0, Math.max(1, limit));
+  return textOrdered.slice(0, Math.max(1, limit));
 }
 
 function pickGenerationProbeModel(channel) {
@@ -8013,7 +8279,8 @@ function generationModelMissing(outcome) {
 
 function channelNeedsGenerationProof(channel) {
   const id = String(channel.id);
-  if (channel.modelsProbeUnsupported === true) return true;
+  // 纯生图渠道在未发生欠费/请求故障时不主动付费生图，仅在需要恢复证明或排查故障时探测。
+  if (channel.modelsProbeUnsupported === true && !isImageOnlyChannel(channel)) return true;
   return Object.values(state.failoverRuntime || {}).some(runtime => {
     const account = runtime?.accounts?.[id];
     return account && (account.debt === true || account.proofRequiredSince != null);
@@ -8024,12 +8291,18 @@ function generationProbeIntervalMs() {
   return Math.max(60000, Number(autoSwitchConfig.generationProbeIntervalMs) || 300000);
 }
 
+function imageGenerationProbeIntervalMs() {
+  return Math.max(300000, Number(autoSwitchConfig.imageGenerationProbeIntervalMs) || 1800000);
+}
+
 // 不支持 /v1/models 的账号：最近一次真实生成成功才算在线；失败或过期只记“未知”，
 // 不累计探活失败（真实流量故障仍由请求统计判断），避免一次探测失败就被切走。
 function applyGenerationBasedProbeStatus(channels, now = Date.now()) {
-  const maxAge = generationProbeIntervalMs() * 2 + 60000;
+  const textMaxAge = generationProbeIntervalMs() * 2 + 60000;
+  const imageMaxAge = imageGenerationProbeIntervalMs() * 2 + 60000;
   for (const channel of channels) {
     if (channel.modelsProbeUnsupported !== true) continue;
+    const maxAge = isImageOnlyChannel(channel) ? imageMaxAge : textMaxAge;
     const at = Date.parse(channel.lastGenerationProbeAt || '');
     const recentOk = channel.lastGenerationProbeStatus === 'ok' && Number.isFinite(at) && now - at <= maxAge;
     channel.lastProbeStatus = recentOk ? 'online' : 'unknown';
@@ -8043,6 +8316,7 @@ const SUSPECT_PROBE_INTERVAL_MS = 120000;
 
 async function runGenerationProofs(channels) {
   const interval = generationProbeIntervalMs();
+  const imageInterval = imageGenerationProbeIntervalMs();
   const now = Date.now();
   const production = typeof fetchRecentFailoverMetrics === 'function' ? fetchRecentFailoverMetrics() : {};
   const suspect = channel => {
@@ -8055,7 +8329,9 @@ async function runGenerationProofs(channels) {
     if (!channel.apiKey || !channel.baseUrl || channel.passiveHealth === true) return false;
     const suspicious = suspect(channel);
     if (!suspicious && !channelNeedsGenerationProof(channel)) return false;
-    const wait = suspicious ? Math.min(interval, SUSPECT_PROBE_INTERVAL_MS) : interval;
+    const wait = isImageOnlyChannel(channel)
+      ? imageInterval
+      : (suspicious ? Math.min(interval, SUSPECT_PROBE_INTERVAL_MS) : interval);
     return !(Date.parse(channel.lastGenerationProbeAt || '') > now - wait);
   });
   for (let offset = 0; offset < due.length; offset += 4) {
@@ -8063,7 +8339,8 @@ async function runGenerationProofs(channels) {
       const endpoint = channel.baseUrl, apiKey = channel.apiKey;
       let model = null, outcome = null;
       const tried = [];
-      for (const candidate of pickGenerationProbeModels(channel)) {
+      const candidateLimit = isImageOnlyChannel(channel) ? 2 : 4;
+      for (const candidate of pickGenerationProbeModels(channel, candidateLimit)) {
         model = candidate;
         try {
           outcome = await probeChannelModel(channel, candidate);
@@ -10059,12 +10336,13 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // ====== 【新功能 4】模型首字流式测速 (TTFT) 与存活探测路由 ======
+  // ====== 【新功能 4】模型首字流式测速 (TTFT) 与生图实测路由 ======
   if (pathname.match(/^\/api\/channels\/([^/]+)\/probe-model$/) && req.method === 'POST') {
     const match = pathname.match(/^\/api\/channels\/([^/]+)\/probe-model$/);
     const targetId = match[1];
     const body = await getBody();
     const targetModel = (body.model || body.modelName || 'gpt-4o-mini').trim();
+    const probeType = body.probeType === 'image' || body.probeType === 'chat' ? body.probeType : undefined;
 
     const targetChannel = state.channels.find(c => String(c.id) === String(targetId));
     if (!targetChannel) {
@@ -10073,16 +10351,39 @@ async function handleRequest(req, res) {
       return;
     }
 
-    probeChannelModel(targetChannel, targetModel).then(result => {
+    const mappedModel = (targetChannel.modelMapping && typeof targetChannel.modelMapping[targetModel] === 'string'
+      && targetChannel.modelMapping[targetModel].trim() && !targetChannel.modelMapping[targetModel].includes('*'))
+      ? targetChannel.modelMapping[targetModel].trim()
+      : targetModel;
+
+    probeChannelModel(targetChannel, mappedModel, probeType ? { probeType } : {}).then(result => {
+      const nowIso = new Date().toISOString();
       if (!state.liveModelTTFT) state.liveModelTTFT = {};
       const liveKey = `${targetId}:${targetModel}`;
       state.liveModelTTFT[liveKey] = {
         ttftMs: result.ttftMs,
+        durationMs: result.durationMs ?? result.ttftMs,
         statusCode: result.statusCode,
-        timestamp: new Date().toISOString(),
+        timestamp: nowIso,
         error: result.error || null,
-        success: result.success
+        success: result.success,
+        probeType: result.probeType || 'chat',
+        resultKind: result.resultKind || null,
+        imageCount: result.imageCount || null
       };
+
+      if (result.success && (targetChannel.modelsProbeUnsupported === true || isImageOnlyChannel(targetChannel))) {
+        targetChannel.lastGenerationProbeAt = nowIso;
+        targetChannel.lastGenerationProbeStatus = 'ok';
+        targetChannel.lastGenerationProbeModel = mappedModel;
+        targetChannel.lastGenerationProbeError = null;
+        targetChannel.generationProbeModel = mappedModel;
+        if (targetChannel.modelsProbeUnsupported === true) {
+          targetChannel.lastProbeStatus = 'online';
+          targetChannel.lastProbeTime = nowIso;
+          targetChannel.status = 'online';
+        }
+      }
 
       cachedStability = null;
       writeJSON(CHANNELS_FILE, state);
@@ -10092,6 +10393,7 @@ async function handleRequest(req, res) {
       res.end(JSON.stringify({
         success: result.success,
         model: targetModel,
+        upstreamModel: mappedModel,
         channelId: targetId,
         channelName: targetChannel.name,
         result
@@ -10965,6 +11267,18 @@ async function handleRequest(req, res) {
   // ====== 上游价格对账 ======
   if (pathname === '/api/upstream/prices' && req.method === 'GET') {
     const data = upstreamPriceData();
+    const cfg = priceSyncConfig();
+    const groupNameMap = new Map();
+    for (const ch of state.channels || []) {
+      for (const g of ch.groupsDetail || []) if (g && g.id !== undefined) groupNameMap.set(String(g.id), g.name || `分组 #${g.id}`);
+    }
+    for (const s of (data.plan && data.plan.skipped) || []) if (s && s.groupId) groupNameMap.set(String(s.groupId), s.groupName || `分组 #${s.groupId}`);
+    const enrichChange = c => ({
+      ...c,
+      text: priceChangeText(c),
+      fromDesc: c.kind === 'account_rate' ? `${c.from}x` : upstreamPricing.describeSet(c.from),
+      toDesc: c.kind === 'account_rate' ? `${c.to}x` : upstreamPricing.describeSet(c.to)
+    });
     const keys = Object.entries(data.keys || {}).map(([keyId, k]) => ({
       keyId, host: k.host, accountIds: k.accountIds, names: k.names, usageApi: k.usageApi, groupRatio: k.groupRatio || null, panelName: k.panelName || '', error: k.error,
       models: Object.entries(k.models || {}).map(([model, r]) => ({
@@ -10975,9 +11289,11 @@ async function handleRequest(req, res) {
     }));
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
-      success: true, checkedAt: data.checkedAt, reason: data.reason, running: !!upstreamPriceRun, config: priceSyncConfig(), keys,
-      pending: (data.pending || []).map(c => ({ ...c, text: priceChangeText(c) })),
-      applied: (data.applied || []).slice(-50).map(c => ({ ...c, text: priceChangeText(c) })),
+      success: true, checkedAt: data.checkedAt, reason: data.reason, running: !!upstreamPriceRun, config: cfg,
+      excludedGroups: (cfg.excludeGroupIds || []).map(id => ({ id: String(id), name: groupNameMap.get(String(id)) || `分组 #${id}` })),
+      keys,
+      pending: (data.pending || []).map(enrichChange),
+      applied: (data.applied || []).slice(-50).reverse().map(enrichChange),
       skipped: (data.plan && data.plan.skipped) || [], errors: (data.errors || []).slice(-20), probed: (data.probed || []).slice(-20)
     }));
     return;
@@ -11018,11 +11334,18 @@ async function handleRequest(req, res) {
     if (typeof body.autoApply === 'boolean') next.autoApply = body.autoApply;
     if (typeof body.probeNewAccounts === 'boolean') next.probeNewAccounts = body.probeNewAccounts;
     if (Array.isArray(body.excludeKeywords)) next.excludeKeywords = body.excludeKeywords.map(String).map(k => k.trim()).filter(Boolean).slice(0, 20);
-    if (Array.isArray(body.excludeGroupIds)) next.excludeGroupIds = body.excludeGroupIds.map(String).filter(id => /^\d+$/.test(id)).slice(0, 200);
+    if (Array.isArray(body.excludeGroupIds)) next.excludeGroupIds = [...new Set(body.excludeGroupIds.map(String).filter(id => /^\d+$/.test(id)))].slice(0, 200);
     if (body.intervalHours !== undefined) next.intervalHours = Number(body.intervalHours);
     writeJSON(PRICE_SYNC_CONFIG_FILE, next);
+    const savedConfig = priceSyncConfig();
+    const data = upstreamPriceData();
+    const keptPending = (data.pending || []).filter(c => c.kind === 'account_rate' || !upstreamPricing.excludedGroup({ id: c.groupId, name: c.groupName }, savedConfig));
+    if (keptPending.length !== (data.pending || []).length) {
+      upstreamPriceState = upstreamPricing.normalizeState({ ...data, pending: keptPending });
+      writeJSON(UPSTREAM_PRICES_FILE, upstreamPriceState);
+    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ success: true, config: priceSyncConfig() }));
+    res.end(JSON.stringify({ success: true, config: savedConfig, pendingCount: keptPending.length }));
     return;
   }
 
